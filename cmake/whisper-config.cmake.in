@@ -11,24 +11,21 @@ set(GGML_ACCELERATE @GGML_ACCELERATE@)
 
 @PACKAGE_INIT@
 
-set_and_check(WHISPER_INCLUDE_DIR "@PACKAGE_WHISPER_INCLUDE_INSTALL_DIR@")
-set_and_check(WHISPER_LIB_DIR     "@PACKAGE_WHISPER_LIB_INSTALL_DIR@")
-set_and_check(WHISPER_BIN_DIR     "@PACKAGE_WHISPER_BIN_INSTALL_DIR@")
+include(CMakeFindDependencyMacro)
 
 # Ensure transient dependencies satisfied
-
-find_package(Threads REQUIRED)
+find_dependency(Threads REQUIRED)
 
 if (APPLE AND GGML_ACCELERATE)
     find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
 endif()
 
 if (GGML_BLAS)
-    find_package(BLAS REQUIRED)
+    find_dependency(BLAS REQUIRED)
 endif()
 
 if (GGML_CUDA)
-    find_package(CUDAToolkit REQUIRED)
+    find_dependency(CUDAToolkit REQUIRED)
 endif()
 
 if (GGML_METAL)
@@ -38,28 +35,13 @@ if (GGML_METAL)
 endif()
 
 if (GGML_HIPBLAS)
-    find_package(hip REQUIRED)
-    find_package(hipblas REQUIRED)
-    find_package(rocblas REQUIRED)
+    find_dependency(hip REQUIRED)
+    find_dependency(hipblas REQUIRED)
+    find_dependency(rocblas REQUIRED)
 endif()
 
-find_library(whisper_LIBRARY whisper
-    REQUIRED
-    HINTS ${WHISPER_LIB_DIR})
+find_dependency(ggml CONFIG REQUIRED)
 
-set(_whisper_link_deps "Threads::Threads" "@WHISPER_EXTRA_LIBS@")
-set(_whisper_transient_defines "@WHISPER_TRANSIENT_DEFINES@")
-
-add_library(whisper UNKNOWN IMPORTED)
-
-set_target_properties(whisper
-    PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES "${WHISPER_INCLUDE_DIR}"
-        INTERFACE_LINK_LIBRARIES "${_whisper_link_deps}"
-        INTERFACE_COMPILE_DEFINITIONS "${_whisper_transient_defines}"
-        IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
-        IMPORTED_LOCATION "${whisper_LIBRARY}"
-        INTERFACE_COMPILE_FEATURES cxx_std_11
-        POSITION_INDEPENDENT_CODE ON )
+include("${CMAKE_CURRENT_LIST_DIR}/whisper-targets.cmake")
 
 check_required_components(whisper)
