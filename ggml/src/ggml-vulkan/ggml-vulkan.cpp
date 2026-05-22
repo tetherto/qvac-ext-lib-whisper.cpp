@@ -4286,9 +4286,21 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
     uint32_t rm_iq = 2 * rm_kq;
 
-    const bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;
+    // QVAC-19213 — Adreno 740 (Snapdragon 8 Gen 2, Qualcomm Vulkan driver build
+    // E031.41.03.64) miscompiles the mul_mat_vec subgroup-reduction SPIR-V
+    // variant: the GLSL→native compiler (libllvm-qgl.so::CreateQGLCProgram)
+    // null-derefs at fault addr 0x2d0 during vkCreateComputePipeline for
+    // mul_mat_vec_f32_f32_f32_subgroup (and its quantized siblings). Forcing
+    // use_subgroups=false on Qualcomm selects the shmem-reduction variant of
+    // mul_mat_vec which is mathematically equivalent (per shader source) and
+    // compiles + runs correctly. Verified via test-backend-ops: 426 f-type
+    // MUL_MAT tests pass on Adreno 740 with this gate. Narrow once shader-level
+    // fix or driver fix is available.
+    bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;
+    if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) { use_subgroups = false; }
     // Ensure a subgroup size >= 16 is available
-    const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
+    bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
+    if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) { use_subgroups16 = false; }
 
     const uint32_t subgroup_size = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control && device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) ? 16 : device->subgroup_size;
     const uint32_t subgroup_size16 = std::max(subgroup_size, 16u);
