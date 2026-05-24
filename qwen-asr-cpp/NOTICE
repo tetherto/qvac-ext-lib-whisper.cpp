@@ -1,0 +1,45 @@
+qwen-asr-cpp
+============
+
+A C++ inference library for Qwen3-ASR (Alibaba Cloud / Qwen Team)
+on-device automatic speech recognition.
+
+v0.1 wraps the antirez/qwen-asr pure-C inference engine
+(vendored under vendor/qwen-asr-c/) behind a C++ API. v0.2 (planned)
+ports the inference path onto GGML for multi-backend GPU support.
+
+Third-party notices
+-------------------
+
+* Qwen3-ASR (Alibaba Cloud / Qwen Team, Apache License 2.0)
+  https://huggingface.co/Qwen/Qwen3-ASR-0.6B
+  https://huggingface.co/Qwen/Qwen3-ASR-1.7B
+  https://github.com/QwenLM/Qwen3-ASR
+  The model weights are NOT redistributed in this repository; the
+  download-models.sh script fetches them from HuggingFace on demand.
+
+* antirez/qwen-asr (Salvatore Sanfilippo, MIT License)
+  https://github.com/antirez/qwen-asr
+  Vendored verbatim under vendor/qwen-asr-c/ as the v0.1 inference
+  backend. Provides the safetensors loader, WhisperFeatureExtractor
+  mel pipeline, AuT encoder, Qwen3 decoder, BPE tokenizer, and the
+  NEON / AVX / generic SIMD kernels. Upstream LICENSE preserved at
+  vendor/qwen-asr-c/LICENSE; MODEL.md preserved at
+  vendor/qwen-asr-c/MODEL.md for architectural reference.
+
+* parakeet-cpp (Tether Operations Limited, MIT License)
+  Sibling module in this repository. The cross-platform CMake
+  conventions (target shape, install rules, ggml backend-DL setup
+  for the v0.2 path) are derived from parakeet-cpp.
+
+Build-time dependencies (not redistributed)
+-------------------------------------------
+
+* Apple Accelerate framework (closed-source, ships with macOS / iOS).
+  Linked dynamically when QWEN_USE_BLAS=ON on Apple platforms.
+
+* OpenBLAS (BSD-3-Clause). Linked dynamically when QWEN_USE_BLAS=ON
+  on Linux and BLAS_FOUND.
+
+* GGML (MIT, https://github.com/ggerganov/ggml). NOT linked in v0.1;
+  scheduled for v0.2 alongside the GPU backend port.
