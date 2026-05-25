@@ -26,7 +26,7 @@ ensure_adb_device() {
 ensure_app_installed() {
     if ! adb shell pm path "${PKG}" >/dev/null 2>&1; then
         echo "[push-model-android] app '${PKG}' is not installed. Build & install the apk first:" >&2
-        echo "    cd examples/android-demo && gradle :app:assembleDebug" >&2
+        echo "    cd native-app/android && gradle :app:assembleDebug" >&2
         echo "    adb install -r app/build/outputs/apk/debug/app-debug.apk" >&2
         exit 1
     fi

@@ -34,6 +34,23 @@ void fill_result(qwen_c_result * out, const qwen::EngineResult & src) {
 }
 
 qwen::Engine * as_engine(qwen_engine * e) { return reinterpret_cast<qwen::Engine *>(e); }
+const qwen::Engine * as_engine(const qwen_engine * e) { return reinterpret_cast<const qwen::Engine *>(e); }
+
+qwen::Backend from_c_backend(qwen_c_backend b) {
+    switch (b) {
+        case QWEN_BACKEND_GGUF:        return qwen::Backend::GGUF;
+        case QWEN_BACKEND_SAFETENSORS:
+        default:                       return qwen::Backend::Safetensors;
+    }
+}
+
+qwen_c_backend to_c_backend(qwen::Backend b) {
+    switch (b) {
+        case qwen::Backend::GGUF:        return QWEN_BACKEND_GGUF;
+        case qwen::Backend::Safetensors: return QWEN_BACKEND_SAFETENSORS;
+    }
+    return QWEN_BACKEND_SAFETENSORS;
+}
 
 }
 
@@ -41,6 +58,7 @@ extern "C" {
 
 qwen_c_options qwen_c_options_default(void) {
     qwen_c_options o{};
+    o.backend       = QWEN_BACKEND_SAFETENSORS;
     o.n_threads     = 0;
     o.verbose       = 0;
     o.language      = nullptr;
@@ -48,18 +66,27 @@ qwen_c_options qwen_c_options_default(void) {
     return o;
 }
 
-qwen_engine * qwen_c_engine_create(const char *   model_dir,
+int qwen_c_backend_available(qwen_c_backend backend) {
+    return qwen::backend_compiled_in(from_c_backend(backend)) ? 1 : 0;
+}
+
+const char * qwen_c_backend_name(qwen_c_backend backend) {
+    return qwen::backend_name(from_c_backend(backend));
+}
+
+qwen_engine * qwen_c_engine_create(const char *   model_path,
                                    qwen_c_options options,
                                    char **        error_out) {
-    if (model_dir == nullptr || model_dir[0] == '\0') {
-        set_error(error_out, "qwen_c_engine_create: model_dir is required");
+    if (model_path == nullptr || model_path[0] == '\0') {
+        set_error(error_out, "qwen_c_engine_create: model_path is required");
         return nullptr;
     }
     try {
         qwen::EngineOptions opts;
-        opts.model_dir = model_dir;
-        opts.n_threads = options.n_threads;
-        opts.verbose   = options.verbose;
+        opts.backend    = from_c_backend(options.backend);
+        opts.model_path = model_path;
+        opts.n_threads  = options.n_threads;
+        opts.verbose    = options.verbose;
         if (options.language != nullptr)      opts.language      = options.language;
         if (options.system_prompt != nullptr) opts.system_prompt = options.system_prompt;
         auto * engine = new qwen::Engine(opts);
@@ -75,6 +102,11 @@ qwen_engine * qwen_c_engine_create(const char *   model_dir,
 
 void qwen_c_engine_destroy(qwen_engine * engine) {
     delete as_engine(engine);
+}
+
+qwen_c_backend qwen_c_engine_backend(const qwen_engine * engine) {
+    if (engine == nullptr) return QWEN_BACKEND_SAFETENSORS;
+    return to_c_backend(as_engine(engine)->backend());
 }
 
 int qwen_c_engine_transcribe(qwen_engine *   engine,

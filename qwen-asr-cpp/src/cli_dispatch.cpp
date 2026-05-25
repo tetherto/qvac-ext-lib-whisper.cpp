@@ -16,6 +16,12 @@ const char * kQwenVersion =
 #endif
 ;
 
+qwen::Backend parse_backend(const char * s) {
+    if (std::strcmp(s, "gguf") == 0)        return qwen::Backend::GGUF;
+    if (std::strcmp(s, "safetensors") == 0) return qwen::Backend::Safetensors;
+    throw std::runtime_error(std::string("unknown backend '") + s + "' (expected: safetensors | gguf)");
+}
+
 void print_help() {
     std::printf(
         "qwen-asr %s -- Qwen3-ASR speech-to-text\n"
@@ -23,9 +29,12 @@ void print_help() {
         "Usage:\n"
         "  qwen-asr --version\n"
         "  qwen-asr --help\n"
-        "  qwen-asr transcribe --model-dir <dir> --wav <path.wav> [options]\n"
+        "  qwen-asr transcribe --model <path> --wav <path.wav> [options]\n"
         "\n"
         "transcribe options:\n"
+        "  --backend <name>       Inference backend: safetensors (default) | gguf (v0.2)\n"
+        "  --model <path>         Path to the model: directory with model.safetensors\n"
+        "                         (safetensors backend) or .gguf file (gguf backend)\n"
         "  --threads <n>          Number of inference threads (default: autodetect)\n"
         "  --language <name>      Force output language (default: auto-detect)\n"
         "                         Examples: English, Chinese, Cantonese, Spanish, ...\n"
@@ -34,7 +43,7 @@ void print_help() {
         "  --verbose              Print status messages on stderr\n"
         "  --debug                Print per-layer debug information\n"
         "\n"
-        "The model directory must contain the HuggingFace checkpoint files:\n"
+        "Safetensors backend (v0.1, default) expects a HuggingFace checkpoint dir with:\n"
         "  model.safetensors  config.json  vocab.json  merges.txt\n"
         "  tokenizer_config.json  preprocessor_config.json\n"
         "\n"
@@ -49,8 +58,15 @@ int run_transcribe(int argc, char ** argv) {
 
     for (int i = 0; i < argc; ++i) {
         const char * a = argv[i];
-        if (std::strcmp(a, "--model-dir") == 0 && i + 1 < argc) {
-            opts.model_dir = argv[++i];
+        if ((std::strcmp(a, "--model") == 0 || std::strcmp(a, "--model-dir") == 0) && i + 1 < argc) {
+            opts.model_path = argv[++i];
+        } else if (std::strcmp(a, "--backend") == 0 && i + 1 < argc) {
+            try {
+                opts.backend = parse_backend(argv[++i]);
+            } catch (const std::exception & e) {
+                std::fprintf(stderr, "qwen-asr transcribe: %s\n", e.what());
+                return 2;
+            }
         } else if (std::strcmp(a, "--wav") == 0 && i + 1 < argc) {
             wav = argv[++i];
         } else if (std::strcmp(a, "--threads") == 0 && i + 1 < argc) {
@@ -63,13 +79,15 @@ int run_transcribe(int argc, char ** argv) {
             opts.verbose = 1;
         } else if (std::strcmp(a, "--debug") == 0) {
             opts.verbose = 2;
+        } else if (std::strcmp(a, "--max-new-tokens") == 0 && i + 1 < argc) {
+            opts.max_new_tokens = std::atoi(argv[++i]);
         } else {
             std::fprintf(stderr, "qwen-asr transcribe: unknown arg '%s'\n", a);
             return 2;
         }
     }
-    if (opts.model_dir.empty() || wav.empty()) {
-        std::fprintf(stderr, "qwen-asr transcribe: --model-dir and --wav are required\n");
+    if (opts.model_path.empty() || wav.empty()) {
+        std::fprintf(stderr, "qwen-asr transcribe: --model and --wav are required\n");
         return 2;
     }
 

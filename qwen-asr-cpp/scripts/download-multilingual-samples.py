@@ -4,7 +4,7 @@ Bypasses the ``datasets`` audio decoder (which now pulls torchcodec / ffmpeg)
 by downloading a single parquet shard per locale with ``huggingface_hub`` and
 decoding the embedded WAV bytes with ``soundfile``.
 
-Output: examples/ios-simulator-demo/QwenAsrDemo/samples/<lang>.wav (+ .txt).
+Output: native-app/ios/QwenAsrDemo/samples/<lang>.wav (+ .txt).
 """
 
 from __future__ import annotations
@@ -141,7 +141,7 @@ def download_language(code: str, locale: str, label: str, out_dir: Path) -> None
 
 def main() -> int:
     project_root = Path(__file__).resolve().parents[1]
-    out_dir      = project_root / "examples" / "ios-simulator-demo" / "QwenAsrDemo" / "samples"
+    out_dir      = project_root / "native-app" / "ios" / "QwenAsrDemo" / "samples"
     out_dir.mkdir(parents=True, exist_ok=True)
     failures = []
     for code, locale, label in LANGUAGES:

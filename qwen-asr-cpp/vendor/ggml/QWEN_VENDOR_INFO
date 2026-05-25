@@ -1,0 +1,18 @@
+upstream  https://github.com/ggerganov/ggml
+license   MIT (see LICENSE)
+commit    e5a6e7dca8eabc6d0259fbb293098f92c946d488
+date      2026-05-22 17:53:45 +0300
+vendored  2026-05-24
+
+Pruned from upstream:
+- examples/  (not needed for embedded use)
+- tests/     (use ggml's own CMake test suite externally)
+- docs/      (kept upstream)
+- ci/        (CI lives in qvac-ext-lib-whisper.cpp)
+- scripts/   (downstream conversion scripts live in qwen-asr-cpp/scripts/)
+
+To refresh:
+  rm -rf vendor/ggml
+  git clone --depth 1 https://github.com/ggerganov/ggml.git vendor/ggml
+  rm -rf vendor/ggml/.git vendor/ggml/{examples,tests,docs,ci,scripts,requirements.txt}
+  # update QWEN_VENDOR_INFO with new commit + date

@@ -21,12 +21,20 @@ else()
     set(QWEN_MOBILE_DEFAULT ${QWEN_STANDALONE_DEFAULT})
 endif()
 
-option(QWEN_BUILD_LIBRARY     "qwen-asr: build the qwen-asr library"                                ON)
-option(QWEN_BUILD_EXECUTABLES "qwen-asr: build the qwen-asr CLI"                                    ${QWEN_MOBILE_DEFAULT})
-option(QWEN_BUILD_TESTS       "qwen-asr: build the integration tests"                               ${QWEN_MOBILE_DEFAULT})
-option(QWEN_INSTALL           "qwen-asr: generate install rules"                                    ON)
-option(QWEN_USE_BLAS          "qwen-asr: enable BLAS-accelerated matmul (Accelerate / OpenBLAS)"    ON)
-option(QWEN_CCACHE            "qwen-asr: use ccache as compiler launcher if available"              ON)
+option(QWEN_BUILD_LIBRARY        "qwen-asr: build the qwen-asr library"                                ON)
+option(QWEN_BUILD_EXECUTABLES    "qwen-asr: build the qwen-asr CLI"                                    ${QWEN_MOBILE_DEFAULT})
+option(QWEN_BUILD_TESTS          "qwen-asr: build the integration tests"                               ${QWEN_MOBILE_DEFAULT})
+option(QWEN_INSTALL              "qwen-asr: generate install rules"                                    ON)
+option(QWEN_USE_BLAS             "qwen-asr: enable BLAS-accelerated matmul (Accelerate / OpenBLAS)"    ON)
+option(QWEN_CCACHE               "qwen-asr: use ccache as compiler launcher if available"              ON)
+option(QWEN_BACKEND_SAFETENSORS  "qwen-asr: build the safetensors backend (antirez/qwen-asr, v0.1)"    ON)
+option(QWEN_BACKEND_GGUF         "qwen-asr: build the GGUF/GGML backend (v0.2 -- in progress)"         OFF)
+
+if (NOT QWEN_BACKEND_SAFETENSORS AND NOT QWEN_BACKEND_GGUF)
+    message(FATAL_ERROR
+        "qwen-asr: at least one backend must be enabled "
+        "(set -DQWEN_BACKEND_SAFETENSORS=ON or -DQWEN_BACKEND_GGUF=ON).")
+endif()
 
 if (QWEN_CCACHE)
     find_program(QWEN_CCACHE_PROGRAM ccache)
@@ -44,6 +52,7 @@ function(qwen_apply_ccache target)
     endif()
 endfunction()
 
+if (QWEN_BACKEND_SAFETENSORS)
 set(QWEN_VENDOR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/qwen-asr-c)
 
 set(QWEN_VENDOR_SOURCES
@@ -187,12 +196,29 @@ elseif (UNIX)
         endif()
     endif()
 endif()
+endif()
 
 set(QWEN_LIB_SOURCES
-    src/qwen_engine.cpp
+    src/backend.cpp
+    src/engine_facade.cpp
+    src/engine_factory.cpp
     src/cli_dispatch.cpp
     src/c_api.cpp
 )
+
+if (QWEN_BACKEND_SAFETENSORS)
+    list(APPEND QWEN_LIB_SOURCES src/safetensors/engine_safetensors.cpp)
+endif()
+
+if (QWEN_BACKEND_GGUF)
+    list(APPEND QWEN_LIB_SOURCES
+        src/gguf/engine_gguf.cpp
+        src/gguf/model_loader.cpp
+        src/gguf/tokenizer.cpp
+        src/gguf/audio.cpp
+        src/gguf/model.cpp
+    )
+endif()
 
 if (QWEN_BUILD_LIBRARY)
     if (DEFINED BUILD_SHARED_LIBS)
@@ -209,14 +235,30 @@ if (QWEN_BUILD_LIBRARY)
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${QWEN_VENDOR_DIR}
     )
-
-    target_link_libraries(qwen-asr PRIVATE qwen-asr-vendor)
 
     target_compile_definitions(qwen-asr PRIVATE
         QWEN_VERSION="${PROJECT_VERSION}"
     )
+
+    if (QWEN_BACKEND_SAFETENSORS)
+        target_compile_definitions(qwen-asr PUBLIC QWEN_HAVE_BACKEND_SAFETENSORS)
+        target_link_libraries(qwen-asr PRIVATE qwen-asr-vendor)
+        target_include_directories(qwen-asr PRIVATE ${QWEN_VENDOR_DIR})
+    endif()
+
+    if (QWEN_BACKEND_GGUF)
+        target_compile_definitions(qwen-asr PUBLIC QWEN_HAVE_BACKEND_GGUF)
+        if (NOT TARGET ggml)
+            set(GGML_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+            set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+            add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/vendor/ggml ${CMAKE_CURRENT_BINARY_DIR}/_ggml EXCLUDE_FROM_ALL)
+        endif()
+        target_link_libraries(qwen-asr PRIVATE $<BUILD_INTERFACE:ggml>)
+        target_include_directories(qwen-asr PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/vendor/ggml/include
+        )
+    endif()
 
     set_target_properties(qwen-asr PROPERTIES
         POSITION_INDEPENDENT_CODE ON
@@ -256,28 +298,58 @@ if (QWEN_BUILD_TESTS)
     add_test(NAME test-construct COMMAND $<TARGET_FILE:test-construct>)
     set_property(TEST test-construct PROPERTY LABELS "unit")
 
-    set(QWEN_E2E_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models/hf/0.6b" CACHE PATH "qwen-asr: model dir for end-to-end test")
-    set(QWEN_E2E_WAV       "${CMAKE_CURRENT_SOURCE_DIR}/test/samples/jfk.wav" CACHE PATH "qwen-asr: wav fixture for end-to-end test")
-    set(QWEN_E2E_GROUND    "${CMAKE_CURRENT_SOURCE_DIR}/test/samples/jfk.txt" CACHE PATH "qwen-asr: ground-truth transcript for end-to-end test")
+    set(QWEN_E2E_WAV    "${CMAKE_CURRENT_SOURCE_DIR}/test/samples/jfk.wav" CACHE PATH "qwen-asr: wav fixture for end-to-end test")
+    set(QWEN_E2E_GROUND "${CMAKE_CURRENT_SOURCE_DIR}/test/samples/jfk.txt" CACHE PATH "qwen-asr: ground-truth transcript for end-to-end test")
 
     add_executable(test-transcribe-jfk test/test_transcribe_jfk.cpp)
     target_link_libraries(test-transcribe-jfk PRIVATE qwen-asr)
     target_include_directories(test-transcribe-jfk PRIVATE include)
     qwen_apply_ccache(test-transcribe-jfk)
-    add_test(NAME test-transcribe-jfk
-             COMMAND $<TARGET_FILE:test-transcribe-jfk>
-                     "${QWEN_E2E_MODEL_DIR}"
-                     "${QWEN_E2E_WAV}"
-                     "${QWEN_E2E_GROUND}")
-    set_property(TEST test-transcribe-jfk PROPERTY LABELS "e2e")
-    if (NOT EXISTS "${QWEN_E2E_MODEL_DIR}/model.safetensors")
-        set_property(TEST test-transcribe-jfk PROPERTY DISABLED TRUE)
-        message(STATUS "qwen-asr: test-transcribe-jfk disabled (missing ${QWEN_E2E_MODEL_DIR}/model.safetensors)")
+
+    if (QWEN_BACKEND_SAFETENSORS)
+        set(QWEN_E2E_SAFETENSORS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models/hf/0.6b" CACHE PATH
+            "qwen-asr: safetensors model dir for end-to-end test")
+        add_test(NAME test-transcribe-jfk-safetensors
+                 COMMAND $<TARGET_FILE:test-transcribe-jfk>
+                         "${QWEN_E2E_SAFETENSORS_DIR}"
+                         "${QWEN_E2E_WAV}"
+                         "${QWEN_E2E_GROUND}"
+                         "safetensors")
+        set_property(TEST test-transcribe-jfk-safetensors PROPERTY LABELS "e2e;safetensors")
+        if (NOT EXISTS "${QWEN_E2E_SAFETENSORS_DIR}/model.safetensors")
+            set_property(TEST test-transcribe-jfk-safetensors PROPERTY DISABLED TRUE)
+            message(STATUS "qwen-asr: test-transcribe-jfk-safetensors disabled (missing ${QWEN_E2E_SAFETENSORS_DIR}/model.safetensors)")
+        endif()
+    endif()
+
+    if (QWEN_BACKEND_GGUF)
+        set(QWEN_E2E_GGUF_FILE "${CMAKE_CURRENT_SOURCE_DIR}/models/gguf/qwen3-asr-0.6b.gguf" CACHE PATH
+            "qwen-asr: .gguf model file for end-to-end test")
+        add_test(NAME test-transcribe-jfk-gguf
+                 COMMAND $<TARGET_FILE:test-transcribe-jfk>
+                         "${QWEN_E2E_GGUF_FILE}"
+                         "${QWEN_E2E_WAV}"
+                         "${QWEN_E2E_GROUND}"
+                         "gguf")
+        set_property(TEST test-transcribe-jfk-gguf PROPERTY LABELS "e2e;gguf")
+        if (NOT EXISTS "${QWEN_E2E_GGUF_FILE}")
+            set_property(TEST test-transcribe-jfk-gguf PROPERTY DISABLED TRUE)
+            message(STATUS "qwen-asr: test-transcribe-jfk-gguf disabled (missing ${QWEN_E2E_GGUF_FILE})")
+        endif()
     endif()
 endif()
 
+if (QWEN_INSTALL AND QWEN_BUILD_LIBRARY AND QWEN_BACKEND_GGUF)
+    message(STATUS "qwen-asr: skipping CMake install/export rules (QWEN_BACKEND_GGUF=ON pulls non-exported ggml).")
+    set(QWEN_INSTALL OFF)
+endif()
+
 if (QWEN_INSTALL AND QWEN_BUILD_LIBRARY)
-    install(TARGETS qwen-asr qwen-asr-vendor
+    set(QWEN_INSTALL_TARGETS qwen-asr)
+    if (QWEN_BACKEND_SAFETENSORS)
+        list(APPEND QWEN_INSTALL_TARGETS qwen-asr-vendor)
+    endif()
+    install(TARGETS ${QWEN_INSTALL_TARGETS}
         EXPORT qwen-asr-cpp-targets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

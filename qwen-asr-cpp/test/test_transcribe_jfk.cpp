@@ -45,18 +45,28 @@ int fail(const char * msg) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 4) {
-        std::fprintf(stderr, "usage: test-transcribe-jfk <model_dir> <wav> <ground_truth_txt>\n");
+    if (argc < 4 || argc > 5) {
+        std::fprintf(stderr, "usage: test-transcribe-jfk <model_path> <wav> <ground_truth_txt> [backend]\n");
+        std::fprintf(stderr, "  backend: safetensors (default) | gguf\n");
         return 2;
     }
-    const std::string model_dir   = argv[1];
+    const std::string model_path  = argv[1];
     const std::string wav_path    = argv[2];
     const std::string ground_path = argv[3];
+    const std::string backend     = (argc == 5) ? argv[4] : "safetensors";
 
     qwen::EngineOptions opts;
-    opts.model_dir = model_dir;
-    opts.language  = "English";
-    opts.verbose   = 1;
+    if (backend == "gguf") {
+        opts.backend = qwen::Backend::GGUF;
+    } else if (backend == "safetensors") {
+        opts.backend = qwen::Backend::Safetensors;
+    } else {
+        std::fprintf(stderr, "test-transcribe-jfk: unknown backend '%s'\n", backend.c_str());
+        return 2;
+    }
+    opts.model_path = model_path;
+    opts.language   = "English";
+    opts.verbose    = 1;
 
     try {
         qwen::Engine engine(opts);

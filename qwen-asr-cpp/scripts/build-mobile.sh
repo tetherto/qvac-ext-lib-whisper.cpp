@@ -61,8 +61,18 @@ build_android() {
         -DCMAKE_SHARED_LINKER_FLAGS="${page_flags}" \
         -DCMAKE_EXE_LINKER_FLAGS="${page_flags}" \
         -DQWEN_USE_BLAS=ON \
+        -DQWEN_BACKEND_SAFETENSORS=ON \
+        -DQWEN_BACKEND_GGUF=ON \
         -DQWEN_BUILD_EXECUTABLES=OFF \
-        -DQWEN_BUILD_TESTS=OFF
+        -DQWEN_BUILD_TESTS=OFF \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DGGML_STATIC=ON \
+        -DGGML_METAL=OFF \
+        -DGGML_BLAS=OFF \
+        -DGGML_ACCELERATE=OFF \
+        -DGGML_OPENMP=OFF \
+        -DGGML_BUILD_TESTS=OFF \
+        -DGGML_BUILD_EXAMPLES=OFF
     cmake --build "${build_dir}" -j "${PARALLEL_JOBS}"
 }
 
@@ -79,19 +89,40 @@ build_ios() {
         -DCMAKE_OSX_SYSROOT="${sysroot}" \
         -DCMAKE_OSX_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
         -DQWEN_USE_BLAS=ON \
+        -DQWEN_BACKEND_SAFETENSORS=ON \
+        -DQWEN_BACKEND_GGUF=ON \
         -DQWEN_BUILD_EXECUTABLES=OFF \
-        -DQWEN_BUILD_TESTS=OFF
+        -DQWEN_BUILD_TESTS=OFF \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DGGML_STATIC=ON \
+        -DGGML_METAL=OFF \
+        -DGGML_BLAS=OFF \
+        -DGGML_ACCELERATE=OFF \
+        -DGGML_OPENMP=OFF \
+        -DGGML_BUILD_TESTS=OFF \
+        -DGGML_BUILD_EXAMPLES=OFF
     cmake --build "${build_dir}" --config "${CMAKE_BUILD_TYPE}" -- -quiet
+}
+
+collect_ios_libs() {
+    local cfg_dir="$1"
+    local out_var="$2"
+    local libs=()
+    [[ -f "${cfg_dir}/libqwen-asr.a"        ]] && libs+=("${cfg_dir}/libqwen-asr.a")
+    [[ -f "${cfg_dir}/libqwen-asr-vendor.a" ]] && libs+=("${cfg_dir}/libqwen-asr-vendor.a")
+    local ggml_lib
+    while IFS= read -r ggml_lib; do
+        [[ -n "${ggml_lib}" ]] && libs+=("${ggml_lib}")
+    done < <(find "${cfg_dir}/.." -name 'libggml*.a' -type f 2>/dev/null)
+    eval "${out_var}=(\"\${libs[@]}\")"
 }
 
 build_xcframework() {
     local out="${BUILD_ROOT}/QwenAsr.xcframework"
-    local device_lib="${BUILD_ROOT}/ios-device/${CMAKE_BUILD_TYPE}-iphoneos/libqwen-asr.a"
-    local sim_lib="${BUILD_ROOT}/ios-simulator/${CMAKE_BUILD_TYPE}-iphonesimulator/libqwen-asr.a"
-    local device_vendor="${BUILD_ROOT}/ios-device/${CMAKE_BUILD_TYPE}-iphoneos/libqwen-asr-vendor.a"
-    local sim_vendor="${BUILD_ROOT}/ios-simulator/${CMAKE_BUILD_TYPE}-iphonesimulator/libqwen-asr-vendor.a"
+    local device_cfg="${BUILD_ROOT}/ios-device/${CMAKE_BUILD_TYPE}-iphoneos"
+    local sim_cfg="${BUILD_ROOT}/ios-simulator/${CMAKE_BUILD_TYPE}-iphonesimulator"
 
-    if [[ ! -f "${device_lib}" || ! -f "${sim_lib}" ]]; then
+    if [[ ! -f "${device_cfg}/libqwen-asr.a" || ! -f "${sim_cfg}/libqwen-asr.a" ]]; then
         echo "[build-mobile] iOS .a libraries not found; run iOS builds first" >&2
         exit 1
     fi
@@ -99,8 +130,19 @@ build_xcframework() {
     local merge_dir="${BUILD_ROOT}/ios-merged"
     rm -rf "${merge_dir}"
     mkdir -p "${merge_dir}/iphoneos" "${merge_dir}/iphonesimulator"
-    libtool -static -o "${merge_dir}/iphoneos/libqwen-asr-combined.a"        "${device_lib}" "${device_vendor}"
-    libtool -static -o "${merge_dir}/iphonesimulator/libqwen-asr-combined.a" "${sim_lib}"    "${sim_vendor}"
+
+    local device_libs=()
+    local sim_libs=()
+    collect_ios_libs "${device_cfg}" device_libs
+    collect_ios_libs "${sim_cfg}"    sim_libs
+
+    log "device combined.a: ${#device_libs[@]} archives"
+    for l in "${device_libs[@]}"; do log "  + ${l}"; done
+    log "simulator combined.a: ${#sim_libs[@]} archives"
+    for l in "${sim_libs[@]}"; do log "  + ${l}"; done
+
+    libtool -static -o "${merge_dir}/iphoneos/libqwen-asr-combined.a"        "${device_libs[@]}"
+    libtool -static -o "${merge_dir}/iphonesimulator/libqwen-asr-combined.a" "${sim_libs[@]}"
 
     rm -rf "${out}"
     xcodebuild -create-xcframework \
