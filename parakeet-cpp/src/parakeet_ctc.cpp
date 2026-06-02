@@ -234,28 +234,40 @@ void ensure_backends_loaded() {
 // results). Mirrors the equivalent helper in llm-llamacpp's
 // BackendSelection.cpp::parseAdrenoVersion so the two stacks reach
 // the same decision on the same hardware.
+// Find the next "Adreno"/"adreno" at or after p, or null.
+static const char * find_adreno(const char * p) {
+    const char * a = strstr(p, "Adreno");
+    const char * b = strstr(p, "adreno");
+    if (!a) return b;
+    if (!b) return a;
+    return a < b ? a : b;
+}
+
 int parse_adreno_version(const char * s) {
     if (!s) return -1;
-    const char * p = strstr(s, "Adreno");
-    if (!p) p = strstr(s, "adreno");
-    if (!p) return -1;
-    p += 6; // strlen("Adreno") == strlen("adreno") == 6
-    // Skip whitespace, "(TM)", punctuation; stop at first letter or digit.
-    while (*p && !(*p >= '0' && *p <= '9') && *p != 'X' && *p != 'x') ++p;
-    if (!*p) return -1;
-    // X1 / X2 ... naming for Snapdragon X Elite -> treat as 800-tier.
-    if (*p == 'X' || *p == 'x') {
-        ++p;
-        if (*p < '0' || *p > '9') return -1; // "Xclipse" etc. is not Adreno-X
-        return 800;
+    // Scan every "Adreno" and take the highest gen, so a combined string like
+    // "Adreno(TM) (OpenCL 3.0 Adreno(TM) 740)" returns 740, not the "3" in "3.0".
+    int best = -1;
+    for (const char * p = find_adreno(s); p != nullptr; p = find_adreno(p + 6)) {
+        const char * q = p + 6; // strlen("Adreno") == strlen("adreno") == 6
+        // Skip whitespace, "(TM)", punctuation; stop at first digit or X/x.
+        while (*q && !(*q >= '0' && *q <= '9') && *q != 'X' && *q != 'x') ++q;
+        int v = -1;
+        // X1 / X2 ... naming for Snapdragon X Elite -> treat as 800-tier.
+        // "Xclipse" etc. (no digit after X) is not Adreno-X.
+        if (*q == 'X' || *q == 'x') {
+            if (q[1] >= '0' && q[1] <= '9') v = 800;
+        } else if (*q >= '0' && *q <= '9') {
+            v = 0;
+            while (*q >= '0' && *q <= '9') {
+                v = v * 10 + (*q - '0');
+                ++q;
+                if (v > 100000) { v = -1; break; }
+            }
+        }
+        if (v > best) best = v;
     }
-    int v = 0;
-    while (*p >= '0' && *p <= '9') {
-        v = v * 10 + (*p - '0');
-        ++p;
-        if (v > 100000) return -1;
-    }
-    return v;
+    return best;
 }
 
 bool is_adreno_6xx(const char * s) {
@@ -292,7 +304,16 @@ const char * dev_reg_name(ggml_backend_dev_t dev) {
 // are dlopen()'d at runtime and are not linkable from libparakeet.
 // The registry walk reaches the same backends in both modes.
 ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
-    if (n_gpu_layers <= 0) return nullptr;
+    // Unconditional structured trace so adb logcat / stderr can pinpoint
+    // backend selection even when the caller didn't set verbose=true.
+    // Format chosen to be greppable: `[BACKEND-...] key=value ...`.
+    PARAKEET_LOG_INFO("[BACKEND-SELECT] enter n_gpu_layers=%d verbose=%d\n",
+                      n_gpu_layers, verbose ? 1 : 0);
+
+    if (n_gpu_layers <= 0) {
+        PARAKEET_LOG_INFO("[BACKEND-SELECT] result=cpu reason=n_gpu_layers_0\n");
+        return nullptr;
+    }
 
     ensure_backends_loaded();
 
@@ -312,26 +333,46 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
     int max_adreno_version = -1;
 
     const size_t n_dev = ggml_backend_dev_count();
+    PARAKEET_LOG_INFO("[BACKEND-SELECT] total_devices_enumerated=%zu\n", n_dev);
     for (size_t i = 0; i < n_dev; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (!dev) continue;
-        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-        if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
-            type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        if (!dev) {
+            PARAKEET_LOG_INFO("[BACKEND-DEV] idx=%zu status=null_dev_skip\n", i);
             continue;
         }
-        const char * name     = ggml_backend_dev_name(dev);
-        const char * desc     = ggml_backend_dev_description(dev);
-        const char * reg_name = dev_reg_name(dev);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        const char * type_str =
+            (type == GGML_BACKEND_DEVICE_TYPE_GPU)   ? "GPU"   :
+            (type == GGML_BACKEND_DEVICE_TYPE_IGPU)  ? "iGPU"  :
+            (type == GGML_BACKEND_DEVICE_TYPE_CPU)   ? "CPU"   :
+            (type == GGML_BACKEND_DEVICE_TYPE_ACCEL) ? "ACCEL" : "OTHER";
+        const char * dev_name         = ggml_backend_dev_name(dev);
+        const char * dev_desc         = ggml_backend_dev_description(dev);
+        const char * dev_reg_name_str = dev_reg_name(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+            type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            PARAKEET_LOG_INFO(
+                "[BACKEND-DEV] idx=%zu reg=%s name=%s type=%s status=skip_not_gpu\n",
+                i,
+                dev_reg_name_str ? dev_reg_name_str : "?",
+                dev_name ? dev_name : "?",
+                type_str);
+            continue;
+        }
+        const char * name     = dev_name;
+        const char * desc     = dev_desc;
+        const char * reg_name = dev_reg_name_str;
         const bool   is_opencl = std::strcmp(reg_name, "OpenCL") == 0;
 
         const int adreno_v = std::max(parse_adreno_version(name),
                                       parse_adreno_version(desc));
         if (adreno_v > max_adreno_version) max_adreno_version = adreno_v;
 
+        const char * bucket_label = nullptr;
         if (is_opencl) {
             if (adreno_v >= 700) {
                 opencl_adreno_700plus.push_back({dev, name, desc, reg_name});
+                bucket_label = "opencl_adreno_700plus";
             } else if (adreno_v >= 600 && adreno_v < 700) {
                 const char * reported = name ? name : (desc ? desc : "unknown");
                 const char * override_env = getenv("PARAKEET_ALLOW_ADRENO_6XX");
@@ -341,19 +382,39 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
                         "skipping (7xx/8xx/X1E supported, set "
                         "PARAKEET_ALLOW_ADRENO_6XX=1 to override)\n",
                         reported);
+                    PARAKEET_LOG_INFO(
+                        "[BACKEND-DEV] idx=%zu reg=OpenCL name=%s type=%s adreno_v=%d "
+                        "status=skip_adreno_6xx_broken\n",
+                        i, reported, type_str, adreno_v);
                     continue;
                 }
                 if (verbose) PARAKEET_LOG_INFO(
                     "parakeet: PARAKEET_ALLOW_ADRENO_6XX=1 set; "
                     "keeping OpenCL backend on '%s' anyway\n", reported);
                 opencl_other.push_back({dev, name, desc, reg_name});
+                bucket_label = "opencl_other_adreno_6xx_override";
             } else {
                 opencl_other.push_back({dev, name, desc, reg_name});
+                bucket_label = "opencl_other";
             }
         } else {
             other_gpu.push_back({dev, name, desc, reg_name});
+            bucket_label = "other_gpu";
         }
+        PARAKEET_LOG_INFO(
+            "[BACKEND-DEV] idx=%zu reg=%s name=%s desc=%s type=%s adreno_v=%d bucket=%s\n",
+            i,
+            reg_name ? reg_name : "?",
+            name ? name : "?",
+            desc ? desc : "?",
+            type_str,
+            adreno_v,
+            bucket_label ? bucket_label : "?");
     }
+
+    PARAKEET_LOG_INFO(
+        "[BACKEND-SELECT] bucket_sizes opencl_adreno_700plus=%zu other_gpu=%zu opencl_other=%zu max_adreno=%d\n",
+        opencl_adreno_700plus.size(), other_gpu.size(), opencl_other.size(), max_adreno_version);
 
     // Tier policy:
     //   1. Adreno 700+: prefer OpenCL (validated, faster than Vulkan
@@ -363,10 +424,22 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
     //      on Linux/Windows desktop, Mali iGPU via Vulkan, ...).
     //   3. Last resort: any other OpenCL device (e.g. desktop OpenCL
     //      or non-Adreno mobile when no Vulkan is registered).
-    auto try_init = [&](const std::vector<Cand> & bucket) -> ggml_backend_t {
+    auto try_init = [&](const std::vector<Cand> & bucket, const char * tier) -> ggml_backend_t {
         for (const Cand & c : bucket) {
             ggml_backend_t b = ggml_backend_dev_init(c.dev, nullptr);
-            if (!b) continue;
+            if (!b) {
+                PARAKEET_LOG_WARN(
+                    "[BACKEND-DEV] tier=%s reg=%s name=%s ggml_backend_dev_init=failed\n",
+                    tier,
+                    c.reg_name && *c.reg_name ? c.reg_name : "?",
+                    c.name ? c.name : (c.desc ? c.desc : "?"));
+                continue;
+            }
+            PARAKEET_LOG_INFO(
+                "[BACKEND-SELECT] result=gpu tier=%s reg=%s name=%s\n",
+                tier,
+                c.reg_name && *c.reg_name ? c.reg_name : "GPU",
+                c.name ? c.name : (c.desc ? c.desc : "unknown"));
             if (verbose) PARAKEET_LOG_INFO(
                 "parakeet: using %s backend (%s)\n",
                 c.reg_name && *c.reg_name ? c.reg_name : "GPU",
@@ -377,11 +450,19 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
     };
 
     if (!opencl_adreno_700plus.empty()) {
-        if (ggml_backend_t b = try_init(opencl_adreno_700plus)) return b;
+        if (ggml_backend_t b = try_init(opencl_adreno_700plus, "opencl_adreno_700plus")) return b;
     }
-    if (ggml_backend_t b = try_init(other_gpu)) return b;
-    if (ggml_backend_t b = try_init(opencl_other)) return b;
+    if (ggml_backend_t b = try_init(other_gpu, "other_gpu")) return b;
+    if (ggml_backend_t b = try_init(opencl_other, "opencl_other")) return b;
 
+    const char * fallback_reason =
+        (max_adreno_version >= 600 && max_adreno_version < 700)
+            ? "only_adreno_6xx_detected_broken"
+            : (n_dev == 0 ? "no_devices_enumerated"
+                          : "no_gpu_backend_could_init");
+    PARAKEET_LOG_WARN(
+        "[BACKEND-SELECT] result=cpu reason=%s max_adreno=%d total_devices=%zu\n",
+        fallback_reason, max_adreno_version, n_dev);
     if (verbose) {
         if (max_adreno_version >= 600 && max_adreno_version < 700) {
             PARAKEET_LOG_INFO(
