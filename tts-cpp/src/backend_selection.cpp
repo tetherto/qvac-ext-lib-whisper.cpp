@@ -280,7 +280,8 @@ bool is_qualcomm_adreno(const char * name, const char * desc) {
         }
         return false;
     };
-    return (contains_ci(name, "adreno")   || contains_ci(desc, "adreno")) && (contains_ci(name, "qualcomm") || contains_ci(desc, "qualcomm"));
+    return contains_ci(name, "adreno")   || contains_ci(desc, "adreno") ||
+           contains_ci(name, "qualcomm") || contains_ci(desc, "qualcomm");
 }
 
 // Pick a GPU backend using the same tier policy as parakeet-cpp's
