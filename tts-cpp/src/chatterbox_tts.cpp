@@ -94,6 +94,11 @@ struct model_ctx {
     // the latter runs in the preload thread and would race conditioning's init_cpu_backend().
     mutable ggml_backend_t cpu_backend = nullptr;
     mutable ggml_backend_sched_t sched = nullptr;
+    // Guards the one-time lazy creation of `sched` / `cpu_backend` in
+    // s3gen_sched_alloc. A unique_ptr (not a bare std::once_flag) so model_ctx
+    // stays move-constructible — it is moved into the process-wide cache via
+    // make_unique<model_ctx>(load_s3gen_gguf(...)).
+    mutable std::unique_ptr<std::once_flag> sched_once = std::make_unique<std::once_flag>();
     ggml_context * ctx_w = nullptr;
     ggml_backend_buffer_t buffer_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
@@ -113,12 +118,16 @@ struct model_ctx {
 // at alloc time, so callers set inputs AFTER s3gen_sched_alloc and before
 // s3gen_sched_compute (S3Gen sites already follow alloc -> set -> compute).
 static void s3gen_sched_alloc(const model_ctx & m, ggml_cgraph * gf) {
-    // Lazy, single-threaded creation: reached only from run_hift_decode on the
-    // synthesis thread, after preload + conditioning, so init_cpu_backend() races nothing.
-    if (!m.sched) {
+    // Thread-safe one-time creation via call_once: the sched, cpu_backend and the
+    // buffer_w USAGE_WEIGHTS flag are built exactly once, so a future parallel /
+    // batched-synthesis caller cannot race two scheds into existence (leaking one)
+    // or double-mark the buffer. The work is still deferred to the synthesis thread
+    // (not load_s3gen_gguf on the preload thread) so it doesn't race conditioning's
+    // init_cpu_backend(). call_once re-runs the body if it throws, matching the
+    // previous retry-on-failure behaviour.
+    std::call_once(*m.sched_once, [&] {
         // Mark weights USAGE_WEIGHTS so sched copies a GPU-resident weight to CPU
-        // when a CPU-routed op (conv_transpose_1d) consumes it. Done here
-        // (synthesis thread), not in load_s3gen_gguf (preload thread).
+        // when a CPU-routed op (conv_transpose_1d) consumes it.
         ggml_backend_buffer_set_usage(m.buffer_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         ggml_backend_t sched_backends[2] = { m.backend, nullptr };
         int n_sched_backends = 1;
@@ -134,7 +143,7 @@ static void s3gen_sched_alloc(const model_ctx & m, ggml_cgraph * gf) {
                                          n_sched_backends, /*graph_size=*/131072,
                                          /*parallel=*/false, /*op_offload=*/false);
         if (!m.sched) throw std::runtime_error("s3gen: ggml_backend_sched_new failed");
-    }
+    });
     ggml_backend_sched_reset(m.sched);
     if (!ggml_backend_sched_alloc_graph(m.sched, gf)) {
         throw std::runtime_error("s3gen_sched_alloc: ggml_backend_sched_alloc_graph failed");

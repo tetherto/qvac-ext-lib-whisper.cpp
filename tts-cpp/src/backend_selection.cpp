@@ -4,10 +4,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <regex>
 #include <string>
 #include <vector>
 
@@ -212,36 +214,20 @@ void ensure_backends_loaded() {
 // reach the same decision on the same hardware.
 int parse_adreno_version(const char * s) {
     if (!s) return -1;
-    // Scan EVERY "Adreno"/"adreno" marker and keep the largest plausible
-    // (>= 100, i.e. real 3-digit model) version found. Some OpenCL device
-    // strings embed the API version before the model number, e.g.
-    // "QUALCOMM Adreno(TM) (OpenCL 3.0 Adreno(TM) 740)": parsing only the
-    // first marker yields 3 (from "OpenCL 3.0") and mis-tiers the GPU below
-    // Vulkan; the second "Adreno 740" marker recovers the real version.
+    std::string lowered(s);
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    // After an "adreno" marker (skipping "(tm)", spaces, punctuation), the model
+    // is a 3-4 digit generation ("740"/"830") or the Snapdragon-X "x<n>" token
+    // ("x1-85" -> 800-tier). Scan every marker and keep the highest; requiring
+    // 3-4 digits skips the "opencl 3.0" noise in a combined OpenCL description
+    // like "QUALCOMM Adreno(TM) (OpenCL 3.0 Adreno(TM) 740)" -> 740, not 3.
+    static const std::regex re(R"(dreno\D*?(\d{3,4}|x\d))", std::regex::optimize);
     int best = -1;
-    for (const char * p = s; *p; ++p) {
-        if (std::strncmp(p, "Adreno", 6) != 0 &&
-            std::strncmp(p, "adreno", 6) != 0) {
-            continue;
-        }
-        const char * q = p + 6; // strlen("Adreno") == strlen("adreno") == 6
-        while (*q && !(*q >= '0' && *q <= '9') && *q != 'X' && *q != 'x') ++q;
-        if (!*q) continue;
-        if (*q == 'X' || *q == 'x') {
-            if (*(q + 1) >= '0' && *(q + 1) <= '9') { // "Adreno X1-..." family
-                if (800 > best) best = 800;
-            }
-            continue; // "Xclipse" etc. is not Adreno-X
-        }
-        int v = 0;
-        bool overflow = false;
-        while (*q >= '0' && *q <= '9') {
-            v = v * 10 + (*q - '0');
-            ++q;
-            if (v > 100000) { overflow = true; break; }
-        }
-        // Adreno models are 3-digit; ignore API-version noise like "OpenCL 3.0".
-        if (!overflow && v >= 100 && v > best) best = v;
+    for (std::sregex_iterator it(lowered.begin(), lowered.end(), re), end; it != end; ++it) {
+        const std::string tok = (*it)[1].str();
+        const int v = (tok[0] == 'x') ? 800 : std::stoi(tok);
+        if (v > best) best = v;
     }
     return best;
 }
