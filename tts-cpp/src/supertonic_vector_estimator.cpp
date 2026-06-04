@@ -639,6 +639,16 @@ void build_text_attention_cache(vector_text_attention_cache & cache,
                                 int head_dim,
                                 const std::string & out_w_source,
                                 const std::string & out_b_source) {
+    // Reuse the cached graph when it already matches this shape AND was built on
+    // the direct backend path (cache.allocr non-null). The scheduler path leaves
+    // cache.allocr null, so it always rebuilds from a clean graph
+    // (ggml_backend_sched_alloc_graph mutates node->src[]). Mirrors run_hift_decode.
+    if (cache.ctx && cache.allocr && cache.generation_id == model.generation_id
+        && cache.q_len == q_len && cache.kv_len == kv_len
+        && cache.n_heads == n_heads && cache.head_dim == head_dim
+        && cache.out_w_source == out_w_source && cache.out_b_source == out_b_source) {
+        return;
+    }
     free_text_attention_cache(cache);
     cache.model = &model;
     cache.generation_id = model.generation_id;
@@ -705,15 +715,28 @@ std::vector<float> run_text_attention_cache(vector_text_attention_cache & cache,
                                             int current_step,
                                             const char * island,
                                             std::vector<float> * ctx_trace) {
-    // Rebuild every call: ggml_backend_sched_alloc_graph mutates node->src[] when it
-    // inserts cross-backend GPU<->CPU copies, corrupting a graph reused across denoise
-    // steps. Build is microseconds vs millisecond compute, so always rebuilding is free.
+    // Reuse the shape-keyed graph on the direct backend path; rebuild + route
+    // through the scheduler only when an op must run on CPU. Mirrors run_hift_decode.
     build_text_attention_cache(cache, model, q_len, kv_len, n_heads, head_dim, out_w_source, out_b_source);
-    supertonic_sched_alloc(model, cache.gf);
+    bool direct = true;
+    const int n_nodes = ggml_graph_n_nodes(cache.gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        if (!ggml_backend_supports_op(model.backend, ggml_graph_node(cache.gf, i))) { direct = false; break; }
+    }
+    if (direct) {
+        if (!cache.allocr) {
+            cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+            ggml_gallocr_reserve(cache.allocr, cache.gf);
+        }
+        ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+    } else {
+        supertonic_sched_alloc(model, cache.gf);
+    }
     ggml_backend_tensor_set(cache.q_tc_in, q_tc.data(), 0, q_tc.size()*sizeof(float));
     ggml_backend_tensor_set(cache.k_tc_in, k_tc.data(), 0, k_tc.size()*sizeof(float));
     ggml_backend_tensor_set(cache.v_tc_in, v_tc.data(), 0, v_tc.size()*sizeof(float));
-    profile_vector_compute(model, cache.gf, current_step, island);
+    if (direct) supertonic_graph_compute(model, cache.gf);
+    else        profile_vector_compute(model, cache.gf, current_step, island);
     if (ctx_trace) *ctx_trace = tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, "vector_attn_ctx"));
     return tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, "vector_attn_out"));
 }
@@ -785,6 +808,19 @@ void build_group_graph_cache(vector_group_graph_cache & cache,
                              const std::string & k_name,
                              const std::string & v_name,
                              bool trace_outputs) {
+    // Reuse the cached graph when it already matches this shape AND was built on
+    // the direct backend path (cache.allocr non-null). The scheduler path leaves
+    // cache.allocr null, so it always rebuilds. Mirrors run_hift_decode.
+    if (cache.ctx && cache.allocr && cache.generation_id == model.generation_id
+        && cache.L == L && cache.C == C && cache.text_len == text_len
+        && cache.group == group && cache.conv_block == conv_block
+        && cache.linear_block == linear_block && cache.post_block == post_block
+        && cache.trace_outputs == trace_outputs && cache.matmul_source == matmul_source
+        && cache.q_matmul_source == q_matmul_source && cache.k_matmul_source == k_matmul_source
+        && cache.v_matmul_source == v_matmul_source && cache.q_name == q_name
+        && cache.k_name == k_name && cache.v_name == v_name) {
+        return;
+    }
     free_group_graph_cache(cache);
     cache.model = &model;
     cache.generation_id = model.generation_id;
@@ -891,18 +927,32 @@ vector_group_graph_result run_group_graph_cache(vector_group_graph_cache & cache
                                                 const std::string & v_name,
                                                 const char * island,
                                                 std::vector<supertonic_trace_tensor> * trace) {
-    // Rebuild every call — scheduler alloc corrupts a reused graph; see
-    // run_text_attention_cache for the full rationale.
+    // Reuse the shape-keyed graph on the direct backend path; rebuild + route
+    // through the scheduler only when an op must run on CPU. Mirrors run_hift_decode.
     build_group_graph_cache(cache, model, L, C, group, conv_block, linear_block, matmul_source, post_block,
                             text_len, q_matmul_source, k_matmul_source, v_matmul_source,
                             q_name, k_name, v_name,
                             trace != nullptr);
     std::vector<float> x_raw = pack_time_channel_for_ggml(x_tc, L, C);
-    supertonic_sched_alloc(model, cache.gf);
+    bool direct = true;
+    const int n_nodes = ggml_graph_n_nodes(cache.gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        if (!ggml_backend_supports_op(model.backend, ggml_graph_node(cache.gf, i))) { direct = false; break; }
+    }
+    if (direct) {
+        if (!cache.allocr) {
+            cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+            ggml_gallocr_reserve(cache.allocr, cache.gf);
+        }
+        ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+    } else {
+        supertonic_sched_alloc(model, cache.gf);
+    }
     ggml_backend_tensor_set(cache.x_in, x_raw.data(), 0, x_raw.size()*sizeof(float));
     ggml_backend_tensor_set(cache.temb_in, temb.data(), 0, temb.size()*sizeof(float));
     ggml_backend_tensor_set(cache.text_in, text_lc_host, 0, (size_t) text_len * 256 * sizeof(float));
-    profile_vector_compute(model, cache.gf, current_step, island);
+    if (direct) supertonic_graph_compute(model, cache.gf);
+    else        profile_vector_compute(model, cache.gf, current_step, island);
     if (trace) {
         for (int j = 0; j < 4; ++j) {
             const std::string name = "ve_group" + std::to_string(group) + "_convnext" + std::to_string(j);
@@ -985,6 +1035,19 @@ void build_res_style_qkv_cache(vector_res_style_qkv_cache & cache,
                                const std::string & k_name,
                                const std::string & v_name,
                                bool trace_outputs) {
+    // Reuse the cached graph when it already matches this shape AND was built on
+    // the direct backend path (cache.allocr non-null). The scheduler path leaves
+    // cache.allocr null, so it always rebuilds. Mirrors run_hift_decode.
+    if (cache.ctx && cache.allocr && cache.generation_id == model.generation_id
+        && cache.L == L && cache.C == C && cache.norm_block == norm_block
+        && cache.post_block == post_block && cache.style_block == style_block
+        && cache.trace_outputs == trace_outputs && cache.q_matmul_source == q_matmul_source
+        && cache.k_matmul_source == k_matmul_source && cache.v_matmul_source == v_matmul_source
+        && cache.residual_name == residual_name && cache.norm_name == norm_name
+        && cache.post_name == post_name && cache.q_name == q_name
+        && cache.k_name == k_name && cache.v_name == v_name) {
+        return;
+    }
     free_res_style_qkv_cache(cache);
     cache.model = &model;
     cache.generation_id = model.generation_id;
@@ -1083,20 +1146,34 @@ vector_res_style_qkv_result run_res_style_qkv_cache(vector_res_style_qkv_cache &
                                                     const char * island,
                                                     std::vector<supertonic_trace_tensor> * trace) {
     const bool want_trace = trace != nullptr;
-    // Rebuild every call — scheduler alloc corrupts a reused graph; see
-    // run_text_attention_cache for the full rationale.
+    // Reuse the shape-keyed graph on the direct backend path; rebuild + route
+    // through the scheduler only when an op must run on CPU. Mirrors run_hift_decode.
     build_res_style_qkv_cache(cache, model, L, C, norm_block, post_block, style_block,
                               q_matmul_source, k_matmul_source, v_matmul_source,
                               residual_name, norm_name, post_name, q_name, k_name, v_name,
                               want_trace);
     std::vector<float> lhs_raw = pack_time_channel_for_ggml(lhs_tc, L, C);
     std::vector<float> rhs_raw = pack_time_channel_for_ggml(rhs_tc, L, C);
-    supertonic_sched_alloc(model, cache.gf);
+    bool direct = true;
+    const int n_nodes = ggml_graph_n_nodes(cache.gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        if (!ggml_backend_supports_op(model.backend, ggml_graph_node(cache.gf, i))) { direct = false; break; }
+    }
+    if (direct) {
+        if (!cache.allocr) {
+            cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+            ggml_gallocr_reserve(cache.allocr, cache.gf);
+        }
+        ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+    } else {
+        supertonic_sched_alloc(model, cache.gf);
+    }
     ggml_backend_tensor_set(cache.lhs_in, lhs_raw.data(), 0, lhs_raw.size() * sizeof(float));
     ggml_backend_tensor_set(cache.rhs_in, rhs_raw.data(), 0, rhs_raw.size() * sizeof(float));
     ggml_backend_tensor_set(cache.style_v_in, style_v_raw.data(), 0, style_v_raw.size() * sizeof(float));
     ggml_backend_tensor_set(cache.kctx_in, kctx_raw.data(), 0, kctx_raw.size() * sizeof(float));
-    profile_vector_compute(model, cache.gf, current_step, island);
+    if (direct) supertonic_graph_compute(model, cache.gf);
+    else        profile_vector_compute(model, cache.gf, current_step, island);
     if (trace) {
         push_trace(*trace, residual_name, L, C, tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, residual_name.c_str())));
         push_trace(*trace, norm_name, L, C, tensor_to_time_channel(ggml_graph_get_tensor(cache.gf, norm_name.c_str())));
@@ -1190,6 +1267,14 @@ void build_tail_graph_cache(vector_tail_graph_cache & cache,
                             int Cin,
                             int total_steps,
                             bool trace_outputs) {
+    // Reuse the cached graph when it already matches this shape AND was built on
+    // the direct backend path (cache.allocr non-null). The scheduler path leaves
+    // cache.allocr null, so it always rebuilds. Mirrors run_hift_decode.
+    if (cache.ctx && cache.allocr && cache.generation_id == model.generation_id
+        && cache.L == L && cache.C == C && cache.Cin == Cin
+        && cache.total_steps == total_steps && cache.trace_outputs == trace_outputs) {
+        return;
+    }
     free_tail_graph_cache(cache);
     cache.model = &model;
     cache.generation_id = model.generation_id;
@@ -1266,8 +1351,8 @@ std::vector<float> run_tail_graph_cache(vector_tail_graph_cache & cache,
                                         int current_step,
                                         int total_steps,
                                         std::vector<supertonic_trace_tensor> * trace) {
-    // Rebuild every call — scheduler alloc corrupts a reused graph; see
-    // run_text_attention_cache for the full rationale.
+    // Reuse the shape-keyed graph on the direct backend path; rebuild + route
+    // through the scheduler only when an op must run on CPU. Mirrors run_hift_decode.
     build_tail_graph_cache(cache, model, L, C, Cin, total_steps, trace != nullptr);
     std::vector<float> tail_in_raw = pack_time_channel_for_ggml(x_tc, L, C);
     std::vector<float> noise_tc((size_t)L*Cin);
@@ -1277,11 +1362,25 @@ std::vector<float> run_tail_graph_cache(vector_tail_graph_cache & cache,
         }
     }
     std::vector<float> noise_raw = pack_time_channel_for_ggml(noise_tc, L, Cin);
-    supertonic_sched_alloc(model, cache.gf);
+    bool direct = true;
+    const int n_nodes = ggml_graph_n_nodes(cache.gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        if (!ggml_backend_supports_op(model.backend, ggml_graph_node(cache.gf, i))) { direct = false; break; }
+    }
+    if (direct) {
+        if (!cache.allocr) {
+            cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+            ggml_gallocr_reserve(cache.allocr, cache.gf);
+        }
+        ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+    } else {
+        supertonic_sched_alloc(model, cache.gf);
+    }
     ggml_backend_tensor_set(cache.tail_in, tail_in_raw.data(), 0, tail_in_raw.size()*sizeof(float));
     ggml_backend_tensor_set(cache.tail_mask, latent_mask, 0, (size_t)L*sizeof(float));
     ggml_backend_tensor_set(cache.tail_noise, noise_raw.data(), 0, noise_raw.size()*sizeof(float));
-    profile_vector_compute(model, cache.gf, current_step, "tail");
+    if (direct) supertonic_graph_compute(model, cache.gf);
+    else        profile_vector_compute(model, cache.gf, current_step, "tail");
     if (trace) {
         for (int j = 0; j < 4; ++j) {
             const std::string name = "ve_last_convnext" + std::to_string(j);

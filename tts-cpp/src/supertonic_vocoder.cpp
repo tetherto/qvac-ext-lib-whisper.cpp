@@ -366,6 +366,13 @@ void free_vocoder_cache(vocoder_graph_cache & cache) {
 void build_supertonic_vocoder_cache(vocoder_graph_cache & cache,
                                     const supertonic_model & model,
                                     int latent_len) {
+    // Reuse the cached graph when it already matches this shape AND was built on
+    // the direct backend path (cache.allocr non-null). The scheduler path leaves
+    // cache.allocr null, so it always rebuilds. Mirrors run_hift_decode.
+    if (cache.ctx && cache.allocr && cache.generation_id == model.generation_id
+        && cache.latent_len == latent_len) {
+        return;
+    }
     free_vocoder_cache(cache);
     cache.model = &model;
     cache.generation_id = model.generation_id;
@@ -722,18 +729,32 @@ bool supertonic_vocoder_forward_ggml(const supertonic_model & model,
         profile_vocoder_checkpoint("bn_params", profile_last);
 
         thread_local vocoder_graph_cache cache;
-        // Rebuild every call: the scheduler's alloc_graph mutates node->src[], so a
-        // cached graph can't be reused (full rationale in the vector estimator).
+        // Reuse the shape-keyed graph on the direct backend path; rebuild + route
+        // through the scheduler only when an op must run on CPU. Mirrors run_hift_decode.
         build_supertonic_vocoder_cache(cache, model, latent_len);
         profile_vocoder_checkpoint("graph_cache", profile_last);
 
-        supertonic_sched_alloc(model, cache.gf);
+        bool direct = true;
+        const int n_nodes = ggml_graph_n_nodes(cache.gf);
+        for (int i = 0; i < n_nodes; ++i) {
+            if (!ggml_backend_supports_op(model.backend, ggml_graph_node(cache.gf, i))) { direct = false; break; }
+        }
+        if (direct) {
+            if (!cache.allocr) {
+                cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+                ggml_gallocr_reserve(cache.allocr, cache.gf);
+            }
+            ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
+        } else {
+            supertonic_sched_alloc(model, cache.gf);
+        }
         ggml_backend_tensor_set(cache.x_in, x_in.data(), 0, x_in.size() * sizeof(float));
         ggml_backend_tensor_set(cache.bn_scale, bn_scale.data(), 0, bn_scale.size() * sizeof(float));
         ggml_backend_tensor_set(cache.bn_shift, bn_shift.data(), 0, bn_shift.size() * sizeof(float));
         profile_vocoder_checkpoint("set_inputs", profile_last);
 
-        supertonic_sched_compute(model, cache.gf);
+        if (direct) supertonic_graph_compute(model, cache.gf);
+        else        supertonic_sched_compute(model, cache.gf);
         profile_vocoder_checkpoint("compute", profile_last);
         wav_out = ggml_tensor_to_time_channel(cache.wav);
         profile_vocoder_checkpoint("readback", profile_last);
