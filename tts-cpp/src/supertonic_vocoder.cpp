@@ -742,7 +742,10 @@ bool supertonic_vocoder_forward_ggml(const supertonic_model & model,
         if (direct) {
             if (!cache.allocr) {
                 cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-                ggml_gallocr_reserve(cache.allocr, cache.gf);
+                if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new supertonic vocoder failed");
+                if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+                    throw std::runtime_error("ggml_gallocr_reserve supertonic vocoder failed");
+                }
             }
             ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
         } else {

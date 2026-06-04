@@ -726,7 +726,10 @@ std::vector<float> run_text_attention_cache(vector_text_attention_cache & cache,
     if (direct) {
         if (!cache.allocr) {
             cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-            ggml_gallocr_reserve(cache.allocr, cache.gf);
+            if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new supertonic text attention failed");
+            if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+                throw std::runtime_error("ggml_gallocr_reserve supertonic text attention failed");
+            }
         }
         ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
     } else {
@@ -942,7 +945,10 @@ vector_group_graph_result run_group_graph_cache(vector_group_graph_cache & cache
     if (direct) {
         if (!cache.allocr) {
             cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-            ggml_gallocr_reserve(cache.allocr, cache.gf);
+            if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new supertonic group graph failed");
+            if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+                throw std::runtime_error("ggml_gallocr_reserve supertonic group graph failed");
+            }
         }
         ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
     } else {
@@ -1162,7 +1168,10 @@ vector_res_style_qkv_result run_res_style_qkv_cache(vector_res_style_qkv_cache &
     if (direct) {
         if (!cache.allocr) {
             cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-            ggml_gallocr_reserve(cache.allocr, cache.gf);
+            if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new supertonic res style qkv failed");
+            if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+                throw std::runtime_error("ggml_gallocr_reserve supertonic res style qkv failed");
+            }
         }
         ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
     } else {
@@ -1370,7 +1379,10 @@ std::vector<float> run_tail_graph_cache(vector_tail_graph_cache & cache,
     if (direct) {
         if (!cache.allocr) {
             cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
-            ggml_gallocr_reserve(cache.allocr, cache.gf);
+            if (!cache.allocr) throw std::runtime_error("ggml_gallocr_new supertonic tail graph failed");
+            if (!ggml_gallocr_reserve(cache.allocr, cache.gf)) {
+                throw std::runtime_error("ggml_gallocr_reserve supertonic tail graph failed");
+            }
         }
         ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
     } else {
