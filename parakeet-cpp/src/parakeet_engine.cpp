@@ -441,12 +441,13 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
 
     const bool is_tdt = (pimpl_->model.model_type == ParakeetModelType::TDT);
     const bool is_eou = (pimpl_->model.model_type == ParakeetModelType::EOU);
+    const bool is_rnnt = (pimpl_->model.model_type == ParakeetModelType::RNNT);
 
     int32_t prev_token = -1;
     TdtDecodeState tdt_state;
     EouDecodeState eou_state;
     if (is_tdt) tdt_init_state(pimpl_->tdt_rt, (int) pimpl_->model.blank_id, tdt_state);
-    if (is_eou) eou_init_state(pimpl_->eou_rt, eou_state);
+    if (is_eou || is_rnnt) eou_init_state(pimpl_->eou_rt, eou_state);
 
     int chunk_index = 0;
     bool first_segment = true;
@@ -489,6 +490,22 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
                                          "eou_decode_window failed (rc=" + std::to_string(rc) + ")");
             }
             eou_boundaries_in_chunk = static_cast<int>(win_segments.size());
+        } else if (is_rnnt) {
+            EouDecodeOptions dopts;
+            dopts.max_symbols_per_step   = pimpl_->model.encoder_cfg.eou_max_symbols_per_step;
+            dopts.disable_special_tokens = true;   // plain greedy RNN-T
+            std::vector<EouSegmentBoundary> win_segments;
+            int steps = 0;
+            const float * win_enc = enc_out.encoder_out.data()
+                                  + static_cast<size_t>(start) * enc_out.d_model;
+            if (int rc = eou_decode_window(pimpl_->model, pimpl_->eou_rt,
+                                           win_enc, end - start, enc_out.d_model,
+                                           dopts, eou_state,
+                                           win_tokens, win_segments, steps);
+                rc != 0) {
+                throw std::runtime_error("parakeet::Engine::transcribe_samples_stream: "
+                                         "rnnt decode_window failed (rc=" + std::to_string(rc) + ")");
+            }
         } else {
             ctc_greedy_decode_window(enc_out.logits.data(),
                                      start, end, vocab, blank,
@@ -1004,6 +1021,23 @@ void StreamSession::Impl::process_window(const float * window_samples, int windo
                                      std::to_string(rc) + ")");
         }
         eou_boundaries_in_chunk = static_cast<int>(win_segments.size());
+    } else if (engine_impl->model.model_type == ParakeetModelType::RNNT) {
+        EouDecodeOptions dopts;
+        dopts.max_symbols_per_step   = engine_impl->model.encoder_cfg.eou_max_symbols_per_step;
+        dopts.disable_special_tokens = true;   // plain greedy RNN-T
+        std::vector<EouSegmentBoundary> win_segments;
+        int steps = 0;
+        const int n_frames = std::max(0, center_end_frame - left_drop_frames);
+        const float * win_enc = enc_out.encoder_out.data()
+                              + static_cast<size_t>(left_drop_frames) * enc_out.d_model;
+        if (int rc = eou_decode_window(engine_impl->model, engine_impl->eou_rt,
+                                       win_enc, n_frames, enc_out.d_model,
+                                       dopts, eou_state,
+                                       win_tokens, win_segments, steps);
+            rc != 0) {
+            throw std::runtime_error("StreamSession: rnnt decode_window failed (rc=" +
+                                     std::to_string(rc) + ")");
+        }
     } else {
         ctc_greedy_decode_window(enc_out.logits.data(),
                                  left_drop_frames, center_end_frame,
@@ -1225,7 +1259,8 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
             opts.energy_vad_hangover_ms,
             opts.energy_vad_threshold_db);
     }
-    if (pimpl_->model.model_type == ParakeetModelType::EOU) {
+    if (pimpl_->model.model_type == ParakeetModelType::EOU ||
+        pimpl_->model.model_type == ParakeetModelType::RNNT) {
         eou_init_state(pimpl_->eou_rt, impl->eou_state);
     }
 
