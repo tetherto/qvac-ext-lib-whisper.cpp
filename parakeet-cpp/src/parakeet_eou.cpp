@@ -170,7 +170,8 @@ std::string trim_spaces(const std::string & s) {
 }
 
 int eou_prepare_runtime(const ParakeetCtcModel & model, EouRuntimeWeights & W) {
-    if (model.model_type != ParakeetModelType::EOU) {
+    const bool is_rnnt = model.model_type == ParakeetModelType::RNNT;
+    if (model.model_type != ParakeetModelType::EOU && !is_rnnt) {
         return 1;
     }
     W.H_pred   = model.encoder_cfg.eou_pred_hidden;
@@ -179,8 +180,11 @@ int eou_prepare_runtime(const ParakeetCtcModel & model, EouRuntimeWeights & W) {
     W.L        = model.encoder_cfg.eou_pred_rnn_layers;
     W.V_plus_1 = (int) model.vocab_size + 1;
     W.blank_id = (int) model.blank_id;
-    W.eou_id   = model.eou_id >= 0 ? model.eou_id : (int) model.vocab_size - 2;
-    W.eob_id   = model.eob_id >= 0 ? model.eob_id : (int) model.vocab_size - 1;
+    // Plain RNN-T has no <EOU>/<EOB>: keep the sentinels at -1 (never matched)
+    // rather than EOU's vocab_size-2 / -1 fallback, which would alias real BPE
+    // tokens. The engine also runs the decoder in disable_special_tokens mode.
+    W.eou_id   = is_rnnt ? -1 : (model.eou_id >= 0 ? model.eou_id : (int) model.vocab_size - 2);
+    W.eob_id   = is_rnnt ? -1 : (model.eob_id >= 0 ? model.eob_id : (int) model.vocab_size - 1);
 
     dequantize_to_f32(model.eou.predict_embed, W.embed);
 
@@ -254,6 +258,7 @@ int eou_decode_window(const ParakeetCtcModel & model,
     const int eou   = W.eou_id;
     const int eob   = W.eob_id;
     const int max_syms = std::max(1, opts.max_symbols_per_step);
+    const bool plain   = opts.disable_special_tokens;  // plain RNN-T: blank-only break
 
     std::vector<float> scratch_lstm;
     std::vector<float> scratch_lstm_layer_input;
@@ -280,7 +285,7 @@ int eou_decode_window(const ParakeetCtcModel & model,
             }
 
             // <EOB>: training-time block boundary; treat as a no-op skip.
-            if (best == eob) {
+            if (!plain && best == eob) {
                 break;
             }
 
@@ -289,7 +294,7 @@ int eou_decode_window(const ParakeetCtcModel & model,
             // NeMo `eouDecodeChunk` reference: do NOT feed `<EOU>`
             // back into the predictor; reset h/c to zero and lastToken
             // to blank.
-            if (best == eou) {
+            if (!plain && best == eou) {
                 if (state.has_emitted_token_since_last_eou) {
                     EouSegmentBoundary boundary;
                     boundary.token_index  = (int) out_tokens.size();
@@ -312,7 +317,7 @@ int eou_decode_window(const ParakeetCtcModel & model,
 
             // Skip any other special token defensively (e.g. <unk>);
             // any vocab piece wrapped in `<...>` is treated as special.
-            if (best >= 0 && (size_t) best < n_vocab) {
+            if (!plain && best >= 0 && (size_t) best < n_vocab) {
                 const std::string & piece = model.vocab.pieces[best];
                 if (!piece.empty() && piece.front() == '<' && piece.back() == '>') {
                     break;

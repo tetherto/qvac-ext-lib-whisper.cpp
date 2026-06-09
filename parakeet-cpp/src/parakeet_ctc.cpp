@@ -1016,6 +1016,7 @@ int load_from_gguf(const std::string & gguf_path,
 
     const std::string mtype_str = get_str(g, "parakeet.model.type", "ctc");
     if      (mtype_str == "tdt")        out_model.model_type = ParakeetModelType::TDT;
+    else if (mtype_str == "rnnt")       out_model.model_type = ParakeetModelType::RNNT;
     else if (mtype_str == "eou")        out_model.model_type = ParakeetModelType::EOU;
     else if (mtype_str == "sortformer") out_model.model_type = ParakeetModelType::SORTFORMER;
     else                                out_model.model_type = ParakeetModelType::CTC;
@@ -1057,6 +1058,25 @@ int load_from_gguf(const std::string & gguf_path,
         const int id_eob = find_key(g, "parakeet.eou.eob_id");
         out_model.eou_id = id_eou >= 0 ? gguf_get_val_i32(g, id_eou) : -1;
         out_model.eob_id = id_eob >= 0 ? gguf_get_val_i32(g, id_eob) : -1;
+    }
+
+    if (out_model.model_type == ParakeetModelType::RNNT) {
+        // Plain RNN-T (e.g. the Transducer head of a hybrid checkpoint).
+        // Reuse the encoder_cfg.eou_* predictor/joint fields so the shared
+        // eou_prepare_runtime + eou_decode_window path works unchanged. There
+        // are no <EOU>/<EOB> tokens: eou_id/eob_id stay -1 and the engine runs
+        // the decoder in disable_special_tokens mode. vocab_size is the BPE
+        // label count (no blank); blank_id is that count (blank_as_pad), so
+        // V_plus_1 = vocab_size + 1 in eou_prepare_runtime.
+        out_model.encoder_cfg.eou_pred_hidden          = get_u32(g, "parakeet.rnnt.pred_hidden",          640);
+        out_model.encoder_cfg.eou_pred_rnn_layers      = get_u32(g, "parakeet.rnnt.pred_rnn_layers",      1);
+        out_model.encoder_cfg.eou_joint_hidden         = get_u32(g, "parakeet.rnnt.joint_hidden",         640);
+        out_model.encoder_cfg.eou_max_symbols_per_step = get_u32(g, "parakeet.rnnt.max_symbols_per_step", 10);
+
+        out_model.vocab_size = get_u32(g, "parakeet.rnnt.vocab_size", 1024);
+        out_model.blank_id   = get_u32(g, "parakeet.rnnt.blank_id",   out_model.vocab_size);
+        out_model.eou_id = -1;
+        out_model.eob_id = -1;
     }
 
     if (out_model.model_type == ParakeetModelType::SORTFORMER) {
@@ -1219,6 +1239,26 @@ int load_from_gguf(const std::string & gguf_path,
         out_model.eou.joint_pred_b = require_tensor(impl->ctx, "eou.joint.pred.bias");
         out_model.eou.joint_out_w  = require_tensor(impl->ctx, "eou.joint.out.weight");
         out_model.eou.joint_out_b  = require_tensor(impl->ctx, "eou.joint.out.bias");
+    } else if (out_model.model_type == ParakeetModelType::RNNT) {
+        // Plain RNN-T predictor + joint, stored in the shared EouWeights slot
+        // (rnnt.* GGUF tensors; same shapes as eou.* minus the special-token
+        // rows). Consumed by eou_prepare_runtime via model.eou.
+        out_model.eou.predict_embed = require_tensor(impl->ctx, "rnnt.predict.embed.weight");
+        for (int l = 0; l < out_model.encoder_cfg.eou_pred_rnn_layers; ++l) {
+            const std::string pl = "rnnt.predict.lstm." + std::to_string(l) + ".";
+            TdtLstmLayer lyr;
+            lyr.w_ih = require_tensor(impl->ctx, pl + "w_ih");
+            lyr.w_hh = require_tensor(impl->ctx, pl + "w_hh");
+            lyr.b_ih = require_tensor(impl->ctx, pl + "b_ih");
+            lyr.b_hh = require_tensor(impl->ctx, pl + "b_hh");
+            out_model.eou.lstm.push_back(lyr);
+        }
+        out_model.eou.joint_enc_w  = require_tensor(impl->ctx, "rnnt.joint.enc.weight");
+        out_model.eou.joint_enc_b  = require_tensor(impl->ctx, "rnnt.joint.enc.bias");
+        out_model.eou.joint_pred_w = require_tensor(impl->ctx, "rnnt.joint.pred.weight");
+        out_model.eou.joint_pred_b = require_tensor(impl->ctx, "rnnt.joint.pred.bias");
+        out_model.eou.joint_out_w  = require_tensor(impl->ctx, "rnnt.joint.out.weight");
+        out_model.eou.joint_out_b  = require_tensor(impl->ctx, "rnnt.joint.out.bias");
     } else if (out_model.model_type == ParakeetModelType::SORTFORMER) {
         out_model.sortformer.encoder_proj_w = require_tensor(impl->ctx, "sortformer.encoder_proj.weight");
         out_model.sortformer.encoder_proj_b = require_tensor(impl->ctx, "sortformer.encoder_proj.bias");
@@ -1334,6 +1374,7 @@ ggml_backend_sched_t model_sched(const ParakeetCtcModel & m) {
 void print_model_summary(const ParakeetCtcModel & m) {
     const char * mt = "ctc";
     if (m.model_type == ParakeetModelType::TDT)        mt = "tdt";
+    else if (m.model_type == ParakeetModelType::RNNT)       mt = "rnnt";
     else if (m.model_type == ParakeetModelType::EOU)        mt = "eou";
     else if (m.model_type == ParakeetModelType::SORTFORMER) mt = "sortformer";
     PARAKEET_LOG_INFO("parakeet-%s loaded:\n", mt);
@@ -1357,6 +1398,13 @@ void print_model_summary(const ParakeetCtcModel & m) {
                       (double) m.mel_cfg.log_zero_guard_value);
     if (m.model_type == ParakeetModelType::CTC) {
         PARAKEET_LOG_INFO("  ctc:     vocab=%d blank=%d\n", m.vocab_size, m.blank_id);
+    } else if (m.model_type == ParakeetModelType::RNNT) {
+        PARAKEET_LOG_INFO("  rnnt:    vocab=%d blank=%d pred_hidden=%d pred_layers=%d "
+                          "joint_hidden=%d max_syms=%d\n",
+                          m.vocab_size, m.blank_id,
+                          m.encoder_cfg.eou_pred_hidden, m.encoder_cfg.eou_pred_rnn_layers,
+                          m.encoder_cfg.eou_joint_hidden,
+                          m.encoder_cfg.eou_max_symbols_per_step);
     } else if (m.model_type == ParakeetModelType::EOU) {
         PARAKEET_LOG_INFO("  eou:     vocab=%d blank=%d eou_id=%d eob_id=%d "
                           "pred_hidden=%d pred_layers=%d joint_hidden=%d "

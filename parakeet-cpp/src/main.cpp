@@ -799,6 +799,23 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
                                            dopts, dres); rc != 0) return rc;
             ids_out  = std::move(dres.token_ids);
             text_out = std::move(dres.text);
+        } else if (model.model_type == ParakeetModelType::RNNT) {
+            static EouRuntimeWeights rt;
+            static bool rt_ready = false;
+            if (!rt_ready) {
+                if (eou_prepare_runtime(model, rt) != 0) return 20;
+                rt_ready = true;
+            }
+            EouDecodeOptions dopts;
+            dopts.max_symbols_per_step   = model.encoder_cfg.eou_max_symbols_per_step;
+            dopts.disable_special_tokens = true;   // plain greedy RNN-T
+            EouDecodeResult  dres;
+            if (int rc = eou_greedy_decode(model, rt,
+                                           enc_out.encoder_out.data(),
+                                           enc_out.n_enc_frames, enc_out.d_model,
+                                           dopts, dres); rc != 0) return rc;
+            ids_out  = std::move(dres.token_ids);
+            text_out = std::move(dres.text);
         } else {
             ids_out = ctc_greedy_decode(
                 enc_out.logits.data(), enc_out.n_enc_frames, model.vocab_size, model.blank_id);

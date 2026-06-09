@@ -174,7 +174,10 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(std::make_unique<Impl>()) {
         }
         pimpl_->tdt_ready = true;
     }
-    if (pimpl_->model.model_type == ParakeetModelType::EOU) {
+    if (pimpl_->model.model_type == ParakeetModelType::EOU ||
+        pimpl_->model.model_type == ParakeetModelType::RNNT) {
+        // RNNT shares EOU's predictor/joint runtime (eou_rt); the decoder runs
+        // in disable_special_tokens mode for plain greedy RNN-T.
         if (eou_prepare_runtime(pimpl_->model, pimpl_->eou_rt) != 0) {
             throw std::runtime_error("Engine: eou_prepare_runtime failed");
         }
@@ -201,6 +204,7 @@ const EngineOptions & Engine::options() const {
 std::string Engine::model_type() const {
     switch (pimpl_->model.model_type) {
         case ParakeetModelType::TDT:        return "tdt";
+        case ParakeetModelType::RNNT:       return "rnnt";
         case ParakeetModelType::EOU:        return "eou";
         case ParakeetModelType::SORTFORMER: return "sortformer";
         case ParakeetModelType::CTC:
@@ -215,6 +219,7 @@ bool Engine::is_diarization_model() const {
 bool Engine::is_transcription_model() const {
     return pimpl_->model.model_type == ParakeetModelType::CTC ||
            pimpl_->model.model_type == ParakeetModelType::TDT  ||
+           pimpl_->model.model_type == ParakeetModelType::RNNT ||
            pimpl_->model.model_type == ParakeetModelType::EOU;
 }
 
@@ -311,6 +316,20 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
                                        enc_out.n_enc_frames, enc_out.d_model,
                                        dopts, dres); rc != 0) {
             throw std::runtime_error("parakeet::Engine::transcribe_samples: eou_greedy_decode failed (rc=" +
+                                     std::to_string(rc) + ")");
+        }
+        ids  = std::move(dres.token_ids);
+        text = std::move(dres.text);
+    } else if (pimpl_->model.model_type == ParakeetModelType::RNNT) {
+        EouDecodeOptions dopts;
+        dopts.max_symbols_per_step   = pimpl_->model.encoder_cfg.eou_max_symbols_per_step;
+        dopts.disable_special_tokens = true;   // plain greedy RNN-T
+        EouDecodeResult dres;
+        if (int rc = eou_greedy_decode(pimpl_->model, pimpl_->eou_rt,
+                                       enc_out.encoder_out.data(),
+                                       enc_out.n_enc_frames, enc_out.d_model,
+                                       dopts, dres); rc != 0) {
+            throw std::runtime_error("parakeet::Engine::transcribe_samples: rnnt greedy decode failed (rc=" +
                                      std::to_string(rc) + ")");
         }
         ids  = std::move(dres.token_ids);

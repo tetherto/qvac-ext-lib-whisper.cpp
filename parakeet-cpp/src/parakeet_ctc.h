@@ -201,6 +201,8 @@ struct TdtWeights {
 enum class ParakeetModelType {
     CTC,
     TDT,
+    RNNT,        // Plain RNN-T (Transducer). Shares EOU's predictor/joint
+                 // runtime + greedy decoder, minus the <EOU>/<EOB> tokens.
     EOU,
     SORTFORMER,
 };

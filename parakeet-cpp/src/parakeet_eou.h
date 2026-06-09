@@ -48,6 +48,9 @@ struct EouRuntimeWeights {
 
 struct EouDecodeOptions {
     int max_symbols_per_step = 5;
+    // Plain RNN-T mode: disable all <EOU>/<EOB>/<...> special-token handling so
+    // the greedy loop breaks only on the transducer blank (matches NeMo greedy).
+    bool disable_special_tokens = false;
 };
 
 struct EouDecodeState {

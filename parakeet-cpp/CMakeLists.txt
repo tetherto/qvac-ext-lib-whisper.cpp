@@ -747,6 +747,23 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_fr_multipiece_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_fr_multipiece_wav}")
 
+    # Plain RNN-T greedy decoder parity (run manually: <rnnt.gguf> <wav> [ref-dir]).
+    # No repo fixture yet (Georgian rnnt GGUF is external), so not auto-registered.
+    add_executable(test-rnnt-decoder-parity
+        test/test_rnnt_decoder_parity.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-rnnt-decoder-parity PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-rnnt-decoder-parity PRIVATE include src ggml/include)
+    parakeet_apply_backend_defs(test-rnnt-decoder-parity)
+
     add_executable(test-sortformer-parity
         test/test_sortformer_parity.cpp
         src/parakeet_ctc.cpp
