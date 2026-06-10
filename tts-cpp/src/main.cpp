@@ -1,5 +1,6 @@
 #include "backend_selection.h"
 #include "backend_util.h"
+#include "gguf_stream.h"
 #include "gpt2_bpe.h"
 #include "mtl_tokenizer.h"
 #include "ggml.h"
@@ -118,8 +119,10 @@ bool compute_prompt_feat_native(const std::string & wav_path,
     if ((int)wav.size() > dec_cond_samples) wav.resize(dec_cond_samples);
 
     // Pull the precomputed mel filterbank out of chatterbox-s3gen.gguf.
+    // no_alloc=true + streamed read: this used to stage the whole ~1 GB
+    // s3gen data section in host memory just to copy one 80-row matrix.
     ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_init_params gp = { /*.no_alloc=*/ true, /*.ctx=*/ &tmp_ctx };
     gguf_context * g = gguf_init_from_file(s3gen_gguf_path.c_str(), gp);
     if (!g) {
         fprintf(stderr, "voice: failed to open %s\n", s3gen_gguf_path.c_str());
@@ -132,7 +135,13 @@ bool compute_prompt_feat_native(const std::string & wav_path,
         return false;
     }
     std::vector<float> mel_fb(ggml_nelements(fb));
-    std::memcpy(mel_fb.data(), ggml_get_data(fb), ggml_nbytes(fb));
+    {
+        ::tts_cpp::detail::gguf_stream_reader reader(g, s3gen_gguf_path);
+        if (!reader.ok() || !reader.to_host("s3gen/mel_fb/24k_80", mel_fb.data(), ggml_nbytes(fb))) {
+            gguf_free(g); if (tmp_ctx) ggml_free(tmp_ctx);
+            return false;
+        }
+    }
     gguf_free(g);
     if (tmp_ctx) ggml_free(tmp_ctx);
 
@@ -160,9 +169,10 @@ bool compute_embedding_native(const std::string & wav_path,
     }
 
     // Mel filterbank for the Kaldi-style fbank lives alongside CAMPPlus in
-    // the s3gen GGUF (baked in by the converter).
+    // the s3gen GGUF (baked in by the converter).  Streamed read — no
+    // full-file staging (see gguf_stream.h).
     ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_init_params gp = { /*.no_alloc=*/ true, /*.ctx=*/ &tmp_ctx };
     gguf_context * g = gguf_init_from_file(s3gen_gguf_path.c_str(), gp);
     if (!g) return false;
     ggml_tensor * fb_t = ggml_get_tensor(tmp_ctx, "campplus/mel_fb_kaldi_80");
@@ -172,7 +182,13 @@ bool compute_embedding_native(const std::string & wav_path,
         return false;
     }
     std::vector<float> mel_fb(ggml_nelements(fb_t));
-    std::memcpy(mel_fb.data(), ggml_get_data(fb_t), ggml_nbytes(fb_t));
+    {
+        ::tts_cpp::detail::gguf_stream_reader reader(g, s3gen_gguf_path);
+        if (!reader.ok() || !reader.to_host("campplus/mel_fb_kaldi_80", mel_fb.data(), ggml_nbytes(fb_t))) {
+            gguf_free(g); if (tmp_ctx) ggml_free(tmp_ctx);
+            return false;
+        }
+    }
     gguf_free(g); if (tmp_ctx) ggml_free(tmp_ctx);
 
     std::vector<float> wav;
@@ -334,8 +350,11 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
             }
         }
     }
+    // no_alloc=true: tmp_ctx carries tensor METADATA only; payloads are
+    // streamed straight from the file into the backend buffer below so the
+    // full data section is never staged in host memory (see gguf_stream.h).
     ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gguf_params = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_init_params gguf_params = { /*.no_alloc=*/ true, /*.ctx=*/ &tmp_ctx };
     gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gguf_params);
     if (!gguf_ctx) { fprintf(stderr, "%s: failed to open '%s'\n", __func__, path.c_str()); return false; }
 
@@ -370,9 +389,15 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
             model.tensors[name] = dst;
         }
         model.buffer_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
-        for (ggml_tensor * cur = ggml_get_first_tensor(model.ctx_w); cur; cur = ggml_get_next_tensor(model.ctx_w, cur)) {
-            ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
-            ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+        {
+            ::tts_cpp::detail::gguf_stream_reader reader(gguf_ctx, path);
+            if (!reader.ok()) throw std::runtime_error("failed to reopen GGUF for tensor data: " + path);
+            for (ggml_tensor * cur = ggml_get_first_tensor(model.ctx_w); cur; cur = ggml_get_next_tensor(model.ctx_w, cur)) {
+                if (!reader.to_backend(ggml_get_name(cur), cur)) {
+                    throw std::runtime_error(std::string("failed to stream tensor '") +
+                                             ggml_get_name(cur) + "' from " + path);
+                }
+            }
         }
 
         model.wpe              = require_tensor(model, "model/wpe");

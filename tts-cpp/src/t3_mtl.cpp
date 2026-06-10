@@ -26,6 +26,7 @@
 #include "t3_alignment_analyzer.h"
 
 #include "backend_util.h"
+#include "gguf_stream.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -1645,8 +1646,11 @@ bool load_model_gguf_mtl(const std::string & path,
                          int requested_ctx,
                          int n_gpu_layers) {
     extern int g_log_verbose;
+    // no_alloc=true: tmp_ctx carries tensor METADATA only; payloads are
+    // streamed straight from the file into the backend buffer below so the
+    // full data section is never staged in host memory (see gguf_stream.h).
     ggml_context * tmp_ctx = nullptr;
-    gguf_init_params params = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_init_params params = { /*.no_alloc=*/ true, /*.ctx=*/ &tmp_ctx };
     gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), params);
     if (!gguf_ctx) {
         fprintf(stderr, "load_model_gguf_mtl: failed to open '%s'\n", path.c_str());
@@ -1734,10 +1738,16 @@ bool load_model_gguf_mtl(const std::string & path,
                                      "weights buffer (backend out of memory?)");
         }
 
-        for (ggml_tensor * cur = ggml_get_first_tensor(model.ctx_w); cur; cur = ggml_get_next_tensor(model.ctx_w, cur)) {
-            if (cur == freq_factors) continue;
-            ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
-            ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+        {
+            ::tts_cpp::detail::gguf_stream_reader reader(gguf_ctx, path);
+            if (!reader.ok()) throw std::runtime_error("failed to reopen GGUF for tensor data: " + path);
+            for (ggml_tensor * cur = ggml_get_first_tensor(model.ctx_w); cur; cur = ggml_get_next_tensor(model.ctx_w, cur)) {
+                if (cur == freq_factors) continue;
+                if (!reader.to_backend(ggml_get_name(cur), cur)) {
+                    throw std::runtime_error(std::string("failed to stream tensor '") +
+                                             ggml_get_name(cur) + "' from " + path);
+                }
+            }
         }
 
         {
