@@ -97,13 +97,6 @@ public:
         return true;
     }
 
-    // Drop the chunk scratch buffer early (it is otherwise held until the
-    // reader goes out of scope).
-    void release_scratch() {
-        scratch_.clear();
-        scratch_.shrink_to_fit();
-    }
-
 private:
     // 8 MiB: large enough that fread/ggml_backend_tensor_set call overhead
     // is negligible against disk/flash bandwidth, small enough to be noise
