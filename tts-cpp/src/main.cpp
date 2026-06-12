@@ -328,7 +328,16 @@ ggml_backend_t init_backend(int n_gpu_layers, bool * out_gpu_unsupported) {
 // Model loading
 // --------------------------------------------------------------------------
 
-bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers) {
+ggml_type chatterbox_kv_type_from_str(const std::string & s) {
+    if (s.empty() || s == "f32") return GGML_TYPE_F32;
+    if (s == "f16")  return GGML_TYPE_F16;
+    if (s == "q8_0") return GGML_TYPE_Q8_0;
+    fprintf(stderr, "chatterbox: unknown kv_cache_type '%s' (expected f32|f16|q8_0); using f32\n",
+            s.c_str());
+    return GGML_TYPE_F32;
+}
+
+bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers, ggml_type kv_type) {
     {
         gguf_init_params peek_params = { /*.no_alloc=*/ true, /*.ctx=*/ nullptr };
         gguf_context * peek_ctx = gguf_init_from_file(path.c_str(), peek_params);
@@ -346,7 +355,7 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
             }
             gguf_free(peek_ctx);
             if (variant == "t3_mtl") {
-                return load_model_gguf_mtl(path, model, requested_ctx, n_gpu_layers);
+                return load_model_gguf_mtl(path, model, requested_ctx, n_gpu_layers, kv_type);
             }
         }
     }
@@ -430,11 +439,17 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
             l.c_mlp_proj_b  = require_tensor(model, (p + "/mlp/c_proj/b").c_str());
         }
 
+        // Token-major KV slab: per (layer) the cache is [n_embd, n_ctx]
+        // rows (one row per cached position), so the per-step append is
+        // a contiguous span — required for quantised kv_type (ggml-cpu's
+        // dup→quantized path aborts on a non-contiguous dst) and what
+        // lets f16/q8_0 shrink the cache (f16 ½, q8_0 ~27% of f32).
+        hp.kv_type = kv_type;
         ggml_init_params kv_params = { ggml_tensor_overhead() * 2, nullptr, true };
         model.ctx_kv = ggml_init(kv_params);
         int64_t n_elements = (int64_t) hp.n_embd * hp.n_layer * hp.n_ctx;
-        model.memory_k = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
-        model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
+        model.memory_k = ggml_new_tensor_1d(model.ctx_kv, hp.kv_type, n_elements);
+        model.memory_v = ggml_new_tensor_1d(model.ctx_kv, hp.kv_type, n_elements);
         model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
 
         if (g_log_verbose) fprintf(stderr, "%s: ctx=%d embd=%d layers=%d heads=%d text_vocab=%d speech_vocab=%d cond_prompt=%d\n",
@@ -491,15 +506,21 @@ static ggml_tensor * build_transformer_core(
     const int HD = n_embd / n_head;
     const int64_t L = n_past + N;
 
-    // KV cache layout: each layer is interpreted as [HD, n_ctx, n_head] instead
-    // of the older [n_embd, n_ctx].  The total size is unchanged (HD*n_ctx*n_head
-    // == n_embd*n_ctx), but new-in-[seq, head] stride lets ggml_flash_attn_ext
-    // read the K/V slice as a [HD, L, n_head] view without a per-step
-    // permute+cont — which was the main reason an earlier FA attempt regressed
-    // on the T3 step path.
-    const size_t kv_layer_elems  = (size_t) HD * n_ctx * n_head;  // same as n_embd * n_ctx
-    const size_t kv_head_stride  = (size_t) HD * n_ctx * sizeof(float);
-    const size_t kv_pos_stride   = (size_t) HD * sizeof(float);
+    // KV cache layout: token-major — each layer is [n_embd, n_ctx]: one
+    // ggml_row_size(kv_type, n_embd) row per cached position, heads
+    // packed [HD-head0 ‖ HD-head1 ‖ ...] inside the row (the natural
+    // order of the fused-QKV projection output, so the append needs no
+    // permute).  Two wins over the older head-major [HD, n_ctx, n_head]
+    // slab: the per-step append at position n_past is a CONTIGUOUS span
+    // (which is what allows a quantised kv_type — ggml-cpu's
+    // dup→quantized path aborts on non-contiguous dst), and
+    // ggml_flash_attn_ext still reads the [HD, L, n_head] slice with
+    // plain strides (pos stride = one token row, head stride = one
+    // HD-row inside it; llama.cpp's KV views have the same shape).
+    const ggml_type kvt = model.memory_k->type;
+    const size_t kv_tok_row     = ggml_row_size(kvt, n_embd);  // bytes per cached position
+    const size_t kv_head_row    = ggml_row_size(kvt, HD);      // bytes per head inside a row
+    const size_t kv_layer_bytes = (size_t) n_ctx * kv_tok_row;
 
     // Causal attention mask for flash_attn_ext.  Shape [n_kv, N] broadcast
     // over heads, F16 (Metal FA requires F16 masks; CPU / CUDA / Vulkan all
@@ -530,44 +551,44 @@ static ggml_tensor * build_transformer_core(
             qkv_col_stride,
             qkv_head_stride,
             0);  // Qcur slot
-        ggml_tensor * Kcur_QNH = ggml_view_3d(ctx, cur, HD, N, n_head,
+        // K/V slots viewed as [n_embd, N]: one row per position, heads
+        // packed inside — already the token-major cache row layout, so
+        // the append below is a single contiguous-destination copy.
+        ggml_tensor * Kcur = ggml_view_2d(ctx, cur, n_embd, N,
             qkv_col_stride,
-            qkv_head_stride,
             (size_t) n_embd * sizeof(float));  // Kcur slot
-        ggml_tensor * Vcur_QNH = ggml_view_3d(ctx, cur, HD, N, n_head,
+        ggml_tensor * Vcur = ggml_view_2d(ctx, cur, n_embd, N,
             qkv_col_stride,
-            qkv_head_stride,
             (size_t) 2 * n_embd * sizeof(float));  // Vcur slot
 
-        // KV cache append: write the [HD, N, n_head] source into a strided
-        // [HD, N, n_head] view of the cache starting at position n_past.
-        // One kernel launch per tensor.
-        const size_t layer_off = (size_t) il * kv_layer_elems * sizeof(float);
+        // KV cache append: positions [n_past, n_past+N) are consecutive
+        // token rows, so the destination view is contiguous and ggml_cpy
+        // converts/quantises f32 → kv_type on write.  One kernel launch
+        // per tensor.
+        const size_t layer_off = (size_t) il * kv_layer_bytes;
         {
-            ggml_tensor * k_dst = ggml_view_3d(ctx, model.memory_k,
-                HD, N, n_head,
-                kv_pos_stride,
-                kv_head_stride,
-                layer_off + (size_t) n_past * kv_pos_stride);
-            ggml_tensor * v_dst = ggml_view_3d(ctx, model.memory_v,
-                HD, N, n_head,
-                kv_pos_stride,
-                kv_head_stride,
-                layer_off + (size_t) n_past * kv_pos_stride);
+            ggml_tensor * k_dst = ggml_view_2d(ctx, model.memory_k,
+                n_embd, N,
+                kv_tok_row,
+                layer_off + (size_t) n_past * kv_tok_row);
+            ggml_tensor * v_dst = ggml_view_2d(ctx, model.memory_v,
+                n_embd, N,
+                kv_tok_row,
+                layer_off + (size_t) n_past * kv_tok_row);
 
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_QNH, k_dst));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_QNH, v_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur, k_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur, v_dst));
         }
 
         ggml_tensor * K = ggml_view_3d(ctx, model.memory_k,
             HD, L, n_head,
-            kv_pos_stride,
-            kv_head_stride,
+            kv_tok_row,
+            kv_head_row,
             layer_off);
         ggml_tensor * V = ggml_view_3d(ctx, model.memory_v,
             HD, L, n_head,
-            kv_pos_stride,
-            kv_head_stride,
+            kv_tok_row,
+            kv_head_row,
             layer_off);
 
         ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, kq_mask,

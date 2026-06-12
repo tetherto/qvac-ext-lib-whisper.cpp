@@ -97,7 +97,20 @@ struct chatterbox_hparams {
     float   rope_low_freq      = 1.0f;
     float   rope_high_freq     = 4.0f;
     int32_t rope_orig_max_pos  = 8192;
+
+    // KV-cache storage type (host-selected, not a GGUF property).  The
+    // cache slab uses a token-major layout — one ggml_row_size(kv_type,
+    // head_dim * n_kv_head) row per cached position — so the per-step
+    // append is a CONTIGUOUS view and ggml_cpy can quantise on write
+    // (ggml-cpu's dup→quantized path aborts on non-contiguous dst).
+    // ggml_flash_attn_ext reads f16/q8_0 K/V natively on CPU + Metal.
+    ggml_type kv_type = GGML_TYPE_F32;
 };
+
+// Map an EngineOptions/CLI kv-cache-type string to a ggml type.
+// Accepts "f32" (or empty), "f16", "q8_0"; anything else falls back to
+// F32 with a warning so a typo can't silently change numerics.
+ggml_type chatterbox_kv_type_from_str(const std::string & s);
 
 struct gpt2_layer {
     ggml_tensor * ln_1_g = nullptr;
@@ -272,7 +285,8 @@ bool load_model_gguf(
     const std::string & path,
     chatterbox_model &  model,
     int                 requested_ctx,
-    int                 n_gpu_layers);
+    int                 n_gpu_layers,
+    ggml_type           kv_type = GGML_TYPE_F32);
 
 bool eval_prompt(
     const chatterbox_model &     model,
@@ -330,7 +344,8 @@ bool load_model_gguf_mtl(
     const std::string & path,
     chatterbox_model &  model,
     int                 requested_ctx,
-    int                 n_gpu_layers);
+    int                 n_gpu_layers,
+    ggml_type           kv_type = GGML_TYPE_F32);
 
 bool eval_prompt_mtl(
     const chatterbox_model &     model,
