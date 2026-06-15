@@ -358,6 +358,23 @@ ggml_type chatterbox_resolve_kv_type(ggml_backend_t backend, ggml_type requested
                                      int head_dim, int n_head, int n_kv_head) {
     if (requested == GGML_TYPE_F32 || !backend) return GGML_TYPE_F32;
 
+    // ggml-vulkan's supports_op ADVERTISES quantized K/V flash-attention
+    // but the NV_coopmat2 kernel faults at compute on quantized K/V:
+    // toggle-confirmed in CI (QVAC-19557) — a q8_0 KV cache SIGSEGVs the
+    // chatterbox GPU smoke on NVIDIA coopmat2 runners where the identical
+    // f32 run passes.  MoltenVK (scalar FA, no coopmat) runs q8_0 fine, so
+    // this is specific to the coopmat2 dequant-in-shader path.  The probe
+    // below can't catch an advertise-vs-actual gap, so force quantized K/V
+    // to f32 on Vulkan until the upstream coopmat2 FA kernel is fixed.
+    // f16 (the native FA input type, not dequantized in-shader) is left
+    // intact.  Metal / CPU keep quantized K/V (validated byte-identical).
+    if (ggml_is_quantized(requested) && ::tts_cpp::detail::backend_is_vulkan(backend)) {
+        fprintf(stderr, "chatterbox: quantized (%s) KV cache is not yet reliable on the "
+                        "Vulkan backend (coopmat2 flash-attn faults); using f32 KV cache\n",
+                ggml_type_name(requested));
+        return GGML_TYPE_F32;
+    }
+
     bool supported = false;
     ggml_init_params pp = { ggml_tensor_overhead() * 8, nullptr, /*no_alloc=*/true };
     if (ggml_context * pc = ggml_init(pp)) {
