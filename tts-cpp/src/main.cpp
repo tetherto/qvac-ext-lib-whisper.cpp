@@ -337,6 +337,54 @@ ggml_type chatterbox_kv_type_from_str(const std::string & s) {
     return GGML_TYPE_F32;
 }
 
+// Resolve the effective KV-cache dtype for `backend`: returns `requested`
+// when the backend accepts a flash-attention node with K/V of that type at
+// the model's head geometry, else falls back to F32 with a stderr warning.
+//
+// F32 is always supported, so it short-circuits.  For f16/q8_0 we build a
+// throwaway, no_alloc flash_attn_ext node shaped like the real T3 attention
+// (Q=F32 [HD, 1, n_head], K/V=kv_type [HD, 8, n_kv_head], F16 mask) and ask
+// ggml_backend_supports_op.  This stops an f16/q8_0 request from asserting
+// deep inside a backend that genuinely rejects quantized K/V (the graph
+// would otherwise fail at first compute, long after load).
+//
+// CAVEAT: a backend that ADVERTISES support via supports_op but faults at
+// compute is not caught here — notably ggml-vulkan reports q8_0 K/V FA as
+// supported on both its scalar and coopmat2 paths (see ggml-vulkan.cpp
+// GGML_OP_FLASH_ATTN_EXT and the supertonic notes in supertonic_internal.h).
+// That advertise-vs-actual gap is an upstream ggml concern; this probe is
+// the load-time guard for honest backends and future ports.
+ggml_type chatterbox_resolve_kv_type(ggml_backend_t backend, ggml_type requested,
+                                     int head_dim, int n_head, int n_kv_head) {
+    if (requested == GGML_TYPE_F32 || !backend) return GGML_TYPE_F32;
+
+    bool supported = false;
+    ggml_init_params pp = { ggml_tensor_overhead() * 8, nullptr, /*no_alloc=*/true };
+    if (ggml_context * pc = ggml_init(pp)) {
+        try {
+            const int kv = 8;  // any small length; supports_op checks types + head geometry
+            // Null mask mirrors the real single-step (N=1) attention call,
+            // which avoids ggml's mask-padding constraints in the probe.
+            ggml_tensor * Q = ggml_new_tensor_3d(pc, GGML_TYPE_F32, head_dim, 1,  n_head);
+            ggml_tensor * K = ggml_new_tensor_3d(pc, requested,     head_dim, kv, n_kv_head);
+            ggml_tensor * V = ggml_new_tensor_3d(pc, requested,     head_dim, kv, n_kv_head);
+            ggml_tensor * op = ggml_flash_attn_ext(pc, Q, K, V, /*mask=*/nullptr,
+                                                   1.0f / std::sqrt((float) head_dim), 0.0f, 0.0f);
+            supported = (op != nullptr) && ggml_backend_supports_op(backend, op);
+        } catch (...) {
+            supported = false;
+        }
+        ggml_free(pc);
+    }
+
+    if (!supported) {
+        fprintf(stderr, "chatterbox: backend does not support %s K/V flash-attention; "
+                        "falling back to f32 KV cache\n", ggml_type_name(requested));
+        return GGML_TYPE_F32;
+    }
+    return requested;
+}
+
 bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers, ggml_type kv_type) {
     {
         gguf_init_params peek_params = { /*.no_alloc=*/ true, /*.ctx=*/ nullptr };
@@ -444,7 +492,11 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
         // a contiguous span — required for quantised kv_type (ggml-cpu's
         // dup→quantized path aborts on a non-contiguous dst) and what
         // lets f16/q8_0 shrink the cache (f16 ½, q8_0 ~27% of f32).
-        hp.kv_type = kv_type;
+        // Fall back to F32 KV if the resolved backend can't run flash
+        // attention with the requested quantized/f16 K/V (turbo uses
+        // n_head == n_kv_head; head_dim = n_embd / n_head).
+        hp.kv_type = chatterbox_resolve_kv_type(model.backend, kv_type,
+                                                hp.n_embd / hp.n_head, hp.n_head, hp.n_head);
         ggml_init_params kv_params = { ggml_tensor_overhead() * 2, nullptr, true };
         model.ctx_kv = ggml_init(kv_params);
         int64_t n_elements = (int64_t) hp.n_embd * hp.n_layer * hp.n_ctx;

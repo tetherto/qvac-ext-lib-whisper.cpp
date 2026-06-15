@@ -112,6 +112,13 @@ struct chatterbox_hparams {
 // F32 with a warning so a typo can't silently change numerics.
 ggml_type chatterbox_kv_type_from_str(const std::string & s);
 
+// Resolve the effective KV-cache dtype for `backend`: returns `requested`
+// when the backend's flash-attention accepts K/V of that type at the given
+// head geometry, else falls back to GGML_TYPE_F32 with a stderr warning
+// (so an f16/q8_0 request can't assert deep inside an unsupporting backend).
+ggml_type chatterbox_resolve_kv_type(ggml_backend_t backend, ggml_type requested,
+                                     int head_dim, int n_head, int n_kv_head);
+
 struct gpt2_layer {
     ggml_tensor * ln_1_g = nullptr;
     ggml_tensor * ln_1_b = nullptr;

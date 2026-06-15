@@ -1826,7 +1826,10 @@ bool load_model_gguf_mtl(const std::string & path,
         // `b_offset_elems` parameter to build_llama_block; the B=2 batched
         // path views ne[3]=2 over the same memory with batch_stride=
         // kv_layer_elems * sizeof(float).
-        hp.kv_type = kv_type;
+        // Fall back to F32 KV if the resolved backend can't run flash
+        // attention with the requested quantized/f16 K/V.
+        hp.kv_type = chatterbox_resolve_kv_type(model.backend, kv_type,
+                                                hp.head_dim, hp.n_head, hp.n_kv_head);
         ggml_init_params kv_params = { ggml_tensor_overhead() * 4, nullptr, true };
         model.ctx_kv = ggml_init(kv_params);
         const int64_t kv_elements_b2 =
