@@ -108,6 +108,9 @@ struct ParakeetCtcModel::Impl {
     ggml_backend_t         backend_blas   = nullptr;
     ggml_backend_t         backend_gpu    = nullptr;
     ggml_backend_t         backend_active = nullptr;
+    // True when a GPU was detected but skipped as known-bad (Mali), so
+    // backend_active fell back to CPU.
+    bool                   gpu_unsupported = false;
     ggml_backend_buffer_t  weights_buffer = nullptr;
     std::vector<std::unique_ptr<EncoderGraph>> encoder_graphs;
     static constexpr size_t k_encoder_graph_cache_max = 3;
@@ -291,7 +294,9 @@ const char * dev_reg_name(ggml_backend_dev_t dev) {
 // with, those entry points live in separate shared libraries that
 // are dlopen()'d at runtime and are not linkable from libparakeet.
 // The registry walk reaches the same backends in both modes.
-ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
+ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
+                                bool & out_skipped_unsupported_gpu) {
+    out_skipped_unsupported_gpu = false;
     if (n_gpu_layers <= 0) return nullptr;
 
     ensure_backends_loaded();
@@ -351,7 +356,20 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
                 opencl_other.push_back({dev, name, desc, reg_name});
             }
         } else {
-            other_gpu.push_back({dev, name, desc, reg_name});
+            // ARM Mali (Valhall) Vulkan mis-computes every parakeet model (its
+            // narrow subgroup width breaks the ggml-vulkan shaders), so guard it
+            // by name as a known-bad backend (like the Adreno-6xx skip above) and
+            // route it to CPU.
+            const bool is_mali = (name && std::strstr(name, "Mali")) ||
+                                 (desc && std::strstr(desc, "Mali"));
+            if (is_mali) {
+                out_skipped_unsupported_gpu = true;
+                if (verbose) PARAKEET_LOG_INFO(
+                    "parakeet: Mali GPU '%s' mis-computes on Vulkan; using CPU\n",
+                    name ? name : (desc ? desc : "unknown"));
+            } else {
+                other_gpu.push_back({dev, name, desc, reg_name});
+            }
         }
     }
 
@@ -576,8 +594,10 @@ int load_from_gguf(const std::string & gguf_path,
         backend_set_n_threads(impl->backend_blas, resolved_threads);
     }
 
-    impl->backend_gpu    = init_gpu_backend(n_gpu_layers, verbose);
+    bool skipped_unsupported_gpu = false;
+    impl->backend_gpu    = init_gpu_backend(n_gpu_layers, verbose, skipped_unsupported_gpu);
     impl->backend_active = impl->backend_gpu ? impl->backend_gpu : impl->backend_cpu;
+    impl->gpu_unsupported = skipped_unsupported_gpu && impl->backend_gpu == nullptr;
 
     gguf_init_params params = { /*no_alloc=*/ true, &impl->ctx };
     impl->gguf = gguf_init_from_file(gguf_path.c_str(), params);
@@ -944,6 +964,10 @@ int load_from_gguf(const std::string & gguf_path,
 
 bool model_has_gpu_backend(const ParakeetCtcModel & m) {
     return m.impl && m.impl->backend_gpu != nullptr;
+}
+
+bool model_gpu_unsupported(const ParakeetCtcModel & m) {
+    return m.impl && m.impl->gpu_unsupported;
 }
 
 std::string model_active_backend_name(const ParakeetCtcModel & m) {

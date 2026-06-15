@@ -329,6 +329,9 @@ int load_from_gguf(const std::string & gguf_path,
 void print_model_summary(const ParakeetCtcModel & m);
 
 bool        model_has_gpu_backend(const ParakeetCtcModel & m);
+// True when a GPU was detected but routed to CPU as a known-bad backend (Mali).
+// Lets hosts treat the CPU backend as expected, not a GPU regression.
+bool        model_gpu_unsupported(const ParakeetCtcModel & m);
 std::string model_active_backend_name(const ParakeetCtcModel & m);
 ggml_backend_t model_active_backend(ParakeetCtcModel & m);
 

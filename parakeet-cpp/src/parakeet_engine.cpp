@@ -227,6 +227,10 @@ std::string Engine::backend_name() const {
     return model_active_backend_name(pimpl_->model);
 }
 
+bool Engine::gpu_unsupported() const {
+    return model_gpu_unsupported(pimpl_->model);
+}
+
 void Engine::cancel() {
     pimpl_->cancel_flag.store(true);
 }
