@@ -369,6 +369,8 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
                         "skipping (7xx/8xx/X1E supported, set "
                         "PARAKEET_ALLOW_ADRENO_6XX=1 to override)\n",
                         reported);
+                    // GPU detected but routed to CPU as known-bad (model_gpu_unsupported).
+                    out_skipped_unsupported_gpu = true;
                     continue;
                 }
                 if (verbose) PARAKEET_LOG_INFO(
@@ -585,6 +587,13 @@ void set_opencl_cache_dir(const std::string & dir) {
     (void) dir;
 #endif
 }
+
+// Tripwire: build_sortformer_cpu_weights() hand-enumerates every field; fail the build if one is added/removed.
+static_assert(sizeof(SortformerTransformerBlock) == 16 * sizeof(ggml_tensor *),
+              "SortformerTransformerBlock layout changed; update build_sortformer_cpu_weights()");
+static_assert(sizeof(SortformerWeights) ==
+                  6 * sizeof(ggml_tensor *) + sizeof(std::vector<SortformerTransformerBlock>),
+              "SortformerWeights layout changed; update build_sortformer_cpu_weights()");
 
 // Duplicate the Sortformer head weights into a fresh context + buffer on the
 // CPU backend. Used on Mali-Vulkan, where the head runs on CPU while its encoder
