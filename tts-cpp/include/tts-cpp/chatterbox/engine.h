@@ -341,11 +341,8 @@ public:
     // of the Engine.
     BackendDevice backend_device() const;
 
-    // True when GPU was requested but the engine fell back to CPU because a GPU
-    // device was present yet declined by policy (an Android GPU vendor outside
-    // the validated allowlist, such as Mali). Distinguishes a correct CPU
-    // fallback on a GPU device from a GPU-less host. False when backend_device()
-    // == GPU.
+    // True iff a GPU was present but declined by policy (vendor off the validated
+    // allowlist, e.g. Mali), so we fell back to CPU. Distinguishes this from a GPU-less host.
     bool gpu_unsupported() const;
 
 private:

@@ -225,11 +225,8 @@ struct Engine::Impl {
             // override via `--f16-attn 1` still forces dispatch
             // (useful for debug-shim backends).
             if (opts.f16_attn < 0) {
-                // ggml-opencl has no F32×F16 mat-vec kernel, so any F16
-                // activation reaching mul_mat aborts at graph compute
-                // (GGML_ASSERT(src1t == GGML_TYPE_F32)). Keep Supertonic
-                // F32-only on OpenCL; the perf cost is negligible there
-                // (OpenCL is already far slower than CPU on Adreno).
+                // ggml-opencl lacks an F32×F16 mat-vec kernel: F16 at mul_mat aborts
+                // (GGML_ASSERT src1t==F32). Stay F32-only on OpenCL; perf cost negligible.
                 model.use_f16_attn = !model.backend_is_cpu &&
                                      !::tts_cpp::detail::backend_is_opencl(model.backend) &&
                                      supertonic_backend_supports_f16_kv_flash_attn(model.backend);

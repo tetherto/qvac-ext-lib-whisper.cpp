@@ -1050,16 +1050,8 @@ void free_text_attention_cache(vector_text_attention_cache & cache) {
     cache = {};
 }
 
-// Build the attention context the out-projection consumes:
-// cont(transpose(reshape_2d(attn, n_heads*head_dim, q_len))); scale multiplies
-// the QK scores before softmax (flash-attention semantics).
-//
-// Usually one ggml_flash_attn_ext node. Where the backend can't run it on-device
-// (ggml-opencl routes FLASH_ATTN_EXT to CPU on Adreno/Xclipse), the scheduler
-// bridges attention across CPU<->GPU and the GPU-side context goes stale when the
-// per-step CFM graph is reused, corrupting every step after the first. So when
-// supports_op says FA won't run on the backend, use explicit GPU ops (mul_mat QK
-// -> soft_max -> mul_mat V): identical math, backend-resident, no bridge.
+// Attention context for the out-projection. Normally flash_attn_ext; when a backend
+// routes FA to CPU the bridge goes stale on per-step graph reuse, so use explicit ops.
 static ggml_tensor * supertonic_attention_ctx_ggml(ggml_context * ctx,
                                                     const supertonic_model & model,
                                                     ggml_tensor * q_in,
@@ -1072,9 +1064,8 @@ static ggml_tensor * supertonic_attention_ctx_ggml(ggml_context * ctx,
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, q_in, k_in, v_in,
                                              nullptr, scale, 0.0f, 0.0f);
     if (!ggml_backend_supports_op(model.backend, attn)) {
-        // Explicit per-head attention. cont the strided q/k/v views first so
-        // every mul_mat sees a contiguous operand (the views' time stride >
-        // head stride, which the GPU mul_mat kernels don't accept directly).
+        // Explicit per-head attention; cont the strided q/k/v views first because the
+        // GPU mul_mat kernels reject non-contiguous operands (time stride > head stride).
         ggml_tensor * q_c = ggml_cont(ctx, q_in);                                 // [head_dim, q_len,  n_heads]
         ggml_tensor * k_c = ggml_cont(ctx, k_in);                                 // [head_dim, kv_len, n_heads]
         ggml_tensor * v_c = ggml_cont(ctx, v_in);                                 // [head_dim, kv_len, n_heads]

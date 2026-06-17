@@ -70,17 +70,15 @@ void ensure_backends_loaded();
 //                  pick on hybrid desktops/laptops).
 // No effect when zero / one Vulkan adapters are visible, or when the
 // chosen backend is non-Vulkan (CUDA / Metal / OpenCL).
-// `out_gpu_present_but_unused` (optional): set to true when the function
-// returns nullptr (CPU fallback) BECAUSE a GPU device was present but declined
-// BY POLICY — an Android GPU vendor outside the validated allowlist (e.g. Mali)
-// or an Adreno 6xx (broken OpenCL). Lets the caller surface a "GPU present but
-// unsupported" signal and accept the CPU fallback as correct. Deliberately NOT
-// set when a validated GPU was tried but failed to init (a real regression),
-// nor on success, nor when no GPU device was visible at all.
+// `out_gpu_present_but_unused` (optional): set true only when CPU fallback is by
+// policy (GPU present but off-allowlist, e.g. Mali / Adreno 6xx); NOT on init failure.
+// `allow_arm_mali` (default false): opt-in to ARM Mali/Immortalis (Valhall) Vulkan.
+// Only Supertonic sets it — its st_mul_mat output-pad dodges the Valhall mul_mat bug.
 ggml_backend_t init_gpu_backend(int n_gpu_layers,
                                 bool verbose,
                                 const char * log_prefix,
                                 int vulkan_device = 0,
+                                bool allow_arm_mali = false,
                                 bool * out_gpu_present_but_unused = nullptr);
 
 // Convenience wrapper that picks up the registered CPU device and

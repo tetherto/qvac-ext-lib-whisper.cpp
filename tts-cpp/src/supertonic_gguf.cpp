@@ -271,9 +271,8 @@ void convert_supertonic_tensor_data(const ggml_tensor * src,
     const size_t dst_bytes = ggml_row_size(dst_type, n);
     out_buf.resize(dst_bytes);
 
-    // `ggml_get_type_traits_cpu(...)->from_float` lives in the CPU backend
-    // shared library, which is unlinkable under GGML_BACKEND_DL. Quantize via
-    // the ggml-base `ggml_quantize_chunk` API (one row of `n` elements).
+    // from_float lives in the CPU backend shlib, unlinkable under GGML_BACKEND_DL.
+    // Quantize via ggml-base ggml_quantize_chunk (one row of `n` elements) instead.
     ggml_quantize_chunk(dst_type, f32_pivot.data(), out_buf.data(),
                         /*start=*/0, /*nrows=*/1, /*n_per_row=*/n, /*imatrix=*/nullptr);
 }
@@ -293,7 +292,8 @@ ggml_backend_t init_supertonic_backend(int n_gpu_layers, bool verbose, int vulka
     // visible or when the chosen backend is non-Vulkan.
     bool gpu_present_but_unused = false;
     if (ggml_backend_t b = ::tts_cpp::detail::init_gpu_backend(
-            n_gpu_layers, verbose, "supertonic", vulkan_device, &gpu_present_but_unused)) {
+            n_gpu_layers, verbose, "supertonic", vulkan_device,
+            /*allow_arm_mali=*/true, &gpu_present_but_unused)) {
         return b;
     }
     if (out_gpu_unsupported) *out_gpu_unsupported = gpu_present_but_unused;
@@ -1436,10 +1436,8 @@ thread_local bool g_supertonic_use_native_leaky_relu = true;
 // Defaults to false (pure-GGML) so a helper called outside any dispatch scope
 // never emits a backend-unsupported fused supertonic op.
 thread_local bool g_supertonic_use_fused_supertonic_ops = false;
-// QVAC-20557 — current backend's small-output-dim mul_mat-miscompute flag.
-// Defaults to false so a graph builder called outside any dispatch scope
-// emits a plain `ggml_mul_mat` (no padding) — only the broken backend, inside
-// an active scope, flips this on.
+// Small-output-dim mul_mat-miscompute flag. Defaults to false so a builder outside
+// any dispatch scope emits a plain ggml_mul_mat; only the broken backend flips it on.
 thread_local bool g_supertonic_mulmat_needs_pad = false;
 // QVAC-18605 round 4 — current K/V flash-attn dispatch dtype.
 // Defaults to f32 so a graph builder called outside any
@@ -1927,12 +1925,9 @@ bool load_supertonic_gguf(const std::string & path,
         model.use_native_leaky_relu = cached_backend_capabilities(model.backend).native_leaky_relu;
         model.backend_supports_fused_supertonic_ops =
             cached_backend_capabilities(model.backend).fused_supertonic_ops;
-        // QVAC-20557 — device-identity gate (NO compute): the ARM Mali/Immortalis
-        // (Valhall) Vulkan driver miscomputes (and can HANG on) small-output-dim
-        // mul_mat on the GEMM path, so st_mul_mat pads those dims up to 64 on this
-        // backend.  Gated on the device description (DL-safe, no vulkan symbol, no
-        // graph compute) rather than an empirical probe — an at-load compute probe
-        // HUNG the driver (round 10).  False on every other backend.
+        // ARM Mali Valhall Vulkan miscomputes/hangs on small-output-dim mul_mat, so
+        // st_mul_mat pads those dims to 64 here. Device-identity gate (DL-safe, no
+        // compute) since an at-load compute probe hung the driver. False elsewhere.
         model.mulmat_needs_pad = ::tts_cpp::detail::backend_is_arm_mali_vulkan(model.backend);
         if (verbose) {
             fprintf(stderr, "supertonic: backend_is_cpu=%s backend_is_vk=%s use_native_leaky_relu=%s fused_supertonic_ops=%s mulmat_needs_pad=%s\n",
@@ -1960,10 +1955,8 @@ bool load_supertonic_gguf(const std::string & path,
         // override via `--f16-weights 1` still forces dispatch
         // (useful for debug-shim backends and forward-compat tests).
         if (f16_weights < 0) {
-            // ggml-opencl's mat-vec kernel rejects an F16 src1
-            // (GGML_ASSERT(src1t == GGML_TYPE_F32)); an F16 weight used as
-            // the second mul_mat operand therefore aborts at graph compute.
-            // Keep weights F32 on OpenCL (negligible perf cost there).
+            // ggml-opencl mat-vec asserts src1t == GGML_TYPE_F32, so an F16 weight as
+            // mul_mat src1 aborts at compute. Keep weights F32 on OpenCL (negligible cost).
             model.use_f16_weights = !model.backend_is_cpu &&
                                     !::tts_cpp::detail::backend_is_opencl(model.backend) &&
                                     cached_backend_capabilities(model.backend).f16_mul_mat;

@@ -296,7 +296,8 @@ ggml_backend_t init_backend(int n_gpu_layers, bool * out_gpu_unsupported) {
     // per-backend static `ggml_backend_<x>_init` entry points.
     bool gpu_present_but_unused = false;
     if (ggml_backend_t b = ::tts_cpp::detail::init_gpu_backend(
-            n_gpu_layers, v, "chatterbox", 0, &gpu_present_but_unused)) {
+            n_gpu_layers, v, "chatterbox", 0,
+            /*allow_arm_mali=*/false, &gpu_present_but_unused)) {
         return b;
     }
     if (out_gpu_unsupported) *out_gpu_unsupported = gpu_present_but_unused;

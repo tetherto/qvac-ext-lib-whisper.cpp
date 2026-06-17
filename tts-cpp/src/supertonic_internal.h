@@ -355,11 +355,8 @@ struct supertonic_model {
     // the lifetime of the model.  See `OpenCL bring-up` section in
     // PROGRESS_SUPERTONIC.md for the rationale.
     bool backend_is_cpu = true;
-    // True when GPU was requested (n_gpu_layers > 0) but the engine fell back
-    // to CPU because a GPU device was present yet unusable (e.g. an Android GPU
-    // outside the validated allowlist, like Mali). Lets the host distinguish a
-    // correct CPU fallback on a GPU device from a GPU-less host. Set once in
-    // load_supertonic_gguf() from init_supertonic_backend()'s out-param.
+    // True when GPU was requested but a present GPU device was unusable (e.g. an
+    // Android GPU outside the allowlist) and we fell back to CPU; distinct from a GPU-less host.
     bool gpu_unsupported = false;
     // QVAC-18605 / Vulkan bring-up: True when the resolved backend is
     // ggml-vulkan (`ggml_backend_is_vk`).  Mirrors `backend_is_cpu` in
@@ -413,21 +410,8 @@ struct supertonic_model {
     // silently skipped on Vulkan/OpenCL single-backend graphs → garbage output.
     // Default false = safe (pure-GGML) until the load-time probe runs.
     bool backend_supports_fused_supertonic_ops = false;
-    // QVAC-20557 — true when the resolved backend MISCOMPUTES a small-output-
-    // dimension `ggml_mul_mat` on the GEMM (mul_mm) path.  This is the ARM
-    // Mali/Valhall Vulkan driver bug (verified on-device): a GEMM whose output
-    // M (=src0->ne[1]) or N (=src1->ne[1]) is < ~48 returns wrong/NaN results,
-    // while the SAME op with that dim >= 48 is exact, and Adreno/Metal/CUDA/CPU
-    // are exact at every size.  Detected EMPIRICALLY at load (a tiny standalone
-    // mul_mat vs a host double-precision gold) — NOT a vendor/name table and NOT
-    // `ggml_backend_supports_op` (the driver reports support; it just
-    // miscomputes).  So this auto-fires only on the actually-broken backend and
-    // is false on every healthy one (incl. desktop Vulkan and any future-fixed
-    // Mali driver).  When true the `st_mul_mat` helper zero-pads the small
-    // output dim up to 64, computes, and slices the real sub-block back —
-    // mathematically exact (padded rows/cols are discarded).  The
-    // supertonic_op_dispatch_scope mirrors it onto the thread-local
-    // `g_supertonic_mulmat_needs_pad` for the graph builders.  Default false.
+    // ARM Mali/Valhall Vulkan miscomputes a GEMM mul_mat whose output dim < ~48; set via
+    // device-identity (not supports_op: driver claims support). st_mul_mat pads to 64; harmless elsewhere.
     bool mulmat_needs_pad = false;
     // When true, the per-step vector-estimator attention graphs materialise
     // K/V into contiguous F16 before calling ggml_flash_attn_ext so OpenCL
@@ -1128,21 +1112,12 @@ bool supertonic_use_f16_attn();
 // unsupported fused op.
 bool supertonic_use_fused_supertonic_ops();
 
-// QVAC-20557 — thread-local mirror of `supertonic_model::mulmat_needs_pad`,
-// set by `supertonic_op_dispatch_scope` for each public forward entry (same
-// RAII pattern as `supertonic_use_fused_supertonic_ops`).  Read by `st_mul_mat`
-// below.  Defaults to `false` outside any scope, so a builder called without a
-// scope (e.g. CPU parity tests) emits a plain `ggml_mul_mat` — no behaviour
-// change on any backend that isn't the broken one.
+// Thread-local mirror of `supertonic_model::mulmat_needs_pad`, set by the dispatch scope.
+// Defaults to false outside any scope, so st_mul_mat emits a plain ggml_mul_mat.
 bool supertonic_mulmat_needs_pad();
 
-// QVAC-20557 — single source of truth for the Mali/Valhall small-output-dim
-// `mul_mat` miscompute workaround.  Drop-in for `ggml_mul_mat`: on a backend
-// flagged `mulmat_needs_pad`, zero-pad whichever GEMM output dim (M=a->ne[1] /
-// N=b->ne[1]) is < 64 up to 64, compute, then slice the real [M,N] block back —
-// mathematically exact (padding only adds discarded rows/cols).  No-op (plain
-// ggml_mul_mat) on healthy backends, on the mat-vec path (correct on the driver),
-// and on non-F32 operands (ggml_pad requires F32; those sites already have large M).
+// Drop-in for ggml_mul_mat: when mulmat_needs_pad, zero-pad a GEMM output dim < 64 up to 64,
+// then slice back the [M,N] block (exact). No-op on healthy backends, mat-vec, or non-F32 operands.
 inline ggml_tensor * st_mul_mat(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
     if (!supertonic_mulmat_needs_pad()) return ggml_mul_mat(ctx, a, b);
     const int64_t M = a->ne[1];
@@ -1157,10 +1132,8 @@ inline ggml_tensor * st_mul_mat(ggml_context * ctx, ggml_tensor * a, ggml_tensor
     ggml_tensor * ap = a;
     ggml_tensor * bp = b;
     if (pad_a) {
-        // Some sites pass strided/permuted views (e.g. batched attention q/k).
-        // Materialise before padding so ggml_pad sees a simple layout and the
-        // padded operand is a clean contiguous mul_mat input.  Only on the pad
-        // path (broken backend), so it never costs a healthy backend anything.
+        // Materialise strided/permuted views first so ggml_pad sees a simple
+        // contiguous layout. Only on the pad path, so healthy backends pay nothing.
         if (!ggml_is_contiguous(ap)) ap = ggml_cont(ctx, ap);
         ap = ggml_pad(ctx, ap, 0, (int) (64 - M), 0, 0);
     }
@@ -1475,7 +1448,7 @@ struct supertonic_op_dispatch_scope {
     bool prev_use_f16_attn;
     bool prev_use_native_leaky_relu;
     bool prev_use_fused_supertonic_ops;
-    // QVAC-20557 — saved `mulmat_needs_pad` flag for RAII teardown.
+    // saved `mulmat_needs_pad` flag for RAII teardown.
     bool prev_mulmat_needs_pad;
     // QVAC-18605 round 4 — saved K/V dispatch dtype for RAII
     // teardown.  Restored on scope destruction so a follow-on

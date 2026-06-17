@@ -47,21 +47,39 @@ inline bool backend_is_opencl(ggml_backend_t b) {
     return std::strcmp(backend_reg_name(b), "OpenCL") == 0;
 }
 
-// QVAC-20557 — true iff `b` is ggml-vulkan running on an ARM Mali / Immortalis
-// (Valhall) GPU, whose driver miscomputes (and can hang on) small-output-dim
-// mul_mat on the GEMM path.  Gates the `st_mul_mat` output-pad workaround.
-// DL-safe + NO compute: reads the device description (== Vulkan
-// VkPhysicalDeviceProperties.deviceName, e.g. "Mali-G715") through the same
-// core ggml-backend accessor used above, so it links under GGML_BACKEND_DL=ON
-// and can't hang.  Targeted at the broken ARM-Valhall class; false on every
-// other backend (Adreno/desktop-Vulkan/Metal/CUDA/CPU).
+// Null-safe ASCII case-insensitive substring match: device name capitalisation
+// varies across OpenCL CL_DEVICE_NAME and Vulkan deviceName.
+inline bool str_contains_ci(const char * hay, const char * needle) {
+    if (!hay || !needle) return false;
+    for (const char * h = hay; *h; ++h) {
+        const char * a = h;
+        const char * b = needle;
+        while (*a && *b) {
+            const char ca = (*a >= 'A' && *a <= 'Z') ? char(*a + 32) : *a;
+            const char cb = (*b >= 'A' && *b <= 'Z') ? char(*b + 32) : *b;
+            if (ca != cb) break;
+            ++a;
+            ++b;
+        }
+        if (!*b) return true;
+    }
+    return false;
+}
+
+// Single matcher for ARM Mali/Immortalis (Valhall), shared by GPU allowlist and pad gate so they can't disagree.
+// Valhall miscomputes small-output-dim mul_mat; the st_mul_mat output-pad works around it.
+inline bool desc_or_name_is_arm_mali(const char * name, const char * desc) {
+    return str_contains_ci(name, "mali")       || str_contains_ci(desc, "mali") ||
+           str_contains_ci(name, "immortalis") || str_contains_ci(desc, "immortalis");
+}
+
+// Gates the st_mul_mat output-pad: true iff `b` is ggml-vulkan on an ARM Mali/Immortalis GPU.
+// DL-safe, no compute: reads device name via core ggml accessors, so it links under GGML_BACKEND_DL=ON.
 inline bool backend_is_arm_mali_vulkan(ggml_backend_t b) {
     if (!backend_is_vulkan(b)) return false;
     ggml_backend_dev_t dev = ggml_backend_get_device(b);
     if (!dev) return false;
-    const char * desc = ggml_backend_dev_description(dev);
-    if (!desc) return false;
-    return std::strstr(desc, "Mali") != nullptr || std::strstr(desc, "Immortalis") != nullptr;
+    return desc_or_name_is_arm_mali(ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
 }
 
 inline void backend_set_n_threads(ggml_backend_t b, int n_threads) {
