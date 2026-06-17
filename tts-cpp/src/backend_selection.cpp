@@ -314,25 +314,47 @@ bool is_adreno_700plus(const char * s) {
 // because the strings vary in capitalisation: ggml-opencl reports
 // CL_DEVICE_NAME ("QUALCOMM Adreno(TM)") and ggml-vulkan reports the Vulkan
 // deviceName ("Adreno (TM) 740").
-bool is_qualcomm_adreno(const char * name, const char * desc) {
-    auto contains_ci = [](const char * hay, const char * needle) -> bool {
-        if (!hay || !needle) return false;
-        for (const char * h = hay; *h; ++h) {
-            const char * a = h;
-            const char * b = needle;
-            while (*a && *b) {
-                const char ca = (*a >= 'A' && *a <= 'Z') ? char(*a + 32) : *a;
-                const char cb = (*b >= 'A' && *b <= 'Z') ? char(*b + 32) : *b;
-                if (ca != cb) break;
-                ++a;
-                ++b;
-            }
-            if (!*b) return true;
+// ASCII case-insensitive substring match (the device strings vary in
+// capitalisation across the OpenCL CL_DEVICE_NAME and the Vulkan deviceName).
+bool contains_ci(const char * hay, const char * needle) {
+    if (!hay || !needle) return false;
+    for (const char * h = hay; *h; ++h) {
+        const char * a = h;
+        const char * b = needle;
+        while (*a && *b) {
+            const char ca = (*a >= 'A' && *a <= 'Z') ? char(*a + 32) : *a;
+            const char cb = (*b >= 'A' && *b <= 'Z') ? char(*b + 32) : *b;
+            if (ca != cb) break;
+            ++a;
+            ++b;
         }
-        return false;
-    };
+        if (!*b) return true;
+    }
+    return false;
+}
+
+bool is_qualcomm_adreno(const char * name, const char * desc) {
     return contains_ci(name, "adreno")   || contains_ci(desc, "adreno") ||
            contains_ci(name, "qualcomm") || contains_ci(desc, "qualcomm");
+}
+
+// True if the device name/description identifies a Samsung Xclipse GPU
+// (AMD RDNA2-based; e.g. Xclipse 920 on Exynos 2200). Validated on Android for
+// the Vulkan backend: the Supertonic + Chatterbox graphs compute correctly on
+// its proprietary Vulkan driver (verified on SM-S711B / Xclipse 920). ggml-opencl
+// is not loaded for non-Adreno Android GPUs, so this only ever selects the Vulkan
+// device. Second allowlisted Android GPU vendor alongside Qualcomm Adreno.
+bool is_samsung_xclipse(const char * name, const char * desc) {
+    return contains_ci(name, "xclipse") || contains_ci(desc, "xclipse");
+}
+
+// QVAC-20557: ARM Mali (Valhall) Vulkan detector. Allowlisted as a validated
+// Android GPU vendor — Supertonic computes correctly on its Vulkan driver via
+// the model-side mul_mat output-pad (the driver miscomputes small GEMM output
+// dims; st_mul_mat pads them into the correct regime). See backend_util.h's
+// backend_is_arm_mali_vulkan (the load-time pad gate) for the device match.
+bool is_arm_mali(const char * name, const char * desc) {
+    return contains_ci(name, "mali") || contains_ci(desc, "mali");
 }
 
 // Pick a GPU backend using the same tier policy as parakeet-cpp's
@@ -361,7 +383,9 @@ bool is_qualcomm_adreno(const char * name, const char * desc) {
 ggml_backend_t init_gpu_backend(int n_gpu_layers,
                                 bool verbose,
                                 const char * log_prefix,
-                                int vulkan_device) {
+                                int vulkan_device,
+                                bool * out_gpu_present_but_unused) {
+    if (out_gpu_present_but_unused) *out_gpu_present_but_unused = false;
     if (n_gpu_layers <= 0) return nullptr;
     if (!log_prefix) log_prefix = "tts-cpp";
 
@@ -384,6 +408,15 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
     std::vector<Cand>   vulkan_devs;
     std::vector<size_t> vulkan_free_vram;
     std::vector<bool>   vulkan_is_uma;
+
+    // True when a GPU device was present but the engine declined it BY POLICY
+    // (an Android GPU vendor outside the validated allowlist, e.g. Mali; or
+    // Adreno 6xx, whose OpenCL is known-broken) — i.e. we never even tried to
+    // init it. Drives the "GPU present but unsupported" report so the caller
+    // can accept the CPU fallback as correct. Deliberately NOT set when a
+    // VALIDATED GPU was tried but ggml_backend_dev_init failed — that is a real
+    // regression the caller should still surface.
+    bool gpu_present_but_unvalidated = false;
 
     const size_t n_dev = ggml_backend_dev_count();
     for (size_t i = 0; i < n_dev; ++i) {
@@ -420,20 +453,22 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
         }
 
 #if defined(__ANDROID__)
-        // Android GPU allowlist: only Qualcomm Adreno is validated for the
-        // tts-cpp GPU backends (OpenCL on Adreno 700+, Vulkan as the
-        // bring-up fallback). Other Android GPU vendors are not validated,
-        // and at least one (ARM Mali / Tensor) aborts the whole host
-        // process from inside ggml_backend_graph_compute via GGML_ASSERT ->
-        // ggml_abort(), which cannot be caught from C++. Skip non-Adreno
-        // devices so the policy falls through to CPU instead of risking a
-        // fatal abort on an unvalidated driver.
-        if (!is_qualcomm_adreno(name, desc)) {
+        // Android GPU allowlist: only validated vendors are kept — Qualcomm
+        // Adreno (OpenCL on 700+, Vulkan otherwise), Samsung Xclipse (Vulkan;
+        // OpenCL is not loaded for non-Adreno), and ARM Mali (Vulkan; QVAC-20557
+        // — Supertonic is correct on it via the model-side mul_mat output-pad).
+        // Other Android GPU vendors are not validated and are skipped so the
+        // policy falls through to CPU instead of risking a miscompute or a fatal
+        // abort (some drivers GGML_ASSERT -> ggml_abort() from inside
+        // ggml_backend_graph_compute, which cannot be caught from C++).
+        if (!is_qualcomm_adreno(name, desc) && !is_samsung_xclipse(name, desc) &&
+            !is_arm_mali(name, desc)) {
+            gpu_present_but_unvalidated = true;
             if (verbose) {
                 fprintf(stderr,
-                    "%s: Android GPU '%s' (%s) is not Qualcomm Adreno; "
-                    "skipping (only Adreno is validated on Android; "
-                    "falling through to CPU)\n",
+                    "%s: Android GPU '%s' (%s) is not a validated vendor "
+                    "(Qualcomm Adreno / Samsung Xclipse); skipping (falling "
+                    "through to CPU)\n",
                     log_prefix,
                     name ? name : "?",
                     desc ? desc : "?");
@@ -453,6 +488,7 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
                 const char * reported = name ? name : (desc ? desc : "unknown");
                 const char * override_env = std::getenv("TTS_CPP_ALLOW_ADRENO_6XX");
                 if (!override_env || override_env[0] != '1') {
+                    gpu_present_but_unvalidated = true;
                     if (verbose) {
                         fprintf(stderr,
                             "%s: OpenCL device '%s' is Adreno 6xx; "
@@ -607,6 +643,11 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
                 log_prefix);
         }
     }
+    // A GPU device was present but declined by policy (Android non-validated
+    // vendor like Mali, or Adreno 6xx): report it so the caller can accept the
+    // CPU fallback as correct rather than a regression. Not set when a
+    // validated GPU was tried and failed to init.
+    if (out_gpu_present_but_unused) *out_gpu_present_but_unused = gpu_present_but_unvalidated;
     return nullptr;
 }
 

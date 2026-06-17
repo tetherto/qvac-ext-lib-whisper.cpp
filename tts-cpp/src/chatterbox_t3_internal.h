@@ -166,6 +166,12 @@ struct perceiver_weights {
 struct chatterbox_model {
     chatterbox_hparams hparams;
 
+    // True when GPU was requested but the engine fell back to CPU because a GPU
+    // device was present yet declined by policy (an Android GPU vendor outside
+    // the validated allowlist, e.g. Mali). Set by init_backend()'s out-param in
+    // load_model_gguf(); surfaced via Engine::gpu_unsupported().
+    bool gpu_unsupported = false;
+
     ggml_tensor * wpe              = nullptr;
     ggml_tensor * ln_f_g           = nullptr;
     ggml_tensor * ln_f_b           = nullptr;
@@ -262,7 +268,7 @@ struct chatterbox_sampling_params {
     float   cfg_weight     = 0.0f;
 };
 
-ggml_backend_t init_backend(int n_gpu_layers);
+ggml_backend_t init_backend(int n_gpu_layers, bool * out_gpu_unsupported = nullptr);
 
 bool load_model_gguf(
     const std::string & path,

@@ -415,6 +415,12 @@ public:
     // otherwise.  Stable for the lifetime of the Engine.
     BackendDevice backend_device() const;
 
+    // True when GPU was requested but the engine fell back to CPU because a GPU
+    // device was present yet unusable (e.g. an Android GPU outside the validated
+    // allowlist, such as Mali). Distinguishes a correct CPU fallback on a GPU
+    // device from a GPU-less host. Always false when backend_device() == GPU.
+    bool gpu_unsupported() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> pimpl_;

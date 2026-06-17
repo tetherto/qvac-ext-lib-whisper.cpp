@@ -3,6 +3,9 @@
 #include <cstdint>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <functional>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -11,6 +14,8 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+
+#include "backend_util.h"
 
 namespace tts_cpp::supertonic::detail {
 
@@ -350,6 +355,12 @@ struct supertonic_model {
     // the lifetime of the model.  See `OpenCL bring-up` section in
     // PROGRESS_SUPERTONIC.md for the rationale.
     bool backend_is_cpu = true;
+    // True when GPU was requested (n_gpu_layers > 0) but the engine fell back
+    // to CPU because a GPU device was present yet unusable (e.g. an Android GPU
+    // outside the validated allowlist, like Mali). Lets the host distinguish a
+    // correct CPU fallback on a GPU device from a GPU-less host. Set once in
+    // load_supertonic_gguf() from init_supertonic_backend()'s out-param.
+    bool gpu_unsupported = false;
     // QVAC-18605 / Vulkan bring-up: True when the resolved backend is
     // ggml-vulkan (`ggml_backend_is_vk`).  Mirrors `backend_is_cpu` in
     // intent — informational + dispatch-key.  Set once in
@@ -402,6 +413,22 @@ struct supertonic_model {
     // silently skipped on Vulkan/OpenCL single-backend graphs → garbage output.
     // Default false = safe (pure-GGML) until the load-time probe runs.
     bool backend_supports_fused_supertonic_ops = false;
+    // QVAC-20557 — true when the resolved backend MISCOMPUTES a small-output-
+    // dimension `ggml_mul_mat` on the GEMM (mul_mm) path.  This is the ARM
+    // Mali/Valhall Vulkan driver bug (verified on-device): a GEMM whose output
+    // M (=src0->ne[1]) or N (=src1->ne[1]) is < ~48 returns wrong/NaN results,
+    // while the SAME op with that dim >= 48 is exact, and Adreno/Metal/CUDA/CPU
+    // are exact at every size.  Detected EMPIRICALLY at load (a tiny standalone
+    // mul_mat vs a host double-precision gold) — NOT a vendor/name table and NOT
+    // `ggml_backend_supports_op` (the driver reports support; it just
+    // miscomputes).  So this auto-fires only on the actually-broken backend and
+    // is false on every healthy one (incl. desktop Vulkan and any future-fixed
+    // Mali driver).  When true the `st_mul_mat` helper zero-pads the small
+    // output dim up to 64, computes, and slices the real sub-block back —
+    // mathematically exact (padded rows/cols are discarded).  The
+    // supertonic_op_dispatch_scope mirrors it onto the thread-local
+    // `g_supertonic_mulmat_needs_pad` for the graph builders.  Default false.
+    bool mulmat_needs_pad = false;
     // When true, the per-step vector-estimator attention graphs materialise
     // K/V into contiguous F16 before calling ggml_flash_attn_ext so OpenCL
     // (and other backends carrying the mixed-precision kernel) dispatch
@@ -632,7 +659,9 @@ void release_duration_thread_local_caches();
 // Mirrors the `!ggml_backend_is_cpu(backend)` idiom Chatterbox uses to gate
 // its Metal-only batched-CFG path.
 inline bool model_prefers_cpu_kernels(const supertonic_model & model) {
-    return model.backend == nullptr || ggml_backend_is_cpu(model.backend);
+    // `ggml_backend_is_cpu` lives in the CPU backend shared library, which is
+    // unlinkable under GGML_BACKEND_DL. Route through the registry-based shim.
+    return model.backend == nullptr || ::tts_cpp::detail::backend_is_cpu(model.backend);
 }
 
 // QVAC-19254 — scheduler-based alloc + compute (Option A), used by stages
@@ -1099,6 +1128,52 @@ bool supertonic_use_f16_attn();
 // unsupported fused op.
 bool supertonic_use_fused_supertonic_ops();
 
+// QVAC-20557 — thread-local mirror of `supertonic_model::mulmat_needs_pad`,
+// set by `supertonic_op_dispatch_scope` for each public forward entry (same
+// RAII pattern as `supertonic_use_fused_supertonic_ops`).  Read by `st_mul_mat`
+// below.  Defaults to `false` outside any scope, so a builder called without a
+// scope (e.g. CPU parity tests) emits a plain `ggml_mul_mat` — no behaviour
+// change on any backend that isn't the broken one.
+bool supertonic_mulmat_needs_pad();
+
+// QVAC-20557 — single source of truth for the Mali/Valhall small-output-dim
+// `mul_mat` miscompute workaround.  Drop-in for `ggml_mul_mat`: on a backend
+// flagged `mulmat_needs_pad`, zero-pad whichever GEMM output dim (M=a->ne[1] /
+// N=b->ne[1]) is < 64 up to 64, compute, then slice the real [M,N] block back —
+// mathematically exact (padding only adds discarded rows/cols).  No-op (plain
+// ggml_mul_mat) on healthy backends, on the mat-vec path (correct on the driver),
+// and on non-F32 operands (ggml_pad requires F32; those sites already have large M).
+inline ggml_tensor * st_mul_mat(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
+    if (!supertonic_mulmat_needs_pad()) return ggml_mul_mat(ctx, a, b);
+    const int64_t M = a->ne[1];
+    const int64_t N = b->ne[1];
+    // GEMM-path predicate (the only path that miscomputes).  Anything that would
+    // dispatch as mat-vec is correct on the driver and must not be perturbed.
+    const bool is_gemm = (N != 1) && !(N <= 8 && b->ne[2] * b->ne[3] == 1);
+    if (!is_gemm) return ggml_mul_mat(ctx, a, b);
+    const bool pad_a = (M < 64 && a->type == GGML_TYPE_F32);
+    const bool pad_b = (N < 64 && b->type == GGML_TYPE_F32);
+    if (!pad_a && !pad_b) return ggml_mul_mat(ctx, a, b);  // nothing paddable (e.g. non-F32 src)
+    ggml_tensor * ap = a;
+    ggml_tensor * bp = b;
+    if (pad_a) {
+        // Some sites pass strided/permuted views (e.g. batched attention q/k).
+        // Materialise before padding so ggml_pad sees a simple layout and the
+        // padded operand is a clean contiguous mul_mat input.  Only on the pad
+        // path (broken backend), so it never costs a healthy backend anything.
+        if (!ggml_is_contiguous(ap)) ap = ggml_cont(ctx, ap);
+        ap = ggml_pad(ctx, ap, 0, (int) (64 - M), 0, 0);
+    }
+    if (pad_b) {
+        if (!ggml_is_contiguous(bp)) bp = ggml_cont(ctx, bp);
+        bp = ggml_pad(ctx, bp, 0, (int) (64 - N), 0, 0);
+    }
+    ggml_tensor * r = ggml_mul_mat(ctx, ap, bp);             // [Mpad, Npad, ne2, ne3], contiguous F32
+    ggml_tensor * v = ggml_view_4d(ctx, r, M, N, r->ne[2], r->ne[3],
+                                   r->nb[1], r->nb[2], r->nb[3], 0);  // real top-left sub-block
+    return ggml_cont(ctx, v);  // repack tight: downstream consumers require contiguity
+}
+
 // QVAC-18605 round 4 — thread-local accessor for the currently-
 // active K/V dispatch dtype, mirroring `supertonic_use_f16_attn`'s
 // pattern.  Returns `kv_attn_dtype::f32` when no
@@ -1400,6 +1475,8 @@ struct supertonic_op_dispatch_scope {
     bool prev_use_f16_attn;
     bool prev_use_native_leaky_relu;
     bool prev_use_fused_supertonic_ops;
+    // QVAC-20557 — saved `mulmat_needs_pad` flag for RAII teardown.
+    bool prev_mulmat_needs_pad;
     // QVAC-18605 round 4 — saved K/V dispatch dtype for RAII
     // teardown.  Restored on scope destruction so a follow-on
     // engine on the same thread sees the default value, not the
@@ -1797,7 +1874,7 @@ inline ggml_tensor * convnext_block_fused_ggml(
     // `mul_mat(im2col_reshape, w_reshape)` for `K=1`.
     ggml_tensor * pw1_w_2d = ggml_reshape_2d(
         ctx, pw1_w, pw1_w->ne[0] * pw1_w->ne[1], pw1_w->ne[2]);
-    ggml_tensor * pw1_out = ggml_mul_mat(ctx, pw1_w_2d, y);
+    ggml_tensor * pw1_out = st_mul_mat(ctx, pw1_w_2d, y);
     if (pw1_b) {
         ggml_tensor * pw1_b_2d = ggml_reshape_2d(ctx, pw1_b, hidden, 1);
         pw1_out = ggml_add(ctx, pw1_out, ggml_repeat(ctx, pw1_b_2d, pw1_out));
@@ -1810,7 +1887,7 @@ inline ggml_tensor * convnext_block_fused_ggml(
     // pw2 — symmetric to pw1.  Output is `[C, T0]`.
     ggml_tensor * pw2_w_2d = ggml_reshape_2d(
         ctx, pw2_w, pw2_w->ne[0] * pw2_w->ne[1], pw2_w->ne[2]);
-    ggml_tensor * pw2_out = ggml_mul_mat(ctx, pw2_w_2d, gelu_out);
+    ggml_tensor * pw2_out = st_mul_mat(ctx, pw2_w_2d, gelu_out);
     if (pw2_b) {
         ggml_tensor * pw2_b_2d = ggml_reshape_2d(ctx, pw2_b, C, 1);
         pw2_out = ggml_add(ctx, pw2_out, ggml_repeat(ctx, pw2_b_2d, pw2_out));

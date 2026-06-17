@@ -225,7 +225,13 @@ struct Engine::Impl {
             // override via `--f16-attn 1` still forces dispatch
             // (useful for debug-shim backends).
             if (opts.f16_attn < 0) {
+                // ggml-opencl has no F32×F16 mat-vec kernel, so any F16
+                // activation reaching mul_mat aborts at graph compute
+                // (GGML_ASSERT(src1t == GGML_TYPE_F32)). Keep Supertonic
+                // F32-only on OpenCL; the perf cost is negligible there
+                // (OpenCL is already far slower than CPU on Adreno).
                 model.use_f16_attn = !model.backend_is_cpu &&
+                                     !::tts_cpp::detail::backend_is_opencl(model.backend) &&
                                      supertonic_backend_supports_f16_kv_flash_attn(model.backend);
             } else {
                 model.use_f16_attn = opts.f16_attn != 0;
@@ -660,6 +666,10 @@ BackendDevice Engine::backend_device() const {
     return ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU
                ? BackendDevice::CPU
                : BackendDevice::GPU;
+}
+
+bool Engine::gpu_unsupported() const {
+    return pimpl_ && pimpl_->model.gpu_unsupported;
 }
 
 // Convenience one-shot wrapper.  Pays the full GGUF load + free per
