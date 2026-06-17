@@ -118,11 +118,12 @@ jobs:
   ubuntu-22:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
         arch: [linux/amd64, linux/ppc64le]
 
     steps:
@@ -150,7 +151,12 @@ jobs:
   ubuntu-22-arm64:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04-arm, ubuntu-26.04-arm]
 
     steps:
       - name: Clone
@@ -169,11 +175,12 @@ jobs:
   ubuntu-22-arm-v7:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
         arch: [linux/arm/v7]
 
     steps:
@@ -258,11 +265,12 @@ jobs:
   ubuntu-22-gcc:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
         build: [Debug, Release]
         arch: [linux/amd64, linux/ppc64le]
 
@@ -292,11 +300,12 @@ jobs:
   ubuntu-22-gcc-arm64:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-22.04-arm, ubuntu-26.04-arm]
         build: [Debug, Release]
 
     steps:
@@ -324,11 +333,12 @@ jobs:
   ubuntu-22-gcc-arm-v7:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
         build: [Debug, Release]
         arch: [linux/arm/v7]
 
@@ -358,11 +368,12 @@ jobs:
   ubuntu-22-clang:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
         build: [Debug, Release]
         #arch: [linux/amd64, linux/arm64, linux/arm/v7, linux/ppc64le]
         # TODO: arm/v7 disabled due to clang bug
@@ -395,11 +406,12 @@ jobs:
   ubuntu-22-clang-arm64:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-22.04-arm, ubuntu-26.04-arm]
         build: [Debug, Release]
 
     steps:
@@ -425,11 +437,12 @@ jobs:
   ubuntu-22-gcc-sanitized:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
         sanitizer: [ADDRESS, THREAD, UNDEFINED]
 
     steps:
@@ -452,11 +465,12 @@ jobs:
   ubuntu-22-cmake-sycl:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
         dwhisper_sycl: [ON]
         dcmake_c_compiler: [icx]
         dcmake_cxx_compiler: [icpx]
@@ -504,11 +518,12 @@ jobs:
   ubuntu-22-cmake-sycl-fp16:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
         dwhisper_sycl: [ON]
         dcmake_c_compiler: [icx]
         dcmake_cxx_compiler: [icpx]
@@ -992,10 +1007,11 @@ jobs:
   emscripten:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
 
     strategy:
       matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
         build: [Release]
 
     steps:
@@ -1073,7 +1089,12 @@ jobs:
   android:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
 
     steps:
       - name: Clone
@@ -1102,7 +1123,12 @@ jobs:
           ./gradlew assembleRelease --no-daemon
 
   android_java:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
 
     steps:
       - name: Clone
@@ -1228,7 +1254,12 @@ jobs:
   quantize:
     if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' ||
             github.event.inputs.run_type == 'full-ci' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
 
     steps:
       - name: Clone
@@ -1360,7 +1391,12 @@ jobs:
 
 # TODO: simplify the following workflows using a matrix
   ggml-ci-x64-cpu-low-perf:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
 
     steps:
       - name: Clone
@@ -1385,7 +1421,12 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-arm64-cpu-low-perf:
-    runs-on: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04-arm, ubuntu-26.04-arm]
 
     steps:
       - name: Clone
@@ -1410,7 +1451,12 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-x64-cpu-high-perf:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-26.04]
 
     steps:
       - name: Clone
@@ -1435,7 +1481,12 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-arm64-cpu-high-perf:
-    runs-on: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04-arm, ubuntu-26.04-arm]
 
     steps:
       - name: Clone
@@ -1460,7 +1511,12 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_NO_SVE=1 GG_BUILD_NO_BF16=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-arm64-cpu-high-perf-sve:
-    runs-on: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04-arm, ubuntu-26.04-arm]
 
     steps:
       - name: Clone
