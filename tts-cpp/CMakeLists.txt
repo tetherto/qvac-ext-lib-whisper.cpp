@@ -831,6 +831,18 @@ if (TTS_CPP_BUILD_TESTS)
         LABEL "unit"
         ARGS  "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/voiceclone/v1")
 
+    # Ticket 4 — analytic backward of the style-dependent text-encoder tail
+    # (speech-prompted attention + final layer norm).  Model-free: every
+    # analytic gradient is gradchecked against finite differences, so it ALWAYS
+    # runs on a fresh checkout (no-skip policy, no model/fixtures needed).
+    add_executable(test-supertonic-text-encoder-backward
+        test/test_supertonic_text_encoder_backward.cpp
+        src/supertonic_text_encoder_backward.cpp
+        src/voiceclone_gradcheck.cpp)
+    target_include_directories(test-supertonic-text-encoder-backward PRIVATE src)
+    tts_cpp_apply_ccache(test-supertonic-text-encoder-backward)
+    tts_cpp_register_test(test-supertonic-text-encoder-backward LABEL "unit")
+
     # Engine-level streaming-callback contract test for the per-sentence
     # segmentation path (Fix #2): monotonic global chunk_index, single final
     # is_last, result.pcm == concat(callbacks), accumulated stats.  Gated on
