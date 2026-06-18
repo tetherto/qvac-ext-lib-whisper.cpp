@@ -1957,8 +1957,13 @@ bool load_supertonic_gguf(const std::string & path,
         if (f16_weights < 0) {
             // ggml-opencl mat-vec asserts src1t == GGML_TYPE_F32, so an F16 weight as
             // mul_mat src1 aborts at compute. Keep weights F32 on OpenCL (negligible cost).
+            // Same on ARM Mali (mulmat_needs_pad): the st_mul_mat output-pad only covers F32
+            // operands, so an F16 weight with a <64 output dim would re-expose the Valhall
+            // small-output miscompute. Gating on the same flag keeps "pad on" and "F16 off"
+            // from ever drifting apart.
             model.use_f16_weights = !model.backend_is_cpu &&
                                     !::tts_cpp::detail::backend_is_opencl(model.backend) &&
+                                    !model.mulmat_needs_pad &&
                                     cached_backend_capabilities(model.backend).f16_mul_mat;
         } else {
             model.use_f16_weights = (f16_weights != 0);

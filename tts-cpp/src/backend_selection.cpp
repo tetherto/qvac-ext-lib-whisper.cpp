@@ -315,34 +315,15 @@ bool is_adreno_700plus(const char * s) {
 // because the strings vary in capitalisation: ggml-opencl reports
 // CL_DEVICE_NAME ("QUALCOMM Adreno(TM)") and ggml-vulkan reports the Vulkan
 // deviceName ("Adreno (TM) 740").
-// ASCII case-insensitive substring match (device strings vary in capitalisation
-// across the OpenCL CL_DEVICE_NAME and the Vulkan deviceName).
-bool contains_ci(const char * hay, const char * needle) {
-    if (!hay || !needle) return false;
-    for (const char * h = hay; *h; ++h) {
-        const char * a = h;
-        const char * b = needle;
-        while (*a && *b) {
-            const char ca = (*a >= 'A' && *a <= 'Z') ? char(*a + 32) : *a;
-            const char cb = (*b >= 'A' && *b <= 'Z') ? char(*b + 32) : *b;
-            if (ca != cb) break;
-            ++a;
-            ++b;
-        }
-        if (!*b) return true;
-    }
-    return false;
-}
-
 bool is_qualcomm_adreno(const char * name, const char * desc) {
-    return contains_ci(name, "adreno")   || contains_ci(desc, "adreno") ||
-           contains_ci(name, "qualcomm") || contains_ci(desc, "qualcomm");
+    return str_contains_ci(name, "adreno")   || str_contains_ci(desc, "adreno") ||
+           str_contains_ci(name, "qualcomm") || str_contains_ci(desc, "qualcomm");
 }
 
 // Samsung Xclipse (AMD RDNA2) detector. Validated Android GPU vendor: the graphs
 // compute correctly on its Vulkan driver (ggml-opencl is not loaded for non-Adreno).
 bool is_samsung_xclipse(const char * name, const char * desc) {
-    return contains_ci(name, "xclipse") || contains_ci(desc, "xclipse");
+    return str_contains_ci(name, "xclipse") || str_contains_ci(desc, "xclipse");
 }
 
 // ARM Mali / Immortalis (Valhall) detector. Shares the backend_util.h matcher with

@@ -3,9 +3,6 @@
 #include <cstdint>
 #include <array>
 #include <cmath>
-#include <cstdio>
-#include <cstring>
-#include <functional>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -1124,6 +1121,9 @@ inline ggml_tensor * st_mul_mat(ggml_context * ctx, ggml_tensor * a, ggml_tensor
     const int64_t N = b->ne[1];
     // GEMM-path predicate (the only path that miscomputes).  Anything that would
     // dispatch as mat-vec is correct on the driver and must not be perturbed.
+    // The N<=8 carve-out mirrors ggml-vulkan's mat-vec dispatch (mul_mat_vec_max_cols,
+    // currently 8: mul_mat_vec when dst->ne[1]==1 || (dst->ne[1]<=8 && src1 batch==1)).
+    // Revisit if that upstream threshold changes.
     const bool is_gemm = (N != 1) && !(N <= 8 && b->ne[2] * b->ne[3] == 1);
     if (!is_gemm) return ggml_mul_mat(ctx, a, b);
     const bool pad_a = (M < 64 && a->type == GGML_TYPE_F32);
