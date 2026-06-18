@@ -1,5 +1,11 @@
 #include "supertonic_voice_json.h"
 
+// nlohmann/json is vendored as a single header (src/json.hpp) rather than
+// pulled via vcpkg: tts-cpp builds standalone (its CMake only
+// find_package()s ggml / OpenMP / BLAS — there is no vcpkg manifest in
+// this tree), and the parser must stay robust against untrusted input, so
+// a battle-tested parser beats a hand-rolled one.  Mirrors the existing
+// single-header vendoring convention in this tree (e.g. npy.h).
 #include "json.hpp"
 
 #include <fstream>
@@ -36,11 +42,14 @@ bool to_f32_vector(const json & arr, std::vector<float> & out) {
     return true;
 }
 
+// Product of a shape array.  Sets ok=false if any dimension is not a
+// positive integer — a zero / negative / non-integer dim is an invalid
+// shape, not a tensor we should silently accept.
 long long shape_product(const json & shape, bool & ok) {
     long long prod = 1;
     ok = true;
     for (const auto & dim : shape) {
-        if (!dim.is_number_integer()) {
+        if (!dim.is_number_integer() || dim.get<long long>() <= 0) {
             ok = false;
             return 0;
         }
@@ -49,17 +58,31 @@ long long shape_product(const json & shape, bool & ok) {
     return prod;
 }
 
+// `shape` is optional; when present it must be a non-empty array of
+// positive integers whose product equals the flattened data length.
 bool shape_matches_data(const json & field, size_t data_len, std::string * mismatch) {
     if (!field.is_object()) {
         return true;
     }
     const auto sit = field.find("shape");
-    if (sit == field.end() || !sit->is_array()) {
+    if (sit == field.end()) {
         return true;
+    }
+    if (!sit->is_array() || sit->empty()) {
+        if (mismatch) {
+            *mismatch = "shape must be a non-empty array of positive integers";
+        }
+        return false;
     }
     bool ok = false;
     const long long prod = shape_product(*sit, ok);
-    if (ok && prod > 0 && static_cast<size_t>(prod) != data_len) {
+    if (!ok) {
+        if (mismatch) {
+            *mismatch = "shape must contain only positive integer dimensions";
+        }
+        return false;
+    }
+    if (static_cast<size_t>(prod) != data_len) {
         if (mismatch) {
             *mismatch = "shape product " + std::to_string(prod) +
                         " != data length " + std::to_string(data_len);
@@ -148,11 +171,27 @@ bool parse_supertonic_voice_json(const std::string & json_text,
 bool load_supertonic_voice_json_file(const std::string & path,
                                      external_voice & out,
                                      std::string * err) {
-    std::ifstream f(path, std::ios::binary);
+    // Generous upper bound on a voice JSON.  A full voice is ~13k floats
+    // (style_ttl [1,50,256] + style_dp [1,8,16]); even at full text
+    // precision that's well under a megabyte.  16 MiB leaves headroom for
+    // metadata while rejecting a pathological / malicious file before we
+    // read it whole and build a DOM.
+    constexpr std::streamoff MAX_VOICE_JSON_BYTES = 16 * 1024 * 1024;
+
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
         if (err) *err = "voice json: cannot open file: " + path;
         return false;
     }
+    const std::streamoff size = f.tellg();
+    if (size > MAX_VOICE_JSON_BYTES) {
+        if (err) {
+            *err = "voice json: file too large (" + std::to_string(size) +
+                   " bytes > " + std::to_string(MAX_VOICE_JSON_BYTES) + " byte limit)";
+        }
+        return false;
+    }
+    f.seekg(0, std::ios::beg);
     std::ostringstream ss;
     ss << f.rdbuf();
     return parse_supertonic_voice_json(ss.str(), out, err);

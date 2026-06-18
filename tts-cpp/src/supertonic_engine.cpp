@@ -332,7 +332,20 @@ struct Engine::Impl {
     // QVAC-20978 — pick the voice source (in-memory tensors > voice JSON
     // file > baked-in preset name) and validate it.
     void resolve_voice_source() {
-        if (!opts.voice_style_ttl.empty() && !opts.voice_style_dp.empty()) {
+        // A voice is the *pair* (style_ttl, style_dp).  Supplying only one
+        // tensor is a caller bug: fail loudly instead of silently falling
+        // through to voice_json_path / the baked preset (which would
+        // synthesize a different voice than intended).
+        const bool has_ttl = !opts.voice_style_ttl.empty();
+        const bool has_dp  = !opts.voice_style_dp.empty();
+        if (has_ttl != has_dp) {
+            throw std::runtime_error(
+                "Supertonic Engine: voice_style_ttl and voice_style_dp must "
+                "both be set or both be empty (got only " +
+                std::string(has_ttl ? "voice_style_ttl" : "voice_style_dp") + ")");
+        }
+
+        if (has_ttl && has_dp) {
             ext_style_ttl      = opts.voice_style_ttl;
             ext_style_dp       = opts.voice_style_dp;
             use_external_voice = true;
@@ -381,7 +394,13 @@ struct Engine::Impl {
     void validate_external_voice_dims() const {
         const std::string ref_voice = reference_voice_name();
         if (ref_voice.empty()) {
-            return;
+            // No baked preset to cross-check the external voice against.
+            // Every shipped Supertonic GGUF bundles its presets, so an
+            // empty voice table means a malformed / unexpected model; fail
+            // loudly rather than injecting an unvalidated voice.
+            throw std::runtime_error(
+                "Supertonic Engine: model has no baked voices to validate the "
+                "external voice dimensions against");
         }
         const auto & rv = model.voices.at(ref_voice);
         check_style_size("style_ttl", ext_style_ttl.size(), (size_t) ggml_nelements(rv.ttl));

@@ -90,6 +90,23 @@ int run_parser_unit_tests() {
         check(!parse_supertonic_voice_json(j, v, &err), "shape/data mismatch should fail");
     }
 
+    // A zero dimension in shape is invalid (would make prod==0 and bypass
+    // the data-length cross-check) — must be rejected.
+    {
+        external_voice v;
+        std::string    err;
+        const std::string j = R"({"style_ttl":{"data":[1,2,3],"shape":[0,3]},"style_dp":[1]})";
+        check(!parse_supertonic_voice_json(j, v, &err), "zero shape dim should fail");
+    }
+
+    // A negative dimension in shape is invalid — must be rejected.
+    {
+        external_voice v;
+        std::string    err;
+        const std::string j = R"({"style_ttl":{"data":[1,2,3],"shape":[-1,3]},"style_dp":[1]})";
+        check(!parse_supertonic_voice_json(j, v, &err), "negative shape dim should fail");
+    }
+
     // Malformed JSON fails (no crash).
     {
         external_voice v;
