@@ -11,7 +11,7 @@
   },
   "files": ["dist/"],
   "dependencies": {
-    "jquery": ">=3.4.1"
+    "jquery": ">=3.5.0"
   },
   "devDependencies": {
     "csso": "3.5.1",
