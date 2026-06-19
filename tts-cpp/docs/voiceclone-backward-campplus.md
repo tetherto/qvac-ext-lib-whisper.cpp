@@ -121,8 +121,17 @@ guard it (both in the always-on `unit` ctest tier, model-free):
 - `test-campplus-backward` — gradchecks every primitive and the full chain
   against central finite differences.
 - `test-campplus-backward-parity` — asserts the analytic double forward matches
-  the production scalar forward (`campplus_embed_cpu`) on synthetic weights,
+  the production scalar forward (`campplus_embed_cpu`) on synthetic weights
+  (multi-layer CAM blocks, 2/3/2, so the dense-concat accumulation is exercised),
   anchoring the gradcheck's relevance to the real model.
+
+The scalar CPU forward is the path every `campplus_embed` caller uses today
+(production `main.cpp`, `test-campplus`, `test-voice-embedding` all pass
+`backend==nullptr`), and `test-campplus` / `test-voice-embedding` validate it
+against the Python reference embedding. So the trust chain is complete:
+Python → `campplus_embed_cpu` → analytic forward → gradchecked backward. The
+`campplus_embed_ggml` graph path is not wired to any caller yet; when it is, it
+gets its own fixture parity against the CPU/Python path.
 
 This is mathematically exact, runs on CPU (the enrollment target), and serves as
 the **reference oracle** for the per-stage gradcheck once the GGML-native ops in

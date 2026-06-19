@@ -14,6 +14,16 @@
 // `campplus_embed_cpu` hardcodes growth=32 and bn_channels=128, so the synthetic
 // topology below uses those values.
 //
+// Trust chain: the scalar CPU forward is what every `campplus_embed` caller in
+// the repo actually uses (production `main.cpp`, `test-campplus`,
+// `test-voice-embedding` all pass backend==nullptr), and `test-campplus` /
+// `test-voice-embedding` validate it against the Python reference embedding. So
+// anchoring this parity to `campplus_embed_cpu` ties the analytic forward (and
+// therefore the gradchecked backward) to the real model: Python -> CPU forward
+// -> analytic forward -> backward. The `campplus_embed_ggml` graph path is not
+// exercised by any caller today; if it is wired up later it gets its own
+// fixture parity against the CPU/Python path.
+//
 // Built via CMake (links campplus.cpp -> ggml). Runs in the `unit` ctest tier.
 
 #include "campplus.h"
@@ -156,18 +166,22 @@ campplus_weights build_weights(const Topo & d) {
     w.tdnn_linear = mk_conv1d(d.init_C, fcm_out, 5, 2, 2, 1, 6.0, false);
     w.tdnn_bn = mk_bn(d.init_C, 6.5);
 
-    w.block1 = mk_cam_block(1, d.kernel_size, 1, d.init_C, d.growth, d.bn_channels, 10.0);
-    const int after_b1 = d.init_C + 1 * d.growth;
+    // Multi-layer CAM blocks (2/3/2) so the dense-concat accumulation (layer i
+    // enters with C_in + i*growth) is anchored to production, not only to the
+    // self-referential full-chain gradcheck.
+    const int b1_layers = 2, b2_layers = 3, b3_layers = 2;
+    w.block1 = mk_cam_block(b1_layers, d.kernel_size, 1, d.init_C, d.growth, d.bn_channels, 10.0);
+    const int after_b1 = d.init_C + b1_layers * d.growth;
     w.transit1 = mk_transit(after_b1, 20.0);
 
     const int b2_in = after_b1 / 2;
-    w.block2 = mk_cam_block(1, d.kernel_size, 2, b2_in, d.growth, d.bn_channels, 30.0);
-    const int after_b2 = b2_in + 1 * d.growth;
+    w.block2 = mk_cam_block(b2_layers, d.kernel_size, 2, b2_in, d.growth, d.bn_channels, 30.0);
+    const int after_b2 = b2_in + b2_layers * d.growth;
     w.transit2 = mk_transit(after_b2, 40.0);
 
     const int b3_in = after_b2 / 2;
-    w.block3 = mk_cam_block(1, d.kernel_size, 2, b3_in, d.growth, d.bn_channels, 50.0);
-    const int after_b3 = b3_in + 1 * d.growth;
+    w.block3 = mk_cam_block(b3_layers, d.kernel_size, 2, b3_in, d.growth, d.bn_channels, 50.0);
+    const int after_b3 = b3_in + b3_layers * d.growth;
     w.transit3 = mk_transit(after_b3, 60.0);
 
     const int final_ch = after_b3 / 2;
