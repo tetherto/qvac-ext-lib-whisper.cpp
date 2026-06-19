@@ -42,7 +42,7 @@ Source: `src/supertonic_vocoder.cpp`.
 | Forward op | Where (forward) |
 | --- | --- |
 | reshape/permute/cont | latent unpack (the notional "transposed conv" upsample) |
-| `ggml_scale`, `ggml_mul`, `ggml_add` (broadcast) | denorm, BN affine, residuals, scalar gamma |
+| `ggml_scale`, `ggml_mul`, `ggml_add` (broadcast) | denorm, BN affine, residuals, per-channel gamma |
 | `ggml_im2col` + `ggml_mul_mat` | causal conv1d (embed, pw1/pw2, head1/head2) |
 | custom causal depthwise (`ggml_custom` / `ggml_supertonic_depthwise_1d_causal_ct`) | ConvNeXt depthwise |
 | `ggml_norm` (+ `ggml_supertonic_layer_norm_channel*`) | ConvNeXt channel layer norm |
@@ -111,7 +111,7 @@ individually:
 - `batch_norm_backward_input` — affine BN at inference
 - `leaky_relu_backward` — head PReLU
 - `latent_unpack_backward` — the "transposed conv" upsample (permutation)
-- `convnext_backward_input` — full scalar-gamma ConvNeXt block
+- `convnext_backward_input` — full per-channel-gamma ConvNeXt block
 - `VocoderBackward::backward` — the whole chain → `d(loss)/d(latent)`
 
 Channel layer norm, erf-GELU and pointwise (1x1) convs are shared with the

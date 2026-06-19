@@ -84,7 +84,7 @@ VocConvNextWeights make_block(int C, int hidden, int K, int dilation, double pha
     w.pw1_b    = make_vector(hidden, phase + 0.6);
     w.pw2_w    = make_vector(C * hidden, phase + 0.7);
     w.pw2_b    = make_vector(C, phase + 0.8);
-    w.gamma    = 0.6;
+    w.gamma    = make_vector(C, phase + 0.9);  // per-channel residual scale
     return w;
 }
 

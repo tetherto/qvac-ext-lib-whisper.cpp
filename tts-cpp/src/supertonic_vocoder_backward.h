@@ -29,7 +29,7 @@
 // Pointwise (1x1) convs, channel layer norm and erf-GELU are shared with the
 // vector-estimator backward (`tts_cpp::ve_grad`) since the math is identical;
 // the class adds the vocoder-specific causal convs, affine batch norm,
-// leaky-relu, scalar-gamma ConvNeXt block, latent unpack and the full chain.
+// leaky-relu, per-channel-gamma ConvNeXt block, latent unpack and the full chain.
 
 #include <vector>
 
@@ -39,8 +39,8 @@ namespace voc_grad {
 // --- Plain data holders ------------------------------------------------------
 
 // Vocoder ConvNeXt block weights (matches `convnext_block`). Differs from the
-// vector-estimator block: depthwise is *causal* (left pad), and `gamma` is a
-// single scalar residual scale (not per-channel).
+// vector-estimator block in that the depthwise conv is *causal* (left pad);
+// `gamma` is the per-channel `[C]` residual scale, as in the production model.
 struct VocConvNextWeights {
     std::vector<double> dw_w;      // depthwise [C * K]
     std::vector<double> dw_b;      // [C]
@@ -50,7 +50,7 @@ struct VocConvNextWeights {
     std::vector<double> pw1_b;     // [hidden]
     std::vector<double> pw2_w;     // [C * hidden]
     std::vector<double> pw2_b;     // [C]
-    double gamma = 0.0;            // scalar residual scale
+    std::vector<double> gamma;     // [C], per-channel residual scale
     int C        = 0;
     int hidden   = 0;
     int K        = 0;

@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <stdexcept>
 #include <utility>
 
 namespace tts_cpp {
@@ -229,7 +230,10 @@ std::vector<double> VocoderBackward::convnext_forward(const VocConvNextWeights &
     const std::vector<double> z2 = ve_grad::conv1x1_forward(g, L, w.hidden, w.C, w.pw2_w, w.pw2_b);
 
     std::vector<double> out((std::size_t) L * w.C);
-    for (std::size_t i = 0; i < out.size(); ++i) out[i] = x[i] + w.gamma * z2[i];
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const std::size_t c = i % (std::size_t) w.C;  // [L, C] time-major, gamma is per-channel
+        out[i] = x[i] + w.gamma[c] * z2[i];
+    }
     return out;
 }
 
@@ -237,7 +241,10 @@ std::vector<double> VocoderBackward::convnext_backward_input(const VocConvNextWe
                                                              const VocConvNextActivations & acts,
                                                              const std::vector<double> & d_out, int L) const {
     std::vector<double> d_z2((std::size_t) L * w.C);
-    for (std::size_t i = 0; i < d_z2.size(); ++i) d_z2[i] = w.gamma * d_out[i];
+    for (std::size_t i = 0; i < d_z2.size(); ++i) {
+        const std::size_t c = i % (std::size_t) w.C;  // [L, C] time-major, gamma is per-channel
+        d_z2[i] = w.gamma[c] * d_out[i];
+    }
 
     const std::vector<double> d_g  = ve_grad::conv1x1_backward_input(d_z2, L, w.hidden, w.C, w.pw2_w);
     const std::vector<double> d_z1 = ve_grad::gelu_backward(acts.z1, d_g);
@@ -274,6 +281,9 @@ std::vector<double> VocoderBackward::forward(const std::vector<double> & latent)
 }
 
 std::vector<double> VocoderBackward::backward(const std::vector<double> & d_wav) const {
+    if (head1_out_.empty()) {
+        throw std::logic_error("VocoderBackward::backward called before forward (no cached activations)");
+    }
     const VocoderWeights & w = weights_;
     const int T0 = w.latent_len * w.factor;
 
