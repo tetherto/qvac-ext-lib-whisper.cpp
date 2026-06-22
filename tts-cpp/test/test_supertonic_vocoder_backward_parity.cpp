@@ -29,6 +29,7 @@
 #include "supertonic_internal.h"
 #include "supertonic_vocoder_backward.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
