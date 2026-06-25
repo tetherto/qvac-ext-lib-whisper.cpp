@@ -82,6 +82,29 @@ struct scoped_timer {
 };
 #define TIMED(label) scoped_timer _st_##__LINE__(label)
 
+// ARM Mali / Immortalis (Valhall) Vulkan miscomputes the CFM estimator's f32
+// ggml_flash_attn_ext: the mel comes out subtly wrong (in-range, so it passes a
+// casual check) and the f0 predictor then amplifies it into huge/NaN values ->
+// broken audio.  Device-confirmed on Pixel 9a (Mali-G715): swapping the CFM
+// attention to the unfused soft_max + separate-V matmul clears it.  The swap is
+// numerically equivalent to flash-attn and stays on the GPU, so it is applied on
+// Mali only; every other backend keeps flash_attn_ext.  TTS_CPP_CHBX_CFM_FA=1
+// forces the fused path even on Mali (A/B / escape hatch).
+static bool chbx_force_cfm_fa() {
+    static const bool on = [] {
+        const char * e = getenv("TTS_CPP_CHBX_CFM_FA");
+        return e && e[0] && e[0] != '0';
+    }();
+    return on;
+}
+static bool backend_is_arm_mali(ggml_backend_t b) {
+    if (!b) return false;
+    ggml_backend_dev_t dev = ggml_backend_get_device(b);
+    if (!dev) return false;
+    return ::tts_cpp::detail::is_arm_mali(ggml_backend_dev_name(dev),
+                                          ggml_backend_dev_description(dev));
+}
+
 // ============================================================================
 // GGUF loader + helpers
 // ============================================================================
@@ -112,6 +135,10 @@ struct model_ctx {
     bool  meanflow    = true;
     int   n_timesteps = 2;
     float cfg_rate    = 0.0f;
+
+    // True when the chosen GPU backend is an ARM Mali/Immortalis Vulkan device,
+    // detected once at load time. Gates the CFM unfused-attention fix below.
+    bool  is_mali     = false;
 };
 
 // Allocate + run a graph through the model scheduler — like the single-backend
@@ -163,7 +190,9 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers, bool verbose) {
     // GPU cascade is centralised in backend_selection.cpp's
     // `init_gpu_backend` (Adreno 700+ -> OpenCL, every other GPU ->
     // Vulkan/Metal/CUDA/Mali, with Adreno 6xx OpenCL force-skipped).
-    if (ggml_backend_t b = ::tts_cpp::detail::init_gpu_backend(n_gpu_layers, verbose, "s3gen")) {
+    if (ggml_backend_t b = ::tts_cpp::detail::init_gpu_backend(n_gpu_layers, verbose, "s3gen",
+                                                               /*vulkan_device=*/0,
+                                                               /*allow_arm_mali=*/true)) {
         return b;
     }
     if (ggml_backend_t b = ::tts_cpp::detail::init_cpu_backend()) {
@@ -310,6 +339,9 @@ static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, boo
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) throw std::runtime_error("gguf_init_from_file failed: " + path);
     m.backend = s3gen_init_backend(n_gpu_layers, verbose);
+    m.is_mali = backend_is_arm_mali(m.backend);
+    if (verbose && m.is_mali)
+        fprintf(stderr, "s3gen: ARM Mali Vulkan detected -> CFM uses unfused attention\n");
     int64_t n_tensors = gguf_get_n_tensors(g);
     ggml_init_params p = { ggml_tensor_overhead() * (size_t)n_tensors, nullptr, true };
     m.ctx_w = ggml_init(p);
@@ -1098,7 +1130,8 @@ static basic_tfm_w load_basic_tfm(const model_ctx & m, const std::string & pfx) 
 }
 
 static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
-                               ggml_tensor * x, int T, int C, bool f16_kv_attn, int H = 8, int HD = 64) {
+                               ggml_tensor * x, int T, int C, bool f16_kv_attn,
+                               bool use_unfused, int H = 8, int HD = 64) {
     int INNER = H * HD;
     ggml_tensor * nx = layer_norm(ctx, x, w.norm1_w, w.norm1_b);
     ggml_tensor * q = ggml_mul_mat(ctx, w.to_q, nx);
@@ -1113,6 +1146,20 @@ static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
     q = ggml_view_3d(ctx, q, HD, T, H, col_stride, head_stride, 0);
     k = ggml_view_3d(ctx, k, HD, T, H, col_stride, head_stride, 0);
     v = ggml_view_3d(ctx, v, HD, T, H, col_stride, head_stride, 0);
+    ggml_tensor * flat;
+    if (use_unfused) {
+        // Mali-correct path: classic soft_max + separate-V matmul instead of the
+        // f32 flash_attn_ext kernel that miscomputes on ARM Mali Vulkan (see the
+        // chbx_force_cfm_fa note above).  q,k,v are (HD,T,H) f32 strided views;
+        // output matches FA's (HD,H,T) -> (INNER,T) so to_out is unchanged.
+        ggml_tensor * scores = ggml_mul_mat(ctx, k, q);                 // (T_k, T_q, H)
+        scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float)HD));
+        ggml_tensor * attn = ggml_soft_max(ctx, scores);               // over T_k
+        ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3));    // (T_k,HD,H)
+        ggml_tensor * attn_v = ggml_mul_mat(ctx, v_perm, attn);        // (HD, T_q, H)
+        ggml_tensor * merged = ggml_cont(ctx, ggml_permute(ctx, attn_v, 0, 2, 1, 3)); // (HD,H,T)
+        flat = ggml_reshape_2d(ctx, merged, INNER, T);
+    } else {
     if (f16_kv_attn) {
         // Experimental OpenCL/mobile mode: keep Q in F32 but materialise K/V
         // into contiguous F16 so backends with `flash_attn_f32_f16` (e.g.
@@ -1133,7 +1180,8 @@ static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
                                                 /*max_bias=*/0.0f,
                                                 /*logit_softcap=*/0.0f);
     // flash_attn_ext output: ne=[HD, H, T, 1] (contiguous). Reshape to (INNER, T).
-    ggml_tensor * flat = ggml_reshape_2d(ctx, attn_fa, INNER, T);
+    flat = ggml_reshape_2d(ctx, attn_fa, INNER, T);
+    }
     ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, w.to_out_w, flat), w.to_out_b);
     x = ggml_add(ctx, x, attn_out);
 
@@ -1152,9 +1200,10 @@ static cfm_tfm_stack load_tfm_stack(const model_ctx & m, const std::string & pfx
 }
 
 static ggml_tensor * apply_tfm_stack(ggml_context * ctx, const cfm_tfm_stack & s,
-                                     ggml_tensor * x, int T, int C, bool f16_kv_attn) {
+                                     ggml_tensor * x, int T, int C, bool f16_kv_attn,
+                                     bool use_unfused) {
     ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
-    for (const auto & b : s.blocks) xt = basic_tfm(ctx, b, xt, T, C, f16_kv_attn);
+    for (const auto & b : s.blocks) xt = basic_tfm(ctx, b, xt, T, C, f16_kv_attn, use_unfused);
     return ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));
 }
 
@@ -1201,7 +1250,7 @@ static ggml_tensor * cfm_resnet_b(ggml_context * ctx, const cfm_resnet_w & w,
 
 static ggml_tensor * basic_tfm_b(ggml_context * ctx, const basic_tfm_w & w,
                                  ggml_tensor * x, int T, int C, int B,
-                                 bool f16_kv_attn,
+                                 bool f16_kv_attn, bool use_unfused,
                                  int H = 8, int HD = 64) {
     int INNER = H * HD;
     ggml_tensor * nx = layer_norm(ctx, x, w.norm1_w, w.norm1_b);            // (C, T, B)
@@ -1217,6 +1266,18 @@ static ggml_tensor * basic_tfm_b(ggml_context * ctx, const basic_tfm_w & w,
     q = ggml_view_4d(ctx, q, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
     k = ggml_view_4d(ctx, k, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
     v = ggml_view_4d(ctx, v, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
+    ggml_tensor * flat;
+    if (use_unfused) {
+        // Mali-correct path (B=2): mirror basic_tfm's unfused soft_max + V matmul
+        // with the batch dim carried; output matches FA's (HD,H,T,B)->(INNER,T,B).
+        ggml_tensor * scores = ggml_mul_mat(ctx, k, q);                 // (T_k, T_q, H, B)
+        scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float)HD));
+        ggml_tensor * attn = ggml_soft_max(ctx, scores);               // over T_k
+        ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3));    // (T_k,HD,H,B)
+        ggml_tensor * attn_v = ggml_mul_mat(ctx, v_perm, attn);        // (HD, T_q, H, B)
+        ggml_tensor * merged = ggml_cont(ctx, ggml_permute(ctx, attn_v, 0, 2, 1, 3)); // (HD,H,T,B)
+        flat = ggml_reshape_3d(ctx, merged, INNER, T, B);
+    } else {
     if (f16_kv_attn) {
         // Mirror the batch=1 path: optionally materialise K/V as contiguous
         // F16 so backends with `flash_attn_f32_f16` (Adreno OpenCL) dispatch
@@ -1229,7 +1290,8 @@ static ggml_tensor * basic_tfm_b(ggml_context * ctx, const basic_tfm_w & w,
     ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr,
                                                 1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
     // flash_attn_ext output ne=[HD, H, T, B].  Reshape back to (INNER, T, B).
-    ggml_tensor * flat = ggml_reshape_3d(ctx, attn_fa, INNER, T, B);
+    flat = ggml_reshape_3d(ctx, attn_fa, INNER, T, B);
+    }
     ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, w.to_out_w, flat), w.to_out_b);
     x = ggml_add(ctx, x, attn_out);
 
@@ -1242,9 +1304,9 @@ static ggml_tensor * basic_tfm_b(ggml_context * ctx, const basic_tfm_w & w,
 
 static ggml_tensor * apply_tfm_stack_b(ggml_context * ctx, const cfm_tfm_stack & s,
                                        ggml_tensor * x, int T, int C, int B,
-                                       bool f16_kv_attn) {
+                                       bool f16_kv_attn, bool use_unfused) {
     ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));    // (C, T, B)
-    for (const auto & b : s.blocks) xt = basic_tfm_b(ctx, b, xt, T, C, B, f16_kv_attn);
+    for (const auto & b : s.blocks) xt = basic_tfm_b(ctx, b, xt, T, C, B, f16_kv_attn, use_unfused);
     return ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));               // (T, C, B)
 }
 
@@ -1424,6 +1486,7 @@ static std::vector<float> cfm_estimator_forward(
     bool f16_kv_attn) {
     const int MEL = 80, CH = 256, TIME_DIM = 1024;
     const int N_MID = 12, N_BLOCKS = 4;
+    const bool use_unfused = m.is_mali && !chbx_force_cfm_fa();
 
     const bool build_graph = (cache.T != T) || cache.b2;
     if (build_graph) {
@@ -1463,7 +1526,7 @@ static std::vector<float> cfm_estimator_forward(
     ggml_tensor * down_conv_b = find_tensor(m, "cfm/down_blocks/0/2/bias");
 
     ggml_tensor * z = cfm_resnet(ctx, down_rn, xc, t_emb_in, CH);
-    z = apply_tfm_stack(ctx, down_tfms, z, T, CH, f16_kv_attn);
+    z = apply_tfm_stack(ctx, down_tfms, z, T, CH, f16_kv_attn, use_unfused);
     ggml_tensor * hidden = z;
     z = cfm_causal_k3(ctx, z, down_conv_w, down_conv_b, CH);
 
@@ -1471,7 +1534,7 @@ static std::vector<float> cfm_estimator_forward(
         auto rn = load_cfm_resnet(m, "cfm/mid_blocks/" + std::to_string(i) + "/0");
         auto tfms = load_tfm_stack(m, "cfm/mid_blocks/" + std::to_string(i) + "/1", N_BLOCKS);
         z = cfm_resnet(ctx, rn, z, t_emb_in, CH);
-        z = apply_tfm_stack(ctx, tfms, z, T, CH, f16_kv_attn);
+        z = apply_tfm_stack(ctx, tfms, z, T, CH, f16_kv_attn, use_unfused);
     }
 
     auto up_rn = load_cfm_resnet(m, "cfm/up_blocks/0/0");
@@ -1480,7 +1543,7 @@ static std::vector<float> cfm_estimator_forward(
     ggml_tensor * up_conv_b = find_tensor(m, "cfm/up_blocks/0/2/bias");
     z = ggml_concat(ctx, z, hidden, 1);
     z = cfm_resnet(ctx, up_rn, z, t_emb_in, CH);
-    z = apply_tfm_stack(ctx, up_tfms, z, T, CH, f16_kv_attn);
+    z = apply_tfm_stack(ctx, up_tfms, z, T, CH, f16_kv_attn, use_unfused);
     z = cfm_causal_k3(ctx, z, up_conv_w, up_conv_b, CH);
 
     ggml_tensor * fb_conv_w = find_tensor(m, "cfm/final_block/block/0/weight");
@@ -1550,6 +1613,7 @@ static void cfm_estimator_forward_b2(
     const int MEL = 80, CH = 256, TIME_DIM = 1024;
     const int N_MID = 12, N_BLOCKS = 4;
     const int B = 2;
+    const bool use_unfused = m.is_mali && !chbx_force_cfm_fa();
 
     const bool build_graph = (cache.T != T) || !cache.b2;
     if (build_graph) {
@@ -1590,7 +1654,7 @@ static void cfm_estimator_forward_b2(
     ggml_tensor * down_conv_b = find_tensor(m, "cfm/down_blocks/0/2/bias");
 
     ggml_tensor * z = cfm_resnet_b(ctx, down_rn, xc, t_emb_in, CH);
-    z = apply_tfm_stack_b(ctx, down_tfms, z, T, CH, B, f16_kv_attn);
+    z = apply_tfm_stack_b(ctx, down_tfms, z, T, CH, B, f16_kv_attn, use_unfused);
     ggml_tensor * hidden = z;
     z = cfm_causal_k3_b(ctx, z, down_conv_w, down_conv_b, CH);
 
@@ -1598,7 +1662,7 @@ static void cfm_estimator_forward_b2(
         auto rn = load_cfm_resnet(m, "cfm/mid_blocks/" + std::to_string(i) + "/0");
         auto tfms = load_tfm_stack(m, "cfm/mid_blocks/" + std::to_string(i) + "/1", N_BLOCKS);
         z = cfm_resnet_b(ctx, rn, z, t_emb_in, CH);
-        z = apply_tfm_stack_b(ctx, tfms, z, T, CH, B, f16_kv_attn);
+        z = apply_tfm_stack_b(ctx, tfms, z, T, CH, B, f16_kv_attn, use_unfused);
     }
 
     auto up_rn = load_cfm_resnet(m, "cfm/up_blocks/0/0");
@@ -1607,7 +1671,7 @@ static void cfm_estimator_forward_b2(
     ggml_tensor * up_conv_b = find_tensor(m, "cfm/up_blocks/0/2/bias");
     z = ggml_concat(ctx, z, hidden, 1);
     z = cfm_resnet_b(ctx, up_rn, z, t_emb_in, CH);
-    z = apply_tfm_stack_b(ctx, up_tfms, z, T, CH, B, f16_kv_attn);
+    z = apply_tfm_stack_b(ctx, up_tfms, z, T, CH, B, f16_kv_attn, use_unfused);
     z = cfm_causal_k3_b(ctx, z, up_conv_w, up_conv_b, CH);
 
     ggml_tensor * fb_conv_w = find_tensor(m, "cfm/final_block/block/0/weight");
