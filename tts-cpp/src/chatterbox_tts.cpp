@@ -1129,6 +1129,21 @@ static basic_tfm_w load_basic_tfm(const model_ctx & m, const std::string & pfx) 
     return w;
 }
 
+// Mali-correct CFM attention: unfused soft_max + separate-V matmul, numerically
+// equivalent to ggml_flash_attn_ext but correct on ARM Mali Vulkan (the f32 FA
+// kernel miscomputes there; see chbx_force_cfm_fa).  q,k,v are strided
+// (HD,T,H[,B]) f32 views; returns merged (HD,H,T[,B]).  Callers reshape to
+// (INNER,T) / (INNER,T,B) — the ops carry the optional batch dim transparently.
+static ggml_tensor * cfm_unfused_attn(ggml_context * ctx, ggml_tensor * q,
+                                      ggml_tensor * k, ggml_tensor * v, int HD) {
+    ggml_tensor * scores = ggml_mul_mat(ctx, k, q);                          // (T_k, T_q, H[, B])
+    scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float)HD));
+    ggml_tensor * attn = ggml_soft_max(ctx, scores);                         // over T_k
+    ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3)); // (T_k,HD,H[,B])
+    ggml_tensor * attn_v = ggml_mul_mat(ctx, v_perm, attn);                  // (HD, T_q, H[, B])
+    return ggml_cont(ctx, ggml_permute(ctx, attn_v, 0, 2, 1, 3));            // (HD,H,T[,B])
+}
+
 static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
                                ggml_tensor * x, int T, int C, bool f16_kv_attn,
                                bool use_unfused, int H = 8, int HD = 64) {
@@ -1148,39 +1163,30 @@ static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
     v = ggml_view_3d(ctx, v, HD, T, H, col_stride, head_stride, 0);
     ggml_tensor * flat;
     if (use_unfused) {
-        // Mali-correct path: classic soft_max + separate-V matmul instead of the
-        // f32 flash_attn_ext kernel that miscomputes on ARM Mali Vulkan (see the
-        // chbx_force_cfm_fa note above).  q,k,v are (HD,T,H) f32 strided views;
-        // output matches FA's (HD,H,T) -> (INNER,T) so to_out is unchanged.
-        ggml_tensor * scores = ggml_mul_mat(ctx, k, q);                 // (T_k, T_q, H)
-        scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float)HD));
-        ggml_tensor * attn = ggml_soft_max(ctx, scores);               // over T_k
-        ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3));    // (T_k,HD,H)
-        ggml_tensor * attn_v = ggml_mul_mat(ctx, v_perm, attn);        // (HD, T_q, H)
-        ggml_tensor * merged = ggml_cont(ctx, ggml_permute(ctx, attn_v, 0, 2, 1, 3)); // (HD,H,T)
-        flat = ggml_reshape_2d(ctx, merged, INNER, T);
+        // Route off the Mali-miscomputing f32 flash_attn_ext; equivalent, stays on GPU.
+        flat = ggml_reshape_2d(ctx, cfm_unfused_attn(ctx, q, k, v, HD), INNER, T);
     } else {
-    if (f16_kv_attn) {
-        // Experimental OpenCL/mobile mode: keep Q in F32 but materialise K/V
-        // into contiguous F16 so backends with `flash_attn_f32_f16` (e.g.
-        // Adreno OpenCL, see PROGRESS.md "OpenCL / Adreno bring-up" §
-        // "OpenCL optimization log") dispatch the mixed-precision kernel
-        // instead of the F32-only one.  ggml_cpy handles the strided-source
-        // → contiguous-F16-dst case across Metal / OpenCL / CPU.
-        ggml_tensor * k_f16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, T, H);
-        ggml_tensor * v_f16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, T, H);
-        k = ggml_cpy(ctx, k, k_f16);
-        v = ggml_cpy(ctx, v, v_f16);
-    }
+        if (f16_kv_attn) {
+            // Experimental OpenCL/mobile mode: keep Q in F32 but materialise K/V
+            // into contiguous F16 so backends with `flash_attn_f32_f16` (e.g.
+            // Adreno OpenCL, see PROGRESS.md "OpenCL / Adreno bring-up" §
+            // "OpenCL optimization log") dispatch the mixed-precision kernel
+            // instead of the F32-only one.  ggml_cpy handles the strided-source
+            // → contiguous-F16-dst case across Metal / OpenCL / CPU.
+            ggml_tensor * k_f16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, T, H);
+            ggml_tensor * v_f16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, T, H);
+            k = ggml_cpy(ctx, k, k_f16);
+            v = ggml_cpy(ctx, v, v_f16);
+        }
 
-    // Fused softmax(QK^T / sqrt(HD)) @ V, streaming (no materialized T x T attn matrix).
-    // Output layout is (HD, H, T) internally ((D, H, N) per flash_attn_ext docs).
-    ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr,
-                                                /*scale=*/1.0f / std::sqrt((float)HD),
-                                                /*max_bias=*/0.0f,
-                                                /*logit_softcap=*/0.0f);
-    // flash_attn_ext output: ne=[HD, H, T, 1] (contiguous). Reshape to (INNER, T).
-    flat = ggml_reshape_2d(ctx, attn_fa, INNER, T);
+        // Fused softmax(QK^T / sqrt(HD)) @ V, streaming (no materialized T x T attn matrix).
+        // Output layout is (HD, H, T) internally ((D, H, N) per flash_attn_ext docs).
+        ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr,
+                                                    /*scale=*/1.0f / std::sqrt((float)HD),
+                                                    /*max_bias=*/0.0f,
+                                                    /*logit_softcap=*/0.0f);
+        // flash_attn_ext output: ne=[HD, H, T, 1] (contiguous). Reshape to (INNER, T).
+        flat = ggml_reshape_2d(ctx, attn_fa, INNER, T);
     }
     ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, w.to_out_w, flat), w.to_out_b);
     x = ggml_add(ctx, x, attn_out);
@@ -1268,29 +1274,22 @@ static ggml_tensor * basic_tfm_b(ggml_context * ctx, const basic_tfm_w & w,
     v = ggml_view_4d(ctx, v, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
     ggml_tensor * flat;
     if (use_unfused) {
-        // Mali-correct path (B=2): mirror basic_tfm's unfused soft_max + V matmul
-        // with the batch dim carried; output matches FA's (HD,H,T,B)->(INNER,T,B).
-        ggml_tensor * scores = ggml_mul_mat(ctx, k, q);                 // (T_k, T_q, H, B)
-        scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float)HD));
-        ggml_tensor * attn = ggml_soft_max(ctx, scores);               // over T_k
-        ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3));    // (T_k,HD,H,B)
-        ggml_tensor * attn_v = ggml_mul_mat(ctx, v_perm, attn);        // (HD, T_q, H, B)
-        ggml_tensor * merged = ggml_cont(ctx, ggml_permute(ctx, attn_v, 0, 2, 1, 3)); // (HD,H,T,B)
-        flat = ggml_reshape_3d(ctx, merged, INNER, T, B);
+        // B=2: same Mali-correct unfused attention, batch dim carried.
+        flat = ggml_reshape_3d(ctx, cfm_unfused_attn(ctx, q, k, v, HD), INNER, T, B);
     } else {
-    if (f16_kv_attn) {
-        // Mirror the batch=1 path: optionally materialise K/V as contiguous
-        // F16 so backends with `flash_attn_f32_f16` (Adreno OpenCL) dispatch
-        // the mixed-precision kernel.  See basic_tfm() for full rationale.
-        ggml_tensor * k_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HD, T, H, B);
-        ggml_tensor * v_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HD, T, H, B);
-        k = ggml_cpy(ctx, k, k_f16);
-        v = ggml_cpy(ctx, v, v_f16);
-    }
-    ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr,
-                                                1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
-    // flash_attn_ext output ne=[HD, H, T, B].  Reshape back to (INNER, T, B).
-    flat = ggml_reshape_3d(ctx, attn_fa, INNER, T, B);
+        if (f16_kv_attn) {
+            // Mirror the batch=1 path: optionally materialise K/V as contiguous
+            // F16 so backends with `flash_attn_f32_f16` (Adreno OpenCL) dispatch
+            // the mixed-precision kernel.  See basic_tfm() for full rationale.
+            ggml_tensor * k_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HD, T, H, B);
+            ggml_tensor * v_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HD, T, H, B);
+            k = ggml_cpy(ctx, k, k_f16);
+            v = ggml_cpy(ctx, v, v_f16);
+        }
+        ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr,
+                                                    1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
+        // flash_attn_ext output ne=[HD, H, T, B].  Reshape back to (INNER, T, B).
+        flat = ggml_reshape_3d(ctx, attn_fa, INNER, T, B);
     }
     ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, w.to_out_w, flat), w.to_out_b);
     x = ggml_add(ctx, x, attn_out);
