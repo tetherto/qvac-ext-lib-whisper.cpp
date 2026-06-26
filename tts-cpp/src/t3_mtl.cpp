@@ -1830,6 +1830,23 @@ bool load_model_gguf_mtl(const std::string & path,
         // attention with the requested quantized/f16 K/V.
         hp.kv_type = chatterbox_resolve_kv_type(model.backend, kv_type,
                                                 hp.head_dim, hp.n_head, hp.n_kv_head);
+        // QVAC-19557: the MTL variant's batched-CFG (B=2) decode CONTs the
+        // strided quantized K/V cache, which ggml-metal can't do (no quantized
+        // CONT kernel) — so a quantized KV cache SIGABRTs at eval_step_mtl
+        // ("unsupported op 'CONT'") on Metal.  The resolve probe above only
+        // validates flash_attn_ext, not the downstream CONT, so the guard below
+        // restricts quantized K/V to the CPU backend.  See
+        // chatterbox_mtl_guard_kv_type for the full rationale; it is pure so we
+        // log the downgrade here.
+        {
+            const ggml_type guarded = chatterbox_mtl_guard_kv_type(model.backend, hp.kv_type);
+            if (guarded != hp.kv_type) {
+                fprintf(stderr, "chatterbox(mtl): quantized (%s) KV cache is only supported on the "
+                                "CPU backend for the multilingual variant (GPU CONT on quantized "
+                                "K/V is unsupported); using f32 KV cache\n", ggml_type_name(hp.kv_type));
+                hp.kv_type = guarded;
+            }
+        }
         ggml_init_params kv_params = { ggml_tensor_overhead() * 4, nullptr, true };
         model.ctx_kv = ggml_init(kv_params);
         const int64_t kv_elements_b2 =

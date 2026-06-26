@@ -66,6 +66,22 @@ int main() {
     CHECK(chatterbox_resolve_kv_type(cpu, GGML_TYPE_Q8_0, head_dim, n_head, n_kv_head)
               == GGML_TYPE_Q8_0, "cpu retains q8_0 KV");
 
+    // ---- MTL guard (QVAC-19557): quantized K/V only on CPU ----
+    // The multilingual variant's batched-CFG decode CONTs the strided quantized
+    // K/V cache, which ggml-metal can't do; the guard restricts quantized K/V to
+    // the CPU backend.  Here we cover the pass-through branches that hold on any
+    // runner; the GPU->f32 downgrade is covered (Metal) in test_metal_ops.cpp.
+    CHECK(chatterbox_mtl_guard_kv_type(cpu, GGML_TYPE_Q8_0) == GGML_TYPE_Q8_0,
+          "mtl guard: cpu keeps q8_0 (cpu has the quantized CONT kernel)");
+    CHECK(chatterbox_mtl_guard_kv_type(cpu, GGML_TYPE_F16) == GGML_TYPE_F16,
+          "mtl guard: cpu keeps f16");
+    CHECK(chatterbox_mtl_guard_kv_type(cpu, GGML_TYPE_F32) == GGML_TYPE_F32,
+          "mtl guard: cpu keeps f32");
+    // Non-quantized types are never downgraded regardless of backend, and a null
+    // backend is a no-op (null->f32 is chatterbox_resolve_kv_type's job upstream).
+    CHECK(chatterbox_mtl_guard_kv_type(nullptr, GGML_TYPE_Q8_0) == GGML_TYPE_Q8_0,
+          "mtl guard: null backend is a no-op");
+
     ggml_backend_free(cpu);
 
     if (g_failures) {

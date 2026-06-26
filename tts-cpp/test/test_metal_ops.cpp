@@ -335,6 +335,52 @@ static int test_mul_mm_fused(ggml_backend_t cpu, ggml_backend_t gpu,
     return 1;
 }
 
+// QVAC-19557: regression sentinel for the MTL Metal q8-KV SIGABRT.  The
+// multilingual Chatterbox variant's batched-CFG (B=2) decode reads the
+// token-major K/V cache as a strided 4D view, which the GPU flash-attn path
+// materialises through a CONT.  ggml-metal has no CONT kernel for quantized
+// tensors, so that op is unsupported on Metal — and because the MTL path runs a
+// single-backend graph_compute (no scheduler fallback) it crashes at encode
+// time.  chatterbox_mtl_guard_kv_type exists precisely for this; here we assert
+// the underlying ggml limitation directly so this test TRIPS the day ggml grows
+// a quantized CONT kernel, at which point the guard can be relaxed and GPU q8 KV
+// revisited.  The guard's fallback target (f32 CONT) and the CPU quantized CONT
+// must both stay supported.
+static int test_quantized_cont_unsupported(ggml_backend_t cpu, ggml_backend_t gpu) {
+    fprintf(stderr, "[quantized_cont] ");
+    auto supports_cont = [](ggml_backend_t b, ggml_type t) {
+        ggml_init_params p = { ggml_tensor_overhead() * 8, nullptr, /*no_alloc=*/true };
+        ggml_context * ctx = ggml_init(p);
+        // Strided 4D view of a quantized src -> cont, mirroring the MTL
+        // batched-CFG (B=2) token-major K/V read in build_llama_block.
+        ggml_tensor * src  = ggml_new_tensor_4d(ctx, t, 64, 256, 16, 2);
+        ggml_tensor * view = ggml_view_4d(ctx, src, 64, 256, 16, 2,
+                                          src->nb[1], src->nb[2] * 2, src->nb[3], 0);
+        bool sup = ggml_backend_supports_op(b, ggml_cont(ctx, view));
+        ggml_free(ctx);
+        return sup;
+    };
+    int fails = 0;
+    if (supports_cont(gpu, GGML_TYPE_Q8_0)) {
+        fprintf(stderr, "\n  FAIL: Metal now advertises CONT(q8_0) — revisit the MTL KV guard "
+                        "(chatterbox_mtl_guard_kv_type); GPU q8 KV may be possible again\n");
+        ++fails;
+    }
+    if (!supports_cont(gpu, GGML_TYPE_F32)) {
+        fprintf(stderr, "\n  FAIL: Metal CONT(f32) unsupported — the MTL guard's f32 fallback target is broken\n");
+        ++fails;
+    }
+    if (!supports_cont(cpu, GGML_TYPE_Q8_0)) {
+        fprintf(stderr, "\n  FAIL: CPU CONT(q8_0) unsupported — MTL keeps q8 KV on CPU and would break\n");
+        ++fails;
+    }
+    if (!fails) {
+        fprintf(stderr, "ok (Metal CONT(q8_0) unsupported, as the MTL KV guard assumes)\n");
+        return 0;
+    }
+    return 1;
+}
+
 int main() {
     ggml_backend_t cpu = ggml_backend_cpu_init();
     if (!cpu) { fprintf(stderr, "CPU backend init failed\n"); return 1; }
@@ -350,6 +396,7 @@ int main() {
     }
 
     int rc = 0;
+    rc |= test_quantized_cont_unsupported(cpu, gpu);
     rc |= test_diag_mask_inf(cpu, gpu);
     rc |= test_pad_ext(cpu, gpu);
     // HiFT-sized shapes:

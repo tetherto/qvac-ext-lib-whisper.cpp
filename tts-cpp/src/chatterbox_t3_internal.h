@@ -119,6 +119,19 @@ ggml_type chatterbox_kv_type_from_str(const std::string & s);
 ggml_type chatterbox_resolve_kv_type(ggml_backend_t backend, ggml_type requested,
                                      int head_dim, int n_head, int n_kv_head);
 
+// MTL-variant-only guard (QVAC-19557): the multilingual variant's batched-CFG
+// (B=2) decode reads the token-major K/V cache as a 4D strided view, which the
+// GPU flash-attn path materialises through a CONT.  ggml-metal has no CONT
+// kernel for quantized tensors, so a quantized KV cache SIGABRTs at encode time
+// on Metal (the MTL path runs a single-backend graph_compute, so the scheduler
+// never gets to fall the op back to CPU).  This restricts a quantized `kv_type`
+// to the CPU backend and returns GGML_TYPE_F32 on any GPU backend; non-quantized
+// types and a null/CPU backend pass through unchanged.  Pure (no I/O) so the
+// caller logs the downgrade and so it stays unit-testable.  The Turbo variant
+// uses a different eval path that does not hit the CONT and must NOT be routed
+// through this guard.
+ggml_type chatterbox_mtl_guard_kv_type(ggml_backend_t backend, ggml_type kv_type);
+
 struct gpt2_layer {
     ggml_tensor * ln_1_g = nullptr;
     ggml_tensor * ln_1_b = nullptr;

@@ -402,6 +402,20 @@ ggml_type chatterbox_resolve_kv_type(ggml_backend_t backend, ggml_type requested
     return requested;
 }
 
+ggml_type chatterbox_mtl_guard_kv_type(ggml_backend_t backend, ggml_type kv_type) {
+    // Quantized K/V is only safe on CPU for the MTL variant: the GPU flash-attn
+    // path CONTs the strided quantized K/V cache, and ggml-metal has no CONT
+    // kernel for quantized tensors (the resolve probe above validates
+    // flash_attn_ext but not the downstream CONT, so it can't catch this).  Gate
+    // on "not CPU" by device type rather than a backend name so it stays robust
+    // across ggml builds whose Metal registry name differs ("Metal" vs "MTL").
+    if (ggml_is_quantized(kv_type) && backend &&
+        !::tts_cpp::detail::backend_is_cpu(backend)) {
+        return GGML_TYPE_F32;
+    }
+    return kv_type;
+}
+
 bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers, ggml_type kv_type) {
     {
         gguf_init_params peek_params = { /*.no_alloc=*/ true, /*.ctx=*/ nullptr };
