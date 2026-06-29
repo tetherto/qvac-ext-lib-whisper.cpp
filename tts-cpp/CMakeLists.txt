@@ -328,7 +328,7 @@ if (TTS_CPP_BUILD_LIBRARY)
     # EngineOptions::cangjie_tsv_path (API).
     # ------------------------------------------------------------------
     find_library(MECAB_LIBRARY    NAMES mecab)
-    find_path   (MECAB_INCLUDE_DIR NAMES mecab.h)
+    find_path   (MECAB_INCLUDE_DIR NAMES mecab.h PATH_SUFFIXES mecab)
     if (MECAB_LIBRARY AND MECAB_INCLUDE_DIR)
         message(STATUS "MeCab (Japanese preprocess): ENABLED")
         message(STATUS "  library : ${MECAB_LIBRARY}")
