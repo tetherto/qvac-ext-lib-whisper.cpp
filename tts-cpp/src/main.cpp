@@ -375,6 +375,24 @@ ggml_type chatterbox_resolve_kv_type(ggml_backend_t backend, ggml_type requested
         return GGML_TYPE_F32;
     }
 
+    // ggml-opencl (Adreno) has the same advertise-vs-actual gap: supports_op
+    // reports both the q8_0 flash-attn and the align-probe's strided q8->f32
+    // cast as supported, but the driver SIGSEGVs on the quantized cache at load
+    // (clEnqueueWriteBuffer inside ChatterboxEngine construction).  Device-farm
+    // confirmed (QVAC-19557): a q8_0 KV cache crashes the multilingual GPU load
+    // on a Samsung Galaxy S25 Ultra (Adreno) where the identical f16/f32 cache
+    // passes, and the same model loads fine on a Pixel 9 (Mali-Vulkan, force-f32'd
+    // above).  The probe below can't catch this, so force quantized K/V to f32 on
+    // OpenCL.  f16 (the native FA input type) is left intact; Metal / CPU keep
+    // quantized K/V (validated).
+    if (ggml_is_quantized(requested) && ::tts_cpp::detail::backend_is_opencl(backend)) {
+        fprintf(stderr, "chatterbox: quantized (%s) KV cache faults on the OpenCL/Adreno "
+                        "backend (advertises support but SIGSEGVs on the q8 cache at load); "
+                        "using f32 KV cache\n",
+                ggml_type_name(requested));
+        return GGML_TYPE_F32;
+    }
+
     bool supported = false;
     ggml_init_params pp = { ggml_tensor_overhead() * 8, nullptr, /*no_alloc=*/true };
     if (ggml_context * pc = ggml_init(pp)) {
