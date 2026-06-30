@@ -1134,7 +1134,7 @@ ggml_backend_t model_active_backend(ParakeetCtcModel & m) {
     return m.impl->backend_active;
 }
 
-ggml_backend_t model_sortformer_backend(ParakeetCtcModel & m) {
+ggml_backend_t model_sortformer_backend(const ParakeetCtcModel & m) {
     if (!m.impl) return nullptr;
     return m.impl->sortformer_force_cpu ? m.impl->backend_cpu
                                         : m.impl->backend_active;

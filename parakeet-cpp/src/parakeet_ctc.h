@@ -342,7 +342,7 @@ ggml_backend_t model_active_backend(ParakeetCtcModel & m);
 
 // Backend for the Sortformer head: the active backend normally, but CPU on
 // Mali-Vulkan (its transformer block 0 miscomputes to NaN; encoder stays on GPU).
-ggml_backend_t model_sortformer_backend(ParakeetCtcModel & m);
+ggml_backend_t model_sortformer_backend(const ParakeetCtcModel & m);
 
 // True when the head is routed to CPU (Mali-Vulkan); the graph then reads the
 // CPU-resident weight copies (model.sortformer_cpu), not the GPU originals.
