@@ -207,7 +207,7 @@ if (TTS_CPP_OPENMP)
 endif()
 
 if (MSVC)
-    add_compile_definitions(_USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
+    add_compile_definitions(_USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS NOMINMAX)
 endif()
 
 # Legacy interface library kept for export-set compatibility (it is
