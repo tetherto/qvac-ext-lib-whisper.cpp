@@ -159,6 +159,7 @@ ggml_tensor * sf_build_graph(ggml_context * ctx,
 // Allocate, upload input, compute, and download output for a Sortformer graph.
 // Returns 0 on success, negative on failure.  Caller must free ctx afterwards.
 int sf_exec_graph(ggml_context * ctx, ggml_backend_t backend,
+                  ggml_backend_sched_t sched, bool force_cpu,
                   ggml_tensor * x_in, ggml_tensor * x_out,
                   const float * encoder_out,
                   int D_in, int T_enc, int num_spks,
@@ -167,24 +168,42 @@ int sf_exec_graph(ggml_context * ctx, ggml_backend_t backend,
     ggml_cgraph * cg = ggml_new_graph_custom(ctx, graph_slots, false);
     ggml_build_forward_expand(cg, x_out);
 
-    ggml_gallocr_t alloc = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_reserve(alloc, cg))  { ggml_gallocr_free(alloc); return -2; }
-    if (!ggml_gallocr_alloc_graph(alloc, cg)) { ggml_gallocr_free(alloc); return -3; }
+    // Reset the shared scheduler at the head: the encoder already downloaded its
+    // output to host, so freeing its scheduler allocation here is safe (and the
+    // normal path below reuses the scheduler to allocate this head graph).
+    ggml_backend_sched_reset(sched);
 
-    ggml_backend_tensor_set(x_in, encoder_out, 0,
-                            (size_t)D_in * T_enc * sizeof(float));
-
-    if (ggml_backend_graph_compute(backend, cg) != GGML_STATUS_SUCCESS) {
-        ggml_gallocr_free(alloc);
-        return -4;
+    ggml_gallocr_t alloc = nullptr;
+    if (!force_cpu) {
+        // Normal path: per-op CPU fallback via the shared scheduler.
+        if (!ggml_backend_sched_alloc_graph(sched, cg)) return -3;
+        ggml_backend_tensor_set(x_in, encoder_out, 0,
+                                (size_t)D_in * T_enc * sizeof(float));
+        if (ggml_backend_sched_graph_compute(sched, cg) != GGML_STATUS_SUCCESS) {
+            return -4;
+        }
+    } else {
+        // Force-CPU path (Mali-Vulkan miscompute workaround): run the head
+        // directly on the CPU backend with the CPU-resident weights, bypassing
+        // the scheduler -- supports_op is true for these ops, so the scheduler
+        // would route them back to the GPU and reproduce the block-0 NaN.
+        alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!ggml_gallocr_reserve(alloc, cg))     { ggml_gallocr_free(alloc); return -2; }
+        if (!ggml_gallocr_alloc_graph(alloc, cg)) { ggml_gallocr_free(alloc); return -3; }
+        ggml_backend_tensor_set(x_in, encoder_out, 0,
+                                (size_t)D_in * T_enc * sizeof(float));
+        if (ggml_backend_graph_compute(backend, cg) != GGML_STATUS_SUCCESS) {
+            ggml_gallocr_free(alloc);
+            return -4;
+        }
     }
 
     speaker_probs.resize((size_t)T_enc * num_spks);
     ggml_backend_tensor_get(x_out, speaker_probs.data(), 0,
                             speaker_probs.size() * sizeof(float));
-
-    ggml_gallocr_free(alloc);
+    // Free the head gallocr only AFTER the output is downloaded -- x_out lives in
+    // this buffer (the scheduler path keeps its tensors until the next reset).
+    if (alloc) ggml_gallocr_free(alloc);
     return 0;
 }
 
@@ -658,7 +677,11 @@ int sortformer_diarize_ggml(const ParakeetCtcModel & model,
                                          tf_d, D_in, T_enc, &x_in);
 
     // 3. Execute on backend
-    int rc = sf_exec_graph(ctx, backend, x_in, x_out,
+    // Force-CPU (Mali-Vulkan) bypasses the scheduler and computes directly on the
+    // CPU backend; otherwise run through the shared sched for per-op CPU fallback.
+    int rc = sf_exec_graph(ctx, backend, model_sched(model),
+                           model_sortformer_on_cpu(model),
+                           x_in, x_out,
                            encoder_out, D_in, T_enc, num_spks,
                            out.speaker_probs);
     ggml_free(ctx);

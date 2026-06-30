@@ -17,6 +17,8 @@ struct ggml_tensor;
 struct gguf_context;
 struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
+struct ggml_backend_sched;
+typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
 namespace parakeet {
 
@@ -345,6 +347,10 @@ ggml_backend_t model_sortformer_backend(ParakeetCtcModel & m);
 // True when the head is routed to CPU (Mali-Vulkan); the graph then reads the
 // CPU-resident weight copies (model.sortformer_cpu), not the GPU originals.
 bool model_sortformer_on_cpu(const ParakeetCtcModel & m);
+
+// The shared compute scheduler (active backend + CPU). Graphs run through it get
+// per-op CPU fallback. Returns nullptr if the model is not loaded.
+ggml_backend_sched_t model_sched(const ParakeetCtcModel & m);
 
 int run_subsampling(ParakeetCtcModel   & model,
                     const float        * mel,

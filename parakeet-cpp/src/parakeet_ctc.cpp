@@ -35,7 +35,6 @@ namespace parakeet {
 struct EncoderGraph {
     ggml_context * graph_ctx = nullptr;
     ggml_cgraph  * cgraph    = nullptr;
-    ggml_gallocr_t alloc     = nullptr;
     int            T_mel     = 0;
     int            T_enc     = 0;          // post-subsampling frame count
     int            n_run_layers = 0;
@@ -82,7 +81,6 @@ struct EncoderGraph {
     ggml_tensor * logits_node          = nullptr;
 
     void free_() {
-        if (alloc)     { ggml_gallocr_free(alloc); alloc = nullptr; }
         if (graph_ctx) { ggml_free(graph_ctx);     graph_ctx = nullptr; }
         cgraph = nullptr;
         mel_in = mask_t0 = mask_t1 = mask_t2 = mask_t3 = pe_in = nullptr;
@@ -121,6 +119,10 @@ struct ParakeetCtcModel::Impl {
     ggml_context         * sortformer_cpu_ctx    = nullptr;
     ggml_backend_buffer_t  sortformer_cpu_buffer = nullptr;
     ggml_backend_buffer_t  weights_buffer = nullptr;
+    // Compute scheduler over [active backend, CPU] (CPU last). Routes ops the
+    // active backend cannot run to CPU per-op; a single-split pass-through when
+    // every op is supported. Must be freed before the backends it references.
+    ggml_backend_sched_t   sched          = nullptr;
     std::vector<std::unique_ptr<EncoderGraph>> encoder_graphs;
     static constexpr size_t k_encoder_graph_cache_max = 3;
 
@@ -129,6 +131,7 @@ struct ParakeetCtcModel::Impl {
             if (g) g->free_();
         }
         encoder_graphs.clear();
+        if (sched)          ggml_backend_sched_free(sched);
         if (weights_buffer) ggml_backend_buffer_free(weights_buffer);
         if (sortformer_cpu_buffer) ggml_backend_buffer_free(sortformer_cpu_buffer);
         if (sortformer_cpu_ctx)    ggml_free(sortformer_cpu_ctx);
@@ -697,6 +700,30 @@ int load_from_gguf(const std::string & gguf_path,
             "(encoder + CTC/TDT/EOU stay on the GPU)\n");
     }
 
+    // Compute scheduler over the active backend + CPU (CPU MUST be last; ggml
+    // asserts this). When the active backend is the GPU, ops it cannot run fall
+    // back to CPU per-op; when CPU-only, the scheduler is a single-backend
+    // pass-through. op_offload=false: all Parakeet weights live on the active
+    // backend, so the CPU-weight->GPU offload heuristic never applies here.
+    // graph_size mirrors the encoder cgraph capacity (build_encoder_graph_cached);
+    // actual node counts are far smaller (verify via GGML_SCHED_DEBUG).
+    {
+        ggml_backend_t sched_backends[2];
+        int n_sched = 0;
+        if (impl->backend_gpu && impl->backend_active == impl->backend_gpu) {
+            sched_backends[n_sched++] = impl->backend_gpu;
+        }
+        sched_backends[n_sched++] = impl->backend_cpu;   // CPU last (mandatory)
+        impl->sched = ggml_backend_sched_new(
+            sched_backends, /*bufts=*/nullptr, n_sched,
+            /*graph_size=*/GGML_DEFAULT_GRAPH_SIZE * 16,
+            /*parallel=*/false, /*op_offload=*/false);
+        if (!impl->sched) {
+            PARAKEET_LOG_ERROR("gguf: ggml_backend_sched_new failed\n");
+            return 13;
+        }
+    }
+
     gguf_init_params params = { /*no_alloc=*/ true, &impl->ctx };
     impl->gguf = gguf_init_from_file(gguf_path.c_str(), params);
     if (!impl->gguf) {
@@ -1102,6 +1129,10 @@ ggml_backend_t model_sortformer_backend(ParakeetCtcModel & m) {
 
 bool model_sortformer_on_cpu(const ParakeetCtcModel & m) {
     return m.impl && m.impl->sortformer_force_cpu;
+}
+
+ggml_backend_sched_t model_sched(const ParakeetCtcModel & m) {
+    return m.impl ? m.impl->sched : nullptr;
 }
 
 void print_model_summary(const ParakeetCtcModel & m) {
@@ -1633,7 +1664,6 @@ int run_subsampling(ParakeetCtcModel   & model,
                     int                & out_n_frames) {
     if (!model.impl || !model.impl->backend_active) return -1;
 
-    ggml_backend_t backend = model.impl->backend_active;
     const int C_sub = model.encoder_cfg.subsampling_channels;
     const int d_model = model.encoder_cfg.d_model;
 
@@ -1680,6 +1710,7 @@ int run_subsampling(ParakeetCtcModel   & model,
 
     ggml_tensor * mel_in  = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_mels, L0, 1, 1);
     ggml_set_name(mel_in, "mel_in");
+    ggml_set_input(mel_in);
     ggml_tensor * mask_t0 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L0, 1, 1);
     ggml_tensor * mask_t1 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L1, 1, 1);
     ggml_tensor * mask_t2 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L2, 1, 1);
@@ -1688,6 +1719,10 @@ int run_subsampling(ParakeetCtcModel   & model,
     ggml_set_name(mask_t1, "mask_t1");
     ggml_set_name(mask_t2, "mask_t2");
     ggml_set_name(mask_t3, "mask_t3");
+    ggml_set_input(mask_t0);
+    ggml_set_input(mask_t1);
+    ggml_set_input(mask_t2);
+    ggml_set_input(mask_t3);
 
     ggml_tensor * out = subsampling_graph(gctx, mel_in, model.subsampling, C_sub, d_model,
                                           mask_t0, mask_t1, mask_t2, mask_t3, false,
@@ -1697,9 +1732,10 @@ int run_subsampling(ParakeetCtcModel   & model,
     ggml_cgraph * gf = ggml_new_graph(gctx);
     ggml_build_forward_expand(gf, out);
 
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
-        if (alloc) ggml_gallocr_free(alloc);
+    // Reset at the HEAD (the previous run already downloaded its outputs to host);
+    // the shared sched owns allocation. Never reset at the tail.
+    ggml_backend_sched_reset(model.impl->sched);
+    if (!ggml_backend_sched_alloc_graph(model.impl->sched, gf)) {
         ggml_free(gctx);
         return -3;
     }
@@ -1710,8 +1746,7 @@ int run_subsampling(ParakeetCtcModel   & model,
     ggml_backend_tensor_set(mask_t2, m2.data(), 0, m2.size() * sizeof(float));
     ggml_backend_tensor_set(mask_t3, m3.data(), 0, m3.size() * sizeof(float));
 
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
-        ggml_gallocr_free(alloc);
+    if (ggml_backend_sched_graph_compute(model.impl->sched, gf) != GGML_STATUS_SUCCESS) {
         ggml_free(gctx);
         return -4;
     }
@@ -1722,7 +1757,6 @@ int run_subsampling(ParakeetCtcModel   & model,
     ggml_backend_tensor_get(out, out_feats.data(), 0, out_feats.size() * sizeof(float));
     out_n_frames = H_out;
 
-    ggml_gallocr_free(alloc);
     ggml_free(gctx);
     return 0;
 }
@@ -1819,6 +1853,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
         g.mask_t0 = g.mask_t1 = g.mask_t2 = g.mask_t3 = nullptr;
         g.pre_encode_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, d_model, T);
         ggml_set_name(g.pre_encode_in, "pre_encode_in");
+        ggml_set_input(g.pre_encode_in);
     } else {
         g.mel_in  = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_mels, L0, 1, 1);
         g.mask_t0 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L0, 1, 1);
@@ -1830,16 +1865,23 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
         ggml_set_name(g.mask_t1, "mask_t1");
         ggml_set_name(g.mask_t2, "mask_t2");
         ggml_set_name(g.mask_t3, "mask_t3");
+        ggml_set_input(g.mel_in);
+        ggml_set_input(g.mask_t0);
+        ggml_set_input(g.mask_t1);
+        ggml_set_input(g.mask_t2);
+        ggml_set_input(g.mask_t3);
         g.pre_encode_in = nullptr;
     }
     g.pe_in   = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, d_model, 2 * T - 1);
     if (use_chunked_mask) {
         g.att_mask = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, T, T, 1, 1);
         ggml_set_name(g.att_mask, "att_mask");
+        ggml_set_input(g.att_mask);
     } else {
         g.att_mask = nullptr;
     }
     ggml_set_name(g.pe_in,   "pe_in");
+    ggml_set_input(g.pe_in);
 
     ggml_tensor * x;
     if (bypass_pre_encode) {
@@ -1951,11 +1993,9 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     ggml_build_forward_expand(g.cgraph, g.encoder_out_node);
     if (g.logits_node) ggml_build_forward_expand(g.cgraph, g.logits_node);
 
-    g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!g.alloc || !ggml_gallocr_reserve(g.alloc, g.cgraph)) {
-        g.free_();
-        return -3;
-    }
+    // Graph allocation is owned by the shared ggml_backend_sched (see run_encoder /
+    // run_encoder_bypass_pre_encode); the cached graph keeps only its topology and
+    // the host-precomputed PE / attention masks.
 
     g.T_mel = bypass_pre_encode ? 0 : n_mel_frames;
     g.T_enc = T;
@@ -2065,7 +2105,11 @@ int run_encoder(ParakeetCtcModel   & model,
     refresh_mask(g.m2_host, g.m2_v, L2, V2);
     refresh_mask(g.m3_host, g.m3_v, L3, V3);
 
-    if (!ggml_gallocr_alloc_graph(g.alloc, g.cgraph)) {
+    // Reset at the HEAD of run_encoder: the previous run already downloaded its
+    // outputs to host, so freeing the prior graph here is safe. Never reset at the
+    // tail (the download below reads the still-allocated output tensors).
+    ggml_backend_sched_reset(model.impl->sched);
+    if (!ggml_backend_sched_alloc_graph(model.impl->sched, g.cgraph)) {
         return -3;
     }
 
@@ -2083,7 +2127,7 @@ int run_encoder(ParakeetCtcModel   & model,
                  g.att_mask_host.size() * sizeof(float));
     }
 
-    if (ggml_backend_graph_compute(backend, g.cgraph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(model.impl->sched, g.cgraph) != GGML_STATUS_SUCCESS) {
         return -4;
     }
 
@@ -2181,7 +2225,10 @@ int run_encoder_bypass_pre_encode(ParakeetCtcModel & model,
     }
     EncoderGraph & g = *g_ptr;
 
-    if (!ggml_gallocr_alloc_graph(g.alloc, g.cgraph)) {
+    // Reset at the HEAD (the previous run already downloaded its outputs); never
+    // at the tail. The shared sched frees the prior graph and allocates this one.
+    ggml_backend_sched_reset(model.impl->sched);
+    if (!ggml_backend_sched_alloc_graph(model.impl->sched, g.cgraph)) {
         return -3;
     }
 
@@ -2196,7 +2243,7 @@ int run_encoder_bypass_pre_encode(ParakeetCtcModel & model,
                  g.att_mask_host.size() * sizeof(float));
     }
 
-    if (ggml_backend_graph_compute(backend, g.cgraph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(model.impl->sched, g.cgraph) != GGML_STATUS_SUCCESS) {
         return -4;
     }
 
