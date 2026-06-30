@@ -10,6 +10,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -24,6 +25,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(__ANDROID__) || defined(__unix__) || defined(__APPLE__)
@@ -80,6 +82,16 @@ struct EncoderGraph {
     ggml_tensor * encoder_out_node     = nullptr;
     ggml_tensor * logits_node          = nullptr;
 
+    // Pristine snapshot of every compute node's source pointers, captured once
+    // when the graph is built and reused across runs. ggml_backend_sched rewrites
+    // node->src[j] in place when a per-op CPU fallback inserts a cross-backend
+    // copy (the copy tensor lives in the scheduler's per-run context, which is
+    // freed at the head of the next allocation); restoring the originals before
+    // each run's allocation keeps this cached graph reusable. Keyed by node
+    // pointer, not array index, because some backends (Metal, Vulkan) reorder
+    // cgraph->nodes[] in place during graph optimization. See run_encoder.
+    std::vector<std::pair<ggml_tensor *, std::array<ggml_tensor *, GGML_MAX_SRC>>> src_backup;
+
     void free_() {
         if (graph_ctx) { ggml_free(graph_ctx);     graph_ctx = nullptr; }
         cgraph = nullptr;
@@ -96,6 +108,7 @@ struct EncoderGraph {
         att_mask_host.clear();
         m0_host.clear(); m1_host.clear(); m2_host.clear(); m3_host.clear();
         m0_v = m1_v = m2_v = m3_v = -1;
+        src_backup.clear();
     }
 };
 
@@ -720,7 +733,7 @@ int load_from_gguf(const std::string & gguf_path,
             /*parallel=*/false, /*op_offload=*/false);
         if (!impl->sched) {
             PARAKEET_LOG_ERROR("gguf: ggml_backend_sched_new failed\n");
-            return 13;
+            return 16;
         }
     }
 
@@ -1728,6 +1741,7 @@ int run_subsampling(ParakeetCtcModel   & model,
                                           mask_t0, mask_t1, mask_t2, mask_t3, false,
                                           causal_ds);
     ggml_set_name(out, "sub_out");
+    ggml_set_output(out);
 
     ggml_cgraph * gf = ggml_new_graph(gctx);
     ggml_build_forward_expand(gf, out);
@@ -1759,6 +1773,37 @@ int run_subsampling(ParakeetCtcModel   & model,
 
     ggml_free(gctx);
     return 0;
+}
+
+// Capture every compute node's source pointers in their pristine, just-built
+// state, keyed by node pointer (see EncoderGraph::src_backup). Called once after
+// the graph is constructed, before it is ever handed to the scheduler.
+static void snapshot_encoder_graph_srcs(EncoderGraph & g) {
+    g.src_backup.clear();
+    if (!g.cgraph) return;
+    const int n_nodes = ggml_graph_n_nodes(g.cgraph);
+    g.src_backup.reserve((size_t) n_nodes);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(g.cgraph, i);
+        std::array<ggml_tensor *, GGML_MAX_SRC> srcs;
+        for (int j = 0; j < GGML_MAX_SRC; ++j) srcs[j] = node->src[j];
+        g.src_backup.emplace_back(node, srcs);
+    }
+}
+
+// Restore the source pointers captured by snapshot_encoder_graph_srcs. The
+// scheduler rewrites node->src[j] in place when a per-op CPU fallback inserts a
+// cross-backend copy; that copy lives in the scheduler's per-run context, which
+// is freed before the next allocation. Restoring at the head of each run (before
+// allocation) returns the cached graph to its pristine topology so the run starts
+// clean. Keyed by node pointer, so it is unaffected by backends that reorder
+// cgraph->nodes[]. The restore only writes the saved pointers and never reads the
+// stale ones, so it is safe regardless of whether the prior copies were freed.
+static void restore_encoder_graph_srcs(EncoderGraph & g) {
+    for (auto & entry : g.src_backup) {
+        ggml_tensor * node = entry.first;
+        for (int j = 0; j < GGML_MAX_SRC; ++j) node->src[j] = entry.second[j];
+    }
 }
 
 static int build_encoder_graph_cached(const ParakeetCtcModel & model,
@@ -1993,6 +2038,10 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     ggml_build_forward_expand(g.cgraph, g.encoder_out_node);
     if (g.logits_node) ggml_build_forward_expand(g.cgraph, g.logits_node);
 
+    // Snapshot the pristine source pointers now, before the scheduler ever sees
+    // this graph, so each run can restore them after a per-op CPU fallback split.
+    snapshot_encoder_graph_srcs(g);
+
     // Graph allocation is owned by the shared ggml_backend_sched (see run_encoder /
     // run_encoder_bypass_pre_encode); the cached graph keeps only its topology and
     // the host-precomputed PE / attention masks.
@@ -2109,6 +2158,11 @@ int run_encoder(ParakeetCtcModel   & model,
     // outputs to host, so freeing the prior graph here is safe. Never reset at the
     // tail (the download below reads the still-allocated output tensors).
     ggml_backend_sched_reset(model.impl->sched);
+    // Restore the pristine source pointers before allocation: the previous run's
+    // scheduler split may have rewritten node->src[j] to per-op-fallback copies
+    // that are now freed. Doing it here (rather than after compute) keeps the
+    // cached graph clean even if the previous run returned on an error path.
+    restore_encoder_graph_srcs(g);
     if (!ggml_backend_sched_alloc_graph(model.impl->sched, g.cgraph)) {
         return -3;
     }
@@ -2228,6 +2282,10 @@ int run_encoder_bypass_pre_encode(ParakeetCtcModel & model,
     // Reset at the HEAD (the previous run already downloaded its outputs); never
     // at the tail. The shared sched frees the prior graph and allocates this one.
     ggml_backend_sched_reset(model.impl->sched);
+    // Restore pristine source pointers before allocation (see run_encoder): the
+    // scheduler rewrites node->src[j] in place on per-op CPU fallback and those
+    // copies are freed by the next run.
+    restore_encoder_graph_srcs(g);
     if (!ggml_backend_sched_alloc_graph(model.impl->sched, g.cgraph)) {
         return -3;
     }
