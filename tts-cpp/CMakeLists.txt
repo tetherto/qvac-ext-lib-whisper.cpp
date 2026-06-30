@@ -207,7 +207,7 @@ if (TTS_CPP_OPENMP)
 endif()
 
 if (MSVC)
-    add_compile_definitions(_USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
+    add_compile_definitions(_USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS NOMINMAX)
 endif()
 
 # Legacy interface library kept for export-set compatibility (it is
@@ -316,19 +316,19 @@ if (TTS_CPP_BUILD_LIBRARY)
     #   * `ja` -- libmecab (dictionary path passed at runtime)
     #   * `zh` -- Cangjie5_TC mapping (TSV path passed at runtime)
     #
-    # libmecab is autodetected via find_library / find_path. The
-    # dictionary path is no longer baked in at compile time; callers
-    # pass it at runtime via --mecab-dict (CLI) or
-    # EngineOptions::mecab_dict_path (API). Use
-    # scripts/build_mecab_dict.py to materialize the IPAdic dictionary
+    # libmecab is autodetected via find_package / find_library / find_path.
+    # The dictionary path is no longer baked in at compile time; callers
+    # pass it at runtime via --mecab-dict (CLI) or EngineOptions::mecab_dict_path
+    # (API). Use scripts/build_mecab_dict.py to materialize the IPAdic dictionary
     # from the `ipadic` PyPI package.
     #
     # Cangjie no longer requires a compile-time TSV path; callers
     # pass it at runtime via --cangjie-tsv (CLI) or
     # EngineOptions::cangjie_tsv_path (API).
     # ------------------------------------------------------------------
+    find_package(mecab CONFIG QUIET)
     find_library(MECAB_LIBRARY    NAMES mecab)
-    find_path   (MECAB_INCLUDE_DIR NAMES mecab.h)
+    find_path   (MECAB_INCLUDE_DIR NAMES mecab.h PATH_SUFFIXES mecab)
     if (MECAB_LIBRARY AND MECAB_INCLUDE_DIR)
         message(STATUS "MeCab (Japanese preprocess): ENABLED")
         message(STATUS "  library : ${MECAB_LIBRARY}")
@@ -340,7 +340,13 @@ if (TTS_CPP_BUILD_LIBRARY)
         # the MinGW mecab.h headers never leak into a consumer's TU).
         target_compile_definitions(tts-cpp PRIVATE TTS_CPP_HAS_MECAB)
         target_include_directories(tts-cpp PRIVATE ${MECAB_INCLUDE_DIR})
-        target_link_libraries     (tts-cpp PRIVATE ${MECAB_LIBRARY})
+        if (TARGET mecab::mecab)
+            # The vcpkg mecab target carries the Windows static-library
+            # compile definitions needed to avoid dllimport references.
+            target_link_libraries(tts-cpp PRIVATE mecab::mecab)
+        else()
+            target_link_libraries(tts-cpp PRIVATE ${MECAB_LIBRARY})
+        endif()
     else()
         message(STATUS "MeCab (Japanese preprocess): DISABLED (libmecab / mecab.h not found)")
     endif()
@@ -974,6 +980,31 @@ if (TTS_CPP_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "${_tcb_t3_turbo_gguf}" "${_tcb_s3gen_gguf}"
         REQUIRES "${_tcb_t3_turbo_gguf}" "${_tcb_s3gen_gguf}")
+
+    # QVAC-21483 — output-frequency selection on the chatterbox::Engine API
+    # (batch + streaming + validation).  Uses the multilingual fixtures so it
+    # runs anywhere the mtl-synth tests do; auto-disabled when they're absent.
+    add_executable(test-output-sample-rate test/test_output_sample_rate.cpp)
+    target_link_libraries(test-output-sample-rate PRIVATE tts-cpp ggml tts-cpp-backend-defs)
+    target_include_directories(test-output-sample-rate PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-output-sample-rate)
+    tts_cpp_register_test(test-output-sample-rate
+        LABEL    "fixture"
+        ARGS     "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}"
+        REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}")
+
+    # QVAC-21483 — Supertonic sibling of the above: native rate, 16 kHz batch
+    # ratio, construction rejection, streaming result.pcm == concat, and the
+    # streaming-equals-whole-buffer-resample batch-exact property.  Gated on the
+    # Supertonic GGUF fixture; auto-disabled when it's absent.
+    add_executable(test-output-sample-rate-supertonic test/test_output_sample_rate_supertonic.cpp)
+    target_link_libraries(test-output-sample-rate-supertonic PRIVATE tts-cpp ggml tts-cpp-backend-defs)
+    target_include_directories(test-output-sample-rate-supertonic PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-output-sample-rate-supertonic)
+    tts_cpp_register_test(test-output-sample-rate-supertonic
+        LABEL    "fixture"
+        ARGS     "${_tcb_super_gguf}"
+        REQUIRES "${_tcb_super_gguf}")
 
     # CPU-side persistent-cache validation.
     # Exercises the time_mlp / time_emb / cfm_estimator / weight_mirror
