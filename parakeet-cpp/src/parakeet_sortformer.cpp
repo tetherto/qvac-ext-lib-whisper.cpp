@@ -174,7 +174,10 @@ int sf_exec_graph(ggml_context * ctx, ggml_backend_t backend,
     // Reset the shared scheduler at the head: the encoder already downloaded its
     // output to host, so freeing its scheduler allocation here is safe (and the
     // normal path below reuses the scheduler to allocate this head graph).
-    ggml_backend_sched_reset(sched);
+    // The normal path needs the scheduler; the force-CPU head bypasses it. Guard
+    // both the requirement and the reset so a null scheduler can't crash here.
+    if (!force_cpu && !sched) return -2;
+    if (sched) ggml_backend_sched_reset(sched);
 
     ggml_gallocr_t alloc = nullptr;
     if (!force_cpu) {

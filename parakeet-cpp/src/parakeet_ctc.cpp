@@ -92,7 +92,18 @@ struct EncoderGraph {
     // cgraph->nodes[] in place during graph optimization. See run_encoder.
     std::vector<std::pair<ggml_tensor *, std::array<ggml_tensor *, GGML_MAX_SRC>>> src_backup;
 
+    // Persistent per-graph allocator. The cached encoder graph is allocated and
+    // computed directly on the active backend through this gallocr, not the shared
+    // ggml_backend_sched: reusing a cached graph through the scheduler corrupts its
+    // output on Adreno OpenCL/Vulkan (first use correct, every reuse garbage), while
+    // a persistent gallocr reuses byte-identically on every backend. The encoder is
+    // fully supported everywhere (1 split / 0 copies) so it never needs the sched's
+    // per-op CPU fallback; run_subsampling and the Sortformer head still use the
+    // shared sched (they build a fresh graph each call and are unaffected).
+    ggml_gallocr_t alloc = nullptr;
+
     void free_() {
+        if (alloc) { ggml_gallocr_free(alloc); alloc = nullptr; }
         if (graph_ctx) { ggml_free(graph_ctx);     graph_ctx = nullptr; }
         cgraph = nullptr;
         mel_in = mask_t0 = mask_t1 = mask_t2 = mask_t3 = pe_in = nullptr;
@@ -110,6 +121,12 @@ struct EncoderGraph {
         m0_v = m1_v = m2_v = m3_v = -1;
         src_backup.clear();
     }
+
+    // Own the gallocr + graph context via RAII so a build_encoder_graph_cached
+    // failure (which destroys a half-built cache entry with cache.pop_back())
+    // cannot leak them. free_() is idempotent, so the explicit free_() calls in
+    // ~Impl / cache eviction stay safe (double free_() is a no-op).
+    ~EncoderGraph() { free_(); }
 };
 
 struct ParakeetCtcModel::Impl {
@@ -1675,7 +1692,7 @@ int run_subsampling(ParakeetCtcModel   & model,
                     int                  n_mels,
                     std::vector<float> & out_feats,
                     int                & out_n_frames) {
-    if (!model.impl || !model.impl->backend_active) return -1;
+    if (!model.impl || !model.impl->backend_active || !model.impl->sched) return -1;
 
     const int C_sub = model.encoder_cfg.subsampling_channels;
     const int d_model = model.encoder_cfg.d_model;
@@ -2038,13 +2055,17 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     ggml_build_forward_expand(g.cgraph, g.encoder_out_node);
     if (g.logits_node) ggml_build_forward_expand(g.cgraph, g.logits_node);
 
-    // Snapshot the pristine source pointers now, before the scheduler ever sees
-    // this graph, so each run can restore them after a per-op CPU fallback split.
+    // Snapshot the pristine source pointers now, so a run can restore them if the
+    // graph is ever mutated in place. Dormant on the current encoder path (the
+    // gallocr below never splits), kept defensively.
     snapshot_encoder_graph_srcs(g);
 
-    // Graph allocation is owned by the shared ggml_backend_sched (see run_encoder /
-    // run_encoder_bypass_pre_encode); the cached graph keeps only its topology and
-    // the host-precomputed PE / attention masks.
+    // Persistent per-graph allocator (see EncoderGraph::alloc). Reserve once here so
+    // every reuse just re-runs ggml_gallocr_alloc_graph with stable offsets.
+    g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!g.alloc || !ggml_gallocr_reserve(g.alloc, g.cgraph)) {
+        return -3;
+    }
 
     g.T_mel = bypass_pre_encode ? 0 : n_mel_frames;
     g.T_enc = T;
@@ -2154,16 +2175,14 @@ int run_encoder(ParakeetCtcModel   & model,
     refresh_mask(g.m2_host, g.m2_v, L2, V2);
     refresh_mask(g.m3_host, g.m3_v, L3, V3);
 
-    // Reset at the HEAD of run_encoder: the previous run already downloaded its
-    // outputs to host, so freeing the prior graph here is safe. Never reset at the
-    // tail (the download below reads the still-allocated output tensors).
-    ggml_backend_sched_reset(model.impl->sched);
-    // Restore the pristine source pointers before allocation: the previous run's
-    // scheduler split may have rewritten node->src[j] to per-op-fallback copies
-    // that are now freed. Doing it here (rather than after compute) keeps the
-    // cached graph clean even if the previous run returned on an error path.
+    // Restore the pristine source pointers before allocation (dormant on this path,
+    // kept defensively): only a scheduler split rewrites node->src[j] in place, and
+    // the encoder no longer runs through the shared sched.
     restore_encoder_graph_srcs(g);
-    if (!ggml_backend_sched_alloc_graph(model.impl->sched, g.cgraph)) {
+    // Allocate the cached graph on the active backend via its persistent gallocr
+    // (see EncoderGraph::alloc) -- not the shared sched, whose cached-graph reuse
+    // corrupts on Adreno OpenCL/Vulkan.
+    if (!ggml_gallocr_alloc_graph(g.alloc, g.cgraph)) {
         return -3;
     }
 
@@ -2181,7 +2200,7 @@ int run_encoder(ParakeetCtcModel   & model,
                  g.att_mask_host.size() * sizeof(float));
     }
 
-    if (ggml_backend_sched_graph_compute(model.impl->sched, g.cgraph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(backend, g.cgraph) != GGML_STATUS_SUCCESS) {
         return -4;
     }
 
@@ -2279,14 +2298,13 @@ int run_encoder_bypass_pre_encode(ParakeetCtcModel & model,
     }
     EncoderGraph & g = *g_ptr;
 
-    // Reset at the HEAD (the previous run already downloaded its outputs); never
-    // at the tail. The shared sched frees the prior graph and allocates this one.
-    ggml_backend_sched_reset(model.impl->sched);
-    // Restore pristine source pointers before allocation (see run_encoder): the
-    // scheduler rewrites node->src[j] in place on per-op CPU fallback and those
-    // copies are freed by the next run.
+    // Restore pristine source pointers before allocation (dormant here, kept
+    // defensively; see run_encoder): the encoder graph no longer runs through the
+    // shared sched, so nothing rewrites node->src[j] in place.
     restore_encoder_graph_srcs(g);
-    if (!ggml_backend_sched_alloc_graph(model.impl->sched, g.cgraph)) {
+    // Allocate + compute the cached graph on the active backend via its persistent
+    // gallocr, not the shared sched (whose cached-graph reuse corrupts on Adreno).
+    if (!ggml_gallocr_alloc_graph(g.alloc, g.cgraph)) {
         return -3;
     }
 
@@ -2301,7 +2319,7 @@ int run_encoder_bypass_pre_encode(ParakeetCtcModel & model,
                  g.att_mask_host.size() * sizeof(float));
     }
 
-    if (ggml_backend_sched_graph_compute(model.impl->sched, g.cgraph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(backend, g.cgraph) != GGML_STATUS_SUCCESS) {
         return -4;
     }
 
