@@ -720,9 +720,12 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_s3gen_gguf}"
         REQUIRES "${_tcb_s3gen_gguf}")
 
-    # Supertonic dispatch pinning: TTS_CPP_FORCE_SCHED must stay INERT for
-    # Supertonic (reuse-through-sched corrupts; see supertonic_use_sched),
-    # A/B/A' through the Engine with a fresh Engine per phase.
+    # Supertonic dual-path dispatch equivalence: forced-sched synth
+    # (TTS_CPP_FORCE_SCHED) must be bit-identical to direct — every
+    # dual-path graph rebuilds per sched pass (sched graphs are single-use
+    # for allocation).  Two registrations share one binary: CPU (degenerate
+    # [primary] sched) and GPU (real [metal, cpu] multi-backend sched, the
+    # configuration that used to SIGSEGV on reuse).
     add_executable(test-supertonic-sched-equivalence test/test_supertonic_sched_equivalence.cpp)
     target_link_libraries(test-supertonic-sched-equivalence PRIVATE tts-cpp ggml tts-cpp-backend-defs)
     target_include_directories(test-supertonic-sched-equivalence PRIVATE ggml/include src include)
@@ -730,6 +733,11 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_register_test(test-supertonic-sched-equivalence
         LABEL    "fixture"
         ARGS     "${_tcb_super2_gguf}"
+        REQUIRES "${_tcb_super2_gguf}")
+    tts_cpp_register_test(test-supertonic-sched-equivalence-gpu
+        EXE      test-supertonic-sched-equivalence
+        LABEL    "fixture"
+        ARGS     "${_tcb_super2_gguf}" "99"
         REQUIRES "${_tcb_super2_gguf}")
 
     # ------------------------------------------------------------------

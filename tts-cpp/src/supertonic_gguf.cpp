@@ -1817,17 +1817,17 @@ void supertonic_sched_compute(const supertonic_model & model, ggml_cgraph * grap
         "supertonic_sched_compute");
 }
 
-// NOTE: deliberately does NOT honor TTS_CPP_FORCE_SCHED (unlike the T3 /
-// S3Gen dispatch gates).  Supertonic REUSES its sched-routed cached graphs
-// across calls, and forcing the scheduler onto a walk-passing backend was
-// measured to corrupt the SECOND use of a freshly-built cached graph on a
-// CPU primary (first use bit-identical, every reuse diverges) and to crash
-// outright on a Metal primary (the f16-KV flash-attn graph built FOR Metal
-// lands partially on the CPU backend).  T3 and HiFT are force-safe only
-// because they rebuild the graph for every sched pass; Supertonic's reuse
-// contract makes the force hatch unsound here.
+// Honors TTS_CPP_FORCE_SCHED like the T3 / S3Gen gates: every dual-path
+// Supertonic site rebuilds its graph before any sched pass (the sched route
+// leaves cache.allocr null, so the build early-return never reuses a
+// sched-mutated graph — sched graphs are single-use for allocation, see the
+// contract note above supertonic_sched_alloc's declaration), and *_gpu
+// cross-graph handles are withheld from sched-run producers.  The
+// front-block and style-residual islands never consult this gate and stay
+// direct even when the flag is set.
 bool supertonic_use_sched(const supertonic_model & model, const ggml_cgraph * graph) {
-    return !::tts_cpp::detail::graph_fully_supported(model.backend, graph);
+    return ::tts_cpp::detail::sched_force_enabled() ||
+           !::tts_cpp::detail::graph_fully_supported(model.backend, graph);
 }
 
 static void bind_vocoder_weights(supertonic_model & model) {

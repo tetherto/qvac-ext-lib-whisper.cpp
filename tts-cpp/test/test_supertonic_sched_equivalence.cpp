@@ -1,22 +1,24 @@
-// Pinning test for the Supertonic dispatch after its migration onto
-// src/sched_dispatch.{h,cpp}.
+// Equivalence test for the Supertonic dual-path dispatch
+// (src/sched_dispatch.{h,cpp}): the forced scheduler path must produce
+// BIT-IDENTICAL audio to the direct path.
 //
-// Supertonic's dispatch gate (supertonic_use_sched) deliberately does NOT
-// honor TTS_CPP_FORCE_SCHED: Supertonic reuses its sched-routed cached
-// graphs across calls, and forcing the scheduler onto a walk-passing
-// backend was measured to corrupt the second use of a freshly-built
-// cached graph on CPU (first use bit-identical, every reuse diverges,
-// deterministic) and to crash on Metal (the f16-KV flash-attn graph built
-// for Metal lands partially on the CPU backend).  T3/HiFT are force-safe
-// only because they rebuild the graph per sched pass.
+// This holds because every dual-path site REBUILDS its graph before each
+// sched pass (sched graphs are single-use for allocation: alloc rewires
+// node->src[] into sched-owned copies the next pass frees, and
+// buffer/data bindings survive sched_reset — reusing a sched-allocated
+// graph computes deterministic garbage on CPU and crashes on a
+// [metal,cpu] sched; both were measured before the rebuild fix).  The
+// *_gpu cross-graph handles are withheld from sched-run producers, so
+// sched-route consumers take the host path with the same in-graph values.
 //
-// This test pins BOTH properties that keep that decision safe:
 //   A  — direct synth
-//   B  — TTS_CPP_FORCE_SCHED=1: Supertonic must IGNORE the flag; output
-//        must stay bit-identical to A.  If someone wires the flag into
-//        supertonic_use_sched without first making reuse-through-sched
-//        safe, this fails (or crashes) immediately.
-//   A' — direct again: determinism / no state poisoning across engines.
+//   B  — TTS_CPP_FORCE_SCHED=1: every dual-path graph through the
+//        scheduler ([primary] on CPU; [metal, cpu] with n_gpu_layers>0 —
+//        the multi-backend case is the one that used to SIGSEGV).  The
+//        front-block and style-residual islands never consult the gate
+//        and stay direct; the 6 dual-path graphs are exactly the
+//        corruption surface this guards.
+//   A' — direct again: no cross-phase state poisoning.
 // A fresh Engine per phase (generation_id bump rebuilds every
 // thread_local cache).  PCM compared byte-for-byte (memcmp); bit-exactness
 // is the bar — do NOT relax this to a numeric tolerance.
@@ -104,8 +106,8 @@ int main(int argc, char ** argv) {
         if (pcm_a.size() == pcm_b.size() && !pcm_a.empty()) {
             const bool ab_same = std::memcmp(pcm_a.data(), pcm_b.data(),
                                              pcm_a.size() * sizeof(float)) == 0;
-            CHECK_MSG(ab_same, "TTS_CPP_FORCE_SCHED leaked into Supertonic dispatch "
-                               "(output changed; reuse-through-sched is UNSAFE here)");
+            CHECK_MSG(ab_same, "direct vs forced-sched PCM NOT bit-identical "
+                               "(a dual-path graph was reused through the scheduler?)");
             if (!ab_same) {
                 size_t first = pcm_a.size();
                 size_t n_diff = 0;
