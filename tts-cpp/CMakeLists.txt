@@ -1346,7 +1346,10 @@ if (TTS_CPP_BUILD_TESTS)
     # weights; no GGUF, no fixture; runs in <50 ms.
     add_executable(test-supertonic-convnext-block-fused
         test/test_supertonic_convnext_block_fused.cpp)
-    target_link_libraries(test-supertonic-convnext-block-fused PRIVATE ggml)
+    # tts-cpp is needed for supertonic_mulmat_needs_pad(): the header-inline
+    # st_mul_mat (supertonic_internal.h) calls it since the Mali output-pad
+    # change, and it is defined in supertonic_gguf.cpp inside libtts-cpp.
+    target_link_libraries(test-supertonic-convnext-block-fused PRIVATE tts-cpp ggml)
     target_include_directories(test-supertonic-convnext-block-fused PRIVATE ggml/include src)
     tts_cpp_apply_ccache(test-supertonic-convnext-block-fused)
     tts_cpp_register_test(test-supertonic-convnext-block-fused LABEL "unit")
