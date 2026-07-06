@@ -706,6 +706,19 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_t3_mtl_gguf}" "--step-cache"
         REQUIRES "${_tcb_t3_mtl_gguf}")
 
+    # S3Gen dual-path dispatch equivalence: forced-sched full synth
+    # (TTS_CPP_FORCE_SCHED) must be bit-identical to the direct path,
+    # A/B/A' with a model-cache teardown between phases.  Built-in voice
+    # + synthetic tokens, so the only fixture is the S3Gen GGUF.
+    add_executable(test-s3gen-sched-equivalence test/test_s3gen_sched_equivalence.cpp)
+    target_link_libraries(test-s3gen-sched-equivalence PRIVATE tts-cpp ggml tts-cpp-backend-defs)
+    target_include_directories(test-s3gen-sched-equivalence PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-s3gen-sched-equivalence)
+    tts_cpp_register_test(test-s3gen-sched-equivalence
+        LABEL    "fixture"
+        ARGS     "${_tcb_s3gen_gguf}"
+        REQUIRES "${_tcb_s3gen_gguf}")
+
     # ------------------------------------------------------------------
     # Multilingual integration tests (23 languages).
     # ------------------------------------------------------------------
@@ -926,6 +939,7 @@ if (TTS_CPP_BUILD_TESTS)
     add_executable(test-streaming
         test/test_streaming.cpp
         src/chatterbox_tts.cpp
+        src/sched_dispatch.cpp
         src/backend_selection.cpp)
     target_link_libraries(test-streaming PRIVATE ggml tts-cpp-backend-defs)
     target_include_directories(test-streaming PRIVATE ggml/include src include)
@@ -1140,6 +1154,7 @@ if (TTS_CPP_BUILD_TESTS)
     add_executable(test-cpu-caches
         test/test_cpu_caches.cpp
         src/chatterbox_tts.cpp
+        src/sched_dispatch.cpp
         src/backend_selection.cpp)
     target_link_libraries(test-cpu-caches PRIVATE ggml tts-cpp-backend-defs)
     target_include_directories(test-cpu-caches PRIVATE ggml/include src include)
