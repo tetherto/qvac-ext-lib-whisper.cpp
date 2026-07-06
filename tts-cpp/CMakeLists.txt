@@ -1409,6 +1409,16 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-t3-sched-dispatch)
     tts_cpp_register_test(test-t3-sched-dispatch LABEL "unit")
 
+    # Real per-op migration through sched_dispatch: a BLAS (ACCEL) primary
+    # rejects everything but matmul-class ops, so add/scale/cpy nodes
+    # genuinely migrate to the CPU-last backend (multi-split schedule with
+    # cross-backend traffic).  Self-skips when no ACCEL device is built in.
+    add_executable(test-t3-sched-migration test/test_t3_sched_migration.cpp)
+    target_link_libraries(test-t3-sched-migration PRIVATE tts-cpp ggml tts-cpp-backend-defs)
+    target_include_directories(test-t3-sched-migration PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-t3-sched-migration)
+    tts_cpp_register_test(test-t3-sched-migration LABEL "unit")
+
     add_executable(test-supertonic-portable-ops
         test/test_supertonic_portable_ops.cpp)
     target_link_libraries(test-supertonic-portable-ops PRIVATE tts-cpp)
