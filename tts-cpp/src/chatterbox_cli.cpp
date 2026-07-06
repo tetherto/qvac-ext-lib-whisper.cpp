@@ -1291,6 +1291,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 // backend would assert inside the
                 // ggml-metal / ggml-vulkan / ggml-cuda dylib finalisers.
                 tts_cpp::chatterbox::detail::t3_release_caches();
+                // Same ordering contract for the eval-side fallback scheduler.
+                tts_cpp::detail::sched_fallback_free(model.sched_fb);
                 ggml_backend_buffer_free(model.buffer_w);
                 ggml_backend_buffer_free(model.buffer_kv);
                 if (model.buffer_stack)    ggml_backend_buffer_free(model.buffer_stack);
@@ -2586,6 +2588,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
         // Drop T3 step-graph cache BEFORE freeing the backend
         // (gallocators in cached entries reference it).
         tts_cpp::chatterbox::detail::t3_release_caches();
+        // Same ordering contract for the eval-side fallback scheduler.
+        tts_cpp::detail::sched_fallback_free(model.sched_fb);
         ggml_backend_buffer_free(model.buffer_w);
         ggml_backend_buffer_free(model.buffer_kv);
         if (model.buffer_override) ggml_backend_buffer_free(model.buffer_override);

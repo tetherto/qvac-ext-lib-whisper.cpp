@@ -227,6 +227,7 @@ add_library(tts-cpp-backend-defs INTERFACE)
 
 set(TTS_CPP_LIB_SOURCES
     src/backend_selection.cpp
+    src/sched_dispatch.cpp
     src/main.cpp
     src/chatterbox_cli.cpp
     src/gpt2_bpe.cpp
@@ -685,6 +686,25 @@ if (TTS_CPP_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "${_tcb_t3_mtl_gguf}" "${_tcb_t3_mtl_ref}" "ALL"
         REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_t3_mtl_ref}")
+
+    # T3 dual-path dispatch equivalence: the forced scheduler path
+    # (TTS_CPP_T3_FORCE_SCHED) must be bit-identical to the direct path,
+    # and a sched run must not poison the step-graph cache.  Two
+    # registrations share one binary: with and without the opt-in
+    # CHATTERBOX_T3_STEP_CACHE (latched per process on first use).
+    add_executable(test-t3-sched-equivalence test/test_t3_sched_equivalence.cpp)
+    target_link_libraries(test-t3-sched-equivalence PRIVATE tts-cpp ggml tts-cpp-backend-defs)
+    target_include_directories(test-t3-sched-equivalence PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-t3-sched-equivalence)
+    tts_cpp_register_test(test-t3-sched-equivalence
+        LABEL    "fixture"
+        ARGS     "${_tcb_t3_mtl_gguf}"
+        REQUIRES "${_tcb_t3_mtl_gguf}")
+    tts_cpp_register_test(test-t3-sched-equivalence-step-cache
+        EXE      test-t3-sched-equivalence
+        LABEL    "fixture"
+        ARGS     "${_tcb_t3_mtl_gguf}" "--step-cache"
+        REQUIRES "${_tcb_t3_mtl_gguf}")
 
     # ------------------------------------------------------------------
     # Multilingual integration tests (23 languages).
@@ -1376,6 +1396,15 @@ if (TTS_CPP_BUILD_TESTS)
     target_include_directories(test-supertonic-backend-dispatch PRIVATE ggml/include src include)
     tts_cpp_apply_ccache(test-supertonic-backend-dispatch)
     tts_cpp_register_test(test-supertonic-backend-dispatch LABEL "unit")
+
+    # T3 dual-path dispatch helper unit tests (src/sched_dispatch.{h,cpp}):
+    # supports_op walk, force-env escape hatch, sched_fallback lifecycle,
+    # pre-allocated-op abort guard.  CPU-only, no GGUF needed.
+    add_executable(test-t3-sched-dispatch test/test_t3_sched_dispatch.cpp)
+    target_link_libraries(test-t3-sched-dispatch PRIVATE tts-cpp ggml tts-cpp-backend-defs)
+    target_include_directories(test-t3-sched-dispatch PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-t3-sched-dispatch)
+    tts_cpp_register_test(test-t3-sched-dispatch LABEL "unit")
 
     add_executable(test-supertonic-portable-ops
         test/test_supertonic_portable_ops.cpp)
