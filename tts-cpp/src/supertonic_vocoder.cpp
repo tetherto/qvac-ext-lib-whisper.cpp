@@ -976,11 +976,7 @@ bool supertonic_vocoder_forward_ggml(const supertonic_model & model,
         // direct vs scheduler routing. Re-uses cache.allocr
         // for direct dispatch; falls through to the model scheduler when
         // an op must run on CPU (GGML_OP_CUSTOM etc.).
-        bool direct = true;
-        const int n_nodes = ggml_graph_n_nodes(cache.gf);
-        for (int i = 0; i < n_nodes; ++i) {
-            if (!ggml_backend_supports_op(model.backend, ggml_graph_node(cache.gf, i))) { direct = false; break; }
-        }
+        const bool direct = !supertonic_use_sched(model, cache.gf);
         if (direct) {
             if (!cache.allocr) {
                 cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));

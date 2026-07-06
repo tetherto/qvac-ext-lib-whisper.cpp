@@ -523,6 +523,7 @@ if (TTS_CPP_BUILD_TESTS)
     set(_tcb_s3gen_gguf         "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-s3gen.gguf")
     set(_tcb_s3gen_mtl_gguf     "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-s3gen-mtl.gguf")
     set(_tcb_super_gguf         "${TTS_CPP_TEST_MODEL_DIR}/supertonic.gguf")
+    set(_tcb_super2_gguf        "${TTS_CPP_TEST_MODEL_DIR}/supertonic2.gguf")
     set(_tcb_super_ref          "${TTS_CPP_TEST_REF_DIR}/supertonic-ref-quick")
     set(_tcb_super_ref_noise    "${_tcb_super_ref}/noise.npy")
     set(_tcb_s3gen_ref          "${TTS_CPP_TEST_REF_DIR}/s3gen-ref")
@@ -718,6 +719,18 @@ if (TTS_CPP_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "${_tcb_s3gen_gguf}"
         REQUIRES "${_tcb_s3gen_gguf}")
+
+    # Supertonic dispatch pinning: TTS_CPP_FORCE_SCHED must stay INERT for
+    # Supertonic (reuse-through-sched corrupts; see supertonic_use_sched),
+    # A/B/A' through the Engine with a fresh Engine per phase.
+    add_executable(test-supertonic-sched-equivalence test/test_supertonic_sched_equivalence.cpp)
+    target_link_libraries(test-supertonic-sched-equivalence PRIVATE tts-cpp ggml tts-cpp-backend-defs)
+    target_include_directories(test-supertonic-sched-equivalence PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-supertonic-sched-equivalence)
+    tts_cpp_register_test(test-supertonic-sched-equivalence
+        LABEL    "fixture"
+        ARGS     "${_tcb_super2_gguf}"
+        REQUIRES "${_tcb_super2_gguf}")
 
     # ------------------------------------------------------------------
     # Multilingual integration tests (23 languages).

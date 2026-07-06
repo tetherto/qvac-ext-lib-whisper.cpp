@@ -1223,11 +1223,7 @@ std::vector<float> run_text_attention_cache(vector_text_attention_cache & cache,
     // direct backend path when every node is supported by
     // the primary backend; route through the scheduler when an op must
     // run on CPU (GGML_OP_CUSTOM etc.).
-    bool direct = true;
-    const int n_nodes = ggml_graph_n_nodes(cache.gf);
-    for (int i = 0; i < n_nodes; ++i) {
-        if (!ggml_backend_supports_op(model.backend, ggml_graph_node(cache.gf, i))) { direct = false; break; }
-    }
+    const bool direct = !supertonic_use_sched(model, cache.gf);
     if (direct) {
         if (!cache.allocr) {
             cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
@@ -1302,13 +1298,7 @@ std::vector<float> run_text_attention_cache_gpu(vector_text_attention_cache & ca
     // the subsequent `ggml_backend_tensor_copy` aborts with
     // "tensor buffer not set".  Mirrors the direct/sched dispatch in
     // `run_text_attention_cache` above.
-    bool direct = true;
-    {
-        const int n_nodes = ggml_graph_n_nodes(cache.gf);
-        for (int i = 0; i < n_nodes; ++i) {
-            if (!ggml_backend_supports_op(model.backend, ggml_graph_node(cache.gf, i))) { direct = false; break; }
-        }
-    }
+    const bool direct = !supertonic_use_sched(model, cache.gf);
     if (direct) {
         if (!cache.allocr) {
             cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
@@ -1800,11 +1790,7 @@ vector_group_graph_result run_group_graph_cache(vector_group_graph_cache & cache
     // build-time data forward).  So on direct path: only allocate
     // the gallocr lazily IF the build didn't (defensive — every
     // current build path does), and never re-alloc.
-    bool direct = true;
-    const int n_nodes = ggml_graph_n_nodes(cache.gf);
-    for (int i = 0; i < n_nodes; ++i) {
-        if (!ggml_backend_supports_op(model.backend, ggml_graph_node(cache.gf, i))) { direct = false; break; }
-    }
+    const bool direct = !supertonic_use_sched(model, cache.gf);
     if (direct) {
         if (!cache.allocr) {
             cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
@@ -2197,11 +2183,7 @@ vector_res_style_qkv_result run_res_style_qkv_cache(vector_res_style_qkv_cache &
                                   want_trace);
     }
     // direct vs scheduler routing.
-    bool direct = true;
-    const int n_nodes = ggml_graph_n_nodes(cache.gf);
-    for (int i = 0; i < n_nodes; ++i) {
-        if (!ggml_backend_supports_op(model.backend, ggml_graph_node(cache.gf, i))) { direct = false; break; }
-    }
+    const bool direct = !supertonic_use_sched(model, cache.gf);
     if (direct) {
         if (!cache.allocr) {
             cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
@@ -2564,11 +2546,7 @@ std::vector<float> run_tail_graph_cache(vector_tail_graph_cache & cache,
         build_tail_graph_cache(cache, model, L, C, Cin, total_steps, trace != nullptr);
     }
     // direct vs scheduler routing.
-    bool direct = true;
-    const int n_nodes = ggml_graph_n_nodes(cache.gf);
-    for (int i = 0; i < n_nodes; ++i) {
-        if (!ggml_backend_supports_op(model.backend, ggml_graph_node(cache.gf, i))) { direct = false; break; }
-    }
+    const bool direct = !supertonic_use_sched(model, cache.gf);
     if (direct) {
         if (!cache.allocr) {
             cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
