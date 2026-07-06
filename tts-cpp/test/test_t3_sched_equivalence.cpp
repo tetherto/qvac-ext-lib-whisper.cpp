@@ -8,7 +8,7 @@
 //
 // Sequence (same model, same tokens, same KV positions each phase):
 //   A  — direct path:      eval_prompt_mtl + N eval_step_mtl
-//   B  — TTS_CPP_T3_FORCE_SCHED=1: same calls through the scheduler
+//   B  — TTS_CPP_FORCE_SCHED=1: same calls through the scheduler
 //   A' — direct again:     must still match A (cache not poisoned)
 // All logits are compared byte-for-byte (memcmp); bit-exactness is the
 // bar — do NOT relax this to a numeric tolerance.
@@ -137,7 +137,7 @@ int main(int argc, char ** argv) {
     // Must be set before the FIRST eval call: the flag is latched in a
     // static on first use.
     if (step_cache) setenv("CHATTERBOX_T3_STEP_CACHE", "1", 1);
-    unsetenv("TTS_CPP_T3_FORCE_SCHED");
+    unsetenv("TTS_CPP_FORCE_SCHED");
 
     std::fprintf(stderr, "test-t3-sched-equivalence: model=%s threads=%d gpu_layers=%d step_cache=%d\n",
                  model_path.c_str(), n_threads, n_gpu_layers, step_cache ? 1 : 0);
@@ -169,9 +169,9 @@ int main(int argc, char ** argv) {
 
     // B — forced scheduler path (per-op fallback machinery engaged even
     // though every op is supported: single-backend pass-through split).
-    setenv("TTS_CPP_T3_FORCE_SCHED", "1", 1);
+    setenv("TTS_CPP_FORCE_SCHED", "1", 1);
     const bool phase_b_ok = run_phase(model, allocr, n_threads, text_tokens, forced_b);
-    unsetenv("TTS_CPP_T3_FORCE_SCHED");
+    unsetenv("TTS_CPP_FORCE_SCHED");
     if (!phase_b_ok) return 1;
     compare_phases("direct vs forced-sched", direct_a, forced_b);
 

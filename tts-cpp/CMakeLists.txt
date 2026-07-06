@@ -688,7 +688,7 @@ if (TTS_CPP_BUILD_TESTS)
         REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_t3_mtl_ref}")
 
     # T3 dual-path dispatch equivalence: the forced scheduler path
-    # (TTS_CPP_T3_FORCE_SCHED) must be bit-identical to the direct path,
+    # (TTS_CPP_FORCE_SCHED) must be bit-identical to the direct path,
     # and a sched run must not poison the step-graph cache.  Two
     # registrations share one binary: with and without the opt-in
     # CHATTERBOX_T3_STEP_CACHE (latched per process on first use).

@@ -318,7 +318,7 @@ ggml_backend_t init_backend(int n_gpu_layers, bool * out_gpu_unsupported = nullp
 // eval functions; implemented in main.cpp on top of src/sched_dispatch.h.
 //
 // t3_use_sched: read-only decision — true when the primary backend cannot
-// run every op of `gf` (or TTS_CPP_T3_FORCE_SCHED is set).  Safe to probe
+// run every op of `gf` (or TTS_CPP_FORCE_SCHED is set).  Safe to probe
 // cached graphs.  NOTE: a cached graph must NOT be fed to the sched path
 // (ggml_backend_sched_alloc_graph rewrites node->src[] in place); when this
 // returns true for a cached graph, rebuild the graph fresh first.

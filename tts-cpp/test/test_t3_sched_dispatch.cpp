@@ -1,6 +1,6 @@
 // Unit tests for the shared dual-path dispatch helpers in
 // src/sched_dispatch.{h,cpp} (per-op GPU->CPU fallback for the T3 eval
-// paths): graph_fully_supported walk, TTS_CPP_T3_FORCE_SCHED escape
+// paths): graph_fully_supported walk, TTS_CPP_FORCE_SCHED escape
 // hatch, sched_fallback lifecycle (ensure/alloc/compute/free) and the
 // pre-allocated-op abort guard.
 //
@@ -77,13 +77,13 @@ void test_walk_and_force_env(ggml_backend_t cpu) {
 
     // The force env var is read per call (NOT latched in a static), so a
     // test can toggle it mid-process.
-    unsetenv("TTS_CPP_T3_FORCE_SCHED");
+    unsetenv("TTS_CPP_FORCE_SCHED");
     CHECK(!sched_force_enabled());
-    setenv("TTS_CPP_T3_FORCE_SCHED", "1", 1);
+    setenv("TTS_CPP_FORCE_SCHED", "1", 1);
     CHECK(sched_force_enabled());
-    setenv("TTS_CPP_T3_FORCE_SCHED", "0", 1);
+    setenv("TTS_CPP_FORCE_SCHED", "0", 1);
     CHECK(!sched_force_enabled());
-    unsetenv("TTS_CPP_T3_FORCE_SCHED");
+    unsetenv("TTS_CPP_FORCE_SCHED");
 
     // No node of the toy graph is bound to a pre-allocated buffer, so the
     // abort guard must pass.

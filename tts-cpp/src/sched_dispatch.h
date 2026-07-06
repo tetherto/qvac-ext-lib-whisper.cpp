@@ -4,18 +4,17 @@
 // primary backend supports every op in a graph, ggml_backend_sched over
 // [primary, CPU-last] when it does not — the scheduler then routes the
 // unsupported ops to CPU per-node instead of the backend asserting inside
-// graph_compute.  Mirrors the pattern S3Gen (chatterbox_tts.cpp
-// s3gen_sched_alloc/s3gen_sched_compute) and Supertonic (supertonic_gguf.cpp
-// supertonic_sched_*) each hand-roll; kept engine-agnostic here so the
-// engines can converge on one implementation.
+// graph_compute.  Shared by all three engines: T3 (main.cpp/t3_mtl.cpp),
+// S3Gen (chatterbox_tts.cpp s3gen_sched_prepare/s3gen_sched_compute) and
+// Supertonic (supertonic_gguf.cpp supertonic_sched_*).
 //
 // The compute entry points return the backend's ggml_status so callers can
 // surface a graceful compute failure instead of silently consuming
 // whatever half-written output the graph left behind.
 //
-// Threading: NOT thread-safe by design.  T3 eval on one model is serialized
-// (single-threaded CLI/engine synthesis loops); lazy creation is guarded by
-// a plain null check, matching that contract.
+// Threading: NOT thread-safe by design.  Synthesis on one model is
+// serialized (single-threaded CLI/engine synthesis loops); lazy creation is
+// guarded by a plain null check, matching that contract.
 
 #include "ggml-backend.h"
 
@@ -50,7 +49,7 @@ struct sched_fallback {
 bool graph_fully_supported(ggml_backend_t backend, const ggml_cgraph * gf);
 
 // Test/debug escape hatch: force the sched path even when the walk passes.
-// Reads TTS_CPP_T3_FORCE_SCHED on every call (NOT cached in a static) so
+// Reads TTS_CPP_FORCE_SCHED on every call (NOT cached in a static) so
 // tests can toggle it per-phase within one process.
 bool sched_force_enabled();
 

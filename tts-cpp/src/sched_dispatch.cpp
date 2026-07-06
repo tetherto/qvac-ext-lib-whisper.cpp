@@ -25,7 +25,7 @@ bool graph_fully_supported(ggml_backend_t backend, const ggml_cgraph * gf) {
 }
 
 bool sched_force_enabled() {
-    const char * e = getenv("TTS_CPP_T3_FORCE_SCHED");
+    const char * e = getenv("TTS_CPP_FORCE_SCHED");
     return e && e[0] && e[0] != '0';
 }
 
