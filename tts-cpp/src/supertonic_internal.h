@@ -654,17 +654,26 @@ inline bool model_prefers_cpu_kernels(const supertonic_model & model) {
 //   supertonic_sched_alloc(model, gf);            // reset + allocate via sched
 //   ggml_backend_tensor_set(input_leaf, ...);     // inputs now have memory
 //   supertonic_sched_compute(model, gf);          // run (routes customs -> CPU)
-// The graph topology may be a reused thread_local cache; sched_reset does not
-// touch the user graph, so caches stay valid across calls.
+// GRAPH LIFETIME CONTRACT: a graph fed to supertonic_sched_alloc is
+// SINGLE-USE — sched alloc rewires node->src[] into sched-owned copy
+// tensors that the NEXT sched pass frees, and tensor buffer/data bindings
+// survive sched_reset, so re-feeding the same graph computes garbage
+// deterministically (or crashes on a multi-backend sched).  Every dual-path
+// run_* site therefore REBUILDS its graph before each sched pass (the sched
+// route leaves cache.allocr null, so the build early-return never reuses),
+// and *_gpu cross-graph tensor handles must only ever come from a
+// DIRECT-run producer (sched-owned slabs are reset/re-planned by the
+// consumer's own sched pass).  See ggml-backend.h ("single-use in terms of
+// allocation" / sched_reset docs) and
+// docs/supertonic-sched-graph-reuse-investigation.md.
 void supertonic_sched_alloc(const supertonic_model & model, ggml_cgraph * graph);
 void supertonic_sched_compute(const supertonic_model & model, ggml_cgraph * graph);
 
 // Dispatch gate shared by every dual-path stage: supports_op walk over the
-// graph.  Deliberately does NOT read TTS_CPP_FORCE_SCHED — Supertonic
-// reuses sched-routed cached graphs across calls and forcing the scheduler
-// onto a walk-passing backend corrupts the reuse (see the definition in
-// supertonic_gguf.cpp for the measured evidence).
-// test-supertonic-sched-equivalence pins the flag staying inert here.
+// graph + the TTS_CPP_FORCE_SCHED escape hatch (safe: every dual-path site
+// rebuilds its graph before a sched pass — see the contract note above —
+// so the forced path is bit-identical to direct;
+// test-supertonic-sched-equivalence enforces that on CPU and Metal).
 bool supertonic_use_sched(const supertonic_model & model, const ggml_cgraph * graph);
 
 ggml_tensor * require_tensor(const supertonic_model & model, const std::string & name);

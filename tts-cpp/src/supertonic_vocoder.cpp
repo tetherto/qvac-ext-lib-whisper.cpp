@@ -562,7 +562,8 @@ void build_supertonic_vocoder_cache(vocoder_graph_cache & cache,
     // AND was built on the direct backend path (cache.allocr non-null).  The
     // scheduler path leaves cache.allocr null, so it always rebuilds.
     // Mirrors run_hift_decode.
-    if (cache.ctx && cache.allocr && cache.generation_id == model.generation_id
+    if (cache.ctx && cache.allocr && cache.model == &model
+        && cache.generation_id == model.generation_id
         && cache.latent_len == latent_len) {
         return;
     }

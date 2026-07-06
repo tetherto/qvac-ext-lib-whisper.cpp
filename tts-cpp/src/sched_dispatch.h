@@ -76,6 +76,13 @@ bool sched_fallback_ensure(sched_fallback & fb, ggml_backend_t primary,
 // Reset-at-head + allocate: sched allocates at alloc time, so callers set
 // input data AFTER this and read outputs after compute, before the next
 // reset.  Returns false on allocation failure.
+//
+// GRAPH LIFETIME: `gf` must be FRESHLY BUILT for every call — sched graphs
+// are single-use for allocation (ggml-backend.h: alloc rewires node->src[]
+// into sched-owned copies that the next pass frees; tensor buffer/data
+// bindings survive the reset).  Feeding a previously sched-allocated graph
+// back in computes garbage deterministically or crashes.  T3, HiFT and
+// every Supertonic dual-path site rebuild before each sched pass.
 bool sched_fallback_alloc(sched_fallback & fb, ggml_cgraph * gf);
 
 // Set the CPU-side thread count, run the graph through the scheduler and
