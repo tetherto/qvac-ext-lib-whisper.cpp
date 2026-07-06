@@ -12,22 +12,35 @@
 // The compute entry points return the backend's ggml_status so callers can
 // surface a graceful compute failure instead of silently consuming
 // whatever half-written output the graph left behind.
+//
+// Threading: NOT thread-safe by design.  T3 eval on one model is serialized
+// (single-threaded CLI/engine synthesis loops); lazy creation is guarded by
+// a plain null check, matching that contract.
 
 #include "ggml-backend.h"
 
-#include <memory>
-#include <mutex>
 #include <vector>
 
 namespace tts_cpp::detail {
 
 // Lazily-created [primary, CPU-last] scheduler bundle; one per model.
-// Mirrors model_ctx::{cpu_backend, sched, sched_once} in chatterbox_tts.cpp,
-// including the unique_ptr<once_flag> so an owning struct stays movable.
+//
+// Ordering contract: the sched holds references into its backends, so a
+// sched_fallback MUST be freed (sched_fallback_free) or destroyed BEFORE
+// ggml_backend_free(primary).  Every production teardown site calls
+// sched_fallback_free explicitly in that order; the destructor is a safety
+// net for paths that never freed the primary at all (tests, early exits).
+// Non-copyable/non-movable: a copy would double-free, and nothing moves it.
 struct sched_fallback {
     ggml_backend_t       cpu_backend = nullptr;  // owned; null when primary is CPU
     ggml_backend_sched_t sched       = nullptr;  // owned
-    std::unique_ptr<std::once_flag> once = std::make_unique<std::once_flag>();
+
+    sched_fallback() = default;
+    sched_fallback(const sched_fallback &)             = delete;
+    sched_fallback & operator=(const sched_fallback &) = delete;
+    sched_fallback(sched_fallback &&)                  = delete;
+    sched_fallback & operator=(sched_fallback &&)      = delete;
+    ~sched_fallback();
 };
 
 // True iff `backend` supports every node op in `gf`.  Read-only walk with
@@ -50,13 +63,13 @@ bool sched_force_enabled();
 // than enter the scheduler.
 bool graph_has_unsupported_preallocated_op(ggml_backend_t primary, const ggml_cgraph * gf);
 
-// One-time creation (thread-safe via call_once; the body re-runs on a later
-// call if creation fails, matching s3gen_sched_alloc's retry-on-throw):
-// marks each non-null buffer in `weight_buffers` USAGE_WEIGHTS (so sched
-// may copy a primary-resident weight to CPU for a CPU-routed op), creates
-// cpu_backend (skipped when the primary is the CPU) and the sched over
-// [primary, cpu-last] with parallel=false, op_offload=false.
-// Returns false with a stderr log on failure instead of throwing.
+// Lazy one-time creation, guarded by the null check (see threading note
+// above): marks each non-null buffer in `weight_buffers` USAGE_WEIGHTS (so
+// sched may copy a primary-resident weight to CPU for a CPU-routed op),
+// creates cpu_backend (skipped when the primary is the CPU) and the sched
+// over [primary, cpu-last] with parallel=false, op_offload=false.
+// Returns false with a stderr log on failure; a failed attempt leaves the
+// bundle empty, so a later call retries naturally.
 bool sched_fallback_ensure(sched_fallback & fb, ggml_backend_t primary,
                            size_t graph_size,
                            const std::vector<ggml_backend_buffer_t> & weight_buffers);
@@ -77,8 +90,8 @@ ggml_status sched_fallback_compute(sched_fallback & fb, ggml_backend_t primary,
 ggml_status direct_compute(ggml_backend_t backend, ggml_cgraph * gf, int n_threads);
 
 // Free sched then cpu_backend (that order — the sched holds backend refs).
-// MUST run before ggml_backend_free(primary).  Idempotent; re-arms the
-// once_flag so a later ensure() can rebuild.
+// MUST run before ggml_backend_free(primary).  Idempotent; a later
+// ensure() can rebuild.
 void sched_fallback_free(sched_fallback & fb);
 
 } // namespace tts_cpp::detail

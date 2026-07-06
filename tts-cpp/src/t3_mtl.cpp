@@ -1255,11 +1255,7 @@ bool run_prompt_pass(const chatterbox_model & model,
     fill_causal_mask_f16(mask, N);
     set_in("kq_mask", mask.data(), mask.size() * sizeof(ggml_fp16_t));
 
-    const ggml_status status = t3_dispatch_compute(model, gf, n_threads, use_sched);
-    if (status != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "run_prompt_pass: graph compute failed (ggml_status=%d)\n", (int)status);
-        return false;
-    }
+    if (!t3_dispatch_compute(model, gf, n_threads, use_sched, "run_prompt_pass")) return false;
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(ggml_nelements(logits));
@@ -1330,11 +1326,7 @@ bool run_prompt_pass_b2(const chatterbox_model & model,
     fill_causal_mask_f16(mask, N);
     set_in("kq_mask", mask.data(), mask.size() * sizeof(ggml_fp16_t));
 
-    const ggml_status status = t3_dispatch_compute(model, gf, n_threads, use_sched);
-    if (status != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "run_prompt_pass_b2: graph compute failed (ggml_status=%d)\n", (int)status);
-        return false;
-    }
+    if (!t3_dispatch_compute(model, gf, n_threads, use_sched, "run_prompt_pass_b2")) return false;
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     // logits ne=[n_speech_vocab, 1, 2], contiguous.  Cond at b=0, uncond at b=1.
@@ -1381,12 +1373,7 @@ bool run_step_pass_b2(const chatterbox_model & model,
     int32_t pos = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos_ids"), &pos, 0, sizeof(pos));
 
-    const ggml_status status = t3_dispatch_compute(model, gf, n_threads, use_sched);
-    if (status != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "run_step_pass_b2: graph compute failed (n_past=%d, ggml_status=%d)\n",
-                n_past, (int)status);
-        return false;
-    }
+    if (!t3_dispatch_compute(model, gf, n_threads, use_sched, "run_step_pass_b2", n_past)) return false;
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     const size_t per_batch_bytes = (size_t) hp.n_speech_vocab * sizeof(float);
@@ -1461,12 +1448,7 @@ bool run_step_pass(const chatterbox_model & model,
     int32_t pos = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos_ids"), &pos, 0, sizeof(pos));
 
-    const ggml_status status = t3_dispatch_compute(model, gf, n_threads, use_sched);
-    if (status != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "run_step_pass: graph compute failed (n_past=%d, ggml_status=%d)\n",
-                n_past, (int)status);
-        return false;
-    }
+    if (!t3_dispatch_compute(model, gf, n_threads, use_sched, "run_step_pass", n_past)) return false;
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(ggml_nelements(logits));

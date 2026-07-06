@@ -5,9 +5,12 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <stdexcept>
 
 namespace tts_cpp::detail {
+
+sched_fallback::~sched_fallback() {
+    sched_fallback_free(*this);
+}
 
 bool graph_fully_supported(ggml_backend_t backend, const ggml_cgraph * gf) {
     if (!backend || !gf) return false;
@@ -26,6 +29,21 @@ bool sched_force_enabled() {
     return e && e[0] && e[0] != '0';
 }
 
+// MIRRORS SCHEDULER INTERNALS — re-verify on EVERY ggml-speech sync.
+//
+// This re-derives, outside the scheduler, the exact condition under which
+// ggml_backend_sched_backend_id_from_cur() hits
+//   GGML_ABORT("pre-allocated tensor (%s) in a buffer (%s) that cannot run
+//               the operation (%s)")
+// (ggml src/ggml-backend.cpp, backend-assignment pass; see
+// ggml_backend_sched_backend_from_buffer just above it: a backend qualifies
+// for a pre-allocated node only when it supports BOTH the buffer type and
+// the op).  Our sched set is exactly [primary, CPU-last], so checking those
+// two candidates is complete FOR THE CURRENT PREDICATE.  If a ggml sync
+// changes that assignment logic, this guard silently stops matching and the
+// uncatchable abort comes back — the deeper fix (converting the ABORT into
+// an error status inside ggml) belongs in qvac-ext-ggml and rides the
+// registry release train.
 bool graph_has_unsupported_preallocated_op(ggml_backend_t primary, const ggml_cgraph * gf) {
     if (!primary || !gf) return false;
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -35,8 +53,6 @@ bool graph_has_unsupported_preallocated_op(ggml_backend_t primary, const ggml_cg
         ggml_backend_buffer_t buffer = node->view_src ? node->view_src->buffer : node->buffer;
         if (!buffer) continue;
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer);
-        // Mirror ggml_backend_sched_backend_from_buffer: a backend qualifies
-        // only when it supports BOTH the buffer type and the op.
         if (ggml_backend_supports_buft(primary, buft) &&
             ggml_backend_supports_op(primary, node)) {
             continue;
@@ -63,39 +79,31 @@ bool sched_fallback_ensure(sched_fallback & fb, ggml_backend_t primary,
                            const std::vector<ggml_backend_buffer_t> & weight_buffers) {
     if (!primary) return false;
     if (fb.sched) return true;
-    try {
-        // call_once re-runs the body if it throws, matching s3gen_sched_alloc's
-        // retry-on-failure behaviour; a successful run is executed exactly once
-        // even under concurrent callers.
-        std::call_once(*fb.once, [&] {
-            // Mark weights USAGE_WEIGHTS so sched copies a primary-resident
-            // weight to CPU when a CPU-routed op consumes it.
-            for (ggml_backend_buffer_t buf : weight_buffers) {
-                if (buf) ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            }
-            ggml_backend_t sched_backends[2] = { primary, nullptr };
-            int n_sched_backends = 1;
-            if (!backend_is_cpu(primary)) {
-                fb.cpu_backend = init_cpu_backend();
-                if (!fb.cpu_backend) {
-                    throw std::runtime_error("init CPU backend for scheduler failed");
-                }
-                sched_backends[1] = fb.cpu_backend;
-                n_sched_backends = 2;
-            }
-            fb.sched = ggml_backend_sched_new(sched_backends, /*bufts=*/nullptr,
-                                              n_sched_backends, graph_size,
-                                              /*parallel=*/false, /*op_offload=*/false);
-            if (!fb.sched) {
-                if (fb.cpu_backend) { ggml_backend_free(fb.cpu_backend); fb.cpu_backend = nullptr; }
-                throw std::runtime_error("ggml_backend_sched_new failed");
-            }
-        });
-    } catch (const std::exception & e) {
-        fprintf(stderr, "sched_dispatch: %s\n", e.what());
+    // Mark weights USAGE_WEIGHTS so sched copies a primary-resident weight
+    // to CPU when a CPU-routed op consumes it.
+    for (ggml_backend_buffer_t buf : weight_buffers) {
+        if (buf) ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+    ggml_backend_t sched_backends[2] = { primary, nullptr };
+    int n_sched_backends = 1;
+    if (!backend_is_cpu(primary)) {
+        fb.cpu_backend = init_cpu_backend();
+        if (!fb.cpu_backend) {
+            fprintf(stderr, "sched_dispatch: init CPU backend for scheduler failed\n");
+            return false;
+        }
+        sched_backends[1] = fb.cpu_backend;
+        n_sched_backends = 2;
+    }
+    fb.sched = ggml_backend_sched_new(sched_backends, /*bufts=*/nullptr,
+                                      n_sched_backends, graph_size,
+                                      /*parallel=*/false, /*op_offload=*/false);
+    if (!fb.sched) {
+        fprintf(stderr, "sched_dispatch: ggml_backend_sched_new failed\n");
+        if (fb.cpu_backend) { ggml_backend_free(fb.cpu_backend); fb.cpu_backend = nullptr; }
         return false;
     }
-    return fb.sched != nullptr;
+    return true;
 }
 
 bool sched_fallback_alloc(sched_fallback & fb, ggml_cgraph * gf) {
@@ -122,8 +130,6 @@ ggml_status direct_compute(ggml_backend_t backend, ggml_cgraph * gf, int n_threa
 void sched_fallback_free(sched_fallback & fb) {
     if (fb.sched)       { ggml_backend_sched_free(fb.sched); fb.sched = nullptr; }
     if (fb.cpu_backend) { ggml_backend_free(fb.cpu_backend); fb.cpu_backend = nullptr; }
-    // Re-arm so a later ensure() can rebuild (e.g. tests reusing one model).
-    fb.once = std::make_unique<std::once_flag>();
 }
 
 } // namespace tts_cpp::detail

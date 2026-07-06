@@ -844,11 +844,23 @@ bool t3_sched_prepare(const chatterbox_model & model, ggml_cgraph * gf,
     return true;
 }
 
-ggml_status t3_dispatch_compute(const chatterbox_model & model, ggml_cgraph * gf,
-                                int n_threads, bool use_sched) {
-    return use_sched
+bool t3_dispatch_compute(const chatterbox_model & model, ggml_cgraph * gf,
+                         int n_threads, bool use_sched,
+                         const char * caller, int n_past) {
+    const ggml_status status = use_sched
         ? ::tts_cpp::detail::sched_fallback_compute(model.sched_fb, model.backend, gf, n_threads)
         : ::tts_cpp::detail::direct_compute(model.backend, gf, n_threads);
+    if (status != GGML_STATUS_SUCCESS) {
+        if (n_past >= 0) {
+            fprintf(stderr, "%s: graph compute failed (n_past=%d, ggml_status=%d)\n",
+                    caller, n_past, (int)status);
+        } else {
+            fprintf(stderr, "%s: graph compute failed (ggml_status=%d)\n",
+                    caller, (int)status);
+        }
+        return false;
+    }
+    return true;
 }
 
 bool eval_prompt(
@@ -893,11 +905,7 @@ bool eval_prompt(
         }
     }
 
-    const ggml_status status = t3_dispatch_compute(model, gf, n_threads, use_sched);
-    if (status != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "%s: graph compute failed (ggml_status=%d)\n", __func__, (int)status);
-        return false;
-    }
+    if (!t3_dispatch_compute(model, gf, n_threads, use_sched, __func__)) return false;
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(model.hparams.n_speech_vocab);
@@ -924,11 +932,7 @@ bool eval_step(
     int32_t position = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), &position, 0, sizeof(position));
 
-    const ggml_status status = t3_dispatch_compute(model, gf, n_threads, use_sched);
-    if (status != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "%s: graph compute failed (ggml_status=%d)\n", __func__, (int)status);
-        return false;
-    }
+    if (!t3_dispatch_compute(model, gf, n_threads, use_sched, __func__, n_past)) return false;
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(model.hparams.n_speech_vocab);

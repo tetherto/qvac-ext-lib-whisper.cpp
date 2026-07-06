@@ -330,10 +330,13 @@ bool t3_use_sched(const chatterbox_model & model, const ggml_cgraph * gf);
 bool t3_sched_prepare(const chatterbox_model & model, ggml_cgraph * gf,
                       const char * caller);
 
-// t3_dispatch_compute: run `gf` on the path chosen above and return the
-// backend's ggml_status (GGML_STATUS_SUCCESS on success).
-ggml_status t3_dispatch_compute(const chatterbox_model & model, ggml_cgraph * gf,
-                                int n_threads, bool use_sched);
+// t3_dispatch_compute: run `gf` on the path chosen above, check the
+// backend's ggml_status and log a "<caller>: graph compute failed" line on
+// failure (with n_past when >= 0, for the per-step sites).  Returns false
+// on any non-SUCCESS status so call sites reduce to a single early return.
+bool t3_dispatch_compute(const chatterbox_model & model, ggml_cgraph * gf,
+                         int n_threads, bool use_sched,
+                         const char * caller, int n_past = -1);
 
 bool load_model_gguf(
     const std::string & path,
