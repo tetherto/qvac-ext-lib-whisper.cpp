@@ -185,8 +185,6 @@ void host_joint_step(const TdtRuntimeWeights & W,
 // is shared between the init-only `g_lstm` graph and the fused
 // `g_lstm_joint` graph so they stay numerically identical.
 struct LstmBodyOuts {
-    ggml_tensor * h_cpy;    // last layer's h write (kept for existing single-node refs)
-    ggml_tensor * c_cpy;    // last layer's c write
     ggml_tensor * pred_cpy;
     // ALL layers' h/c state-write cpy nodes. Every one must be marked as a graph
     // output and forward-expanded, otherwise ggml_build_forward_expand prunes the
@@ -257,10 +255,8 @@ LstmBodyOuts build_lstm_body(TdtRuntimeWeights & rt,
     for (int l = 0; l < L; ++l) {
         ggml_tensor * h_dst = ggml_view_1d(gctx, rt.h_persist, H, (size_t) l * H * sizeof(float));
         ggml_tensor * c_dst = ggml_view_1d(gctx, rt.c_persist, H, (size_t) l * H * sizeof(float));
-        out.h_cpy = ggml_cpy(gctx, h_new_per_layer[l], h_dst);
-        out.c_cpy = ggml_cpy(gctx, c_new_per_layer[l], c_dst);
-        out.state_cpy.push_back(out.h_cpy);
-        out.state_cpy.push_back(out.c_cpy);
+        out.state_cpy.push_back(ggml_cpy(gctx, h_new_per_layer[l], h_dst));
+        out.state_cpy.push_back(ggml_cpy(gctx, c_new_per_layer[l], c_dst));
     }
     out.pred_cpy = ggml_cpy(gctx, h_new_per_layer[L - 1], rt.pred_persist);
     return out;
@@ -350,9 +346,11 @@ void build_lstm_graph(TdtRuntimeWeights & rt) {
     ggml_set_input(rt.lstm_token_in);
 
     LstmBodyOuts outs = build_lstm_body(rt, gctx, rt.lstm_token_in);
-    rt.lstm_h_out    = outs.h_cpy;
-    rt.lstm_c_out    = outs.c_cpy;
     rt.lstm_pred_out = outs.pred_cpy;
+    // state_cpy is the single source of truth for the state write-backs; its last
+    // two entries are the final layer's h,c writes, kept here only for debug names.
+    rt.lstm_h_out    = outs.state_cpy[outs.state_cpy.size() - 2];
+    rt.lstm_c_out    = outs.state_cpy.back();
     ggml_set_name(rt.lstm_h_out,    "lstm.h_out");
     ggml_set_name(rt.lstm_c_out,    "lstm.c_out");
     ggml_set_name(rt.lstm_pred_out, "lstm.pred_out");
