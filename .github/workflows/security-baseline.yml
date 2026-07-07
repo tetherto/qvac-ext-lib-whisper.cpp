@@ -27,9 +27,9 @@ concurrency:
 
 jobs:
   baseline:
-    # Pinned to the 0.1.0 tag's immutable commit SHA per the org freeze-and-pin
-    # convention for reusable workflows (never `@main`).
-    uses: tetherto/qvac-actions/.github/workflows/public-reusable-security.yml@38693d9315c5fb6bba1354d8d1ef9823bf6c10a3 # 0.1.0
+    # Pinned to the qvac-actions 0.2.0 release commit (immutable SHA + version
+    # comment, per the org freeze-and-pin convention).
+    uses: tetherto/qvac-actions/.github/workflows/public-reusable-security.yml@be1d22629cc48b6dcc36645acc9e6d89cfaf54d8 # 0.2.0
     permissions:
       contents: read
       security-events: write
@@ -37,12 +37,13 @@ jobs:
       actions: read
     with:
       # C/C++ fork: set languages explicitly (CodeQL autodetect misses C/C++).
-      # CodeQL uses autobuild for c-cpp; this repo may need per-repo build
-      # tuning before the run goes green — tracked as a follow-up, which is why
-      # the PR is opened as a draft.
       languages: c-cpp
       severity-threshold: high
       # These repos use GitHub "Default setup" for code scanning, which rejects
       # SARIF from advanced workflows. Skip the upload; the severity gate and
       # TruffleHog still run (SARIF is written locally for the gate to read).
       codeql-upload: never
+      # Buildless C/C++ extraction (no compilation / submodule checkout).
+      # Uniform across every Tier-1 C/C++ caller and robust vs autobuild on
+      # native/submodule projects. Requires qvac-actions >= 0.2.0.
+      codeql-build-mode: none
