@@ -43,7 +43,8 @@ bool sched_force_enabled() {
 // changes that assignment logic, this guard silently stops matching and the
 // uncatchable abort comes back — the deeper fix (converting the ABORT into
 // an error status inside ggml) belongs in qvac-ext-ggml and rides the
-// registry release train.
+// registry release train.  Both sides of the mirror are pinned in CI by
+// test-t3-sched-dispatch (guard branches) and its -abort-repro twin.
 bool graph_has_unsupported_preallocated_op(ggml_backend_t primary, const ggml_cgraph * gf) {
     if (!primary || !gf) return false;
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);

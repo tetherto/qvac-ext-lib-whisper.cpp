@@ -1445,6 +1445,17 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-t3-sched-dispatch)
     tts_cpp_register_test(test-t3-sched-dispatch LABEL "unit")
 
+    # Same binary, guard bypassed: passes only while ggml still ABORTs on the
+    # rejected graph, so a ggml sync that un-mirrors the abort guard fails here.
+    tts_cpp_register_test(test-t3-sched-dispatch-abort-repro
+                          EXE test-t3-sched-dispatch
+                          ARGS --sched-abort-repro
+                          LABEL "unit")
+    set_property(TEST test-t3-sched-dispatch-abort-repro PROPERTY PASS_REGULAR_EXPRESSION
+                 "pre-allocated tensor" "SKIP: no cpu-unsupported set_rows dst type")
+    set_property(TEST test-t3-sched-dispatch-abort-repro PROPERTY FAIL_REGULAR_EXPRESSION
+                 "ERROR:")
+
     # Real per-op migration through sched_dispatch: a BLAS (ACCEL) primary
     # rejects everything but matmul-class ops, so add/scale/cpy nodes
     # genuinely migrate to the CPU-last backend (multi-split schedule with
