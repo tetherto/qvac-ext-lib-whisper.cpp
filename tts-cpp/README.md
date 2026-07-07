@@ -17,9 +17,10 @@ Ships both variants out of one binary, autodetected from GGUF metadata:
 - **Turbo** — English, GPT-2 Medium T3, meanflow 2-step CFM.  Optimised for
   lowest-latency CLI use.
 - **Multilingual** — 23 languages, Llama-520M T3 + perceiver resampler +
-  classifier-free guidance, standard 10-step CFM with CFG inside.  Tier-1
-  subset wired up natively (`en, es, fr, de, it, pt, nl, pl, tr, sv, da,
-  fi, no, el, ms, sw, ar, ko`); `ja/he/ru/zh/hi` stay on the backlog.
+  classifier-free guidance, standard 10-step CFM with CFG inside.  The native
+  tokenizer supports `en, es, fr, de, it, pt, nl, pl, tr, sv, da, fi, no, el,
+  ms, sw, ar, ko` plus the external-preprocessor languages `ja, he, ru, zh,
+  hi`; `ja` requires MeCab/IPAdic and `zh` requires a Cangjie5 TSV.
 
 End-to-end inference on a short sentence with voice cloning from an 11 s
 reference wav (T3 + S3Gen + HiFT, warm runs, excludes model load):
@@ -635,7 +636,7 @@ N=6 is too aggressive (cosine 0.990 right at the threshold, PCM cosine
 drops to 0.88).  Streaming chunks ignore this flag and use
 `--stream-cfm-steps` instead.
 
-`--output-sample-rate HZ` (QVAC-21483) selects the output frequency.  The
+`--output-sample-rate HZ` selects the output frequency. The
 pipeline natively emits 24 kHz (Chatterbox) / the model's metadata rate
 (Supertonic); pass a positive rate in `8000..192000` to resample the final
 PCM with the in-tree Kaiser-windowed sinc resampler before it's written or

@@ -90,7 +90,7 @@ struct Engine::Impl {
             !std::filesystem::is_directory(opts.voice_dir)) {
             throw std::runtime_error("Engine: voice_dir not found: " + opts.voice_dir);
         }
-        // QVAC-21483 — fail fast on an unsupported output frequency.
+        // fail fast on an unsupported output frequency.
         validate_output_sample_rate(opts.output_sample_rate, "chatterbox::Engine");
 
         ggml_time_init();
@@ -261,6 +261,8 @@ struct Engine::Impl {
         // against a dead backend asserts inside the GPU-backend dylib
         // finalisers.
         tts_cpp::chatterbox::detail::t3_release_caches();
+        // Same ordering contract for the eval-side fallback scheduler.
+        tts_cpp::detail::sched_fallback_free(model.sched_fb);
         if (model.buffer_w)        { ggml_backend_buffer_free(model.buffer_w);        model.buffer_w        = nullptr; }
         if (model.buffer_kv)       { ggml_backend_buffer_free(model.buffer_kv);       model.buffer_kv       = nullptr; }
         if (model.buffer_stack)    { ggml_backend_buffer_free(model.buffer_stack);    model.buffer_stack    = nullptr; }
@@ -763,7 +765,7 @@ struct Engine::Impl {
             copts.hift_source_tail_out      = &tail_out;
             copts.source_tail_samples       = 480;
             copts.cfm_steps                 = opts.stream_cfm_steps;
-            copts.streaming                 = true;  // QVAC-21118: floor CFM steps for standard CFM
+            copts.streaming = true;  // floor CFM steps for standard CFM
 
             const auto s3_t0 = std::chrono::steady_clock::now();
             const int rc = s3gen_synthesize_to_wav(toks, copts);
@@ -784,7 +786,7 @@ struct Engine::Impl {
             // chunk_index is the global monotonic counter (post-incremented so
             // the first chunk is index 0, matching the single-segment legacy).
             const bool is_final_chunk = is_last_in_seg && is_last_segment;
-            // QVAC-21483 — feed the native chunk through the utterance-spanning
+            // feed the native chunk through the utterance-spanning
             // resampler (0 / 24000 = passthrough).  process() returns only the
             // now-stable output samples and finish() flushes the tail on the
             // final chunk, so the emitted chunks concatenate to the exact same
@@ -836,7 +838,7 @@ struct Engine::Impl {
 
         const bool use_streaming = on_chunk && opts.stream_chunk_tokens > 0;
 
-        // QVAC-21483 — resolve the output rate once.  0 keeps the native
+        // resolve the output rate once. 0 keeps the native
         // 24 kHz.  Streaming flows every chunk through a single utterance-
         // spanning resampler (so the streamed output equals the batch resample
         // with no per-chunk seams); the batch path resamples the assembled PCM
@@ -871,7 +873,7 @@ struct Engine::Impl {
             }
         }
 
-        // QVAC-21483 — the batch path assembles + crossfades segments at the
+        // the batch path assembles + crossfades segments at the
         // native 24 kHz; resample the whole utterance once for best quality.
         // The streaming path already emitted/accumulated at out_sr per chunk.
         if (!use_streaming) {

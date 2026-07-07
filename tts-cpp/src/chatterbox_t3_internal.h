@@ -25,6 +25,8 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#include "sched_dispatch.h"
+
 namespace tts_cpp::chatterbox::detail {
 
 constexpr int CHBX_MAX_NODES = 8192;
@@ -118,6 +120,21 @@ ggml_type chatterbox_kv_type_from_str(const std::string & s);
 // (so an f16/q8_0 request can't assert deep inside an unsupporting backend).
 ggml_type chatterbox_resolve_kv_type(ggml_backend_t backend, ggml_type requested,
                                      int head_dim, int n_head, int n_kv_head);
+
+// MTL-variant resolve: chatterbox_resolve_kv_type plus a probe of the extra
+// quantized-cache op the multilingual decode graph emits — the alignment
+// probe's dequantizing cast of a strided q8 K-cache view to f32
+// (build_llama_block).  Returns f32 when the backend can't encode that cast, so
+// q8 KV stays enabled on backends that support it (Metal) and safely degrades on
+// those that don't, without the single-backend MTL graph SIGABRT'ing at compute.
+ggml_type chatterbox_mtl_resolve_kv_type(ggml_backend_t backend, ggml_type requested,
+                                         int head_dim, int n_head, int n_kv_head);
+
+// Pure decision behind chatterbox_mtl_resolve_kv_type's cross-backend safety net,
+// exposed for unit testing: returns GGML_TYPE_F32 when `resolved` is quantized
+// and the backend cannot encode the align-probe's strided q8->f32 cast, else
+// returns `resolved` unchanged.
+ggml_type chatterbox_mtl_kv_type_for_cast_support(ggml_type resolved, bool cast_supported);
 
 struct gpt2_layer {
     ggml_tensor * ln_1_g = nullptr;
@@ -275,6 +292,15 @@ struct chatterbox_model {
 
     std::string mtl_tokenizer_json;
     std::vector<std::string> mtl_languages;
+
+    // Lazily-created [backend, CPU-last] scheduler used by the eval
+    // functions when the primary backend cannot run every op of a graph
+    // (per-op CPU fallback instead of a backend assert).  `mutable`
+    // because the eval functions take `const chatterbox_model &` — the
+    // exact precedent of S3Gen's model_ctx::{cpu_backend, sched}.
+    // Freed via sched_fallback_free BEFORE ggml_backend_free(backend)
+    // at every teardown site (same ordering contract as t3_release_caches).
+    mutable tts_cpp::detail::sched_fallback sched_fb;
 };
 
 struct chatterbox_sampling_params {
@@ -287,6 +313,30 @@ struct chatterbox_sampling_params {
 };
 
 ggml_backend_t init_backend(int n_gpu_layers, bool * out_gpu_unsupported = nullptr);
+
+// Dual-path dispatch shared by the Turbo (main.cpp) and MTL (t3_mtl.cpp)
+// eval functions; implemented in main.cpp on top of src/sched_dispatch.h.
+//
+// t3_use_sched: read-only decision — true when the primary backend cannot
+// run every op of `gf` (or TTS_CPP_FORCE_SCHED is set).  Safe to probe
+// cached graphs.  NOTE: a cached graph must NOT be fed to the sched path
+// (ggml_backend_sched_alloc_graph rewrites node->src[] in place); when this
+// returns true for a cached graph, rebuild the graph fresh first.
+bool t3_use_sched(const chatterbox_model & model, const ggml_cgraph * gf);
+
+// t3_sched_prepare: guard + lazy sched creation + reset/alloc for the sched
+// path.  Logs and returns false on failure (callers return false in turn).
+// Callers set input data AFTER this, as on the gallocr path.
+bool t3_sched_prepare(const chatterbox_model & model, ggml_cgraph * gf,
+                      const char * caller);
+
+// t3_dispatch_compute: run `gf` on the path chosen above, check the
+// backend's ggml_status and log a "<caller>: graph compute failed" line on
+// failure (with n_past when >= 0, for the per-step sites).  Returns false
+// on any non-SUCCESS status so call sites reduce to a single early return.
+bool t3_dispatch_compute(const chatterbox_model & model, ggml_cgraph * gf,
+                         int n_threads, bool use_sched,
+                         const char * caller, int n_past = -1);
 
 bool load_model_gguf(
     const std::string & path,

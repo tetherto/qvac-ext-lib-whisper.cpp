@@ -116,7 +116,7 @@ static void stream_write_wav(const std::string & path, const std::vector<float> 
     }
 }
 
-// QVAC-21483 — egress output-rate conversion for the Chatterbox CLI path.
+// egress output-rate conversion for the Chatterbox CLI path.
 // The pipeline produces native 24 kHz PCM; these helpers resample at the
 // final write/emit step (internal bookkeeping — mel hop counts, crossfades —
 // stays at 24 kHz).  `out_sr <= 0` or `== 24000` is a passthrough.
@@ -272,29 +272,29 @@ struct cli_params {
     // matmul / pwconv weights (Phase 2A).  -1 = auto / 0 / 1 force.
     // Maps onto EngineOptions::f16_weights.
     int32_t     supertonic_f16_weights = -1;
-    // QVAC-18605 — Vulkan adapter index.  Default 0 (the historical
+    // Vulkan adapter index. Default 0 (the historical
     // hard-coded value).  Maps onto EngineOptions::vulkan_device.
     // Range-checked at GGUF load against
     // `ggml_backend_vk_get_device_count()`; an out-of-range value
     // throws (no silent CPU fallback).  Has no effect on builds
     // compiled without `GGML_VULKAN` or when `--n-gpu-layers 0`.
     int32_t     supertonic_vulkan_device = 0;
-    // QVAC-18605 follow-up — first-synth pre-warm text.  Empty
+    // follow-up — first-synth pre-warm text. Empty
     // disables.  Maps onto EngineOptions::prewarm_text.  Auto no-op
     // on CPU backends.
     std::string supertonic_prewarm_text;
-    // QVAC-18605 round 6 — comma-separated extra deny-list of
+    // round 6 — comma-separated extra deny-list of
     // substring patterns.  Empty default → zero behaviour change.
     // Maps onto EngineOptions::f16_weights_deny_list (after
     // comma-splitting).
     std::vector<std::string> supertonic_f16_weights_deny_list;
-    // QVAC-18605 round 4 — multi-dtype K/V flash-attention dispatch.
+    // round 4 — multi-dtype K/V flash-attention dispatch.
     // -1 = auto (falls back to --f16-attn for back-compat); 0=f32,
     // 1=f16, 2=bf16, 3=q8_0.  Maps onto EngineOptions::kv_attn_type.
     // Probe-gated graceful fallback to f32 on adapters that don't
     // support the requested dtype.
     int32_t     supertonic_kv_attn_type = -1;
-    // QVAC-18605 round 7 — Vulkan env-var overrides applied via
+    // round 7 — Vulkan env-var overrides applied via
     // `apply_vulkan_env_overrides` just before backend init.
     // Operator-set env vars in the shell still WIN over these
     // (set_env_if_unset semantics).  Maps onto
@@ -354,7 +354,7 @@ struct cli_params {
     int32_t max_sentence_chars        = 180;
     int32_t crossfade_ms              = 30;
 
-    // QVAC-21483 — desired output sample rate in Hz.  0 = native 24 kHz (the
+    // desired output sample rate in Hz. 0 = native 24 kHz (the
     // historical CLI behaviour); a positive value (8000..192000) resamples the
     // final PCM before it is written / streamed.  Applied at egress for the
     // Chatterbox path here and forwarded to EngineOptions on the Supertonic
@@ -906,13 +906,54 @@ static int run_supertonic_cli_path(const cli_params & params) {
     opts.f16_weights_deny_list = params.supertonic_f16_weights_deny_list;
     opts.kv_attn_type = params.supertonic_kv_attn_type;
     opts.vulkan_env_overrides = params.supertonic_vulkan_env_overrides;
-    opts.output_sample_rate = params.output_sample_rate;  // QVAC-21483
+    opts.output_sample_rate = params.output_sample_rate;  //
 
     auto result = tts_cpp::supertonic::synthesize(opts, params.text);
     stream_write_wav(params.out_wav, result.pcm, result.sample_rate);
     fprintf(stderr, "wrote %s (%.2fs @ %d Hz, %zu samples)\n",
             params.out_wav.c_str(), result.duration_s, result.sample_rate, result.pcm.size());
     return 0;
+}
+
+// Free all T3-owned backend resources.  Without this Metal's static device
+// destructor asserts at process exit ("rsets->data count != 0") because the
+// residency sets attached to model.buffer_w / buffer_kv are still live when
+// the dylib tears the device down.  (S3Gen's cache registers its own atexit
+// hook; T3 has no such hook, tts_cpp_cli_main is its owner.)
+//
+// Ordering matters: the step-graph cache and the eval-side fallback scheduler
+// carry backend references, so both are dropped BEFORE the backend — freeing
+// them against a dead backend would assert inside the ggml-metal /
+// ggml-vulkan / ggml-cuda dylib finalisers.
+//
+// Idempotent (every free below is NULL-safe and every pointer is nulled), so
+// it is safe to run both explicitly on the happy path and again from the
+// unwind guard in tts_cpp_cli_main.
+static void cli_free_t3(tts_cpp::chatterbox::detail::chatterbox_model & model) {
+    if (model.buffer_stack || model.ctx_stack) {
+        tts_cpp::chatterbox::detail::t3_stack_unregister(
+            model.buffer_stack, model.ctx_stack);
+    }
+    tts_cpp::chatterbox::detail::t3_release_caches();
+    tts_cpp::detail::sched_fallback_free(model.sched_fb);
+    ggml_backend_buffer_free(model.buffer_w);
+    ggml_backend_buffer_free(model.buffer_kv);
+    ggml_backend_buffer_free(model.buffer_stack);
+    ggml_backend_buffer_free(model.buffer_override);
+    ggml_backend_free(model.backend);
+    ggml_free(model.ctx_w);
+    ggml_free(model.ctx_kv);
+    ggml_free(model.ctx_stack);
+    ggml_free(model.ctx_override);
+    model.buffer_w = nullptr;
+    model.buffer_kv = nullptr;
+    model.buffer_stack = nullptr;
+    model.buffer_override = nullptr;
+    model.backend = nullptr;
+    model.ctx_w = nullptr;
+    model.ctx_kv = nullptr;
+    model.ctx_stack = nullptr;
+    model.ctx_override = nullptr;
 }
 
 int tts_cpp_cli_main(int argc, char ** argv) {
@@ -1103,6 +1144,19 @@ int tts_cpp_cli_main(int argc, char ** argv) {
         const int64_t _t3_load_ms = (ggml_time_us() - _t3_load_t0) / 1000;
         fprintf(stderr, "BENCH: T3_LOAD_MS=%lld\n", (long long)_t3_load_ms);
 
+        // Unwind guard: a graceful eval failure below is thrown as
+        // std::runtime_error and lands in the terminal catch, which would
+        // otherwise skip every explicit teardown (cli_free_t3 keeps the
+        // "caches + fallback sched before backend" ordering).  Idempotent —
+        // the happy-path explicit cli_free_t3 calls null everything first.
+        // Declared before the gallocr guards below so it runs LAST on unwind
+        // (allocators are freed before the backend they reference).
+        struct t3_model_guard {
+            chatterbox_model & m;
+            ~t3_model_guard() { cli_free_t3(m); }
+        };
+        t3_model_guard t3_guard{model};
+
         // Warm the S3Gen GGUF cache in the background while T3 inference
         // runs.  This cuts first-audio-out latency by ~700 ms in streaming
         // mode — by the time T3 emits its first chunk of tokens, S3Gen is
@@ -1274,42 +1328,9 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             // destruction.
             if (s3gen_preload_thread.joinable()) s3gen_preload_thread.join();
 
-            // Free all T3-owned GPU resources before an early return.  Without
-            // this Metal's static device destructor asserts at process exit
-            // ("rsets->data count != 0") because the residency sets attached
-            // to model.buffer_w / buffer_kv are still live when the dylib
-            // tears the device down.  (S3Gen's cache registers its own
-            // atexit hook; T3 has no such hook, main() is its owner.)
-            auto free_t3 = [&]() {
-                if (model.buffer_stack || model.ctx_stack) {
-                    tts_cpp::chatterbox::detail::t3_stack_unregister(
-                        model.buffer_stack, model.ctx_stack);
-                }
-                // Drop the T3 step-graph cache BEFORE freeing the
-                // backend.  The cache holds gallocators that carry
-                // backend references; freeing them against a dead
-                // backend would assert inside the
-                // ggml-metal / ggml-vulkan / ggml-cuda dylib finalisers.
-                tts_cpp::chatterbox::detail::t3_release_caches();
-                ggml_backend_buffer_free(model.buffer_w);
-                ggml_backend_buffer_free(model.buffer_kv);
-                if (model.buffer_stack)    ggml_backend_buffer_free(model.buffer_stack);
-                if (model.buffer_override) ggml_backend_buffer_free(model.buffer_override);
-                ggml_backend_free(model.backend);
-                ggml_free(model.ctx_w);
-                ggml_free(model.ctx_kv);
-                if (model.ctx_stack)    ggml_free(model.ctx_stack);
-                if (model.ctx_override) ggml_free(model.ctx_override);
-                model.buffer_w = nullptr;
-                model.buffer_kv = nullptr;
-                model.buffer_stack = nullptr;
-                model.buffer_override = nullptr;
-                model.backend = nullptr;
-                model.ctx_w = nullptr;
-                model.ctx_kv = nullptr;
-                model.ctx_stack = nullptr;
-                model.ctx_override = nullptr;
-            };
+            // Free all T3-owned GPU resources before an early return (see
+            // cli_free_t3 for the why + ordering contract).
+            auto free_t3 = [&]() { cli_free_t3(model); };
 
             if (model.tok_tokens.empty()) {
                 fprintf(stderr,
@@ -1400,6 +1421,12 @@ int tts_cpp_cli_main(int argc, char ** argv) {
 
             ggml_gallocr_t allocr_live = ggml_gallocr_new(
                 ggml_backend_get_default_buffer_type(model.backend));
+            // Freed by the guard at scope exit (incl. the eval-failure
+            // unwind), BEFORE t3_guard tears the backend down.
+            struct allocr_live_guard {
+                ggml_gallocr_t & a;
+                ~allocr_live_guard() { ggml_gallocr_free(a); a = nullptr; }
+            } allocr_live_g{allocr_live};
             std::mt19937 rng_live(params.seed);
 
             constexpr int S3GEN_SIL = tts_cpp::chatterbox::kS3GenSilenceToken;
@@ -1678,7 +1705,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     copts.source_tail_samples      = 480;
                     copts.cfm_steps                = params.stream_cfm_steps > 0 ? params.stream_cfm_steps : params.cfm_steps;
                     copts.cfm_f16_kv_attn          = params.cfm_f16_kv_attn;
-                    copts.streaming                = true;  // QVAC-21118: floor CFM steps for standard CFM
+                    copts.streaming = true;  // floor CFM steps for standard CFM
 
                     int rc = s3gen_synthesize_to_wav(toks, copts);
                     if (rc != 0) return rc;
@@ -1821,6 +1848,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     (long long)t3_total_ms_live, t3_tokens_total_live);
 
             ggml_gallocr_free(allocr_live);
+            allocr_live = nullptr;
             free_t3();
             return loop_rc;
 #endif
@@ -1960,6 +1988,12 @@ int tts_cpp_cli_main(int argc, char ** argv) {
         // The per-segment T3 loop is wrapped in this closure so both the
         // batch and streaming S3Gen branches can call it uniformly.
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+        // Freed by the guard at scope exit (incl. the eval-failure unwind),
+        // BEFORE t3_guard tears the backend down.
+        struct allocr_guard {
+            ggml_gallocr_t & a;
+            ~allocr_guard() { ggml_gallocr_free(a); a = nullptr; }
+        } allocr_g{allocr};
         std::mt19937 rng(params.seed);
         const size_t N_SEG = seg_text_tokens.size();
         std::vector<std::vector<int32_t>> seg_generated(N_SEG);
@@ -2266,7 +2300,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 //                 stdout (so it can be piped into `play` /
                 //                 `ffplay` without streaming mode).
                 ensure_t3(0);
-                // QVAC-21483 — when a non-native output rate is requested we
+                // when a non-native output rate is requested we
                 // must capture PCM (rather than let s3gen write the file) so we
                 // can resample at egress.  osr<=0 / ==24000 keeps the legacy
                 // direct-write path.
@@ -2325,7 +2359,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         "\n=== auto-split: %zu segments, %.0f ms for %.0f ms audio (RTF=%.2f) ===\n",
                         N_SEG, seg_total_ms, audio_ms,
                         audio_ms > 0.0 ? seg_total_ms / audio_ms : 0.0);
-                // QVAC-21483 — resample the assembled utterance once at egress.
+                // resample the assembled utterance once at egress.
                 const int osr = params.output_sample_rate;
                 const bool resample_out = osr > 0 && osr != 24000;
                 if (params.out_wav == "-") {
@@ -2368,13 +2402,13 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                                         : chunk_n;
                 const bool to_stdout    = (params.out_wav == "-");
                 const int  sr           = opts.sr ? opts.sr : 24000;
-                // QVAC-21483 — egress output-rate.  Internal accumulation +
+                // egress output-rate. Internal accumulation +
                 // mel bookkeeping stay at the native `sr`; only the bytes that
                 // leave (stdout chunks, the final file) are resampled.
                 const int  osr          = params.output_sample_rate;
                 const bool resample_out = osr > 0 && osr != sr;
                 const int  egress_sr    = resample_out ? osr : sr;
-                // QVAC-21483 — one utterance-spanning resampler for the stdout
+                // one utterance-spanning resampler for the stdout
                 // egress stream, so streamed bytes equal a whole-utterance
                 // resample (no per-chunk seam artifacts).  Passthrough when osr
                 // is 0/native.  File mode (below) resamples the assembled buffer
@@ -2483,7 +2517,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         copts.source_tail_samples       = 480;
                         copts.cfm_steps                 = params.stream_cfm_steps > 0 ? params.stream_cfm_steps : params.cfm_steps;
                         copts.cfm_f16_kv_attn           = params.cfm_f16_kv_attn;
-                        copts.streaming                 = true;  // QVAC-21118: floor CFM steps for standard CFM
+                        copts.streaming = true;  // floor CFM steps for standard CFM
 
                         ++global_chunk_idx;
                         if (params.verbose) {
@@ -2535,7 +2569,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         const bool more = (si + 1 < N_SEG);
                         if (more && params.crossfade_ms > 0) {
                             const int gap_ms = std::max(150, 2 * params.crossfade_ms);
-                            // QVAC-21483 — feed the inter-segment silence through
+                            // feed the inter-segment silence through
                             // the same resampler as native-rate silence, so it
                             // slots into the continuous egress stream in order
                             // (flushing the previous segment's tail) and comes
@@ -2555,7 +2589,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 }
 
                 if (to_stdout) {
-                    // QVAC-21483 — flush the resampler's final tail samples.
+                    // flush the resampler's final tail samples.
                     std::vector<float> e = stdout_rs.finish();
                     if (!e.empty()) stream_emit_pcm_stdout(e);
                 } else {
@@ -2583,16 +2617,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 (long long)t3_total_ms, t3_tokens_total);
 
         ggml_gallocr_free(allocr);
-        // Drop T3 step-graph cache BEFORE freeing the backend
-        // (gallocators in cached entries reference it).
-        tts_cpp::chatterbox::detail::t3_release_caches();
-        ggml_backend_buffer_free(model.buffer_w);
-        ggml_backend_buffer_free(model.buffer_kv);
-        if (model.buffer_override) ggml_backend_buffer_free(model.buffer_override);
-        ggml_backend_free(model.backend);
-        ggml_free(model.ctx_w);
-        ggml_free(model.ctx_kv);
-        if (model.ctx_override) ggml_free(model.ctx_override);
+        allocr = nullptr;
+        cli_free_t3(model);
     } catch (const std::exception & e) {
         fprintf(stderr, "error: %s\n", e.what());
         return 1;

@@ -360,7 +360,7 @@ ggml_type chatterbox_resolve_kv_type(ggml_backend_t backend, ggml_type requested
 
     // ggml-vulkan's supports_op ADVERTISES quantized K/V flash-attention
     // but the NV_coopmat2 kernel faults at compute on quantized K/V:
-    // toggle-confirmed in CI (QVAC-19557) — a q8_0 KV cache SIGSEGVs the
+    // toggle-confirmed in CI — a q8_0 KV cache SIGSEGVs the
     // chatterbox GPU smoke on NVIDIA coopmat2 runners where the identical
     // f32 run passes.  MoltenVK (scalar FA, no coopmat) runs q8_0 fine, so
     // this is specific to the coopmat2 dequant-in-shader path.  The probe
@@ -371,6 +371,24 @@ ggml_type chatterbox_resolve_kv_type(ggml_backend_t backend, ggml_type requested
     if (ggml_is_quantized(requested) && ::tts_cpp::detail::backend_is_vulkan(backend)) {
         fprintf(stderr, "chatterbox: quantized (%s) KV cache is not yet reliable on the "
                         "Vulkan backend (coopmat2 flash-attn faults); using f32 KV cache\n",
+                ggml_type_name(requested));
+        return GGML_TYPE_F32;
+    }
+
+    // ggml-opencl (Adreno) has the same advertise-vs-actual gap: supports_op
+    // reports both the q8_0 flash-attn and the align-probe's strided q8->f32
+    // cast as supported, but the driver SIGSEGVs on the quantized cache at load
+    // (clEnqueueWriteBuffer inside ChatterboxEngine construction).  Device-farm
+    // confirmed: a q8_0 KV cache crashes the multilingual GPU load
+    // on a Samsung Galaxy S25 Ultra (Adreno) where the identical f16/f32 cache
+    // passes, and the same model loads fine on a Pixel 9 (Mali-Vulkan, force-f32'd
+    // above).  The probe below can't catch this, so force quantized K/V to f32 on
+    // OpenCL.  f16 (the native FA input type) is left intact; Metal / CPU keep
+    // quantized K/V (validated).
+    if (ggml_is_quantized(requested) && ::tts_cpp::detail::backend_is_opencl(backend)) {
+        fprintf(stderr, "chatterbox: quantized (%s) KV cache faults on the OpenCL/Adreno "
+                        "backend (advertises support but SIGSEGVs on the q8 cache at load); "
+                        "using f32 KV cache\n",
                 ggml_type_name(requested));
         return GGML_TYPE_F32;
     }
@@ -400,6 +418,54 @@ ggml_type chatterbox_resolve_kv_type(ggml_backend_t backend, ggml_type requested
         return GGML_TYPE_F32;
     }
     return requested;
+}
+
+ggml_type chatterbox_mtl_kv_type_for_cast_support(ggml_type resolved, bool cast_supported) {
+    // Pure decision split out of chatterbox_mtl_resolve_kv_type so the
+    // cross-backend safety net is unit-testable without a GPU that actually
+    // lacks the cast: a quantized KV type is downgraded to f32 when the backend
+    // cannot encode the align-probe's strided q8->f32 cast; non-quantized types
+    // (and the cast-supported case) pass through unchanged.
+    if (ggml_is_quantized(resolved) && !cast_supported) return GGML_TYPE_F32;
+    return resolved;
+}
+
+ggml_type chatterbox_mtl_resolve_kv_type(ggml_backend_t backend, ggml_type requested,
+                                         int head_dim, int n_head, int n_kv_head) {
+    // Start from the shared resolve (flash_attn_ext probe + Vulkan coopmat2
+    // force-f32).  The MTL decode graph emits one MORE quantized-cache op the
+    // shared probe doesn't cover: the per-(layer,head) alignment probe
+    // dequantizes a STRIDED view of the quantized K cache via ggml_cast(...->f32)
+    // (build_llama_block).  ggml-metal supports that cast (which is why q8 KV now
+    // runs on Metal), but a GPU backend with thinner op coverage
+    // (e.g. some OpenCL/Adreno or Mali-Vulkan builds) can advertise q8 flash-attn
+    // yet be unable to encode the strided q8->f32 cast — and the MTL path runs a
+    // single-backend graph_compute with no scheduler fallback, so that would
+    // SIGABRT at compute.  Probe the cast op directly and fall back to f32 when
+    // the backend can't encode it, instead of the old blanket "force f32 on any
+    // non-CPU backend" guard (which also blocked Metal, the whole bug).
+    ggml_type t = chatterbox_resolve_kv_type(backend, requested, head_dim, n_head, n_kv_head);
+    if (!ggml_is_quantized(t) || !backend) return t;
+
+    bool cast_ok = false;
+    ggml_init_params pp = { ggml_tensor_overhead() * 8, nullptr, /*no_alloc=*/true };
+    if (ggml_context * pc = ggml_init(pp)) {
+        // Mirror the align probe: a strided [head_dim, k] view of the token-major
+        // q8 cache, cast to f32.  Strides come from ggml_row_size so the view is
+        // block-aligned exactly as build_llama_block builds it.
+        const size_t tok_row = ggml_row_size(t, (size_t) head_dim * n_kv_head);
+        ggml_tensor * cache  = ggml_new_tensor_1d(pc, t, (int64_t) head_dim * n_kv_head * 8);
+        ggml_tensor * view   = ggml_view_2d(pc, cache, head_dim, 4, tok_row, 0);
+        ggml_tensor * cast   = ggml_cast(pc, view, GGML_TYPE_F32);
+        cast_ok = (cast != nullptr) && ggml_backend_supports_op(backend, cast);
+        ggml_free(pc);
+    }
+    const ggml_type eff = chatterbox_mtl_kv_type_for_cast_support(t, cast_ok);
+    if (eff != t) {
+        fprintf(stderr, "chatterbox(mtl): backend cannot encode the quantized-KV alignment "
+                        "cast (%s strided -> f32); using f32 KV cache\n", ggml_type_name(t));
+    }
+    return eff;
 }
 
 bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers, ggml_type kv_type) {
@@ -744,6 +810,59 @@ static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past
 // Evaluation
 // --------------------------------------------------------------------------
 
+// Dual-path dispatch shared with t3_mtl.cpp (declared in
+// chatterbox_t3_internal.h): direct single-backend compute when the primary
+// backend supports every op, sched over [backend, CPU-last] otherwise so an
+// unsupported op degrades to a per-op CPU fallback instead of a backend
+// assert inside graph_compute.
+
+bool t3_use_sched(const chatterbox_model & model, const ggml_cgraph * gf) {
+    return ::tts_cpp::detail::sched_force_enabled() ||
+           !::tts_cpp::detail::graph_fully_supported(model.backend, gf);
+}
+
+bool t3_sched_prepare(const chatterbox_model & model, ggml_cgraph * gf,
+                      const char * caller) {
+    // An op that writes a pre-allocated buffer (the persistent KV slab) and
+    // is runnable by no backend would GGML_ABORT inside the scheduler's
+    // split pass — fail gracefully instead.
+    if (::tts_cpp::detail::graph_has_unsupported_preallocated_op(model.backend, gf)) {
+        fprintf(stderr, "%s: an op writing a persistent (KV) buffer is unsupported by the "
+                        "backend; scheduler fallback impossible\n", caller);
+        return false;
+    }
+    if (!::tts_cpp::detail::sched_fallback_ensure(model.sched_fb, model.backend,
+            /*graph_size=*/2 * CHBX_MAX_NODES,
+            {model.buffer_w, model.buffer_stack, model.buffer_override})) {
+        fprintf(stderr, "%s: scheduler creation failed\n", caller);
+        return false;
+    }
+    if (!::tts_cpp::detail::sched_fallback_alloc(model.sched_fb, gf)) {
+        fprintf(stderr, "%s: ggml_backend_sched_alloc_graph failed\n", caller);
+        return false;
+    }
+    return true;
+}
+
+bool t3_dispatch_compute(const chatterbox_model & model, ggml_cgraph * gf,
+                         int n_threads, bool use_sched,
+                         const char * caller, int n_past) {
+    const ggml_status status = use_sched
+        ? ::tts_cpp::detail::sched_fallback_compute(model.sched_fb, model.backend, gf, n_threads)
+        : ::tts_cpp::detail::direct_compute(model.backend, gf, n_threads);
+    if (status != GGML_STATUS_SUCCESS) {
+        if (n_past >= 0) {
+            fprintf(stderr, "%s: graph compute failed (n_past=%d, ggml_status=%d)\n",
+                    caller, n_past, (int)status);
+        } else {
+            fprintf(stderr, "%s: graph compute failed (ggml_status=%d)\n",
+                    caller, (int)status);
+        }
+        return false;
+    }
+    return true;
+}
+
 bool eval_prompt(
     const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
     const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
@@ -754,8 +873,13 @@ bool eval_prompt(
         return false;
     }
     ggml_cgraph * gf = build_prompt_graph(model, (int)text_tokens.size());
-    ggml_gallocr_reserve(allocr, gf);
-    ggml_gallocr_alloc_graph(allocr, gf);
+    const bool use_sched = t3_use_sched(model, gf);
+    if (!use_sched) {
+        ggml_gallocr_reserve(allocr, gf);
+        ggml_gallocr_alloc_graph(allocr, gf);
+    } else if (!t3_sched_prepare(model, gf, __func__)) {
+        return false;
+    }
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "text_tokens"), text_tokens.data(), 0, text_tokens.size()*sizeof(int32_t));
     int32_t st = model.hparams.start_speech_token;
@@ -781,11 +905,7 @@ bool eval_prompt(
         }
     }
 
-    // Registry-routed n_threads (no-op on non-CPU backends); see
-    // src/t3_mtl.cpp for the GGML_BACKEND_DL=ON unresolvable-symbol
-    // rationale.
-    ::tts_cpp::detail::backend_set_n_threads(model.backend, n_threads);
-    ggml_backend_graph_compute(model.backend, gf);
+    if (!t3_dispatch_compute(model, gf, n_threads, use_sched, __func__)) return false;
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(model.hparams.n_speech_vocab);
@@ -800,16 +920,19 @@ bool eval_step(
     int n_past, int32_t token, std::vector<float> & logits_out) {
 
     ggml_cgraph * gf = build_step_graph(model, n_past);
-    ggml_gallocr_reserve(allocr, gf);
-    ggml_gallocr_alloc_graph(allocr, gf);
+    const bool use_sched = t3_use_sched(model, gf);
+    if (!use_sched) {
+        ggml_gallocr_reserve(allocr, gf);
+        ggml_gallocr_alloc_graph(allocr, gf);
+    } else if (!t3_sched_prepare(model, gf, __func__)) {
+        return false;
+    }
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token, 0, sizeof(token));
     int32_t position = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), &position, 0, sizeof(position));
 
-    // Registry-routed n_threads; see src/t3_mtl.cpp for rationale.
-    ::tts_cpp::detail::backend_set_n_threads(model.backend, n_threads);
-    ggml_backend_graph_compute(model.backend, gf);
+    if (!t3_dispatch_compute(model, gf, n_threads, use_sched, __func__, n_past)) return false;
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(model.hparams.n_speech_vocab);

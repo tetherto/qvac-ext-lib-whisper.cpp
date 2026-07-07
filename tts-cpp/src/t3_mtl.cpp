@@ -714,7 +714,16 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
                     layer_off + (size_t) probe_head * kv_head_row
                               + (size_t) ti * kv_tok_row);
             }
-            k_text = ggml_cont(ctx, k_text);
+            // Dequantize-and-pack the text-key slice to contiguous f32 for the
+            // mul_mat.  When the KV cache is quantized (q8_0), a plain ggml_cont
+            // would produce a quantized CONT, which ggml-metal can't encode (no
+            // quantized CONT kernel) — it SIGABRTs the whole decode.  ggml_cast
+            // to f32 is a dequantizing copy that Metal *does* support for a
+            // strided quantized view, and for an f32/f16 cache it
+            // degrades to a cheap cont/upcast.  This slice is tiny (HD × n_text
+            // for one head) and off the hot path, so the dequant cost is
+            // negligible.
+            k_text = ggml_cast(ctx, k_text, GGML_TYPE_F32);
             ggml_tensor * scores = ggml_mul_mat(ctx, k_text, q_h);        // (n_text, N)
             scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float) HD));
             ggml_tensor * aprobs = ggml_soft_max(ctx, scores);           // softmax over n_text
@@ -1200,9 +1209,14 @@ bool run_prompt_pass(const chatterbox_model & model,
     prompt_len_out = N;
 
     ggml_cgraph * gf = build_prompt_graph_mtl(model, (int) text_tokens.size(), is_uncond);
-    // alloc_graph reserves lazily; see run_step_pass_b2 comment.
-    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
-        fprintf(stderr, "run_prompt_pass: gallocr_alloc_graph failed (graph topology exceeded reserved budget?)\n");
+    const bool use_sched = t3_use_sched(model, gf);
+    if (!use_sched) {
+        // alloc_graph reserves lazily; see run_step_pass_b2 comment.
+        if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+            fprintf(stderr, "run_prompt_pass: gallocr_alloc_graph failed (graph topology exceeded reserved budget?)\n");
+            return false;
+        }
+    } else if (!t3_sched_prepare(model, gf, __func__)) {
         return false;
     }
 
@@ -1241,13 +1255,7 @@ bool run_prompt_pass(const chatterbox_model & model,
     fill_causal_mask_f16(mask, N);
     set_in("kq_mask", mask.data(), mask.size() * sizeof(ggml_fp16_t));
 
-    // Registry-routed n_threads (works under GGML_BACKEND_DL=ON: the CPU
-    // backend lives in a dlopen'd per-arch .so, so the static
-    // `ggml_backend_cpu_set_n_threads` symbol is unresolvable at link time).
-    // The helper is a no-op on non-CPU backends and on CPU backends that
-    // don't export `ggml_backend_set_n_threads`.
-    ::tts_cpp::detail::backend_set_n_threads(model.backend, n_threads);
-    ggml_backend_graph_compute(model.backend, gf);
+    if (!t3_dispatch_compute(model, gf, n_threads, use_sched, "run_prompt_pass")) return false;
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(ggml_nelements(logits));
@@ -1274,11 +1282,16 @@ bool run_prompt_pass_b2(const chatterbox_model & model,
     prompt_len_out = N;
 
     ggml_cgraph * gf = build_prompt_graph_mtl_b2(model, (int) text_tokens.size());
-    // alloc_graph below already reserves lazily via ggml_gallocr_needs_realloc;
-    // see run_step_pass_b2 for the rationale on dropping the explicit
-    // ggml_gallocr_reserve(allocr, gf) call here.
-    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
-        fprintf(stderr, "run_prompt_pass_b2: gallocr_alloc_graph failed (graph topology exceeded reserved budget?)\n");
+    const bool use_sched = t3_use_sched(model, gf);
+    if (!use_sched) {
+        // alloc_graph below already reserves lazily via ggml_gallocr_needs_realloc;
+        // see run_step_pass_b2 for the rationale on dropping the explicit
+        // ggml_gallocr_reserve(allocr, gf) call here.
+        if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+            fprintf(stderr, "run_prompt_pass_b2: gallocr_alloc_graph failed (graph topology exceeded reserved budget?)\n");
+            return false;
+        }
+    } else if (!t3_sched_prepare(model, gf, __func__)) {
         return false;
     }
 
@@ -1313,13 +1326,7 @@ bool run_prompt_pass_b2(const chatterbox_model & model,
     fill_causal_mask_f16(mask, N);
     set_in("kq_mask", mask.data(), mask.size() * sizeof(ggml_fp16_t));
 
-    // Registry-routed n_threads (works under GGML_BACKEND_DL=ON: the CPU
-    // backend lives in a dlopen'd per-arch .so, so the static
-    // `ggml_backend_cpu_set_n_threads` symbol is unresolvable at link time).
-    // The helper is a no-op on non-CPU backends and on CPU backends that
-    // don't export `ggml_backend_set_n_threads`.
-    ::tts_cpp::detail::backend_set_n_threads(model.backend, n_threads);
-    ggml_backend_graph_compute(model.backend, gf);
+    if (!t3_dispatch_compute(model, gf, n_threads, use_sched, "run_prompt_pass_b2")) return false;
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     // logits ne=[n_speech_vocab, 1, 2], contiguous.  Cond at b=0, uncond at b=1.
@@ -1342,16 +1349,21 @@ bool run_step_pass_b2(const chatterbox_model & model,
     const auto & hp = model.hparams;
 
     ggml_cgraph * gf = build_step_graph_mtl_b2(model, n_past);
-    // Skip the explicit ggml_gallocr_reserve(allocr, gf) call here:
-    // alloc_graph below already calls ggml_gallocr_needs_realloc, and
-    // only re-runs the topology analysis when the graph actually grew
-    // (single-buffer single-backend case — the default for chatterbox).
-    // The per-step graph keeps the same node count + per-node tensor
-    // shapes for every n_past >= 1, so after the first call alloc_graph
-    // is a fast O(n_nodes) buffer-reset; the explicit reserve forced an
-    // unnecessary topology re-walk on every one of the 84 step calls.
-    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
-        fprintf(stderr, "run_step_pass_b2: gallocr_alloc_graph failed (n_past=%d)\n", n_past);
+    const bool use_sched = t3_use_sched(model, gf);
+    if (!use_sched) {
+        // Skip the explicit ggml_gallocr_reserve(allocr, gf) call here:
+        // alloc_graph below already calls ggml_gallocr_needs_realloc, and
+        // only re-runs the topology analysis when the graph actually grew
+        // (single-buffer single-backend case — the default for chatterbox).
+        // The per-step graph keeps the same node count + per-node tensor
+        // shapes for every n_past >= 1, so after the first call alloc_graph
+        // is a fast O(n_nodes) buffer-reset; the explicit reserve forced an
+        // unnecessary topology re-walk on every one of the 84 step calls.
+        if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+            fprintf(stderr, "run_step_pass_b2: gallocr_alloc_graph failed (n_past=%d)\n", n_past);
+            return false;
+        }
+    } else if (!t3_sched_prepare(model, gf, __func__)) {
         return false;
     }
 
@@ -1361,13 +1373,7 @@ bool run_step_pass_b2(const chatterbox_model & model,
     int32_t pos = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos_ids"), &pos, 0, sizeof(pos));
 
-    // Registry-routed n_threads (works under GGML_BACKEND_DL=ON: the CPU
-    // backend lives in a dlopen'd per-arch .so, so the static
-    // `ggml_backend_cpu_set_n_threads` symbol is unresolvable at link time).
-    // The helper is a no-op on non-CPU backends and on CPU backends that
-    // don't export `ggml_backend_set_n_threads`.
-    ::tts_cpp::detail::backend_set_n_threads(model.backend, n_threads);
-    ggml_backend_graph_compute(model.backend, gf);
+    if (!t3_dispatch_compute(model, gf, n_threads, use_sched, "run_step_pass_b2", n_past)) return false;
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     const size_t per_batch_bytes = (size_t) hp.n_speech_vocab * sizeof(float);
@@ -1415,9 +1421,24 @@ bool run_step_pass(const chatterbox_model & model,
     ggml_cgraph * gf = entry ? entry->gf
                              : build_step_graph_mtl(model, n_past, is_uncond);
 
-    // alloc_graph reserves lazily; see run_step_pass_b2 comment.
-    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
-        fprintf(stderr, "run_step_pass: gallocr_alloc_graph failed (n_past=%d)\n", n_past);
+    // The walk below is read-only, so probing a cached graph is fine; but a
+    // cached graph must NOT be fed to the scheduler itself —
+    // ggml_backend_sched_alloc_graph rewrites node->src[] in place with
+    // per-run fallback copies, which would dangle on the next reuse.
+    // Rebuild fresh for the sched path instead (the entry stays cached and
+    // untouched for future direct-path calls).
+    const bool use_sched = t3_use_sched(model, gf);
+    if (use_sched && entry) {
+        entry = nullptr;
+        gf = build_step_graph_mtl(model, n_past, is_uncond);
+    }
+    if (!use_sched) {
+        // alloc_graph reserves lazily; see run_step_pass_b2 comment.
+        if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+            fprintf(stderr, "run_step_pass: gallocr_alloc_graph failed (n_past=%d)\n", n_past);
+            return false;
+        }
+    } else if (!t3_sched_prepare(model, gf, __func__)) {
         return false;
     }
 
@@ -1427,13 +1448,7 @@ bool run_step_pass(const chatterbox_model & model,
     int32_t pos = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos_ids"), &pos, 0, sizeof(pos));
 
-    // Registry-routed n_threads (works under GGML_BACKEND_DL=ON: the CPU
-    // backend lives in a dlopen'd per-arch .so, so the static
-    // `ggml_backend_cpu_set_n_threads` symbol is unresolvable at link time).
-    // The helper is a no-op on non-CPU backends and on CPU backends that
-    // don't export `ggml_backend_set_n_threads`.
-    ::tts_cpp::detail::backend_set_n_threads(model.backend, n_threads);
-    ggml_backend_graph_compute(model.backend, gf);
+    if (!t3_dispatch_compute(model, gf, n_threads, use_sched, "run_step_pass", n_past)) return false;
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(ggml_nelements(logits));
@@ -1828,8 +1843,18 @@ bool load_model_gguf_mtl(const std::string & path,
         // kv_layer_elems * sizeof(float).
         // Fall back to F32 KV if the resolved backend can't run flash
         // attention with the requested quantized/f16 K/V.
-        hp.kv_type = chatterbox_resolve_kv_type(model.backend, kv_type,
-                                                hp.head_dim, hp.n_head, hp.n_kv_head);
+        // a quantized (q8_0) KV cache used to SIGABRT on Metal
+        // ("unsupported op 'CONT'").  The cause was NOT flash-attention (which
+        // reads the q8 strided cache fine on Metal) but the per-(layer,head)
+        // alignment probe in build_llama_block, which ggml_cont'd a strided view
+        // of the quantized K cache to feed a mul_mat — and ggml-metal has no CONT
+        // kernel for quantized tensors.  That cont is now a dequantizing
+        // ggml_cast to f32 (Metal-supported), so quantized K/V runs on the GPU.
+        // chatterbox_mtl_resolve_kv_type probes that cast per-backend and falls
+        // back to f32 on any GPU backend that can't encode it (Vulkan coopmat2 is
+        // separately force-f32'd inside the shared resolve).
+        hp.kv_type = chatterbox_mtl_resolve_kv_type(model.backend, kv_type,
+                                                    hp.head_dim, hp.n_head, hp.n_kv_head);
         ggml_init_params kv_params = { ggml_tensor_overhead() * 4, nullptr, true };
         model.ctx_kv = ggml_init(kv_params);
         const int64_t kv_elements_b2 =
@@ -1839,7 +1864,7 @@ bool load_model_gguf_mtl(const std::string & path,
         // M3 Ultra (Q4_0 502 → 507 ms; ggml-metal's flash-attn already
         // runs its matmul at F16 internally regardless of storage dtype).
         // The host opts into f16 / q8_0 via EngineOptions::kv_cache_type
-        // when memory matters more than bit-exactness (QVAC-19557): the
+        // when memory matters more than bit-exactness: the
         // token-major slab layout in build_llama_block keeps the per-step
         // append contiguous so ggml_cpy converts/quantises on write.
         model.memory_k = ggml_new_tensor_1d(model.ctx_kv, hp.kv_type, kv_elements_b2);
@@ -1913,29 +1938,36 @@ bool load_model_gguf_mtl(const std::string & path,
             // equality guard above implies wq/wk/wv have identical sizes
             // today, but max over all three so a future shape divergence
             // can't silently truncate a per-layer copy.
+            // Assemble each stacked wqkv fully in host scratch, then upload it
+            // in a SINGLE whole-tensor set_tensor. The OpenCL Q4_0 SOA path
+            // rebuilds the struct-of-arrays (scale/quant) layout from the
+            // ENTIRE tensor and ignores the (offset, size) window — it reads
+            // ggml_nbytes(dst) from `data` regardless of `size`. Writing the
+            // three matrices with per-Q/K/V partial set_tensor calls therefore
+            // made it read past the end of the single-matrix scratch and
+            // SIGSEGV on Adreno at chatterbox-mtl load (QVAC-19557). Q4_0 rows
+            // are M-major and packed contiguously, so concatenating wq|wk|wv
+            // bytes is exactly the wqkv layout.
             size_t scratch_bytes = 0;
             for (int i = 0; i < hp.n_layer; ++i) {
                 auto & l = model.layers_mtl[i];
                 if (!l.wqkv) continue;
-                scratch_bytes = std::max({scratch_bytes,
-                                          ggml_nbytes(l.wq),
-                                          ggml_nbytes(l.wk),
-                                          ggml_nbytes(l.wv)});
+                scratch_bytes = std::max(scratch_bytes, ggml_nbytes(l.wqkv));
             }
             std::vector<char> scratch(scratch_bytes);
             for (int i = 0; i < hp.n_layer; ++i) {
                 auto & l = model.layers_mtl[i];
                 if (!l.wqkv) continue;
                 size_t off = 0;
-                auto copy_into = [&](ggml_tensor * src, ggml_tensor * dst) {
+                auto copy_into = [&](ggml_tensor * src) {
                     const size_t nb = ggml_nbytes(src);
-                    ggml_backend_tensor_get(src, scratch.data(), 0, nb);
-                    ggml_backend_tensor_set(dst, scratch.data(), off, nb);
+                    ggml_backend_tensor_get(src, scratch.data() + off, 0, nb);
                     off += nb;
                 };
-                copy_into(l.wq, l.wqkv);
-                copy_into(l.wk, l.wqkv);
-                copy_into(l.wv, l.wqkv);
+                copy_into(l.wq);
+                copy_into(l.wk);
+                copy_into(l.wv);
+                ggml_backend_tensor_set(l.wqkv, scratch.data(), 0, off);
             }
         }
 
