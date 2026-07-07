@@ -185,9 +185,16 @@ void host_joint_step(const TdtRuntimeWeights & W,
 // is shared between the init-only `g_lstm` graph and the fused
 // `g_lstm_joint` graph so they stay numerically identical.
 struct LstmBodyOuts {
-    ggml_tensor * h_cpy;
-    ggml_tensor * c_cpy;
+    ggml_tensor * h_cpy;    // last layer's h write (kept for existing single-node refs)
+    ggml_tensor * c_cpy;    // last layer's c write
     ggml_tensor * pred_cpy;
+    // ALL layers' h/c state-write cpy nodes. Every one must be marked as a graph
+    // output and forward-expanded, otherwise ggml_build_forward_expand prunes the
+    // writes for layers whose result no downstream node reads (i.e. every layer
+    // except the last): those layers' h_persist/c_persist never update on the
+    // device path and the predictor loses its recurrence -> dropped word-final
+    // subwords. The host path loops all layers, which is why it stays correct.
+    std::vector<ggml_tensor *> state_cpy;
 };
 
 LstmBodyOuts build_lstm_body(TdtRuntimeWeights & rt,
@@ -252,6 +259,8 @@ LstmBodyOuts build_lstm_body(TdtRuntimeWeights & rt,
         ggml_tensor * c_dst = ggml_view_1d(gctx, rt.c_persist, H, (size_t) l * H * sizeof(float));
         out.h_cpy = ggml_cpy(gctx, h_new_per_layer[l], h_dst);
         out.c_cpy = ggml_cpy(gctx, c_new_per_layer[l], c_dst);
+        out.state_cpy.push_back(out.h_cpy);
+        out.state_cpy.push_back(out.c_cpy);
     }
     out.pred_cpy = ggml_cpy(gctx, h_new_per_layer[L - 1], rt.pred_persist);
     return out;
@@ -347,13 +356,14 @@ void build_lstm_graph(TdtRuntimeWeights & rt) {
     ggml_set_name(rt.lstm_h_out,    "lstm.h_out");
     ggml_set_name(rt.lstm_c_out,    "lstm.c_out");
     ggml_set_name(rt.lstm_pred_out, "lstm.pred_out");
-    ggml_set_output(rt.lstm_h_out);
-    ggml_set_output(rt.lstm_c_out);
     ggml_set_output(rt.lstm_pred_out);
+    // Mark EVERY layer's h/c state write as an output (not just the last), else
+    // forward_expand prunes the non-last layers' writes and their state never
+    // advances. See LstmBodyOuts::state_cpy.
+    for (ggml_tensor * n : outs.state_cpy) ggml_set_output(n);
 
     rt.g_lstm = ggml_new_graph_custom(gctx, /*size*/ 256, /*grads*/ false);
-    ggml_build_forward_expand(rt.g_lstm, rt.lstm_h_out);
-    ggml_build_forward_expand(rt.g_lstm, rt.lstm_c_out);
+    for (ggml_tensor * n : outs.state_cpy) ggml_build_forward_expand(rt.g_lstm, n);
     ggml_build_forward_expand(rt.g_lstm, rt.lstm_pred_out);
 }
 
@@ -416,17 +426,17 @@ void build_lstm_joint_graph(TdtRuntimeWeights & rt) {
     ggml_set_name(rt.lj_dur_out,   rt.argmax_on_gpu ? "lstm_joint.dur_argmax"   : "lstm_joint.dur_logits");
     ggml_set_output(rt.lj_token_out);
     ggml_set_output(rt.lj_dur_out);
-    // Mark the LSTM cpy nodes as outputs too so gallocr keeps them alive
-    // (their memory IS h_persist / c_persist; without the output flag the
-    // gallocr might prune them as dead-end intermediate writes).
-    ggml_set_output(lstm_outs.h_cpy);
-    ggml_set_output(lstm_outs.c_cpy);
+    // Mark EVERY layer's h/c state write as an output so gallocr keeps them alive
+    // (their memory IS h_persist / c_persist). Without this, forward_expand prunes
+    // the dead-end intermediate writes for all but the last layer, so those layers'
+    // recurrent state never advances on the device path -> dropped word-final
+    // subwords. See LstmBodyOuts::state_cpy.
+    for (ggml_tensor * n : lstm_outs.state_cpy) ggml_set_output(n);
 
     rt.g_lstm_joint = ggml_new_graph_custom(gctx, /*size*/ 384, /*grads*/ false);
     ggml_build_forward_expand(rt.g_lstm_joint, rt.lj_token_out);
     ggml_build_forward_expand(rt.g_lstm_joint, rt.lj_dur_out);
-    ggml_build_forward_expand(rt.g_lstm_joint, lstm_outs.h_cpy);
-    ggml_build_forward_expand(rt.g_lstm_joint, lstm_outs.c_cpy);
+    for (ggml_tensor * n : lstm_outs.state_cpy) ggml_build_forward_expand(rt.g_lstm_joint, n);
 }
 
 // Build the full-window encoder-side projection graph for a given frame
