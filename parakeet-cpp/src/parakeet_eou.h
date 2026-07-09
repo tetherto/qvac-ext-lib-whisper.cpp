@@ -156,7 +156,10 @@ struct EouRuntimeWeights {
     EouRuntimeWeights & operator=(EouRuntimeWeights && other) noexcept;
     ~EouRuntimeWeights();
 
-    bool ready() const { return weights != nullptr || !embed.empty(); }
+    // Frees owned backend resources (graphs, gallocrs, persistent buffer,
+    // ggml contexts) and resets the handles; keeps the object alive so it
+    // can be re-assigned. Used by the destructor and move-assignment.
+    void release() noexcept;
 };
 
 struct EouDecodeOptions {
@@ -197,7 +200,10 @@ struct EouDecodeResult {
 
 int eou_prepare_runtime(const ParakeetCtcModel & model, EouRuntimeWeights & out);
 
-void eou_init_state(EouRuntimeWeights & W, EouDecodeState & state);
+// Zeroes the predictor state and primes it with one blank-token LSTM step.
+// Returns 0 on success, non-zero if the GPU-path graph compute fails (same
+// rc convention as eou_decode_window).
+int eou_init_state(EouRuntimeWeights & W, EouDecodeState & state);
 
 // Decode an arbitrary span of encoder frames. State is preserved across
 // calls so the same decoder can be driven chunk-by-chunk in

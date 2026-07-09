@@ -529,7 +529,12 @@ EouRuntimeWeights::EouRuntimeWeights(EouRuntimeWeights && o) noexcept { *this = 
 
 EouRuntimeWeights & EouRuntimeWeights::operator=(EouRuntimeWeights && o) noexcept {
     if (this == &o) return *this;
-    this->~EouRuntimeWeights();
+    // Free owned backend resources without ending the object's lifetime
+    // (unlike TdtRuntimeWeights' destroy-then-assign, which is UB when the
+    // destination was already populated — e.g. a second prepare_runtime on
+    // the same object). The vector members are move-assigned below, which
+    // frees their previous storage on its own.
+    release();
 
     H_pred   = o.H_pred;
     H_joint  = o.H_joint;
@@ -578,7 +583,7 @@ EouRuntimeWeights & EouRuntimeWeights::operator=(EouRuntimeWeights && o) noexcep
     return *this;
 }
 
-EouRuntimeWeights::~EouRuntimeWeights() {
+void EouRuntimeWeights::release() noexcept {
     for (auto & g : enc_proj_cache) {
         free_enc_proj_graph(g);
     }
@@ -589,7 +594,18 @@ EouRuntimeWeights::~EouRuntimeWeights() {
     if (persist_buffer) { ggml_backend_buffer_free(persist_buffer); persist_buffer = nullptr; }
     if (persist_ctx) { ggml_free(persist_ctx); persist_ctx = nullptr; }
     if (gctx)        { ggml_free(gctx);        gctx        = nullptr; }
+    // Graph/tensor pointers were parented on the freed contexts.
+    g_lstm = nullptr;        lstm_token_in = nullptr;      lstm_pred_out = nullptr;
+    g_joint = nullptr;       joint_frame_idx_in = nullptr; joint_token_out = nullptr;
+    g_lstm_joint = nullptr;  lj_token_in = nullptr;        lj_frame_idx_in = nullptr;
+    lj_token_out = nullptr;
+    h_persist = nullptr; c_persist = nullptr; pred_persist = nullptr;
+    enc_proj_persist = nullptr;
     // backend is owned by ParakeetCtcModel::Impl; don't free here.
+}
+
+EouRuntimeWeights::~EouRuntimeWeights() {
+    release();
 }
 
 int eou_prepare_runtime(const ParakeetCtcModel & model, EouRuntimeWeights & W) {
@@ -724,7 +740,7 @@ int eou_prepare_runtime(const ParakeetCtcModel & model, EouRuntimeWeights & W) {
     return 0;
 }
 
-void eou_init_state(EouRuntimeWeights & W, EouDecodeState & state) {
+int eou_init_state(EouRuntimeWeights & W, EouDecodeState & state) {
     const int H = W.H_pred;
     const int L = W.L;
 
@@ -737,7 +753,8 @@ void eou_init_state(EouRuntimeWeights & W, EouDecodeState & state) {
     // first decoder forward with `targets=[blank]`).
     if (W.use_graphs) {
         if (!gpu_reset_predictor(W)) {
-            throw std::runtime_error("eou_init_state: LSTM graph compute failed");
+            PARAKEET_LOG_ERROR("eou_init_state: LSTM graph compute failed\n");
+            return 1;
         }
         // Host-side scratch is unused on the GPU path.
         state.h_state.clear();
@@ -758,6 +775,7 @@ void eou_init_state(EouRuntimeWeights & W, EouDecodeState & state) {
     }
 
     state.initialized = true;
+    return 0;
 }
 
 namespace {
@@ -886,7 +904,7 @@ int eou_decode_window(const ParakeetCtcModel & model,
     }
     if (n_frames <= 0) return 0;
     if (!state.initialized) {
-        eou_init_state(W, state);
+        if (eou_init_state(W, state) != 0) return 10;
     }
 
     if (W.use_graphs) {
