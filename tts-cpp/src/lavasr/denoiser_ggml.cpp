@@ -14,6 +14,14 @@
 namespace tts_cpp::lavasr {
 namespace detail {
 
+// fp32-precise matmul: parity with the scalar core requires fp32 arithmetic
+// even on GPUs whose default F32 matmul multiplies in fp16 (e.g. Vulkan).
+static ggml_tensor * mul_mat_f32(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
+    ggml_tensor * r = ggml_mul_mat(ctx, a, b);
+    ggml_mul_mat_set_prec(r, GGML_PREC_F32);
+    return r;
+}
+
 // [n, B] slice of rows [r0, r0+n) from a [3H, B] gate tensor, as a strided view
 // (the consuming add/mul emit a contiguous result, so no cont is needed).
 static ggml_tensor * gate_rows(ggml_context * ctx, ggml_tensor * g, int64_t r0, int64_t n) {
@@ -33,7 +41,7 @@ ggml_tensor * gru_batched(ggml_context * ctx, ggml_tensor * x, ggml_tensor * Wih
 
     // Precompute the state-independent input transform Wih*x for ALL timesteps in one wide
     // [3H, B*L] GEMM (bias broadcast once); bit-identical to the per-step transform.
-    ggml_tensor * gi_all = ggml_add(ctx, ggml_mul_mat(ctx, Wih, ggml_reshape_2d(ctx, x, I, B * L)), bih);
+    ggml_tensor * gi_all = ggml_add(ctx, mul_mat_f32(ctx, Wih, ggml_reshape_2d(ctx, x, I, B * L)), bih);
     gi_all               = ggml_reshape_3d(ctx, gi_all, 3 * H, B, L);          // [3H, B, L]
 
     // Fused GRU op: the whole recurrent sweep in one dispatch; the per-step path below is
@@ -49,7 +57,7 @@ ggml_tensor * gru_batched(ggml_context * ctx, ggml_tensor * x, ggml_tensor * Wih
         ggml_tensor * gi = ggml_view_2d(ctx, gi_all, 3 * H, B, gi_all->nb[1],
                                         (size_t) t * gi_all->nb[2]);           // [3H, B] at time t
         // h == 0 on the first step: Whh*0 = 0, so gh = Bhh broadcast over B.
-        ggml_tensor * gh = h ? ggml_add(ctx, ggml_mul_mat(ctx, Whh, h), bhh)
+        ggml_tensor * gh = h ? ggml_add(ctx, mul_mat_f32(ctx, Whh, h), bhh)
                              : ggml_add(ctx, ggml_scale(ctx, gi, 0.0f), bhh);   // [3H, B]
 
         ggml_tensor * r = ggml_sigmoid(ctx, ggml_add(ctx, gate_rows(ctx, gi, 0, H),
@@ -183,7 +191,7 @@ static ggml_tensor * grnn(ggml_context * ctx, ggml_tensor * x, const std::string
 static ggml_tensor * fc_hidden(ggml_context * ctx, ggml_tensor * y, ggml_tensor * Wfc,
                                ggml_tensor * bias) {
     const int64_t hy = y->ne[0], B = y->ne[1], L = y->ne[2], Cout = Wfc->ne[1];
-    ggml_tensor * r  = ggml_mul_mat(ctx, Wfc, ggml_reshape_2d(ctx, ggml_cont(ctx, y), hy, B * L)); // [Cout, B*L]
+    ggml_tensor * r  = mul_mat_f32(ctx, Wfc, ggml_reshape_2d(ctx, ggml_cont(ctx, y), hy, B * L)); // [Cout, B*L]
     if (bias) r = ggml_add(ctx, r, ggml_reshape_2d(ctx, bias, Cout, 1));
     return ggml_reshape_3d(ctx, r, Cout, B, L);                                // [Cout, B, L]
 }
@@ -264,7 +272,7 @@ static ggml_tensor * erb_bm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * E
     ggml_tensor * lo = ggml_cont(ctx, ggml_view_4d(ctx, x, low, T, C, Bc, x->nb[1], x->nb[2], x->nb[3], 0));
     ggml_tensor * hg = ggml_cont(ctx, ggml_view_4d(ctx, x, in, T, C, Bc, x->nb[1], x->nb[2], x->nb[3],
                                                    (size_t) low * x->nb[0]));            // [in, T, C, Bc]
-    ggml_tensor * hc = ggml_mul_mat(ctx, E, ggml_reshape_2d(ctx, hg, in, T * C * Bc));   // [hi, T*C*Bc]
+    ggml_tensor * hc = mul_mat_f32(ctx, E, ggml_reshape_2d(ctx, hg, in, T * C * Bc));    // [hi, T*C*Bc]
     return ggml_concat(ctx, lo, ggml_reshape_4d(ctx, hc, hi, T, C, Bc), 0);              // [low+hi, T, C, Bc]
 }
 
@@ -274,7 +282,7 @@ static ggml_tensor * erb_bs(ggml_context * ctx, ggml_tensor * m, ggml_tensor * E
     ggml_tensor * lo = ggml_cont(ctx, ggml_view_4d(ctx, m, low, T, C, Bc, m->nb[1], m->nb[2], m->nb[3], 0));
     ggml_tensor * hg = ggml_cont(ctx, ggml_view_4d(ctx, m, hi, T, C, Bc, m->nb[1], m->nb[2], m->nb[3],
                                                    (size_t) low * m->nb[0]));            // [hi, T, C, Bc]
-    ggml_tensor * hc = ggml_mul_mat(ctx, E, ggml_reshape_2d(ctx, hg, hi, T * C * Bc));   // [out, T*C*Bc]
+    ggml_tensor * hc = mul_mat_f32(ctx, E, ggml_reshape_2d(ctx, hg, hi, T * C * Bc));    // [out, T*C*Bc]
     return ggml_concat(ctx, lo, ggml_reshape_4d(ctx, hc, out, T, C, Bc), 0);             // [low+out, T, C, Bc]
 }
 

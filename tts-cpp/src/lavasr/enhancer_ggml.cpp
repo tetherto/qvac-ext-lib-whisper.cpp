@@ -77,6 +77,14 @@ namespace {
 // tolerance the enhancer is validated against.
 // -----------------------------------------------------------------------------
 
+// fp32-precise matmul: parity with the scalar core requires fp32 arithmetic
+// even on GPUs whose default F32 matmul multiplies in fp16 (e.g. Vulkan).
+static ggml_tensor * mul_mat_f32(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
+    ggml_tensor * r = ggml_mul_mat(ctx, a, b);
+    ggml_mul_mat_set_prec(r, GGML_PREC_F32);
+    return r;
+}
+
 // Regular / pointwise Conv1d.  kernel [K, IC, OC], input [T, IC, 1] -> [T, OC, 1].
 // bias (optional) [1, OC] is broadcast over the time axis.
 ggml_tensor * conv1d_same(ggml_context * ctx, ggml_tensor * kernel,
@@ -85,7 +93,7 @@ ggml_tensor * conv1d_same(ggml_context * ctx, ggml_tensor * kernel,
                                        /*s0=*/1, /*s1=*/0, /*p0=*/pad, /*p1=*/0,
                                        /*d0=*/1, /*d1=*/0, /*is_2D=*/false,
                                        GGML_TYPE_F32);
-    ggml_tensor * r = ggml_mul_mat(
+    ggml_tensor * r = mul_mat_f32(
         ctx,
         ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
         ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]));
@@ -117,7 +125,7 @@ ggml_tensor * depthwise_same(ggml_context * ctx, ggml_tensor * kernel,
                                            /*s0=*/1, /*s1=*/0, /*p0=*/pad, /*p1=*/0,
                                            /*d0=*/1, /*d1=*/0, /*is_2D=*/false,
                                            GGML_TYPE_F32); // [K, T, C, 1]
-        y = ggml_mul_mat(ctx, im2col, kernel);             // [T, 1, C, 1]
+        y = mul_mat_f32(ctx, im2col, kernel);              // [T, 1, C, 1]
     }
     y = ggml_reshape_3d(ctx, y, y->ne[0], y->ne[2], 1);    // [T, C, 1]
     if (bias) {
