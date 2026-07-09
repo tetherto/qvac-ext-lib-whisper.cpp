@@ -457,7 +457,7 @@ struct DenoiserGgml::Impl {
     float bn_eps = 1e-5f, ln_eps = 1e-8f;
 
     ggml_backend_t        backend = nullptr;
-    bool                  gpu = false, opencl = false;
+    bool                  gpu = false, opencl = false, vulkan = false;
     ggml_context *        wctx   = nullptr;
     ggml_backend_buffer_t wbuf   = nullptr;
     ggml_gallocr_t        galloc = nullptr;
@@ -493,6 +493,7 @@ void DenoiserGgml::Impl::init_backend(int n_gpu_layers, bool verbose) {
     if (!backend) { backend = ::tts_cpp::detail::init_cpu_backend(); gpu = false; }
     if (!backend) throw std::runtime_error("denoiser_ggml: no backend available");
     opencl = ::tts_cpp::detail::backend_is_opencl(backend);
+    vulkan = ::tts_cpp::detail::backend_is_vulkan(backend);
 }
 
 void DenoiserGgml::Impl::upload_weights(const std::vector<Pend> & pend) {
@@ -515,9 +516,9 @@ void DenoiserGgml::Impl::upload_weights(const std::vector<Pend> & pend) {
 
 GraphIO DenoiserGgml::Impl::build_graph(ggml_context * ctx, ggml_cgraph * gf, int L, int Bc) const {
     const int F = spec_bins, r = freq_comp_ratio;
-    // Fused ops where the backend implements them (OpenCL + CPU); Metal/Vulkan use the
+    // Fused ops where the backend implements them (OpenCL + Vulkan + CPU); Metal uses the
     // standard-op fallback, which the supports_op preflight would otherwise reject.
-    const bool fused = opencl || !gpu;
+    const bool fused = opencl || vulkan || !gpu;
     auto       W     = [this](const std::string & n) { return this->W(n); };
 
     // Inputs must come from the graph ctx so gallocr assigns them backing buffers.
