@@ -19,7 +19,7 @@ void StftProcessor::fft(ComplexVec & x, bool inverse) {
     if (N <= 1) {
         return;
     }
-    // Radix-2 only: a non-power-of-two N would silently corrupt the result.
+    // Power-of-two only: a non-power-of-two N would silently corrupt the result.
     // n_fft/win are validated at GGUF load; this guards every other caller
     // (and FastLRMerge, which always pads to a power of two).
     if ((N & (N - 1)) != 0) {
@@ -43,26 +43,67 @@ void StftProcessor::fft(ComplexVec & x, bool inverse) {
     // Butterflies on raw float storage: std::complex operator* carries C99 inf/nan-recovery
     // overhead that never triggers for finite FFT data, so raw arithmetic is bit-identical, faster.
     float * f = reinterpret_cast<float *>(x.data()); // [re0,im0,re1,im1,...]
-    for (int len = 2; len <= N; len <<= 1) {
+
+    // Mixed radix-4/2: one twiddle-free radix-2 stage when log2(N) is odd
+    // (0xAAAAAAAA = odd bit positions), then radix-4 stages cover the rest.
+    int len = 1;
+    if (N & 0xAAAAAAAA) {
+        // Blocks are independent, so distributing them is bit-identical.  Only
+        // large transforms (FastLRMerge) benefit; per-frame FFTs stay serial.
+        #pragma omp parallel for schedule(static) if (N >= 65536)
+        for (int i = 0; i < N; i += 2) {
+            const int a = 2 * i, b = 2 * i + 2;
+            const float u_re = f[a], u_im = f[a + 1];
+            const float v_re = f[b], v_im = f[b + 1];
+            f[a] = u_re + v_re; f[a + 1] = u_im + v_im;
+            f[b] = u_re - v_re; f[b + 1] = u_im - v_im;
+        }
+        len = 2;
+    }
+    for (; len < N; len <<= 2) {
+        const int   step  = len << 2; // combined block size
         const float angle =
-            2.0f * static_cast<float>(PI) / len * (inverse ? 1.0f : -1.0f);
+            2.0f * static_cast<float>(PI) / step * (inverse ? 1.0f : -1.0f);
         const float wlen_re = std::cos(angle);
         const float wlen_im = std::sin(angle);
+        // Forward: X1 = b - i*d, X3 = b + i*d; the inverse swaps the two
+        // output slots (the twiddle sign already flips via `angle`).
+        const int o1 = 2 * len * (inverse ? 3 : 1);
+        const int o3 = 2 * len * (inverse ? 1 : 3);
         // Blocks are independent and each runs its own twiddle recurrence from
-        // w=1, so distributing them is bit-identical.  Only large transforms
-        // (FastLRMerge's whole-signal FFT) benefit; per-frame FFTs stay serial.
-        #pragma omp parallel for schedule(static) if (N >= 65536 && (N / len) >= 2)
-        for (int i = 0; i < N; i += len) {
+        // w=1, so distributing them is bit-identical.
+        #pragma omp parallel for schedule(static) if (N >= 65536 && (N / step) >= 2)
+        for (int i = 0; i < N; i += step) {
             float w_re = 1.0f, w_im = 0.0f;
-            for (int j = 0; j < len / 2; j++) {
-                const int a = 2 * (i + j);
-                const int b = 2 * (i + j + len / 2);
-                const float u_re = f[a],     u_im = f[a + 1];
-                const float x_re = f[b],     x_im = f[b + 1];
-                const float v_re = x_re * w_re - x_im * w_im; // v = x * w
-                const float v_im = x_re * w_im + x_im * w_re;
-                f[a]     = u_re + v_re; f[a + 1] = u_im + v_im;
-                f[b]     = u_re - v_re; f[b + 1] = u_im - v_im;
+            for (int j = 0; j < len; j++) {
+                const float w2_re = w_re * w_re - w_im * w_im; // w^2
+                const float w2_im = 2.0f * w_re * w_im;
+                const float w3_re = w2_re * w_re - w2_im * w_im; // w^3
+                const float w3_im = w2_re * w_im + w2_im * w_re;
+                const int p0 = 2 * (i + j);
+                const int p1 = p0 + 2 * len;
+                const int p2 = p0 + 4 * len;
+                const int p3 = p0 + 6 * len;
+                // Bit-reversed layout: the block at offset len holds the residue-2
+                // subsequence and offset 2*len holds residue 1, so w^2 and w cross.
+                const float t0_re = f[p0], t0_im = f[p0 + 1];
+                float xr = f[p1], xi = f[p1 + 1];
+                const float t2_re = xr * w2_re - xi * w2_im;
+                const float t2_im = xr * w2_im + xi * w2_re;
+                xr = f[p2]; xi = f[p2 + 1];
+                const float t1_re = xr * w_re - xi * w_im;
+                const float t1_im = xr * w_im + xi * w_re;
+                xr = f[p3]; xi = f[p3 + 1];
+                const float t3_re = xr * w3_re - xi * w3_im;
+                const float t3_im = xr * w3_im + xi * w3_re;
+                const float a_re = t0_re + t2_re, a_im = t0_im + t2_im;
+                const float b_re = t0_re - t2_re, b_im = t0_im - t2_im;
+                const float c_re = t1_re + t3_re, c_im = t1_im + t3_im;
+                const float d_re = t1_re - t3_re, d_im = t1_im - t3_im;
+                f[p0]      = a_re + c_re; f[p0 + 1]      = a_im + c_im;
+                f[p2]      = a_re - c_re; f[p2 + 1]      = a_im - c_im;
+                f[p0 + o1] = b_re + d_im; f[p0 + o1 + 1] = b_im - d_re;
+                f[p0 + o3] = b_re - d_im; f[p0 + o3 + 1] = b_im + d_re;
                 const float nw_re = w_re * wlen_re - w_im * wlen_im; // w *= wlen
                 w_im              = w_re * wlen_im + w_im * wlen_re;
                 w_re              = nw_re;
