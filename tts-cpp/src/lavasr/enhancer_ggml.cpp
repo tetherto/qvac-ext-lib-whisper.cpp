@@ -24,14 +24,15 @@ namespace {
 
 struct BlockW {
     ggml_tensor * dw_w   = nullptr; // depthwise conv   [K, 1, C]
-    ggml_tensor * dw_b   = nullptr; //                  [1, C]
+    ggml_tensor * dwt_w  = nullptr; // dw kernel C-fastest [C, 1, K] (CWHN path)
+    ggml_tensor * dw_b   = nullptr; //                  [C]
     ggml_tensor * norm_g = nullptr; // layer-norm gamma [C]
     ggml_tensor * norm_b = nullptr; //            beta  [C]
-    ggml_tensor * pw1_w  = nullptr; // pointwise 1x1     [1, C, F]
-    ggml_tensor * pw1_b  = nullptr; //                  [1, F]
-    ggml_tensor * pw2_w  = nullptr; // pointwise 1x1     [1, F, C]
-    ggml_tensor * pw2_b  = nullptr; //                  [1, C]
-    ggml_tensor * gamma  = nullptr; // per-channel scale [1, C]
+    ggml_tensor * pw1_w  = nullptr; // pointwise 1x1     [C, F]
+    ggml_tensor * pw1_b  = nullptr; //                  [F]
+    ggml_tensor * pw2_w  = nullptr; // pointwise 1x1     [F, C]
+    ggml_tensor * pw2_b  = nullptr; //                  [C]
+    ggml_tensor * gamma  = nullptr; // per-channel scale [C]
 };
 
 } // namespace
@@ -42,9 +43,9 @@ struct EnhancerGgml {
     ggml_backend_buffer_t wbuf    = nullptr; // weight data on the backend
     ggml_gallocr_t        allocr  = nullptr; // reusable compute allocator
 
-    // Native depthwise conv where the backend implements CONV_2D_DW (Vulkan).
-    // The im2col+matmul fallback stays for Metal/CPU: k=7 per-channel matvecs
-    // are pathological on GPU (<1 GFLOPS) but the direct op is absent on Metal.
+    // Native depthwise conv (CWHN, channel-major) where the backend implements
+    // CONV_2D_DW (Vulkan).  The im2col+matmul fallback stays for Metal/CPU:
+    // k=7 per-channel matvecs are pathological on GPU but the op is absent on Metal.
     bool use_dw_direct = false;
 
     // Geometry snapshot.
@@ -134,17 +135,32 @@ ggml_tensor * depthwise_same(ggml_context * ctx, ggml_tensor * kernel,
     return y;
 }
 
-// LayerNorm over the channel dim.  x [T, C, 1]; gamma/beta [C].  Permute to
-// [C, T, 1] so ggml_norm reduces over the channel axis (ne0), then permute
-// back — matches enhancer_core::layernorm_lastdim (normalise over C per frame).
-ggml_tensor * layernorm_channel(ggml_context * ctx, ggml_tensor * x,
-                                ggml_tensor * gamma, ggml_tensor * beta,
-                                float eps) {
-    ggml_tensor * y = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3)); // [C,T,1]
-    y = ggml_norm(ctx, y, eps);
+// Depthwise Conv1d on channel-major x [C, T, 1] -> [C, T, 1].  cwhn: native
+// CONV_2D_DW on a channels-fastest [T,1,C,1] view of x with the C-fastest
+// kernel copy; otherwise the time-major path wrapped in two transposes.
+ggml_tensor * depthwise_cm(ggml_context * ctx, const BlockW & b, ggml_tensor * x,
+                           int pad, bool cwhn, bool dw_direct) {
+    ggml_tensor * y;
+    if (cwhn) {
+        ggml_tensor * k4 = ggml_permute(ctx, b.dwt_w, 3, 2, 0, 1);           // [K,1,1,C]
+        ggml_tensor * x4 = ggml_permute(ctx, x, 2, 0, 1, 3);                 // [T,1,C,1]
+        y = ggml_conv_2d_dw_direct(ctx, k4, x4, 1, 1, pad, 0, 1, 1);         // [T,1,C,1]
+        y = ggml_permute(ctx, y, 1, 2, 0, 3);                                // [C,T,1]
+    } else {
+        ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3)); // [T,C,1]
+        y = depthwise_same(ctx, b.dw_w, xt, nullptr, pad, dw_direct);
+        y = ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));                // [C,T,1]
+    }
+    return ggml_add(ctx, y, b.dw_b);
+}
+
+// LayerNorm over the channel dim on channel-major x [C, T, 1]; gamma/beta [C]
+// broadcast per frame — ggml_norm reduces over ne0 = C directly, no permutes.
+ggml_tensor * layernorm_cm(ggml_context * ctx, ggml_tensor * x,
+                           ggml_tensor * gamma, ggml_tensor * beta, float eps) {
+    ggml_tensor * y = ggml_norm(ctx, x, eps);
     y = ggml_mul(ctx, y, gamma);
-    y = ggml_add(ctx, y, beta);
-    return ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));            // [T,C,1]
+    return ggml_add(ctx, y, beta);
 }
 
 ggml_tensor * new_1d(ggml_context * ctx, int64_t ne0, const char * name) {
@@ -180,6 +196,32 @@ bool upload_weight(ggml_tensor * t, const EnhancerWeights & w,
         return false;
     }
     ggml_backend_tensor_set(t, src.data(), 0, src.size() * sizeof(float));
+    return true;
+}
+
+// Upload a depthwise kernel transposed to C-fastest memory (t is [C, 1, K]) for
+// the CWHN direct conv; host data is [C][K] (PyTorch [C,1,K] flattened).
+bool upload_weight_dw_cm(ggml_tensor * t, const EnhancerWeights & w,
+                         const std::string & name) {
+    if (!w.has(name)) {
+        std::fprintf(stderr, "lavasr enhancer ggml: missing weight '%s'\n", name.c_str());
+        return false;
+    }
+    const std::vector<float> & src = w.get(name).data;
+    const int64_t C = t->ne[0], K = t->ne[2];
+    if (static_cast<int64_t>(src.size()) != C * K) {
+        std::fprintf(stderr,
+                     "lavasr enhancer ggml: '%s' element count mismatch (have %zu, want %lld)\n",
+                     name.c_str(), src.size(), static_cast<long long>(C * K));
+        return false;
+    }
+    std::vector<float> tr(src.size());
+    for (int64_t c = 0; c < C; c++) {
+        for (int64_t k = 0; k < K; k++) {
+            tr[static_cast<size_t>(k * C + c)] = src[static_cast<size_t>(c * K + k)];
+        }
+    }
+    ggml_backend_tensor_set(t, tr.data(), 0, tr.size() * sizeof(float));
     return true;
 }
 
@@ -224,8 +266,8 @@ EnhancerGgml * enhancer_ggml_create(const EnhancerWeights & w, ggml_backend_t ba
 
     const int C = g->C, F = g->F, M = g->n_mels, K = g->K, B = g->spec_bins;
 
-    // Metadata context sized for every weight tensor (9 per block + head/tail).
-    const int n_tensors = 2 /*embed*/ + 2 /*norm*/ + 9 * g->n_blocks +
+    // Metadata context sized for every weight tensor (10 per block + head/tail).
+    const int n_tensors = 2 /*embed*/ + 2 /*norm*/ + 10 * g->n_blocks +
                           2 /*final_norm*/ + 2 /*spec_head*/ + 8 /*slack*/;
     ggml_init_params ip = {
         /*.mem_size   =*/ static_cast<size_t>(n_tensors) * ggml_tensor_overhead(),
@@ -251,14 +293,15 @@ EnhancerGgml * enhancer_ggml_create(const EnhancerWeights & w, ggml_backend_t ba
         const std::string p = "blk" + std::to_string(i) + ".";
         BlockW & b = g->blocks[static_cast<size_t>(i)];
         b.dw_w   = new_3d(g->wctx, K, 1, C, (p + "dw.w").c_str());
-        b.dw_b   = new_2d(g->wctx, 1, C, (p + "dw.b").c_str());
+        b.dwt_w  = new_3d(g->wctx, C, 1, K, (p + "dw.wt").c_str());
+        b.dw_b   = new_1d(g->wctx, C, (p + "dw.b").c_str());
         b.norm_g = new_1d(g->wctx, C, (p + "norm.g").c_str());
         b.norm_b = new_1d(g->wctx, C, (p + "norm.b").c_str());
-        b.pw1_w  = new_3d(g->wctx, 1, C, F, (p + "pw1.w").c_str());
-        b.pw1_b  = new_2d(g->wctx, 1, F, (p + "pw1.b").c_str());
-        b.pw2_w  = new_3d(g->wctx, 1, F, C, (p + "pw2.w").c_str());
-        b.pw2_b  = new_2d(g->wctx, 1, C, (p + "pw2.b").c_str());
-        b.gamma  = new_2d(g->wctx, 1, C, (p + "gamma").c_str());
+        b.pw1_w  = new_2d(g->wctx, C, F, (p + "pw1.w").c_str());
+        b.pw1_b  = new_1d(g->wctx, F, (p + "pw1.b").c_str());
+        b.pw2_w  = new_2d(g->wctx, F, C, (p + "pw2.w").c_str());
+        b.pw2_b  = new_1d(g->wctx, C, (p + "pw2.b").c_str());
+        b.gamma  = new_1d(g->wctx, C, (p + "gamma").c_str());
     }
 
     g->final_norm_g = new_1d(g->wctx, C, "final_norm.g");
@@ -283,6 +326,7 @@ EnhancerGgml * enhancer_ggml_create(const EnhancerWeights & w, ggml_backend_t ba
         const std::string p = "enhancer.block." + std::to_string(i) + ".";
         const BlockW &    b = g->blocks[static_cast<size_t>(i)];
         ok = ok && upload_weight(b.dw_w, w, p + "dwconv.weight");
+        ok = ok && upload_weight_dw_cm(b.dwt_w, w, p + "dwconv.weight");
         ok = ok && upload_weight(b.dw_b, w, p + "dwconv.bias");
         ok = ok && upload_weight(b.norm_g, w, p + "norm.weight");
         ok = ok && upload_weight(b.norm_b, w, p + "norm.bias");
@@ -346,25 +390,35 @@ bool enhancer_ggml_spec_forward(EnhancerGgml * g,
     ggml_set_name(mel_in, "mel");
     ggml_set_input(mel_in);
 
-    // embed Conv1d(n_mels -> C, k) "same" + LayerNorm.
+    // embed Conv1d(n_mels -> C, k) "same" (time-major, one im2col — runs once),
+    // then one transpose into channel-major [C,T,1] for the whole backbone.
     ggml_tensor * x = conv1d_same(ctx, g->embed_w, mel_in, g->embed_b, pad); // [T,C,1]
-    x = layernorm_channel(ctx, x, g->norm_g, g->norm_b, g->ln_eps);
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));                    // [C,T,1]
+    x = layernorm_cm(ctx, x, g->norm_g, g->norm_b, g->ln_eps);
 
-    // ConvNeXt blocks.
+    // CWHN routing needs nb[1] > nb[0] on the input view, i.e. T > 1
+    // (ggml_is_contiguous_channels); degenerate T falls back to time-major.
+    const bool dw_cwhn = g->use_dw_direct && T > 1;
+
+    // ConvNeXt blocks, all channel-major: the pointwise convs are bare GEMMs
+    // and LayerNorm reduces over ne0 = C directly — no per-layer transposes.
     for (int i = 0; i < g->n_blocks; i++) {
         const BlockW & b   = g->blocks[static_cast<size_t>(i)];
         ggml_tensor *  res = x;
-        ggml_tensor *  y   = depthwise_same(ctx, b.dw_w, x, b.dw_b, pad,
-                                            g->use_dw_direct); // [T,C,1]
-        y                  = layernorm_channel(ctx, y, b.norm_g, b.norm_b, g->ln_eps);
-        y                  = conv1d_same(ctx, b.pw1_w, y, b.pw1_b, 0);    // [T,F,1]
+        ggml_tensor *  y   = depthwise_cm(ctx, b, x, pad, dw_cwhn,
+                                          g->use_dw_direct);              // [C,T,1]
+        y                  = layernorm_cm(ctx, y, b.norm_g, b.norm_b, g->ln_eps);
+        y                  = ggml_add(ctx, mul_mat_f32(ctx, b.pw1_w, y),
+                                      b.pw1_b);                           // [F,T,1]
         y                  = ggml_gelu_erf(ctx, y);
-        y                  = conv1d_same(ctx, b.pw2_w, y, b.pw2_b, 0);    // [T,C,1]
+        y                  = ggml_add(ctx, mul_mat_f32(ctx, b.pw2_w, y),
+                                      b.pw2_b);                           // [C,T,1]
         y                  = ggml_mul(ctx, y, b.gamma);                   // per-channel scale
         x                  = ggml_add(ctx, res, y);
     }
 
-    x = layernorm_channel(ctx, x, g->final_norm_g, g->final_norm_b, g->ln_eps);
+    x = layernorm_cm(ctx, x, g->final_norm_g, g->final_norm_b, g->ln_eps);
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3)); // back to [T,C,1] for the head
 
     // Spec head: Linear(C -> 2*spec_bins), split log-mag / phase, then
     //   mag = clip(exp(log-mag), max=clip_max); real = mag*cos(phase);
