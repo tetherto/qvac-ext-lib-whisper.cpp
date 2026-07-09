@@ -9,7 +9,7 @@ using ComplexVec   = std::vector<std::complex<float>>;
 using Spectrogram  = std::vector<std::vector<std::complex<float>>>; // [T][freq]
 
 // Short-time Fourier transform with a periodic Hann window and reflect
-// padding, plus a mixed radix-4/2 in-place FFT.  Ported (algorithmically)
+// padding, plus a radix-2 in-place FFT.  Ported verbatim (algorithmically)
 // from the @qvac/tts-onnx StftProcessor so the GGML enhancer produces
 // bit-comparable spectrograms.
 //
@@ -23,7 +23,7 @@ public:
     Spectrogram        stft(const std::vector<float> & signal) const;
     std::vector<float> istft(const Spectrogram & spec, int target_len = 0) const;
 
-    // In-place mixed radix-4/2 Cooley-Tukey FFT.  `inverse=true` divides by N.
+    // In-place radix-2 Cooley-Tukey FFT.  `inverse=true` divides by N.
     // Public + static because FastLRMerge reuses it directly.
     static void fft(ComplexVec & x, bool inverse);
 
