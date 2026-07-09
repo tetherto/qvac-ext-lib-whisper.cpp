@@ -5,10 +5,7 @@
 
 #include "ggml-backend.h"
 
-#include <chrono>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -17,10 +14,8 @@
 namespace tts_cpp::lavasr {
 namespace detail {
 
-// [n, B] slice of rows [r0, r0+n) from a [3H, B] gate tensor.  A strided view (no
-// cont): the add/mul that consume it emit a contiguous result for the sigmoid/tanh,
-// so the copy is redundant.  (If a backend rejects strided binary-op inputs the
-// supports_op preflight catches it before compute.)
+// [n, B] slice of rows [r0, r0+n) from a [3H, B] gate tensor, as a strided view
+// (the consuming add/mul emit a contiguous result, so no cont is needed).
 static ggml_tensor * gate_rows(ggml_context * ctx, ggml_tensor * g, int64_t r0, int64_t n) {
     const int64_t B = g->ne[1];
     return ggml_view_2d(ctx, g, n, B, g->nb[1], (size_t) r0 * g->nb[0]);
@@ -28,7 +23,7 @@ static ggml_tensor * gate_rows(ggml_context * ctx, ggml_tensor * g, int64_t r0, 
 
 ggml_tensor * gru_batched(ggml_context * ctx, ggml_tensor * x, ggml_tensor * Wih,
                           ggml_tensor * Whh, ggml_tensor * Bih, ggml_tensor * Bhh,
-                          bool reverse) {
+                          bool reverse, bool fused) {
     const int64_t I = x->ne[0];
     const int64_t B = x->ne[1];
     const int64_t L = x->ne[2];
@@ -36,17 +31,14 @@ ggml_tensor * gru_batched(ggml_context * ctx, ggml_tensor * x, ggml_tensor * Wih
     ggml_tensor * bih = ggml_reshape_2d(ctx, Bih, 3 * H, 1);
     ggml_tensor * bhh = ggml_reshape_2d(ctx, Bhh, 3 * H, 1);
 
-    // Precompute the input transform Wih*x for ALL timesteps in one wide GEMM (it is
-    // state-independent) -> replaces L tiny per-step [3H,B] input matmuls with a single
-    // [3H, B*L] GEMM; bias added once (broadcast). Bit-identical to per-step add(mul_mat(Wih,xt),bih).
+    // Precompute the state-independent input transform Wih*x for ALL timesteps in one wide
+    // [3H, B*L] GEMM (bias broadcast once); bit-identical to the per-step transform.
     ggml_tensor * gi_all = ggml_add(ctx, ggml_mul_mat(ctx, Wih, ggml_reshape_2d(ctx, x, I, B * L)), bih);
     gi_all               = ggml_reshape_3d(ctx, gi_all, 3 * H, B, L);          // [3H, B, L]
 
-    // Fused GRU op (LAVASR_DN_GRU_OP): the whole recurrent sweep in ONE dispatch (parallel over the
-    // batch, loops L internally) instead of L*(matmul + ~10 gate ops) + the concat tree. Same math;
-    // gated so the per-step path below stays as an A/B reference until the op is device-validated.
-    static const bool use_gru_op = std::getenv("LAVASR_DN_GRU_OP") != nullptr;
-    if (use_gru_op) {
+    // Fused GRU op: the whole recurrent sweep in one dispatch; the per-step path below is
+    // the fallback for backends without ggml_gru.
+    if (fused) {
         return ggml_gru(ctx, Whh, gi_all, Bhh, reverse);                        // [H, B, L]
     }
 
@@ -72,9 +64,8 @@ ggml_tensor * gru_batched(ggml_context * ctx, ggml_tensor * x, ggml_tensor * Wih
         h                   = h_new;
         steps[(size_t) t]   = ggml_reshape_3d(ctx, h_new, H, B, 1);
     }
-    // Stitch the L steps [H,B,1] into [H,B,L] with a BALANCED concat tree: concat along ne2 is
-    // associative, so this is bit-identical to the naive left-fold but moves O(L*logL) data
-    // instead of O(L^2) (the left-fold recopies the growing accumulator every step -- E19).
+    // Stitch the L steps [H,B,1] into [H,B,L] with a BALANCED concat tree (associative along
+    // ne2, so bit-identical to a left-fold) -> O(L*logL) data moved instead of O(L^2).
     std::vector<ggml_tensor *> lvl = steps;
     while (lvl.size() > 1) {
         std::vector<ggml_tensor *> nxt;
@@ -88,19 +79,16 @@ ggml_tensor * gru_batched(ggml_context * ctx, ggml_tensor * x, ggml_tensor * Wih
 }
 
 ggml_tensor * conv2d(ggml_context * ctx, ggml_tensor * x, ggml_tensor * W,
-                     ggml_tensor * bias, int stride_f, int pad_f, int groups) {
+                     ggml_tensor * bias, int stride_f, int pad_f, int groups, bool fused) {
     const int64_t kf = W->ne[0], kt = W->ne[1], Cing = W->ne[2], Cout = W->ne[3];
     const int64_t T  = x->ne[1];
-    // Fold both pads INTO the conv (its OpenCL kernel zero-inits OOB gathers -> bit-identical to an
-    // explicit zero-pad, but without the separate WG-overhead-bound pad kernel that was the #1 GPU
-    // cost -- E19/E20): symmetric freq pad p0=pad_f; causal time via symmetric p1=kt-1, then keep the
-    // first T frames (the causal result is out[0:T]; the symmetric bottom pad only adds kt-1 tail).
+    // Fold both pads INTO the conv (bit-identical to an explicit zero-pad): symmetric freq pad,
+    // causal time via symmetric p1=kt-1 then keep the first T frames.
     const int     tp = (int) (kt - 1);
-    static const bool use_dw_op = std::getenv("LAVASR_DN_DW_OP") != nullptr;
     ggml_tensor * y;
     if (groups == 1) {
         y = ggml_conv_2d_direct(ctx, W, x, stride_f, 1, pad_f, tp, 1, 1);    // [Fout, T+tp, Cout, Bc]
-    } else if (use_dw_op && Cing == 1 && groups == Cout) {
+    } else if (fused && Cing == 1 && groups == Cout) {
         // fused depthwise: one CONV_2D_DW op replaces the C-way per-channel loop + concats.  The op's
         // whcn kernel requires a contiguous data tensor (the per-group loop's cont guaranteed this).
         ggml_tensor * xin = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
@@ -128,15 +116,10 @@ ggml_tensor * conv2d(ggml_context * ctx, ggml_tensor * x, ggml_tensor * W,
 }
 
 // Insert stride-1 zeros between freq (ne0) samples: [F,T,C,Bc] -> [(F-1)*s+1, T, C, Bc].
-// The zero-insert forces an "s" dimension innermost to freq. Done naively (reshape [1,F,K],
-// pad ne0 1->s) the pad output has ne0=s (tiny) and the OpenCL pad kernel spawns one workgroup
-// per (ne1,ne2,ne3) = F*K workgroups (~1.5M) each writing s scattered floats -> it dominated GPU
-// time (E19). Transpose so K=T*C*Bc is the contiguous ne0 (big, coalesced) and pad the small "s"
-// as ne1 instead: same result, ~s*32x fewer workgroups.
-static ggml_tensor * zero_upsample_freq(ggml_context * ctx, ggml_tensor * x, int s) {
+// Fallback transposes so the pad runs on a big contiguous ne0 (few, coalesced workgroups).
+static ggml_tensor * zero_upsample_freq(ggml_context * ctx, ggml_tensor * x, int s, bool fused) {
     if (s == 1) return x;
-    static const bool use_ups_op = std::getenv("LAVASR_DN_UPS_OP") != nullptr;
-    if (use_ups_op) return ggml_zero_upsample(ctx, x, s);  // one scatter op vs transpose/pad/transpose/cont
+    if (fused) return ggml_zero_upsample(ctx, x, s);  // one scatter op vs transpose/pad/transpose/cont
     const int64_t F = x->ne[0], T = x->ne[1], C = x->ne[2], Bc = x->ne[3];
     const int64_t K = T * C * Bc;
     ggml_tensor * r = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, x, F, K))); // [K, F]
@@ -150,10 +133,10 @@ static ggml_tensor * zero_upsample_freq(ggml_context * ctx, ggml_tensor * x, int
 }
 
 ggml_tensor * conv_transpose2d(ggml_context * ctx, ggml_tensor * x, ggml_tensor * Wc,
-                               ggml_tensor * bias, int stride_f, int pad_f, int groups) {
+                               ggml_tensor * bias, int stride_f, int pad_f, int groups, bool fused) {
     const int64_t kf = Wc->ne[0];
-    ggml_tensor * u  = zero_upsample_freq(ctx, x, stride_f);
-    return conv2d(ctx, u, Wc, bias, 1, (int) (kf - 1 - pad_f), groups);
+    ggml_tensor * u  = zero_upsample_freq(ctx, x, stride_f, fused);
+    return conv2d(ctx, u, Wc, bias, 1, (int) (kf - 1 - pad_f), groups, fused);
 }
 
 // LayerNorm over the combined (ne0*ne1) per (ne2,ne3) column, affine g,b [ne0*ne1].
@@ -169,30 +152,30 @@ static ggml_tensor * layernorm_fc(ggml_context * ctx, ggml_tensor * x, ggml_tens
 }
 
 static ggml_tensor * gru_uni(ggml_context * ctx, ggml_tensor * x, const std::string & p,
-                             const WResolver & W) {
+                             const WResolver & W, bool fused) {
     return gru_batched(ctx, x, W(p + ".weight_ih_l0"), W(p + ".weight_hh_l0"),
-                       W(p + ".bias_ih_l0"), W(p + ".bias_hh_l0"), false);
+                       W(p + ".bias_ih_l0"), W(p + ".bias_hh_l0"), false, fused);
 }
 
 static ggml_tensor * gru_bi(ggml_context * ctx, ggml_tensor * x, const std::string & p,
-                            const WResolver & W) {
+                            const WResolver & W, bool fused) {
     ggml_tensor * f = gru_batched(ctx, x, W(p + ".weight_ih_l0"), W(p + ".weight_hh_l0"),
-                                  W(p + ".bias_ih_l0"), W(p + ".bias_hh_l0"), false);
+                                  W(p + ".bias_ih_l0"), W(p + ".bias_hh_l0"), false, fused);
     ggml_tensor * r = gru_batched(ctx, x, W(p + ".weight_ih_l0_reverse"),
                                   W(p + ".weight_hh_l0_reverse"), W(p + ".bias_ih_l0_reverse"),
-                                  W(p + ".bias_hh_l0_reverse"), true);
+                                  W(p + ".bias_hh_l0_reverse"), true, fused);
     return ggml_concat(ctx, f, r, 0);                                          // [2H, B, L]
 }
 
 // Grouped RNN: split the feature (ne0) in half, run rnn1/rnn2, concat.  x:[I,B,L].
 static ggml_tensor * grnn(ggml_context * ctx, ggml_tensor * x, const std::string & p,
-                          const WResolver & W, bool bidir) {
+                          const WResolver & W, bool bidir, bool fused) {
     const int64_t I = x->ne[0], B = x->ne[1], L = x->ne[2], half = I / 2;
     ggml_tensor * x1 = ggml_cont(ctx, ggml_view_3d(ctx, x, half, B, L, x->nb[1], x->nb[2], 0));
     ggml_tensor * x2 = ggml_cont(ctx, ggml_view_3d(ctx, x, half, B, L, x->nb[1], x->nb[2],
                                                    (size_t) half * x->nb[0]));
-    ggml_tensor * y1 = bidir ? gru_bi(ctx, x1, p + ".rnn1", W) : gru_uni(ctx, x1, p + ".rnn1", W);
-    ggml_tensor * y2 = bidir ? gru_bi(ctx, x2, p + ".rnn2", W) : gru_uni(ctx, x2, p + ".rnn2", W);
+    ggml_tensor * y1 = bidir ? gru_bi(ctx, x1, p + ".rnn1", W, fused) : gru_uni(ctx, x1, p + ".rnn1", W, fused);
+    ggml_tensor * y2 = bidir ? gru_bi(ctx, x2, p + ".rnn2", W, fused) : gru_uni(ctx, x2, p + ".rnn2", W, fused);
     return ggml_concat(ctx, y1, y2, 0);                                        // [hy, B, L]
 }
 
@@ -206,7 +189,7 @@ static ggml_tensor * fc_hidden(ggml_context * ctx, ggml_tensor * y, ggml_tensor 
 }
 
 ggml_tensor * dpgrnn(ggml_context * ctx, ggml_tensor * x, const std::string & prefix,
-                     const WResolver & W, float ln_eps) {
+                     const WResolver & W, float ln_eps, bool fused) {
     // canonical bottleneck layout xc:[C, F, T, Bc] (from FTC [F,T,C,Bc]).  The
     // chunk-batch Bc folds into each GRU's batch dim (T*Bc intra, F*Bc inter).
     ggml_tensor * xc = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 0, 3));       // [C, F, T, Bc]
@@ -215,7 +198,7 @@ ggml_tensor * dpgrnn(ggml_context * ctx, ggml_tensor * x, const std::string & pr
     // ---- intra (over freq, batch = time*chunk): GRU input [C, T*Bc, F] ----
     ggml_tensor * xi = ggml_cont(ctx, ggml_permute(ctx, xc, 0, 3, 1, 2));      // [C, T, Bc, F]
     xi               = ggml_reshape_3d(ctx, xi, C, T * Bc, Fw);
-    ggml_tensor * gi = grnn(ctx, xi, prefix + ".intra_rnn", W, /*bidir=*/true); // [hy, T*Bc, F]
+    ggml_tensor * gi = grnn(ctx, xi, prefix + ".intra_rnn", W, /*bidir=*/true, fused); // [hy, T*Bc, F]
     ggml_tensor * ai = fc_hidden(ctx, gi, W(prefix + ".intra_fc.weight"),
                                  W(prefix + ".intra_fc.bias"));                // [C, T*Bc, F]
     ai = ggml_reshape_4d(ctx, ai, C, T, Bc, Fw);                               // [C, T, Bc, F]
@@ -226,7 +209,7 @@ ggml_tensor * dpgrnn(ggml_context * ctx, ggml_tensor * x, const std::string & pr
     // ---- inter (over time, batch = freq*chunk): GRU input [C, F*Bc, T] ----
     ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, intra, 0, 1, 3, 2));   // [C, F, Bc, T]
     xt               = ggml_reshape_3d(ctx, xt, C, Fw * Bc, T);
-    ggml_tensor * gt = grnn(ctx, xt, prefix + ".inter_rnn", W, /*bidir=*/false); // [hy2, F*Bc, T]
+    ggml_tensor * gt = grnn(ctx, xt, prefix + ".inter_rnn", W, /*bidir=*/false, fused); // [hy2, F*Bc, T]
     ggml_tensor * at = fc_hidden(ctx, gt, W(prefix + ".inter_fc.weight"),
                                  W(prefix + ".inter_fc.bias"));                // [C, F*Bc, T]
     at = ggml_reshape_4d(ctx, at, C, Fw, Bc, T);                               // [C, F, Bc, T]
@@ -238,7 +221,7 @@ ggml_tensor * dpgrnn(ggml_context * ctx, ggml_tensor * x, const std::string & pr
 }
 
 ggml_tensor * ctfa(ggml_context * ctx, ggml_tensor * x, const std::string & p,
-                   const WResolver & W, int r) {
+                   const WResolver & W, int r, bool fused) {
     const int64_t F = x->ne[0], T = x->ne[1], C = x->ne[2], Bc = x->ne[3];
 
     // ---- TA: energy-mean over freq -> GRU over time (batch=chunk) -> FC -> sigmoid ----
@@ -247,7 +230,7 @@ ggml_tensor * ctfa(ggml_context * ctx, ggml_tensor * x, const std::string & p,
                                          C, Bc, T);                          // [C, Bc, T]
     ggml_tensor * at   = gru_batched(ctx, ztin, W(p + ".ta_gru.weight_ih_l0"),
                                      W(p + ".ta_gru.weight_hh_l0"), W(p + ".ta_gru.bias_ih_l0"),
-                                     W(p + ".ta_gru.bias_hh_l0"), false);     // [2C, Bc, T]
+                                     W(p + ".ta_gru.bias_hh_l0"), false, fused); // [2C, Bc, T]
     at = fc_hidden(ctx, at, W(p + ".ta_fc.weight"), W(p + ".ta_fc.bias"));    // [C, Bc, T]
     at = ggml_sigmoid(ctx, at);
     ggml_tensor * at_b = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, at, C, Bc, T, 1),
@@ -263,7 +246,7 @@ ggml_tensor * ctfa(ggml_context * ctx, ggml_tensor * x, const std::string & p,
     ggml_tensor * ecp  = ggml_pad_ext(ctx, ecF, 0, pad_len, 0, 0, 0, 0, 0, 0); // [Fp, T*Bc]
     ggml_tensor * fold = ggml_reshape_3d(ctx, ecp, r, Hh, T * Bc);           // [r, Hh, T*Bc]
     ggml_tensor * fain = ggml_cont(ctx, ggml_permute(ctx, fold, 0, 2, 1, 3)); // [r, T*Bc, Hh]
-    ggml_tensor * y    = gru_bi(ctx, fain, p + ".fa.gru", W);                // [2*Hfa, T*Bc, Hh]
+    ggml_tensor * y    = gru_bi(ctx, fain, p + ".fa.gru", W, fused);         // [2*Hfa, T*Bc, Hh]
     y                  = fc_hidden(ctx, y, W(p + ".fa.fc.weight"), W(p + ".fa.fc.bias")); // [r, T*Bc, Hh]
     y                  = ggml_sigmoid(ctx, y);
     ggml_tensor * yh   = ggml_cont(ctx, ggml_permute(ctx, y, 0, 2, 1, 3));   // [r, Hh, T*Bc]
@@ -304,9 +287,8 @@ static ggml_tensor * batchnorm(ggml_context * ctx, ggml_tensor * x, ggml_tensor 
 
 // Per-(c,f) affine + per-channel PReLU.  aw,ab: ggml [F,C] (PyTorch [C,F]); slope [C].
 static ggml_tensor * affine_prelu(ggml_context * ctx, ggml_tensor * x, ggml_tensor * aw,
-                                  ggml_tensor * ab, ggml_tensor * slope) {
-    static const bool use_ap_op = std::getenv("LAVASR_DN_AP_OP") != nullptr;
-    if (use_ap_op) return ggml_affine_prelu(ctx, x, aw, ab, slope);  // one fused op vs 7 elementwise
+                                  ggml_tensor * ab, ggml_tensor * slope, bool fused) {
+    if (fused) return ggml_affine_prelu(ctx, x, aw, ab, slope);  // one fused op vs 7 elementwise
     const int64_t F = x->ne[0], C = x->ne[2];
     ggml_tensor * relu   = ggml_relu(ctx, x);
     ggml_tensor * neg    = ggml_sub(ctx, x, relu);                                       // min(x,0)
@@ -318,9 +300,8 @@ static ggml_tensor * affine_prelu(ggml_context * ctx, ggml_tensor * x, ggml_tens
 
 // Channel shuffle (2 groups): o[2c]=x[c], o[2c+1]=x[half+c].  x:[F,T,C,Bc].  The
 // non-channel axes fold to one so the (group,idx) transpose fits ggml's 4D limit.
-static ggml_tensor * shuffle2(ggml_context * ctx, ggml_tensor * x) {
-    static const bool use_shuf_op = std::getenv("LAVASR_DN_SHUF_OP") != nullptr;
-    if (use_shuf_op) return ggml_channel_shuffle(ctx, x, 2);  // one plane-copy op vs 3 permute-conts
+static ggml_tensor * shuffle2(ggml_context * ctx, ggml_tensor * x, bool fused) {
+    if (fused) return ggml_channel_shuffle(ctx, x, 2);  // one plane-copy op vs 3 permute-conts
     const int64_t F = x->ne[0], T = x->ne[1], C = x->ne[2], Bc = x->ne[3], half = C / 2;
     const int64_t S  = T * F * Bc;
     ggml_tensor * xc = ggml_cont(ctx, ggml_permute(ctx, x, 2, 1, 0, 3));                 // [C, T, F, Bc]
@@ -333,50 +314,50 @@ static ggml_tensor * shuffle2(ggml_context * ctx, ggml_tensor * x) {
 // One encoder/decoder block (denoiser_core.cpp run_block).  type 0=XConv 1=XDWS 2=XMB.
 static ggml_tensor * run_block(ggml_context * ctx, ggml_tensor * x, const std::string & base,
                                int type, int cout, int kf, int stride, int groups, bool deconv,
-                               bool is_last, const WResolver & W, int r) {
+                               bool is_last, const WResolver & W, int r, bool fused) {
     (void) cout;
     const int pf = kf / 2;
     auto conv = [&](ggml_tensor * in, const std::string & wn, int st, int grp) -> ggml_tensor * {
-        return deconv ? conv_transpose2d(ctx, in, W(wn + ".ct"), W(wn + ".bias"), st, pf, grp)
-                      : conv2d(ctx, in, W(wn + ".weight"), W(wn + ".bias"), st, pf, grp);
+        return deconv ? conv_transpose2d(ctx, in, W(wn + ".ct"), W(wn + ".bias"), st, pf, grp, fused)
+                      : conv2d(ctx, in, W(wn + ".weight"), W(wn + ".bias"), st, pf, grp, fused);
     };
     auto bn = [&](ggml_tensor * h, const std::string & p) {
         return batchnorm(ctx, h, W(p + ".bn_scale"), W(p + ".bn_shift"));
     };
     auto ap = [&](ggml_tensor * h, const std::string & p) {
-        return affine_prelu(ctx, h, W(p + ".affine_weight"), W(p + ".affine_bias"), W(p + ".slope_weight"));
+        return affine_prelu(ctx, h, W(p + ".affine_weight"), W(p + ".affine_bias"), W(p + ".slope_weight"), fused);
     };
     if (type == 0) { // XConv
         ggml_tensor * h = conv(x, base + ".ops.1", stride, groups);
         h               = bn(h, base + ".ops.2");
         if (!is_last) h = ap(h, base + ".ops.3");
-        h               = ctfa(ctx, h, base + ".ops.4", W, r);
-        if (!is_last && groups == 2) h = shuffle2(ctx, h);
+        h               = ctfa(ctx, h, base + ".ops.4", W, r, fused);
+        if (!is_last && groups == 2) h = shuffle2(ctx, h, fused);
         return h;
     }
     if (type == 1) { // XDWS: pconv(1x1) + depthwise dconv
-        ggml_tensor * h = conv2d(ctx, x, W(base + ".pconv.0.weight"), W(base + ".pconv.0.bias"), 1, 0, groups);
+        ggml_tensor * h = conv2d(ctx, x, W(base + ".pconv.0.weight"), W(base + ".pconv.0.bias"), 1, 0, groups, fused);
         h               = bn(h, base + ".pconv.1");
         h               = ap(h, base + ".pconv.2");
-        if (groups == 2) h = shuffle2(ctx, h);
+        if (groups == 2) h = shuffle2(ctx, h, fused);
         h = conv(h, base + ".dconv.1", stride, (int) h->ne[2]); // depthwise (groups == channels)
         h = bn(h, base + ".dconv.2");
         if (!is_last) h = ap(h, base + ".dconv.3");
-        return ctfa(ctx, h, base + ".dconv.4", W, r);
+        return ctfa(ctx, h, base + ".dconv.4", W, r, fused);
     }
     // type == 2: XMB
-    ggml_tensor * h = conv2d(ctx, x, W(base + ".pconv1.0.weight"), W(base + ".pconv1.0.bias"), 1, 0, groups);
+    ggml_tensor * h = conv2d(ctx, x, W(base + ".pconv1.0.weight"), W(base + ".pconv1.0.bias"), 1, 0, groups, fused);
     h               = bn(h, base + ".pconv1.1");
     h               = ap(h, base + ".pconv1.2");
-    if (groups == 2) h = shuffle2(ctx, h);
+    if (groups == 2) h = shuffle2(ctx, h, fused);
     h = conv(h, base + ".dconv.1", stride, (int) h->ne[2]); // depthwise
     h = bn(h, base + ".dconv.2");
     h = ap(h, base + ".dconv.3");
-    h = conv2d(ctx, h, W(base + ".pconv2.0.weight"), W(base + ".pconv2.0.bias"), 1, 0, groups);
+    h = conv2d(ctx, h, W(base + ".pconv2.0.weight"), W(base + ".pconv2.0.bias"), 1, 0, groups, fused);
     h = bn(h, base + ".pconv2.1");
-    h = ctfa(ctx, h, base + ".pconv2.2", W, r);
+    h = ctfa(ctx, h, base + ".pconv2.2", W, r, fused);
     if (h->ne[0] == x->ne[0] && h->ne[1] == x->ne[1] && h->ne[2] == x->ne[2]) h = ggml_add(ctx, h, x);
-    if (!is_last && groups == 2) h = shuffle2(ctx, h);
+    if (!is_last && groups == 2) h = shuffle2(ctx, h, fused);
     return h;
 }
 
@@ -452,8 +433,6 @@ std::unique_ptr<DenoiserGgml> DenoiserGgml::create(const DenoiserWeights & w, in
     if (!im.backend) { im.backend = ::tts_cpp::detail::init_cpu_backend(); im.gpu = false; }
     if (!im.backend) throw std::runtime_error("denoiser_ggml: no backend available");
     im.opencl = ::tts_cpp::detail::backend_is_opencl(im.backend);
-    std::fprintf(stderr, "lavasr denoiser: ggml backend=%s (gpu=%d opencl=%d)\n",
-                 ggml_backend_name(im.backend), im.gpu ? 1 : 0, im.opencl ? 1 : 0);
 
     struct Pend { std::string name; std::vector<float> data; int64_t ne[4]; int nd; };
     std::vector<Pend> pend;
@@ -519,6 +498,9 @@ void DenoiserGgml::batch_forward(const std::vector<float> & real_in, const std::
                                  int L, int Bc, std::vector<float> & real_out, std::vector<float> & imag_out) {
     Impl &    im = *impl_;
     const int F  = im.spec_bins, r = im.freq_comp_ratio;
+    // Fused ops where the backend implements them (OpenCL + CPU); Metal/Vulkan use the
+    // standard-op fallback, which the supports_op preflight below would otherwise reject.
+    const bool fused = im.opencl || !im.gpu;
 
     constexpr int MAX_NODES = 262144;
     const size_t  buf_size  = ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
@@ -529,9 +511,8 @@ void DenoiserGgml::batch_forward(const std::vector<float> & real_in, const std::
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
     auto          W  = [&](const std::string & n) { return im.W(n); };
 
-    // log-magnitude feature computed on the host (log10(max(|spec|, 1e-12))): the
-    // OpenCL backend has no LOG kernel, and this is trivial per-element work.  The
-    // formula is bit-identical to denoiser_net_forward, so parity is preserved.
+    // log-magnitude feature on the host (no LOG kernel on OpenCL; trivial per-element work).
+    // Bit-identical to denoiser_net_forward.
     std::vector<float> feat_host((size_t) L * F * Bc);
     for (size_t i = 0; i < feat_host.size(); i++) {
         const float rr = real_in[i], ii = imag_in[i];
@@ -549,21 +530,21 @@ void DenoiserGgml::batch_forward(const std::vector<float> & real_in, const std::
     std::vector<ggml_tensor *> en;
     for (int i = 0; i < 5; i++) {
         x = detail::run_block(ctx, x, "encoder.en_convs." + std::to_string(i), kTypes[i], kChans[i],
-                              kKf[i], kStrides[i], kGroups[i], false, false, W, r);
+                              kKf[i], kStrides[i], kGroups[i], false, false, W, r, fused);
         en.push_back(x);
     }
-    x = detail::dpgrnn(ctx, x, "dpgrnn.0", W, im.ln_eps);
-    x = detail::dpgrnn(ctx, x, "dpgrnn.1", W, im.ln_eps);
+    x = detail::dpgrnn(ctx, x, "dpgrnn.0", W, im.ln_eps, fused);
+    x = detail::dpgrnn(ctx, x, "dpgrnn.1", W, im.ln_eps, fused);
 
     int j = 0;
     for (int i = 4; i >= 1; i--, j++) {
         x = ggml_add(ctx, x, en[4 - j]);
         x = detail::run_block(ctx, x, "decoder.de_convs." + std::to_string(j), kTypes[i], kChans[i - 1],
-                              kKf[i], kStrides[i], kGroups[i], true, false, W, r);
+                              kKf[i], kStrides[i], kGroups[i], true, false, W, r, fused);
     }
     x = ggml_add(ctx, x, en[0]);
     x = detail::run_block(ctx, x, "decoder.de_convs." + std::to_string(j), kTypes[0], 1,
-                          kKf[0], kStrides[0], kGroups[0], true, true, W, r);
+                          kKf[0], kStrides[0], kGroups[0], true, true, W, r, fused);
 
     x               = ggml_sigmoid(ctx, x);                                         // ratio mask [129, L, 1]
     ggml_tensor * m = detail::erb_bs(ctx, x, W("erb.ierb_fc.weight"), im.erb_low, im.erb_high); // [F, L, 1]
@@ -590,19 +571,9 @@ void DenoiserGgml::batch_forward(const std::vector<float> & real_in, const std::
     ggml_backend_tensor_set(feat_in, feat_host.data(), 0, feat_host.size() * sizeof(float));
     ggml_backend_tensor_set(re, real_in.data(), 0, (size_t) L * F * Bc * sizeof(float));
     ggml_backend_tensor_set(ie, imag_in.data(), 0, (size_t) L * F * Bc * sizeof(float));
-    // Diagnostic (O1): isolate graph_compute wall-time from host DSP. graph_compute is
-    // synchronous, so this brackets GPU-inclusive dispatch. Gated on LAVASR_DN_TIMING; strip
-    // before shipping.
-    static const bool dn_timing = std::getenv("LAVASR_DN_TIMING") != nullptr;
-    const auto        t_compute0 = std::chrono::steady_clock::now();
     if (ggml_backend_graph_compute(im.backend, gf) != GGML_STATUS_SUCCESS) {
         ggml_free(ctx);
         throw std::runtime_error("denoiser_ggml: graph_compute failed");
-    }
-    if (dn_timing) {
-        const double compute_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_compute0).count();
-        std::fprintf(stderr, "[dn-timing] graph_compute=%.1f ms (nodes=%d, Bc=%d)\n", compute_ms, n_nodes, Bc);
     }
     real_out.resize((size_t) L * F * Bc);
     imag_out.resize((size_t) L * F * Bc);

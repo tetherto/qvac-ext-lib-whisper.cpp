@@ -1,7 +1,5 @@
-// Parity tests for the LavaSR denoiser ggml graph (denoiser_ggml.cpp) vs the
-// scalar reference (denoiser_core.cpp).  Built incrementally: starts with the
-// batched-GRU primitive (the crux of the port), which must match a per-sequence
-// scalar PyTorch GRU.  Pure host math on the CPU backend — no model/fixture.
+// Parity tests for the LavaSR denoiser ggml graph (denoiser_ggml.cpp) vs the scalar
+// reference (denoiser_core.cpp).  Pure host math on the CPU backend — no model/fixture.
 
 #include "lavasr/denoiser_ggml.h"
 

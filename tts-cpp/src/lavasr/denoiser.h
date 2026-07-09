@@ -21,10 +21,8 @@
 
 namespace tts_cpp::lavasr {
 
-// The per-chunk neural core (same contract as denoiser_net_forward): real/imag
-// planes [L*spec_bins] in, masked real/imag planes out.  Lets the shared chunk /
-// overlap-add pipeline run either the scalar core or the ggml (GPU) core, exactly
-// as enhancer.cpp injects EnhanceSpecCore.
+// The per-chunk neural core (same contract as denoiser_net_forward): real/imag [L*spec_bins]
+// in, masked real/imag out.  Lets the pipeline run either the scalar or the ggml (GPU) core.
 using DenoiseChunkCore = std::function<void(const std::vector<float> & real_in,
                                             const std::vector<float> & imag_in, int L,
                                             std::vector<float> & real_out, std::vector<float> & imag_out)>;

@@ -37,9 +37,8 @@ namespace tts_cpp::lavasr {
 class TTS_CPP_API Denoiser {
 public:
     // Load the denoiser GGUF.  Throws std::runtime_error on failure (file
-    // missing, wrong architecture, missing/mis-shaped tensors).  n_gpu_layers:
-    // 0 = scalar CPU (default, unchanged); >0 = run the neural core on a ggml GPU
-    // graph (Adreno OpenCL, CPU fallback); <0 = ggml-CPU (the GPU graph's CPU twin).
+    // missing, wrong architecture, missing/mis-shaped tensors).  n_gpu_layers: 0 = scalar
+    // CPU (default); >0 = ggml GPU graph (Adreno OpenCL); <0 = ggml-CPU (the GPU graph's twin).
     static std::unique_ptr<Denoiser> load(const std::string & gguf_path, int n_gpu_layers = 0);
 
     ~Denoiser();
