@@ -2,6 +2,7 @@
 
 #include "enhancer.h"      // enhance_with(), scalar enhance()
 #include "enhancer_core.h" // EnhancerWeights, enhancer_spec_forward()
+#include "../backend_util.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -40,6 +41,11 @@ struct EnhancerGgml {
     ggml_context *        wctx    = nullptr; // weight tensor metadata
     ggml_backend_buffer_t wbuf    = nullptr; // weight data on the backend
     ggml_gallocr_t        allocr  = nullptr; // reusable compute allocator
+
+    // Native depthwise conv where the backend implements CONV_2D_DW (Vulkan).
+    // The im2col+matmul fallback stays for Metal/CPU: k=7 per-channel matvecs
+    // are pathological on GPU (<1 GFLOPS) but the direct op is absent on Metal.
+    bool use_dw_direct = false;
 
     // Geometry snapshot.
     int   C = 0, F = 0, n_mels = 0, K = 0, n_blocks = 0, spec_bins = 0;
@@ -92,16 +98,27 @@ ggml_tensor * conv1d_same(ggml_context * ctx, ggml_tensor * kernel,
 
 // Depthwise Conv1d (groups == C).  kernel [K, 1, C], input [T, C, 1] -> [T, C, 1].
 // bias (optional) [1, C] broadcast over time.  Mirrors ggml_conv_1d_dw but with
-// an F32 im2col and symmetric zero padding.
+// an F32 im2col and symmetric zero padding.  With dw_direct the whole conv is
+// one native CONV_2D_DW op (1D as W-axis 2D; same taps, same accumulation order).
 ggml_tensor * depthwise_same(ggml_context * ctx, ggml_tensor * kernel,
-                             ggml_tensor * input, ggml_tensor * bias, int pad) {
-    ggml_tensor * new_b = ggml_reshape_4d(ctx, input, input->ne[0], 1,
-                                          input->ne[1], input->ne[2]); // [T,1,C,1]
-    ggml_tensor * im2col = ggml_im2col(ctx, kernel, new_b,
-                                       /*s0=*/1, /*s1=*/0, /*p0=*/pad, /*p1=*/0,
-                                       /*d0=*/1, /*d1=*/0, /*is_2D=*/false,
-                                       GGML_TYPE_F32); // [K, T, C, 1]
-    ggml_tensor * y = ggml_mul_mat(ctx, im2col, kernel);   // [T, 1, C, 1]
+                             ggml_tensor * input, ggml_tensor * bias, int pad,
+                             bool dw_direct) {
+    ggml_tensor * y;
+    if (dw_direct) {
+        ggml_tensor * k4 = ggml_reshape_4d(ctx, kernel, kernel->ne[0], 1, 1,
+                                           kernel->ne[2]);              // [K,1,1,C]
+        ggml_tensor * x4 = ggml_reshape_4d(ctx, input, input->ne[0], 1,
+                                           input->ne[1], input->ne[2]); // [T,1,C,1]
+        y = ggml_conv_2d_dw_direct(ctx, k4, x4, 1, 1, pad, 0, 1, 1);    // [T,1,C,1]
+    } else {
+        ggml_tensor * new_b = ggml_reshape_4d(ctx, input, input->ne[0], 1,
+                                              input->ne[1], input->ne[2]); // [T,1,C,1]
+        ggml_tensor * im2col = ggml_im2col(ctx, kernel, new_b,
+                                           /*s0=*/1, /*s1=*/0, /*p0=*/pad, /*p1=*/0,
+                                           /*d0=*/1, /*d1=*/0, /*is_2D=*/false,
+                                           GGML_TYPE_F32); // [K, T, C, 1]
+        y = ggml_mul_mat(ctx, im2col, kernel);             // [T, 1, C, 1]
+    }
     y = ggml_reshape_3d(ctx, y, y->ne[0], y->ne[2], 1);    // [T, C, 1]
     if (bias) {
         y = ggml_add(ctx, y, bias);
@@ -186,7 +203,8 @@ EnhancerGgml * enhancer_ggml_create(const EnhancerWeights & w, ggml_backend_t ba
     }
 
     EnhancerGgml * g = new EnhancerGgml();
-    g->backend   = backend;
+    g->backend       = backend;
+    g->use_dw_direct = ::tts_cpp::detail::backend_is_vulkan(backend);
     g->C         = w.dim;
     g->F         = w.ffn_dim;
     g->n_mels    = w.n_mels;
@@ -328,7 +346,8 @@ bool enhancer_ggml_spec_forward(EnhancerGgml * g,
     for (int i = 0; i < g->n_blocks; i++) {
         const BlockW & b   = g->blocks[static_cast<size_t>(i)];
         ggml_tensor *  res = x;
-        ggml_tensor *  y   = depthwise_same(ctx, b.dw_w, x, b.dw_b, pad); // [T,C,1]
+        ggml_tensor *  y   = depthwise_same(ctx, b.dw_w, x, b.dw_b, pad,
+                                            g->use_dw_direct); // [T,C,1]
         y                  = layernorm_channel(ctx, y, b.norm_g, b.norm_b, g->ln_eps);
         y                  = conv1d_same(ctx, b.pw1_w, y, b.pw1_b, 0);    // [T,F,1]
         y                  = ggml_gelu_erf(ctx, y);

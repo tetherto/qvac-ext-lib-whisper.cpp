@@ -48,6 +48,10 @@ void StftProcessor::fft(ComplexVec & x, bool inverse) {
             2.0f * static_cast<float>(PI) / len * (inverse ? 1.0f : -1.0f);
         const float wlen_re = std::cos(angle);
         const float wlen_im = std::sin(angle);
+        // Blocks are independent and each runs its own twiddle recurrence from
+        // w=1, so distributing them is bit-identical.  Only large transforms
+        // (FastLRMerge's whole-signal FFT) benefit; per-frame FFTs stay serial.
+        #pragma omp parallel for schedule(static) if (N >= 65536 && (N / len) >= 2)
         for (int i = 0; i < N; i += len) {
             float w_re = 1.0f, w_im = 0.0f;
             for (int j = 0; j < len / 2; j++) {
@@ -115,13 +119,15 @@ Spectrogram StftProcessor::stft(const std::vector<float> & signal) const {
     const int freq_bins = n_fft_ / 2 + 1;
 
     Spectrogram spec(num_frames, std::vector<std::complex<float>>(freq_bins));
-    ComplexVec  frame(n_fft_);
 
     // Two-for-one: pack frame t (real) + frame t+1 (imag) into one complex FFT
     // and recover both spectra from the Hermitian symmetry of the transform.
-    int t = 0;
-    for (; t + 1 < num_frames; t += 2) {
-        std::fill(frame.begin(), frame.end(), std::complex<float>{0.0f, 0.0f});
+    // Frame pairs are independent -> parallel (per-frame math unchanged).
+    const int num_pairs = num_frames / 2;
+    #pragma omp parallel for schedule(static)
+    for (int tp = 0; tp < num_pairs; tp++) {
+        const int  t = 2 * tp;
+        ComplexVec frame(n_fft_, {0.0f, 0.0f});
         for (int i = 0; i < win_length_; i++) {
             frame[i] = {xpad[t * hop_length_ + i] * window_[i],
                         xpad[(t + 1) * hop_length_ + i] * window_[i]};
@@ -135,8 +141,9 @@ Spectrogram StftProcessor::stft(const std::vector<float> & signal) const {
             spec[t + 1][f] = (cf - cm) * std::complex<float>(0.0f, -0.5f);      // FFT(frame t+1)
         }
     }
-    if (t < num_frames) {  // trailing odd frame
-        std::fill(frame.begin(), frame.end(), std::complex<float>{0.0f, 0.0f});
+    if (2 * num_pairs < num_frames) {  // trailing odd frame
+        const int  t = 2 * num_pairs;
+        ComplexVec frame(n_fft_, {0.0f, 0.0f});
         for (int i = 0; i < win_length_; i++) {
             frame[i] = {xpad[t * hop_length_ + i] * window_[i], 0.0f};
         }
@@ -155,10 +162,9 @@ std::vector<float> StftProcessor::istft(const Spectrogram & spec,
 
     std::vector<float> y(output_size, 0.0f);
     std::vector<float> wenv(output_size, 0.0f);
-    ComplexVec         frame(n_fft_);
 
     // Overlap-add one real time-frame (real or imag part of `frame`) at index t.
-    auto add_frame = [&](int t, bool use_imag) {
+    auto add_frame = [&](int t, const ComplexVec & frame, bool use_imag) {
         for (int i = 0; i < win_length_; i++) {
             const float v = use_imag ? frame[i].imag() : frame[i].real();
             y[t * hop_length_ + i]    += v * window_[i];
@@ -168,8 +174,14 @@ std::vector<float> StftProcessor::istft(const Spectrogram & spec,
 
     // Two-for-one: IFFT(A + iB) = a + i·b for real signals a,b (Hermitian A,B),
     // so a frame pair is recovered from one inverse FFT (real→t, imag→t+1).
-    int t = 0;
-    for (; t + 1 < T; t += 2) {
+    // The independent inverse FFTs run in parallel; the overlap-add stays
+    // serial in frame order, so the accumulation is unchanged.
+    const int num_pairs = T / 2;
+    std::vector<ComplexVec> pair_frames(num_pairs);
+    #pragma omp parallel for schedule(static)
+    for (int tp = 0; tp < num_pairs; tp++) {
+        const int  t = 2 * tp;
+        ComplexVec frame(n_fft_);
         for (int k = 0; k < n_fft_; k++) {
             const int kk = (k <= n_fft_ / 2) ? k : n_fft_ - k;
             std::complex<float> a = spec[t][kk];
@@ -184,17 +196,21 @@ std::vector<float> StftProcessor::istft(const Spectrogram & spec,
             frame[k] = a + std::complex<float>(0.0f, 1.0f) * b;
         }
         fft(frame, true);
-        add_frame(t, false);
-        add_frame(t + 1, true);
+        pair_frames[tp] = std::move(frame);
     }
-    if (t < T) {  // trailing odd frame
-        std::fill(frame.begin(), frame.end(), std::complex<float>{0.0f, 0.0f});
+    for (int tp = 0; tp < num_pairs; tp++) {
+        add_frame(2 * tp, pair_frames[tp], false);
+        add_frame(2 * tp + 1, pair_frames[tp], true);
+    }
+    if (2 * num_pairs < T) {  // trailing odd frame
+        const int  t = 2 * num_pairs;
+        ComplexVec frame(n_fft_, {0.0f, 0.0f});
         for (int f = 0; f <= n_fft_ / 2; f++) {
             frame[f] = spec[t][f];
             if (f > 0 && f < n_fft_ / 2) frame[n_fft_ - f] = std::conj(spec[t][f]);
         }
         fft(frame, true);
-        add_frame(t, false);
+        add_frame(t, frame, false);
     }
 
     std::vector<float> out;
