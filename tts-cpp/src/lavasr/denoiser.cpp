@@ -35,8 +35,8 @@ std::vector<float> chunk_weights(int L) {
 
 } // namespace
 
-std::vector<float> denoise(const DenoiserWeights & w,
-                           const std::vector<float> & pcm_in, int sr_in) {
+std::vector<float> denoise_with_core(const DenoiserWeights & w, const std::vector<float> & pcm_in,
+                                     int sr_in, const DenoiseChunkCore & core) {
     if (pcm_in.empty()) {
         return {};
     }
@@ -78,7 +78,7 @@ std::vector<float> denoise(const DenoiserWeights & w,
                 cr[static_cast<size_t>(t) * F + f] = re[static_cast<size_t>(start + t) * F + f];
                 ci[static_cast<size_t>(t) * F + f] = im[static_cast<size_t>(start + t) * F + f];
             }
-        denoiser_net_forward(w, cr, ci, L, orr, oii);
+        core(cr, ci, L, orr, oii);
     };
 
     if (T <= L) {
@@ -134,6 +134,104 @@ std::vector<float> denoise(const DenoiserWeights & w,
     std::vector<float> cleaned = dsp::Resampler::resample(wav_dn, work_sr, sr_in);
     cleaned.resize(pcm_in.size(), 0.0f);
     return cleaned;
+}
+
+std::vector<float> denoise_with_batch_core(const DenoiserWeights & w, const std::vector<float> & pcm_in,
+                                           int sr_in, const DenoiseBatchCore & core) {
+    if (pcm_in.empty()) {
+        return {};
+    }
+    const int work_sr = denoiser_work_sample_rate(w);
+
+    std::vector<float> wav = dsp::Resampler::resample(pcm_in, sr_in, work_sr);
+    if (wav.empty()) {
+        return pcm_in;
+    }
+    dsp::StftProcessor stft(w.n_fft, w.hop, w.win, /*center_pad=*/true);
+    dsp::Spectrogram   spec = stft.stft(wav);
+    const int          T    = static_cast<int>(spec.size());
+    const int          F    = w.spec_bins;
+    if (T == 0) {
+        return dsp::Resampler::resample(wav, work_sr, sr_in);
+    }
+    std::vector<float> re(static_cast<size_t>(T) * F), im(static_cast<size_t>(T) * F);
+    for (int t = 0; t < T; t++)
+        for (int f = 0; f < F; f++) {
+            re[static_cast<size_t>(t) * F + f] = spec[t][f].real();
+            im[static_cast<size_t>(t) * F + f] = spec[t][f].imag();
+        }
+
+    const int        L = w.chunk_frames, H = w.chunk_hop;
+    std::vector<int> starts;
+    if (T <= L) {
+        starts.push_back(0);
+    } else {
+        for (int s = 0; s <= T - L; s += H) starts.push_back(s);
+        if (starts.back() != T - L) starts.push_back(T - L);
+    }
+    const int Nc = static_cast<int>(starts.size());
+
+    // Extract all chunks (zero-padded to L) stacked as [Nc][L*F], run the core once.
+    std::vector<float> cre(static_cast<size_t>(Nc) * L * F, 0.0f), cim(static_cast<size_t>(Nc) * L * F, 0.0f);
+    for (int c = 0; c < Nc; c++) {
+        const int start = starts[c], len = std::min(L, T - start);
+        for (int t = 0; t < len; t++)
+            for (int f = 0; f < F; f++) {
+                cre[(static_cast<size_t>(c) * L + t) * F + f] = re[static_cast<size_t>(start + t) * F + f];
+                cim[(static_cast<size_t>(c) * L + t) * F + f] = im[static_cast<size_t>(start + t) * F + f];
+            }
+    }
+    std::vector<float> orr, oii;
+    core(cre, cim, L, Nc, orr, oii);
+
+    std::vector<float> outRe(static_cast<size_t>(T) * F, 0.0f), outIm(static_cast<size_t>(T) * F, 0.0f);
+    if (T <= L) {
+        for (int t = 0; t < T; t++)
+            for (int f = 0; f < F; f++) {
+                outRe[static_cast<size_t>(t) * F + f] = orr[static_cast<size_t>(t) * F + f];
+                outIm[static_cast<size_t>(t) * F + f] = oii[static_cast<size_t>(t) * F + f];
+            }
+    } else {
+        const std::vector<float> cw = chunk_weights(L);
+        std::vector<float>       accR(static_cast<size_t>(T) * F, 0.0f), accI(static_cast<size_t>(T) * F, 0.0f);
+        std::vector<float>       wacc(T, 0.0f);
+        for (int c = 0; c < Nc; c++) {
+            const int start = starts[c];
+            for (int t = 0; t < L; t++) {
+                const float ww = cw[t];
+                for (int f = 0; f < F; f++) {
+                    accR[static_cast<size_t>(start + t) * F + f] += orr[(static_cast<size_t>(c) * L + t) * F + f] * ww;
+                    accI[static_cast<size_t>(start + t) * F + f] += oii[(static_cast<size_t>(c) * L + t) * F + f] * ww;
+                }
+                wacc[start + t] += ww;
+            }
+        }
+        for (int t = 0; t < T; t++) {
+            const float ww = std::max(wacc[t], 1e-6f);
+            for (int f = 0; f < F; f++) {
+                outRe[static_cast<size_t>(t) * F + f] = accR[static_cast<size_t>(t) * F + f] / ww;
+                outIm[static_cast<size_t>(t) * F + f] = accI[static_cast<size_t>(t) * F + f] / ww;
+            }
+        }
+    }
+
+    dsp::Spectrogram out(T, dsp::ComplexVec(F));
+    for (int t = 0; t < T; t++)
+        for (int f = 0; f < F; f++)
+            out[t][f] = { outRe[static_cast<size_t>(t) * F + f], outIm[static_cast<size_t>(t) * F + f] };
+    std::vector<float> wav_dn  = stft.istft(out, static_cast<int>(wav.size()));
+    std::vector<float> cleaned = dsp::Resampler::resample(wav_dn, work_sr, sr_in);
+    cleaned.resize(pcm_in.size(), 0.0f);
+    return cleaned;
+}
+
+std::vector<float> denoise(const DenoiserWeights & w, const std::vector<float> & pcm_in, int sr_in) {
+    return denoise_with_core(
+        w, pcm_in, sr_in,
+        [&w](const std::vector<float> & re, const std::vector<float> & im, int L,
+             std::vector<float> & orr, std::vector<float> & oii) {
+            denoiser_net_forward(w, re, im, L, orr, oii);
+        });
 }
 
 } // namespace tts_cpp::lavasr

@@ -129,6 +129,22 @@ static void test_stft_istft() {
     CHECK(r > 0.9f && r < 1.1f, "stft->istft preserves energy");
 }
 
+static void test_istft_complex_dc_nyquist() {
+    // A half-spectrum whose ONLY content is imaginary DC/Nyquist represents no real signal
+    // (irfft drops it), so istft must reconstruct ~zero — guards the two-for-one frame pairing.
+    StftProcessor stft(2048, 512, 2048, false);
+    Spectrogram   spec(2, std::vector<std::complex<float>>(1025, {0.0f, 0.0f}));
+    spec[0][0]    = {0.0f, 100.0f}; // imaginary DC in the first frame
+    spec[0][1024] = {0.0f, 60.0f};  // imaginary Nyquist in the first frame
+
+    auto  out = stft.istft(spec, 0);
+    float m   = 0.0f;
+    for (float v : out) {
+        m = std::max(m, std::fabs(v));
+    }
+    CHECK(m < 1e-4f, "istft drops imag DC/Nyquist (no partner-frame leak)");
+}
+
 static void test_mel() {
     MelFilterbank mel(44100, 2048, 80, 0.0f, 8000.0f);
     auto          tone    = generate_sine(24000, 1000.0f, 48000);
@@ -193,6 +209,7 @@ int main() {
     test_resampler();
     test_fft();
     test_stft_istft();
+    test_istft_complex_dc_nyquist();
     test_mel();
     test_fastlr_merge();
 
