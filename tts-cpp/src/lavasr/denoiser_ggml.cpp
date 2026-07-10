@@ -229,7 +229,7 @@ ggml_tensor * dpgrnn(ggml_context * ctx, ggml_tensor * x, const std::string & pr
 }
 
 ggml_tensor * ctfa(ggml_context * ctx, ggml_tensor * x, const std::string & p,
-                   const WResolver & W, int r, bool fused) {
+                   const WResolver & W, int r, bool fused, ggml_cgraph * gf) {
     const int64_t F = x->ne[0], T = x->ne[1], C = x->ne[2], Bc = x->ne[3];
 
     // ---- TA: energy-mean over freq -> GRU over time (batch=chunk) -> FC -> sigmoid ----
@@ -262,6 +262,10 @@ ggml_tensor * ctfa(ggml_context * ctx, ggml_tensor * x, const std::string & p,
     ggml_tensor * afF  = ggml_cont(ctx, ggml_view_2d(ctx, afp, F, T * Bc, afp->nb[1], 0)); // [F, T*Bc]
     ggml_tensor * af_b = ggml_reshape_4d(ctx, afF, F, T, 1, Bc);             // [F, T, 1, Bc]
 
+    if (gf) { // pin the gates so the two mask muls are adjacent (fusable pair)
+        ggml_build_forward_expand(gf, at_b);
+        ggml_build_forward_expand(gf, af_b);
+    }
     return ggml_mul(ctx, ggml_mul(ctx, x, at_b), af_b);                      // [F, T, C, Bc]
 }
 
@@ -322,7 +326,8 @@ ggml_tensor * shuffle2(ggml_context * ctx, ggml_tensor * x, bool fused) {
 // One encoder/decoder block (denoiser_core.cpp run_block).  type 0=XConv 1=XDWS 2=XMB.
 static ggml_tensor * run_block(ggml_context * ctx, ggml_tensor * x, const std::string & base,
                                int type, int cout, int kf, int stride, int groups, bool deconv,
-                               bool is_last, const WResolver & W, int r, bool fused) {
+                               bool is_last, const WResolver & W, int r, bool fused,
+                               ggml_cgraph * gf = nullptr) {
     (void) cout;
     const int pf = kf / 2;
     auto conv = [&](ggml_tensor * in, const std::string & wn, int st, int grp) -> ggml_tensor * {
@@ -339,7 +344,7 @@ static ggml_tensor * run_block(ggml_context * ctx, ggml_tensor * x, const std::s
         ggml_tensor * h = conv(x, base + ".ops.1", stride, groups);
         h               = bn(h, base + ".ops.2");
         if (!is_last) h = ap(h, base + ".ops.3");
-        h               = ctfa(ctx, h, base + ".ops.4", W, r, fused);
+        h               = ctfa(ctx, h, base + ".ops.4", W, r, fused, gf);
         if (!is_last && groups == 2) h = shuffle2(ctx, h, fused);
         return h;
     }
@@ -351,7 +356,7 @@ static ggml_tensor * run_block(ggml_context * ctx, ggml_tensor * x, const std::s
         h = conv(h, base + ".dconv.1", stride, (int) h->ne[2]); // depthwise (groups == channels)
         h = bn(h, base + ".dconv.2");
         if (!is_last) h = ap(h, base + ".dconv.3");
-        return ctfa(ctx, h, base + ".dconv.4", W, r, fused);
+        return ctfa(ctx, h, base + ".dconv.4", W, r, fused, gf);
     }
     // type == 2: XMB
     ggml_tensor * h = conv2d(ctx, x, W(base + ".pconv1.0.weight"), W(base + ".pconv1.0.bias"), 1, 0, groups, fused);
@@ -363,7 +368,7 @@ static ggml_tensor * run_block(ggml_context * ctx, ggml_tensor * x, const std::s
     h = ap(h, base + ".dconv.3");
     h = conv2d(ctx, h, W(base + ".pconv2.0.weight"), W(base + ".pconv2.0.bias"), 1, 0, groups, fused);
     h = bn(h, base + ".pconv2.1");
-    h = ctfa(ctx, h, base + ".pconv2.2", W, r, fused);
+    h = ctfa(ctx, h, base + ".pconv2.2", W, r, fused, gf);
     if (h->ne[0] == x->ne[0] && h->ne[1] == x->ne[1] && h->ne[2] == x->ne[2]) h = ggml_add(ctx, h, x);
     if (!is_last && groups == 2) h = shuffle2(ctx, h, fused);
     return h;
@@ -541,7 +546,7 @@ GraphIO DenoiserGgml::Impl::build_graph(ggml_context * ctx, ggml_cgraph * gf, in
     std::vector<ggml_tensor *> en;
     for (int i = 0; i < 5; i++) {
         x = detail::run_block(ctx, x, "encoder.en_convs." + std::to_string(i), kTypes[i], kChans[i],
-                              kKf[i], kStrides[i], kGroups[i], false, false, W, r, fused);
+                              kKf[i], kStrides[i], kGroups[i], false, false, W, r, fused, gf);
         en.push_back(x);
     }
     x = detail::dpgrnn(ctx, x, "dpgrnn.0", W, ln_eps, fused);
@@ -551,11 +556,11 @@ GraphIO DenoiserGgml::Impl::build_graph(ggml_context * ctx, ggml_cgraph * gf, in
     for (int i = 4; i >= 1; i--, j++) {
         x = ggml_add(ctx, x, en[4 - j]);
         x = detail::run_block(ctx, x, "decoder.de_convs." + std::to_string(j), kTypes[i], kChans[i - 1],
-                              kKf[i], kStrides[i], kGroups[i], true, false, W, r, fused);
+                              kKf[i], kStrides[i], kGroups[i], true, false, W, r, fused, gf);
     }
     x = ggml_add(ctx, x, en[0]);
     x = detail::run_block(ctx, x, "decoder.de_convs." + std::to_string(j), kTypes[0], 1,
-                          kKf[0], kStrides[0], kGroups[0], true, true, W, r, fused);
+                          kKf[0], kStrides[0], kGroups[0], true, true, W, r, fused, gf);
 
     x                = ggml_sigmoid(ctx, x);                                        // ratio mask [129, L, 1]
     ggml_tensor * m  = detail::erb_bs(ctx, x, W("erb.ierb_fc.weight"), erb_low, erb_high); // [F, L, 1]
