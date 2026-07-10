@@ -66,6 +66,7 @@ bool denoise_prep(const DenoiserWeights & w, const std::vector<float> & pcm_in, 
     }
     p.re.resize(static_cast<size_t>(p.T) * F);
     p.im.resize(static_cast<size_t>(p.T) * F);
+    #pragma omp parallel for schedule(static)
     for (int t = 0; t < p.T; t++) {
         for (int f = 0; f < F; f++) {
             p.re[static_cast<size_t>(t) * F + f] = spec[t][f].real();
@@ -124,21 +125,30 @@ void overlap_add_normalize(const std::vector<int> & starts, int T, int F, int L,
         return;
     }
     const std::vector<float> cw = chunk_weights(L);
+    const int                Nc = static_cast<int>(starts.size());
+    std::vector<std::pair<const float *, const float *>> planes(Nc);
+    for (int c = 0; c < Nc; c++) planes[c] = chunk_out(c);
     std::vector<float>       accR(static_cast<size_t>(T) * F, 0.0f);
     std::vector<float>       accI(static_cast<size_t>(T) * F, 0.0f);
     std::vector<float>       wacc(T, 0.0f);
-    for (int c = 0; c < static_cast<int>(starts.size()); c++) {
-        const int                                      start = starts[c];
-        const std::pair<const float *, const float *> p     = chunk_out(c);
-        for (int t = 0; t < L; t++) {
+    // Gather per output row over chunks in ascending c — same accumulation order as the
+    // serial overlap-add, so bit-identical, and each row is written by one thread.
+    #pragma omp parallel for schedule(static)
+    for (int to = 0; to < T; to++) {
+        float wsum = 0.0f;
+        for (int c = 0; c < Nc; c++) {
+            const int t = to - starts[c];
+            if (t < 0 || t >= L) continue;
             const float ww = cw[t];
             for (int f = 0; f < F; f++) {
-                accR[static_cast<size_t>(start + t) * F + f] += p.first[static_cast<size_t>(t) * F + f] * ww;
-                accI[static_cast<size_t>(start + t) * F + f] += p.second[static_cast<size_t>(t) * F + f] * ww;
+                accR[static_cast<size_t>(to) * F + f] += planes[c].first[static_cast<size_t>(t) * F + f] * ww;
+                accI[static_cast<size_t>(to) * F + f] += planes[c].second[static_cast<size_t>(t) * F + f] * ww;
             }
-            wacc[start + t] += ww;
+            wsum += ww;
         }
+        wacc[to] = wsum;
     }
+    #pragma omp parallel for schedule(static)
     for (int t = 0; t < T; t++) {
         const float ww = std::max(wacc[t], 1e-6f);
         for (int f = 0; f < F; f++) {
@@ -156,6 +166,7 @@ std::vector<float> denoise_finish(const DenoiserWeights & w, int sr_in, size_t p
     const int          T = p.T, F = w.spec_bins;
     dsp::StftProcessor stft(w.n_fft, w.hop, w.win, /*center_pad=*/true);
     dsp::Spectrogram   out(T, dsp::ComplexVec(F));
+    #pragma omp parallel for schedule(static)
     for (int t = 0; t < T; t++)
         for (int f = 0; f < F; f++)
             out[t][f] = {outRe[static_cast<size_t>(t) * F + f], outIm[static_cast<size_t>(t) * F + f]};
@@ -212,6 +223,7 @@ std::vector<float> denoise_with_batch_core(const DenoiserWeights & w, const std:
 
     // Extract all chunks stacked [Nc][L*F] and run the core once for the whole clip.
     std::vector<float> cre(static_cast<size_t>(Nc) * L * F), cim(static_cast<size_t>(Nc) * L * F);
+    #pragma omp parallel for schedule(static)
     for (int c = 0; c < Nc; c++) {
         extract_chunk(p.re, p.im, starts[c], p.T, F, L,
                       cre.data() + static_cast<size_t>(c) * L * F,

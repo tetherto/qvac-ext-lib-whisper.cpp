@@ -449,7 +449,9 @@ std::vector<Pend> stage_weights(const DenoiserWeights & w) {
 std::vector<float> compute_log_features(const std::vector<float> & real_in,
                                         const std::vector<float> & imag_in, size_t n) {
     std::vector<float> feat(n);
-    for (size_t i = 0; i < n; i++) {
+    const int64_t      nn = (int64_t) n;
+    #pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < nn; i++) {
         const float rr = real_in[i], ii = imag_in[i];
         float       mg = std::sqrt(rr * rr + ii * ii);
         if (mg < 1e-12f) mg = 1e-12f;
