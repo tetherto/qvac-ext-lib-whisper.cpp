@@ -742,12 +742,202 @@ static void test_batch(const char * gguf_path) {
     CHECK(m < 1e-4f, "batch_forward matches per-chunk chunk_forward");
 }
 
+// Uniform(-scale, scale) fill; '*.running_var' instead gets uniform(0.25, 1) —
+// the BN fold computes g/sqrt(rv+eps), so rv must stay positive (scale ignored).
+static void add_dn(DenoiserWeights & w, const std::string & n, std::vector<int> shape,
+                   std::mt19937 & rng, float scale) {
+    size_t sz = 1;
+    for (int s : shape) sz *= (size_t) s;
+    DnTensor t;
+    t.data.resize(sz);
+    const std::string suf = ".running_var";
+    const bool var = n.size() > suf.size() && n.compare(n.size() - suf.size(), suf.size(), suf) == 0;
+    std::uniform_real_distribution<float> d(var ? 0.25f : -scale, var ? 1.0f : scale);
+    for (float & v : t.data) v = d(rng);
+    t.shape = std::move(shape);
+    w.t[n]  = std::move(t);
+}
+
+// Small but complete synthetic UL-UNAS: spec_bins=17, erb 5+8 (Fe=13 -> F1=7 -> F2=4),
+// chunk 8/3.  0.5/sqrt(fan_in) weights keep the deep chain conditioned (mask unsaturated).
+static DenoiserWeights make_synthetic_denoiser_weights(std::mt19937 & rng) {
+    DenoiserWeights w;
+    w.n_fft = 32; w.hop = 16; w.win = 32; w.spec_bins = 17; w.work_sample_rate = 16000;
+    w.erb_low = 5; w.erb_high = 8; w.freq_comp_ratio = 4;
+    w.chunk_frames = 8; w.chunk_hop = 3;
+    w.bn_eps = 1e-5f; w.ln_eps = 1e-8f;
+
+    const int r = w.freq_comp_ratio, F1 = 7, F2 = 4, Cd = 16;
+    auto ws  = [](int fan_in) { return 0.5f / std::sqrt((float) fan_in); };
+    auto add = [&](const std::string & n, std::vector<int> shp, float sc) { add_dn(w, n, std::move(shp), rng, sc); };
+    auto bnw = [&](const std::string & p, int C) {
+        add(p + ".weight", { C }, 0.1f); add(p + ".bias", { C }, 0.1f);
+        add(p + ".running_mean", { C }, 0.1f); add(p + ".running_var", { C }, 0.0f);
+    };
+    auto apw = [&](const std::string & p, int C, int F) {
+        add(p + ".affine_weight", { C, F }, 0.1f); add(p + ".affine_bias", { C, F }, 0.1f);
+        add(p + ".slope_weight", { C }, 0.1f);
+    };
+    auto gruw = [&](const std::string & p, int I, int H, bool rev) {
+        for (const char * suf : { "", "_reverse" }) {
+            add(p + ".weight_ih_l0" + suf, { 3 * H, I }, ws(I));
+            add(p + ".weight_hh_l0" + suf, { 3 * H, H }, ws(H));
+            add(p + ".bias_ih_l0" + suf, { 3 * H }, 0.1f);
+            add(p + ".bias_hh_l0" + suf, { 3 * H }, 0.1f);
+            if (!rev) break;
+        }
+    };
+    auto ctfaw = [&](const std::string & p, int C) {
+        gruw(p + ".ta_gru", C, 2 * C, false);
+        add(p + ".ta_fc.weight", { C, 2 * C }, ws(2 * C)); add(p + ".ta_fc.bias", { C }, 0.1f);
+        gruw(p + ".fa.gru", r, r, true);
+        add(p + ".fa.fc.weight", { r, 2 * r }, ws(2 * r)); add(p + ".fa.fc.bias", { r }, 0.1f);
+    };
+    auto fcw = [&](const std::string & p, int out, int in) {
+        add(p + ".weight", { out, in }, ws(in)); add(p + ".bias", { out }, 0.1f);
+    };
+    auto convw = [&](const std::string & p, int cout, int cing, int kt, int kf) {
+        add(p + ".weight", { cout, cing, kt, kf }, ws(cing * kt * kf)); add(p + ".bias", { cout }, 0.1f);
+    };
+    // Transposed kernels in raw PyTorch layout [Cin, Cout/g, kt, kf]; create() derives the .ct.
+    auto convtw = [&](const std::string & p, int cin, int coutg, int kt, int kf, int g) {
+        add(p + ".weight", { cin, coutg, kt, kf }, ws(cin / g * kt * kf));
+        add(p + ".bias", { coutg * g }, 0.1f);
+    };
+
+    add("erb.erb_fc.weight", { w.erb_high, w.spec_bins - w.erb_low }, ws(w.spec_bins - w.erb_low));
+    add("erb.ierb_fc.weight", { w.spec_bins - w.erb_low, w.erb_high }, ws(w.erb_high));
+    { // encoder: XConv 1->12 s2, XMB 12->24 s2, XDWS 24->24, XMB 24->32, XDWS 32->16
+        const std::string e0 = "encoder.en_convs.0";
+        convw(e0 + ".ops.1", 12, 1, 3, 3);
+        bnw(e0 + ".ops.2", 12); apw(e0 + ".ops.3", 12, F1); ctfaw(e0 + ".ops.4", 12);
+        const std::string e1 = "encoder.en_convs.1";
+        convw(e1 + ".pconv1.0", 24, 6, 1, 1); bnw(e1 + ".pconv1.1", 24); apw(e1 + ".pconv1.2", 24, F1);
+        convw(e1 + ".dconv.1", 24, 1, 2, 3); bnw(e1 + ".dconv.2", 24); apw(e1 + ".dconv.3", 24, F2);
+        convw(e1 + ".pconv2.0", 24, 12, 1, 1); bnw(e1 + ".pconv2.1", 24); ctfaw(e1 + ".pconv2.2", 24);
+        const std::string e2 = "encoder.en_convs.2";
+        convw(e2 + ".pconv.0", 24, 12, 1, 1); bnw(e2 + ".pconv.1", 24); apw(e2 + ".pconv.2", 24, F2);
+        convw(e2 + ".dconv.1", 24, 1, 2, 3); bnw(e2 + ".dconv.2", 24); apw(e2 + ".dconv.3", 24, F2);
+        ctfaw(e2 + ".dconv.4", 24);
+        const std::string e3 = "encoder.en_convs.3";
+        convw(e3 + ".pconv1.0", 32, 12, 1, 1); bnw(e3 + ".pconv1.1", 32); apw(e3 + ".pconv1.2", 32, F2);
+        convw(e3 + ".dconv.1", 32, 1, 1, 5); bnw(e3 + ".dconv.2", 32); apw(e3 + ".dconv.3", 32, F2);
+        convw(e3 + ".pconv2.0", 32, 16, 1, 1); bnw(e3 + ".pconv2.1", 32); ctfaw(e3 + ".pconv2.2", 32);
+        const std::string e4 = "encoder.en_convs.4";
+        convw(e4 + ".pconv.0", 16, 16, 1, 1); bnw(e4 + ".pconv.1", 16); apw(e4 + ".pconv.2", 16, F2);
+        convw(e4 + ".dconv.1", 16, 1, 1, 5); bnw(e4 + ".dconv.2", 16); apw(e4 + ".dconv.3", 16, F2);
+        ctfaw(e4 + ".dconv.4", 16);
+    }
+    for (int i = 0; i < 2; i++) { // bottleneck: 2x DPGRNN (C=16, F=F2)
+        const std::string p = "dpgrnn." + std::to_string(i);
+        gruw(p + ".intra_rnn.rnn1", Cd / 2, 4, true); gruw(p + ".intra_rnn.rnn2", Cd / 2, 4, true);
+        fcw(p + ".intra_fc", Cd, Cd);
+        add(p + ".intra_ln.weight", { F2 * Cd }, 0.1f); add(p + ".intra_ln.bias", { F2 * Cd }, 0.1f);
+        gruw(p + ".inter_rnn.rnn1", Cd / 2, 8, false); gruw(p + ".inter_rnn.rnn2", Cd / 2, 8, false);
+        fcw(p + ".inter_fc", Cd, Cd);
+        add(p + ".inter_ln.weight", { F2 * Cd }, 0.1f); add(p + ".inter_ln.bias", { F2 * Cd }, 0.1f);
+    }
+    { // decoder mirror: XDWS 16->32, XMB 32->24, XDWS 24->24, XMB 24->12 s2, final XConv 12->1 s2
+        const std::string d0 = "decoder.de_convs.0";
+        convw(d0 + ".pconv.0", 32, 8, 1, 1); bnw(d0 + ".pconv.1", 32); apw(d0 + ".pconv.2", 32, F2);
+        convtw(d0 + ".dconv.1", 32, 1, 1, 5, 32); bnw(d0 + ".dconv.2", 32); apw(d0 + ".dconv.3", 32, F2);
+        ctfaw(d0 + ".dconv.4", 32);
+        const std::string d1 = "decoder.de_convs.1";
+        convw(d1 + ".pconv1.0", 24, 16, 1, 1); bnw(d1 + ".pconv1.1", 24); apw(d1 + ".pconv1.2", 24, F2);
+        convtw(d1 + ".dconv.1", 24, 1, 1, 5, 24); bnw(d1 + ".dconv.2", 24); apw(d1 + ".dconv.3", 24, F2);
+        convw(d1 + ".pconv2.0", 24, 12, 1, 1); bnw(d1 + ".pconv2.1", 24); ctfaw(d1 + ".pconv2.2", 24);
+        const std::string d2 = "decoder.de_convs.2";
+        convw(d2 + ".pconv.0", 24, 12, 1, 1); bnw(d2 + ".pconv.1", 24); apw(d2 + ".pconv.2", 24, F2);
+        convtw(d2 + ".dconv.1", 24, 1, 2, 3, 24); bnw(d2 + ".dconv.2", 24); apw(d2 + ".dconv.3", 24, F2);
+        ctfaw(d2 + ".dconv.4", 24);
+        const std::string d3 = "decoder.de_convs.3";
+        convw(d3 + ".pconv1.0", 12, 12, 1, 1); bnw(d3 + ".pconv1.1", 12); apw(d3 + ".pconv1.2", 12, F2);
+        convtw(d3 + ".dconv.1", 12, 1, 2, 3, 12); bnw(d3 + ".dconv.2", 12); apw(d3 + ".dconv.3", 12, F1);
+        convw(d3 + ".pconv2.0", 12, 6, 1, 1); bnw(d3 + ".pconv2.1", 12); ctfaw(d3 + ".pconv2.2", 12);
+        const std::string d4 = "decoder.de_convs.4"; // is_last: no .ops.3 affine-PReLU
+        convtw(d4 + ".ops.1", 12, 1, 3, 3, 1); bnw(d4 + ".ops.2", 1); ctfaw(d4 + ".ops.4", 1);
+    }
+    return w;
+}
+
+// Always-on e2e parity (no fixture): ggml chunk_forward vs the scalar
+// denoiser_net_forward on the synthetic model, same metrics as test_e2e.
+static void test_e2e_synthetic() {
+    std::mt19937    rng(20260710);
+    DenoiserWeights w = make_synthetic_denoiser_weights(rng);
+    const int       L = w.chunk_frames, F = w.spec_bins;
+    auto            df = [&](std::vector<float> & v) {
+        std::uniform_real_distribution<float> d(-2.0f, 2.0f);
+        for (float & x : v) x = d(rng);
+    };
+    std::vector<float> re((size_t) L * F), im((size_t) L * F);
+    df(re); df(im);
+    std::vector<float> sr, si;
+    tts_cpp::lavasr::denoiser_net_forward(w, re, im, L, sr, si);
+    auto               g = tts_cpp::lavasr::DenoiserGgml::create(w, -1);
+    std::vector<float> gr, gi;
+    g->chunk_forward(re, im, L, gr, gi);
+    auto rel = [](const std::vector<float> & a, const std::vector<float> & b, float & mx) {
+        double num = 0, den = 0;
+        mx = 0.0f;
+        for (size_t i = 0; i < a.size(); i++) {
+            float d = std::fabs(a[i] - b[i]);
+            mx      = std::max(mx, d);
+            num += (double) d * d;
+            den += (double) a[i] * a[i];
+        }
+        return (float) std::sqrt(num / std::max(den, 1e-20));
+    };
+    float mr, mi;
+    float rr = rel(sr, gr, mr), ri = rel(si, gi, mi);
+    float  omax = 0.0f;
+    double oss  = 0.0;
+    for (float v : sr) { omax = std::max(omax, std::fabs(v)); oss += (double) v * v; }
+    const float orms = (float) std::sqrt(oss / std::max<double>((double) sr.size(), 1.0));
+    std::printf("e2e-synthetic: real max_abs=%.3e nrmse=%.3e | imag max_abs=%.3e nrmse=%.3e | out rms=%.3e max=%.3e\n",
+                mr, rr, mi, ri, orms, omax);
+    CHECK(gr.size() == sr.size() && gi.size() == si.size(), "synthetic e2e output size matches scalar");
+    CHECK(rr < 2e-3f && ri < 2e-3f, "synthetic denoiser ggml chunk_forward matches scalar");
+    CHECK(omax > 1e-3f, "synthetic outputs are not all ~0 (mask not degenerate)");
+}
+
+// Always-on chunk-batch consistency on the synthetic model (style of test_batch).
+static void test_batch_synthetic() {
+    std::mt19937    rng(20260710);
+    DenoiserWeights w = make_synthetic_denoiser_weights(rng);
+    const int       L = w.chunk_frames, F = w.spec_bins, N = 3;
+    auto            df = [&](std::vector<float> & v) {
+        std::uniform_real_distribution<float> d(-2.0f, 2.0f);
+        for (float & x : v) x = d(rng);
+    };
+    std::vector<float> re((size_t) N * L * F), im((size_t) N * L * F);
+    df(re); df(im);
+    auto g = tts_cpp::lavasr::DenoiserGgml::create(w, -1);
+    std::vector<float> br, bi;
+    g->batch_forward(re, im, L, N, br, bi);
+    float m = 0.0f;
+    for (int c = 0; c < N; c++) {
+        std::vector<float> cre(re.begin() + (size_t) c * L * F, re.begin() + (size_t) (c + 1) * L * F);
+        std::vector<float> cim(im.begin() + (size_t) c * L * F, im.begin() + (size_t) (c + 1) * L * F);
+        std::vector<float> sr, si;
+        g->chunk_forward(cre, cim, L, sr, si);
+        for (size_t i = 0; i < sr.size(); i++) {
+            m = std::max(m, std::fabs(br[(size_t) c * L * F + i] - sr[i]));
+            m = std::max(m, std::fabs(bi[(size_t) c * L * F + i] - si[i]));
+        }
+    }
+    std::printf("batch-consistency synthetic (N=%d): max_abs=%.3e\n", N, m);
+    CHECK(m < 1e-4f, "synthetic batch_forward matches per-chunk chunk_forward");
+}
+
 int main(int argc, char ** argv) {
     test_gru_batched();
     test_conv2d();
     test_conv_transpose2d();
     test_dpgrnn();
     test_ctfa();
+    test_e2e_synthetic();
+    test_batch_synthetic();
     if (argc > 1) { test_e2e(argv[1]); test_batch(argv[1]); }
     if (g_failures == 0) {
         std::printf("OK: all LavaSR denoiser ggml tests passed\n");

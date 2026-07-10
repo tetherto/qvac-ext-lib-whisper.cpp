@@ -1057,6 +1057,13 @@ if (TTS_CPP_BUILD_TESTS)
     target_include_directories(test-lavasr-denoiser-ggml PRIVATE include src ggml/include)
     tts_cpp_apply_ccache(test-lavasr-denoiser-ggml)
     tts_cpp_register_test(test-lavasr-denoiser-ggml LABEL "unit")
+    # Same binary with the real GGUF: adds the production-weights e2e + batch parity
+    # where the model fixture is present.
+    tts_cpp_register_test(test-lavasr-denoiser-ggml-e2e
+        EXE      test-lavasr-denoiser-ggml
+        LABEL    "fixture"
+        ARGS     "${TTS_CPP_TEST_MODEL_DIR}/lavasr-denoiser.gguf"
+        REQUIRES "${TTS_CPP_TEST_MODEL_DIR}/lavasr-denoiser.gguf")
 
     # LavaSR denoiser GGUF round-trip (follow-up): load the converted
     # GGUF via load_denoiser_gguf() + the public tts_cpp::lavasr::Denoiser API,
