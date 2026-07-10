@@ -48,4 +48,8 @@ int Denoiser::native_sample_rate() const {
     return denoiser_work_sample_rate(impl_->weights);
 }
 
+std::string Denoiser::backend_name() const {
+    return impl_->ggml ? impl_->ggml->backend_name() : "scalar";
+}
+
 } // namespace tts_cpp::lavasr

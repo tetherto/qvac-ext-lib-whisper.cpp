@@ -54,6 +54,11 @@ public:
     // GGUF metadata).  Informational — denoise() itself is rate-preserving.
     int native_sample_rate() const;
 
+    // Compute backend of the neural core, mirroring Enhancer::backend_name():
+    // the ggml backend name (e.g. "OpenCL", "CPU") when a ggml engine is
+    // active, "scalar" for the pure-scalar path.
+    std::string backend_name() const;
+
 private:
     Denoiser();
     struct Impl;
