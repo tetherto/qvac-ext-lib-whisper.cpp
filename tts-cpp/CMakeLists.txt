@@ -258,6 +258,7 @@ set(TTS_CPP_LIB_SOURCES
     src/lavasr/dsp/stft_processor.cpp
     src/lavasr/dsp/mel_filterbank.cpp
     src/lavasr/dsp/fastlr_merge.cpp
+    src/lavasr/dsp/overlap_add.cpp
     src/lavasr/enhancer_core.cpp
     src/lavasr/enhancer.cpp
     src/lavasr/enhancer_ggml.cpp
@@ -995,8 +996,12 @@ if (TTS_CPP_BUILD_TESTS)
         src/lavasr/dsp/resampler.cpp
         src/lavasr/dsp/stft_processor.cpp
         src/lavasr/dsp/mel_filterbank.cpp
-        src/lavasr/dsp/fastlr_merge.cpp)
+        src/lavasr/dsp/fastlr_merge.cpp
+        src/lavasr/dsp/overlap_add.cpp)
     target_include_directories(test-lavasr-dsp PRIVATE src)
+    if (OpenMP_CXX_FOUND)
+        target_link_libraries(test-lavasr-dsp PRIVATE OpenMP::OpenMP_CXX)
+    endif()
     tts_cpp_apply_ccache(test-lavasr-dsp)
     tts_cpp_register_test(test-lavasr-dsp LABEL "unit")
 

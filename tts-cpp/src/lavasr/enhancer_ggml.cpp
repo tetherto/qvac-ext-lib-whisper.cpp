@@ -291,7 +291,8 @@ EnhancerGgml * enhancer_ggml_create(const EnhancerWeights & w, ggml_backend_t ba
         const std::string p = "blk" + std::to_string(i) + ".";
         BlockW & b = g->blocks[static_cast<size_t>(i)];
         b.dw_w   = new_3d(g->wctx, K, 1, C, (p + "dw.w").c_str());
-        b.dwt_w  = new_3d(g->wctx, C, 1, K, (p + "dw.wt").c_str());
+        // CWHN transpose is consumed only on the Vulkan dw-direct path; skip elsewhere.
+        if (g->use_dw_direct) b.dwt_w = new_3d(g->wctx, C, 1, K, (p + "dw.wt").c_str());
         b.dw_b   = new_1d(g->wctx, C, (p + "dw.b").c_str());
         b.norm_g = new_1d(g->wctx, C, (p + "norm.g").c_str());
         b.norm_b = new_1d(g->wctx, C, (p + "norm.b").c_str());
@@ -324,7 +325,7 @@ EnhancerGgml * enhancer_ggml_create(const EnhancerWeights & w, ggml_backend_t ba
         const std::string p = "enhancer.block." + std::to_string(i) + ".";
         const BlockW &    b = g->blocks[static_cast<size_t>(i)];
         ok = ok && upload_weight(b.dw_w, w, p + "dwconv.weight");
-        ok = ok && upload_weight_dw_cm(b.dwt_w, w, p + "dwconv.weight");
+        if (g->use_dw_direct) ok = ok && upload_weight_dw_cm(b.dwt_w, w, p + "dwconv.weight");
         ok = ok && upload_weight(b.dw_b, w, p + "dwconv.bias");
         ok = ok && upload_weight(b.norm_g, w, p + "norm.weight");
         ok = ok && upload_weight(b.norm_b, w, p + "norm.bias");

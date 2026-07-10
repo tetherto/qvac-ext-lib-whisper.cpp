@@ -171,35 +171,38 @@ std::vector<float> StftProcessor::istft(const Spectrogram & spec,
         }
     };
 
-    // Two-for-one: IFFT(A + iB) = a + i·b for real signals a,b (Hermitian A,B),
-    // so a frame pair is recovered from one inverse FFT (real→t, imag→t+1).
-    // The independent inverse FFTs run in parallel; the overlap-add stays
-    // serial in frame order, so the accumulation is unchanged.
-    const int num_pairs = T / 2;
-    std::vector<ComplexVec> pair_frames(num_pairs);
-    #pragma omp parallel for schedule(static)
-    for (int tp = 0; tp < num_pairs; tp++) {
-        const int  t = 2 * tp;
-        ComplexVec frame(n_fft_);
-        for (int k = 0; k < n_fft_; k++) {
-            const int kk = (k <= n_fft_ / 2) ? k : n_fft_ - k;
-            std::complex<float> a = spec[t][kk];
-            std::complex<float> b = spec[t + 1][kk];
-            if (k > n_fft_ / 2) { a = std::conj(a); b = std::conj(b); }
-            // DC and Nyquist must be real for each packed spectrum to be Hermitian, else
-            // frame t+1's DC/Nyquist imag leaks into frame t (per-frame istft drops it via .real()).
-            if (k == 0 || k == n_fft_ / 2) {
-                a = std::complex<float>(a.real(), 0.0f);
-                b = std::complex<float>(b.real(), 0.0f);
+    // Two-for-one: IFFT(A + iB) = a + i·b for real a,b (Hermitian A,B) recovers a frame
+    // pair per inverse FFT. Pairs run in kPairTile parallel tiles (peak memory bounded to
+    // the tile, not T/2); overlap-add stays serial in ascending frame order → unchanged.
+    const int     num_pairs = T / 2;
+    constexpr int kPairTile = 256;
+    std::vector<ComplexVec> pair_frames(static_cast<size_t>(std::min(num_pairs, kPairTile)));
+    for (int base = 0; base < num_pairs; base += kPairTile) {
+        const int tile = std::min(kPairTile, num_pairs - base);
+        #pragma omp parallel for schedule(static)
+        for (int j = 0; j < tile; j++) {
+            const int  t = 2 * (base + j);
+            ComplexVec frame(n_fft_);
+            for (int k = 0; k < n_fft_; k++) {
+                const int kk = (k <= n_fft_ / 2) ? k : n_fft_ - k;
+                std::complex<float> a = spec[t][kk];
+                std::complex<float> b = spec[t + 1][kk];
+                if (k > n_fft_ / 2) { a = std::conj(a); b = std::conj(b); }
+                // DC and Nyquist must be real for each packed spectrum to be Hermitian, else
+                // frame t+1's DC/Nyquist imag leaks into frame t (per-frame istft drops it via .real()).
+                if (k == 0 || k == n_fft_ / 2) {
+                    a = std::complex<float>(a.real(), 0.0f);
+                    b = std::complex<float>(b.real(), 0.0f);
+                }
+                frame[k] = a + std::complex<float>(0.0f, 1.0f) * b;
             }
-            frame[k] = a + std::complex<float>(0.0f, 1.0f) * b;
+            fft(frame, true);
+            pair_frames[static_cast<size_t>(j)] = std::move(frame);
         }
-        fft(frame, true);
-        pair_frames[tp] = std::move(frame);
-    }
-    for (int tp = 0; tp < num_pairs; tp++) {
-        add_frame(2 * tp, pair_frames[tp], false);
-        add_frame(2 * tp + 1, pair_frames[tp], true);
+        for (int j = 0; j < tile; j++) {
+            add_frame(2 * (base + j), pair_frames[static_cast<size_t>(j)], false);
+            add_frame(2 * (base + j) + 1, pair_frames[static_cast<size_t>(j)], true);
+        }
     }
     if (2 * num_pairs < T) {  // trailing odd frame
         const int  t = 2 * num_pairs;
