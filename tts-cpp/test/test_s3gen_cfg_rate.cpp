@@ -33,6 +33,18 @@ int main() {
     CHECK(resolve_s3gen_cfg_rate(opts.cfg_rate, model_rate) == model_rate,
           "untouched opts resolves to the model rate");
 
+    CHECK(apply_cfg_rate_env_override(model_rate, nullptr) == model_rate, "null env -> keep current");
+    CHECK(apply_cfg_rate_env_override(model_rate, "")      == model_rate, "empty env -> keep current");
+    CHECK(apply_cfg_rate_env_override(model_rate, "   ")   == model_rate, "whitespace env -> keep current");
+    CHECK(apply_cfg_rate_env_override(model_rate, "foo")   == model_rate, "unparseable env -> keep current");
+    CHECK(apply_cfg_rate_env_override(model_rate, "0.5x")  == model_rate, "trailing garbage -> keep current");
+    CHECK(apply_cfg_rate_env_override(model_rate, "-1")    == model_rate, "negative sentinel env -> keep current");
+    CHECK(apply_cfg_rate_env_override(model_rate, "-0.7")  == model_rate, "any negative env -> keep current");
+
+    CHECK(apply_cfg_rate_env_override(model_rate, "0")   == 0.0f, "env 0 -> cfg off");
+    CHECK(apply_cfg_rate_env_override(model_rate, "0.5") == 0.5f, "env 0.5 -> override");
+    CHECK(apply_cfg_rate_env_override(model_rate, "1.3") == 1.3f, "env 1.3 -> override");
+
     if (g_failures) {
         fprintf(stderr, "test-s3gen-cfg-rate: %d FAILURE(S)\n", g_failures);
         return 1;

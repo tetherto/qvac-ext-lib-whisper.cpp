@@ -2822,9 +2822,9 @@ int s3gen_synthesize_to_wav(
 
     float cfg_rate = resolve_s3gen_cfg_rate(opts.cfg_rate, m.cfg_rate);
     {
-        static const char * cfg_env = getenv("CHATTERBOX_CFG_RATE");
-        if (cfg_env && cfg_env[0]) {
-            cfg_rate = (float)atof(cfg_env);
+        const float overridden = apply_cfg_rate_env_override(cfg_rate, getenv("CHATTERBOX_CFG_RATE"));
+        if (overridden != cfg_rate) {
+            cfg_rate = overridden;
             static bool warned = false;
             if (!warned) {
                 warned = true;
