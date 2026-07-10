@@ -43,9 +43,8 @@ struct EnhancerGgml {
     ggml_backend_buffer_t wbuf    = nullptr; // weight data on the backend
     ggml_gallocr_t        allocr  = nullptr; // reusable compute allocator
 
-    // Native depthwise conv (CWHN, channel-major) where the backend implements
-    // CONV_2D_DW (Vulkan).  The im2col+matmul fallback stays for Metal/CPU:
-    // k=7 per-channel matvecs are pathological on GPU but the op is absent on Metal.
+    // Native CONV_2D_DW (Vulkan) vs im2col+matmul fallback (Metal/CPU): the k=7
+    // per-channel matvecs are GPU-pathological, but Metal has no CONV_2D_DW.
     bool use_dw_direct = false;
 
     // Geometry snapshot.
@@ -135,9 +134,8 @@ ggml_tensor * depthwise_same(ggml_context * ctx, ggml_tensor * kernel,
     return y;
 }
 
-// Depthwise Conv1d on channel-major x [C, T, 1] -> [C, T, 1].  cwhn: native
-// CONV_2D_DW on a channels-fastest [T,1,C,1] view of x with the C-fastest
-// kernel copy; otherwise the time-major path wrapped in two transposes.
+// Depthwise Conv1d, channel-major [C,T,1].  cwhn: native CONV_2D_DW on a
+// channels-fastest [T,1,C,1] view; else time-major wrapped in two transposes.
 ggml_tensor * depthwise_cm(ggml_context * ctx, const BlockW & b, ggml_tensor * x,
                            int pad, bool cwhn, bool dw_direct) {
     ggml_tensor * y;

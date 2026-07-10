@@ -1,18 +1,5 @@
-// LavaSR two-stage benchmark + by-ear harness.
-//
-// Loads the denoiser + enhancer GGUFs, runs denoise() -> enhance() on a fixed
-// input (a real wav via --in, or a synthetic tone), and reports per-stage
-// wall-time + RTF over N runs (warmup runs dropped).  Optionally writes the
-// denoised / enhanced wavs for by-ear verification.  Mirrors supertonic_bench.
-//
-// Usage:
-//   lavasr-bench --denoiser lavasr-denoiser-f16.gguf --enhancer lavasr-enhancer-f16.gguf
-//                [--in speech.wav] [--seconds 6] [--in-rate 24000]
-//                [--runs 5] [--warmup 1] [--n-gpu-layers 0]
-//                [--out-denoised dn.wav] [--out-enhanced enh.wav]
-//
-// --n-gpu-layers routes the ENHANCER neural core: 0 scalar CPU (default), >0
-// ggml GPU (Adreno OpenCL, CPU fallback), <0 ggml-CPU.  (Denoiser GPU: Phase 2.)
+// LavaSR two-stage bench + by-ear harness: denoise() -> enhance() on a wav or
+// synthetic tone; reports per-stage wall-time + RTF over N runs (warmup dropped).
 
 #include "tts-cpp/lavasr/denoiser.h"
 #include "tts-cpp/lavasr/enhancer.h"

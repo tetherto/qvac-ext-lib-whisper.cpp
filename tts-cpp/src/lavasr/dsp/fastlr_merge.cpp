@@ -75,9 +75,8 @@ std::vector<float> FastLRMerge::merge(const std::vector<float> & enhanced,
         mask[start] = 0.5f;
     }
 
-    // Blend spectra: original low-freq + enhanced high-freq.  The blend is
-    // Hermitian-symmetric (real time signal), so only bins 0..N/2 are kept;
-    // DC and Nyquist (self-conjugate bins) are forced real explicitly.
+    // Blend: original low-freq + enhanced high-freq.  Hermitian-symmetric (real
+    // signal) so only bins 0..N/2 are kept; DC and Nyquist forced real explicitly.
     const int n_half = n_pow2 / 2;
     ComplexVec blended(n_bins);
     for (int i = 0; i < n_bins; i++) {
@@ -91,11 +90,8 @@ std::vector<float> FastLRMerge::merge(const std::vector<float> & enhanced,
         return {blended[0].real()};  // size-1 iFFT is the identity
     }
 
-    // Inverse two-for-one: a Hermitian length-N spectrum B inverts through one
-    // length-N/2 complex iFFT.  With W = e^{+2*pi*i/N}, for k in [0, N/2):
-    //   E[k] = (B[k] + conj(B[N/2-k])) / 2          (spectrum of even samples)
-    //   O[k] = (B[k] - conj(B[N/2-k])) / 2 * W^k    (spectrum of odd samples)
-    //   z = iFFT_{N/2}(E + i*O);  out[2m] = Re z[m], out[2m+1] = Im z[m].
+    // Inverse two-for-one: Hermitian length-N B inverts via one length-N/2 iFFT.
+    // E=(B[k]+conj(B[N/2-k]))/2, O=(B[k]-conj(B[N/2-k]))/2*W^k (W=e^{2pi i/N}); z=iFFT(E+iO), out[2m]=Re z[m], out[2m+1]=Im z[m].
     ComplexVec packed(n_half);
     const float step_re = std::cos(2.0f * static_cast<float>(PI) / n_pow2);
     const float step_im = std::sin(2.0f * static_cast<float>(PI) / n_pow2);

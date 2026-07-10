@@ -48,9 +48,8 @@ void StftProcessor::fft(ComplexVec & x, bool inverse) {
             2.0f * static_cast<float>(PI) / len * (inverse ? 1.0f : -1.0f);
         const float wlen_re = std::cos(angle);
         const float wlen_im = std::sin(angle);
-        // Blocks are independent and each runs its own twiddle recurrence from
-        // w=1, so distributing them is bit-identical.  Only large transforms
-        // (FastLRMerge's whole-signal FFT) benefit; per-frame FFTs stay serial.
+        // Blocks are independent (each twiddle recurrence restarts from w=1), so
+        // parallelising is bit-identical; only large whole-signal FFTs benefit.
         #pragma omp parallel for schedule(static) if (N >= 65536 && (N / len) >= 2)
         for (int i = 0; i < N; i += len) {
             float w_re = 1.0f, w_im = 0.0f;
