@@ -1116,7 +1116,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
             opts.cfm_steps       = params.cfm_steps;
-            opts.s3gen_cfg_rate  = params.cfg_rate;
+            opts.cfg_rate        = params.cfg_rate;
             opts.dump_mel_path   = params.dump_mel_path;
             opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
@@ -1392,7 +1392,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             // chunk; --cfm-steps falls in as the per-chunk default below
             // (`stream_cfm_steps > 0 ? stream_cfm_steps : cfm_steps`).
             opts.cfm_steps       = params.cfm_steps;
-            opts.s3gen_cfg_rate  = params.cfg_rate;
+            opts.cfg_rate        = params.cfg_rate;
             opts.dump_mel_path   = params.dump_mel_path;
             opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
@@ -2276,7 +2276,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             // Streaming chunks honour --stream-cfm-steps with --cfm-steps as
             // fallback when copts is set up further below.
             opts.cfm_steps       = params.cfm_steps;
-            opts.s3gen_cfg_rate  = params.cfg_rate;
+            opts.cfg_rate        = params.cfg_rate;
             opts.dump_mel_path   = params.dump_mel_path;
             opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
