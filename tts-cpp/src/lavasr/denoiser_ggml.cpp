@@ -291,10 +291,14 @@ static ggml_tensor * erb_bs(ggml_context * ctx, ggml_tensor * m, ggml_tensor * E
 }
 
 // BatchNorm folded to per-channel scale/shift (precomputed at load).  x:[F,T,C].
-static ggml_tensor * batchnorm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * scale, ggml_tensor * shift) {
-    const int64_t C = x->ne[2];
-    return ggml_add(ctx, ggml_mul(ctx, x, ggml_reshape_3d(ctx, scale, 1, 1, C)),
-                    ggml_reshape_3d(ctx, shift, 1, 1, C));
+// With gf, the shift operand is pinned into the graph before the mul so the
+// mul and add come out adjacent (fusable pair) — same ops, bit-identical.
+static ggml_tensor * batchnorm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * scale, ggml_tensor * shift,
+                               ggml_cgraph * gf = nullptr) {
+    const int64_t C  = x->ne[2];
+    ggml_tensor * sh = ggml_reshape_3d(ctx, shift, 1, 1, C);
+    if (gf) ggml_build_forward_expand(gf, sh);
+    return ggml_add(ctx, ggml_mul(ctx, x, ggml_reshape_3d(ctx, scale, 1, 1, C)), sh);
 }
 
 // Per-(c,f) affine + per-channel PReLU.  aw,ab: ggml [F,C] (PyTorch [C,F]); slope [C].
@@ -335,7 +339,7 @@ static ggml_tensor * run_block(ggml_context * ctx, ggml_tensor * x, const std::s
                       : conv2d(ctx, in, W(wn + ".weight"), W(wn + ".bias"), st, pf, grp, fused);
     };
     auto bn = [&](ggml_tensor * h, const std::string & p) {
-        return batchnorm(ctx, h, W(p + ".bn_scale"), W(p + ".bn_shift"));
+        return batchnorm(ctx, h, W(p + ".bn_scale"), W(p + ".bn_shift"), gf);
     };
     auto ap = [&](ggml_tensor * h, const std::string & p) {
         return affine_prelu(ctx, h, W(p + ".affine_weight"), W(p + ".affine_bias"), W(p + ".slope_weight"), fused);
