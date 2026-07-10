@@ -3,6 +3,7 @@
 
 #include "lavasr/denoiser_ggml.h"
 
+#include "lavasr/denoiser.h"      // internal: denoise_with_core / denoise_with_batch_core
 #include "lavasr/denoiser_gguf.h" // internal: load_denoiser_gguf
 
 #include "ggml.h"
@@ -24,6 +25,13 @@ static int g_failures = 0;
             std::fprintf(stderr, "FAIL: %s  (%s:%d)\n", msg, __FILE__, __LINE__);\
         }                                                                        \
     } while (0)
+
+// Case name + fused mode, so a failure identifies which graph variant drifted.
+static const char * fmsg(const char * name, bool fused) {
+    static char b[160];
+    std::snprintf(b, sizeof b, "%s [fused=%d]", name, (int) fused);
+    return b;
+}
 
 // Scalar PyTorch GRU (gate order r,z,n), zero init state — a verbatim copy of
 // denoiser_core.cpp gru_seq, the golden reference.  Wih:[3H,I], Whh:[3H,H].
@@ -76,7 +84,8 @@ static std::vector<float> run_batched(const std::vector<float> & x, int I, int B
                                       const std::vector<float> & Bih, const std::vector<float> & Bhh,
                                       bool reverse, bool bidir,
                                       const std::vector<float> & WihR, const std::vector<float> & WhhR,
-                                      const std::vector<float> & BihR, const std::vector<float> & BhhR) {
+                                      const std::vector<float> & BihR, const std::vector<float> & BhhR,
+                                      bool fused) {
     ggml_init_params p{ (size_t) 128 * 1024 * 1024, nullptr, false };
     ggml_context *   ctx = ggml_init(p);
     ggml_tensor *    tx  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, I, B, L);
@@ -90,7 +99,7 @@ static std::vector<float> run_batched(const std::vector<float> & x, int I, int B
     std::memcpy(tBih->data, Bih.data(), ggml_nbytes(tBih));
     std::memcpy(tBhh->data, Bhh.data(), ggml_nbytes(tBhh));
 
-    ggml_tensor * y = detail::gru_batched(ctx, tx, tWih, tWhh, tBih, tBhh, reverse);
+    ggml_tensor * y = detail::gru_batched(ctx, tx, tWih, tWhh, tBih, tBhh, reverse, fused);
     if (bidir) {
         ggml_tensor * tWihR = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, I, 3 * H);
         ggml_tensor * tWhhR = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 3 * H);
@@ -100,7 +109,7 @@ static std::vector<float> run_batched(const std::vector<float> & x, int I, int B
         std::memcpy(tWhhR->data, WhhR.data(), ggml_nbytes(tWhhR));
         std::memcpy(tBihR->data, BihR.data(), ggml_nbytes(tBihR));
         std::memcpy(tBhhR->data, BhhR.data(), ggml_nbytes(tBhhR));
-        ggml_tensor * yr = detail::gru_batched(ctx, tx, tWihR, tWhhR, tBihR, tBhhR, true);
+        ggml_tensor * yr = detail::gru_batched(ctx, tx, tWihR, tWhhR, tBihR, tBhhR, true, fused);
         y                = ggml_concat(ctx, y, yr, 0); // [2H, B, L]
     }
     ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -135,9 +144,9 @@ static void test_gru_batched() {
     };
 
     // Forward: y[(l*B+b)*H+k] must equal per-sequence ref_gru_seq.
-    {
+    for (bool fused : { true, false }) {
         std::vector<float> y = run_batched(x, I, B, L, H, Wih, Whh, Bih, Bhh, false, false,
-                                           {}, {}, {}, {});
+                                           {}, {}, {}, {}, fused);
         float m = 0.0f;
         for (int b = 0; b < B; b++) {
             std::vector<float> ref = ref_gru_seq(x_of(b), L, I, H, Wih, Whh, Bih, Bhh);
@@ -145,12 +154,12 @@ static void test_gru_batched() {
                 for (int k = 0; k < H; k++)
                     m = std::max(m, std::fabs(y[((size_t) l * B + b) * H + k] - ref[(size_t) l * H + k]));
         }
-        CHECK(m < 1e-5f, "gru_batched forward matches scalar gru_seq");
+        CHECK(m < 1e-5f, fmsg("gru_batched forward matches scalar gru_seq", fused));
     }
     // Reverse: matches gru_bi's backward convention (hidden at original position).
-    {
+    for (bool fused : { true, false }) {
         std::vector<float> y = run_batched(x, I, B, L, H, Wih, Whh, Bih, Bhh, true, false,
-                                           {}, {}, {}, {});
+                                           {}, {}, {}, {}, fused);
         float m = 0.0f;
         for (int b = 0; b < B; b++) {
             std::vector<float> ref = ref_gru_rev(x_of(b), L, I, H, Wih, Whh, Bih, Bhh);
@@ -158,12 +167,12 @@ static void test_gru_batched() {
                 for (int k = 0; k < H; k++)
                     m = std::max(m, std::fabs(y[((size_t) l * B + b) * H + k] - ref[(size_t) l * H + k]));
         }
-        CHECK(m < 1e-5f, "gru_batched reverse matches scalar backward");
+        CHECK(m < 1e-5f, fmsg("gru_batched reverse matches scalar backward", fused));
     }
     // BiGRU: concat(forward, reverse) along ne0 == scalar [fwd | bwd].
-    {
+    for (bool fused : { true, false }) {
         std::vector<float> y = run_batched(x, I, B, L, H, Wih, Whh, Bih, Bhh, false, true,
-                                           WihR, WhhR, BihR, BhhR);
+                                           WihR, WhhR, BihR, BhhR, fused);
         float m = 0.0f;
         for (int b = 0; b < B; b++) {
             std::vector<float> f = ref_gru_seq(x_of(b), L, I, H, Wih, Whh, Bih, Bhh);
@@ -175,7 +184,7 @@ static void test_gru_batched() {
                 }
             }
         }
-        CHECK(m < 1e-5f, "gru_batched BiGRU concat matches scalar gru_bi");
+        CHECK(m < 1e-5f, fmsg("gru_batched BiGRU concat matches scalar gru_bi", fused));
     }
 }
 
@@ -218,7 +227,7 @@ static std::vector<float> ref_conv2d(const std::vector<float> & x, int Cin, int 
 
 static std::vector<float> run_conv2d(const std::vector<float> & x, int Cin, int T, int F,
                                      const std::vector<float> & W, int Cout, int Cing, int kt, int kf,
-                                     const std::vector<float> & bias, int stride_f, int pad_f, int groups) {
+                                     const std::vector<float> & bias, int stride_f, int pad_f, int groups, bool fused) {
     ggml_init_params p{ (size_t) 128 * 1024 * 1024, nullptr, false };
     ggml_context *   ctx = ggml_init(p);
     ggml_tensor *    tx  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, F, T, Cin);
@@ -227,7 +236,7 @@ static std::vector<float> run_conv2d(const std::vector<float> & x, int Cin, int 
     std::memcpy(tx->data, x.data(), ggml_nbytes(tx));
     std::memcpy(tW->data, W.data(), ggml_nbytes(tW));
     std::memcpy(tb->data, bias.data(), ggml_nbytes(tb));
-    ggml_tensor * y  = detail::conv2d(ctx, tx, tW, tb, stride_f, pad_f, groups);
+    ggml_tensor * y  = detail::conv2d(ctx, tx, tW, tb, stride_f, pad_f, groups, fused);
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, y);
     ggml_graph_compute_with_ctx(ctx, gf, 1);
@@ -251,11 +260,13 @@ static void test_conv2d() {
         std::vector<float> x((size_t) c.Cin * T * F), W((size_t) c.Cout * Cing * c.kt * c.kf), b(c.Cout);
         rand_fill(x, rng); rand_fill(W, rng); rand_fill(b, rng);
         std::vector<float> ref = ref_conv2d(x, c.Cin, T, F, W, c.Cout, Cing, c.kt, c.kf, &b, c.stride, c.pad, c.groups);
-        std::vector<float> got = run_conv2d(x, c.Cin, T, F, W, c.Cout, Cing, c.kt, c.kf, b, c.stride, c.pad, c.groups);
-        float m = 0.0f;
-        CHECK(got.size() == ref.size(), c.name);
-        for (size_t i = 0; i < ref.size() && i < got.size(); i++) m = std::max(m, std::fabs(got[i] - ref[i]));
-        CHECK(m < 1e-4f, c.name);
+        for (bool fused : { true, false }) {
+            std::vector<float> got = run_conv2d(x, c.Cin, T, F, W, c.Cout, Cing, c.kt, c.kf, b, c.stride, c.pad, c.groups, fused);
+            float m = 0.0f;
+            CHECK(got.size() == ref.size(), fmsg(c.name, fused));
+            for (size_t i = 0; i < ref.size() && i < got.size(); i++) m = std::max(m, std::fabs(got[i] - ref[i]));
+            CHECK(m < 1e-4f, fmsg(c.name, fused));
+        }
     }
 }
 
@@ -320,7 +331,7 @@ static std::vector<float> reindex_ct(const std::vector<float> & Wt, int Cin, int
 
 static std::vector<float> run_conv_transpose2d(const std::vector<float> & x, int Cin, int T, int F,
                                                const std::vector<float> & Wc, int Cout, int ing, int kt, int kf,
-                                               const std::vector<float> & bias, int stride_f, int pad_f, int groups) {
+                                               const std::vector<float> & bias, int stride_f, int pad_f, int groups, bool fused) {
     ggml_init_params p{ (size_t) 128 * 1024 * 1024, nullptr, false };
     ggml_context *   ctx = ggml_init(p);
     ggml_tensor *    tx  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, F, T, Cin);
@@ -329,7 +340,7 @@ static std::vector<float> run_conv_transpose2d(const std::vector<float> & x, int
     std::memcpy(tx->data, x.data(), ggml_nbytes(tx));
     std::memcpy(tW->data, Wc.data(), ggml_nbytes(tW));
     std::memcpy(tb->data, bias.data(), ggml_nbytes(tb));
-    ggml_tensor * y  = detail::conv_transpose2d(ctx, tx, tW, tb, stride_f, pad_f, groups);
+    ggml_tensor * y  = detail::conv_transpose2d(ctx, tx, tW, tb, stride_f, pad_f, groups, fused);
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, y);
     ggml_graph_compute_with_ctx(ctx, gf, 1);
@@ -354,11 +365,81 @@ static void test_conv_transpose2d() {
         rand_fill(x, rng); rand_fill(Wt, rng); rand_fill(b, rng);
         std::vector<float> ref = ref_conv_transpose2d(x, c.Cin, T, F, Wt, c.Coutg, c.kt, c.kf, &b, c.stride, c.pad, c.groups);
         std::vector<float> Wc  = reindex_ct(Wt, c.Cin, c.Coutg, c.kt, c.kf, c.groups);
-        std::vector<float> got = run_conv_transpose2d(x, c.Cin, T, F, Wc, Cout, ing, c.kt, c.kf, b, c.stride, c.pad, c.groups);
+        for (bool fused : { true, false }) {
+            std::vector<float> got = run_conv_transpose2d(x, c.Cin, T, F, Wc, Cout, ing, c.kt, c.kf, b, c.stride, c.pad, c.groups, fused);
+            float m = 0.0f;
+            CHECK(got.size() == ref.size(), fmsg(c.name, fused));
+            for (size_t i = 0; i < ref.size() && i < got.size(); i++) m = std::max(m, std::fabs(got[i] - ref[i]));
+            CHECK(m < 1e-4f, fmsg(c.name, fused));
+        }
+    }
+}
+
+static void test_affine_prelu() {
+    std::mt19937 rng(4242);
+    const int F = 7, T = 5, C = 6;
+    std::vector<float> x((size_t) C * T * F), aw((size_t) C * F), ab((size_t) C * F), sl(C);
+    rand_fill(x, rng); rand_fill(aw, rng); rand_fill(ab, rng); rand_fill(sl, rng);
+    std::vector<float> ref(x.size());
+    for (int c = 0; c < C; c++)
+        for (int t = 0; t < T; t++)
+            for (int f = 0; f < F; f++) {
+                const size_t i = ((size_t) c * T + t) * F + f;
+                const float  v = x[i];
+                ref[i] = (v * aw[(size_t) c * F + f] + ab[(size_t) c * F + f]) + (v > 0.0f ? v : sl[c] * v);
+            }
+    for (bool fused : { true, false }) {
+        ggml_init_params p{ (size_t) 32 * 1024 * 1024, nullptr, false };
+        ggml_context *   ctx = ggml_init(p);
+        ggml_tensor *    tx  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, F, T, C);
+        ggml_tensor *    ta  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, F, C);
+        ggml_tensor *    tb  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, F, C);
+        ggml_tensor *    ts  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        std::memcpy(tx->data, x.data(), ggml_nbytes(tx));
+        std::memcpy(ta->data, aw.data(), ggml_nbytes(ta));
+        std::memcpy(tb->data, ab.data(), ggml_nbytes(tb));
+        std::memcpy(ts->data, sl.data(), ggml_nbytes(ts));
+        ggml_tensor * y  = detail::affine_prelu(ctx, tx, ta, tb, ts, fused);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, y);
+        ggml_graph_compute_with_ctx(ctx, gf, 1);
         float m = 0.0f;
-        CHECK(got.size() == ref.size(), c.name);
-        for (size_t i = 0; i < ref.size() && i < got.size(); i++) m = std::max(m, std::fabs(got[i] - ref[i]));
-        CHECK(m < 1e-4f, c.name);
+        CHECK((size_t) ggml_nelements(y) == ref.size(), fmsg("affine_prelu output size", fused));
+        const float * out = (const float *) y->data;
+        for (size_t i = 0; i < ref.size(); i++) m = std::max(m, std::fabs(out[i] - ref[i]));
+        CHECK(m < 1e-5f, fmsg("affine_prelu matches scalar reference", fused));
+        ggml_free(ctx);
+    }
+}
+
+static void test_shuffle2() {
+    std::mt19937 rng(5151);
+    const int F = 5, T = 4, C = 6, half = C / 2;
+    std::vector<float> x((size_t) C * T * F);
+    rand_fill(x, rng);
+    std::vector<float> ref(x.size());
+    for (int c = 0; c < half; c++)
+        for (int t = 0; t < T; t++)
+            for (int f = 0; f < F; f++) {
+                ref[((size_t) (2 * c) * T + t) * F + f]     = x[((size_t) c * T + t) * F + f];
+                ref[((size_t) (2 * c + 1) * T + t) * F + f] = x[((size_t) (half + c) * T + t) * F + f];
+            }
+    for (bool fused : { true, false }) {
+        ggml_init_params p{ (size_t) 32 * 1024 * 1024, nullptr, false };
+        ggml_context *   ctx = ggml_init(p);
+        ggml_tensor *    tx  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, F, T, C);
+        std::memcpy(tx->data, x.data(), ggml_nbytes(tx));
+        ggml_tensor * y  = detail::shuffle2(ctx, tx, fused);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, y);
+        ggml_graph_compute_with_ctx(ctx, gf, 1);
+        float m = -1.0f;
+        CHECK((size_t) ggml_nelements(y) == ref.size(), fmsg("shuffle2 output size", fused));
+        const float * out = (const float *) y->data;
+        m = 0.0f;
+        for (size_t i = 0; i < ref.size(); i++) m = std::max(m, std::fabs(out[i] - ref[i]));
+        CHECK(m == 0.0f, fmsg("shuffle2 is an exact channel interleave", fused));
+        ggml_free(ctx);
     }
 }
 
@@ -477,7 +558,7 @@ static std::vector<float> ref_dpgrnn(const std::vector<float> & x, int C, int T,
 }
 
 static std::vector<float> run_dpgrnn(const std::vector<float> & x, int C, int T, int F,
-                                     const WBag & bag, float eps) {
+                                     const WBag & bag, float eps, bool fused) {
     ggml_init_params p{ (size_t) 256 * 1024 * 1024, nullptr, false };
     ggml_context *   ctx = ggml_init(p);
     ggml_tensor *    tx  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, F, T, C);
@@ -496,7 +577,7 @@ static std::vector<float> run_dpgrnn(const std::vector<float> & x, int C, int T,
         auto it = tmap.find(n);
         return it == tmap.end() ? nullptr : it->second;
     };
-    ggml_tensor * y  = detail::dpgrnn(ctx, tx, "dp", Wr, eps);
+    ggml_tensor * y  = detail::dpgrnn(ctx, tx, "dp", Wr, eps, fused);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
     ggml_build_forward_expand(gf, y);
     ggml_graph_compute_with_ctx(ctx, gf, 1);
@@ -539,11 +620,13 @@ static void test_dpgrnn() {
     std::vector<float> x((size_t) C * T * F);
     rand_fill(x, rng);
     std::vector<float> ref = ref_dpgrnn(x, C, T, F, "dp", bag, eps);
-    std::vector<float> got = run_dpgrnn(x, C, T, F, bag, eps);
-    float m = 0.0f;
-    CHECK(got.size() == ref.size(), "dpgrnn output size");
-    for (size_t i = 0; i < ref.size() && i < got.size(); i++) m = std::max(m, std::fabs(got[i] - ref[i]));
-    CHECK(m < 2e-4f, "dpgrnn matches scalar denoiser_core dpgrnn");
+    for (bool fused : { true, false }) {
+        std::vector<float> got = run_dpgrnn(x, C, T, F, bag, eps, fused);
+        float m = 0.0f;
+        CHECK(got.size() == ref.size(), fmsg("dpgrnn output size", fused));
+        for (size_t i = 0; i < ref.size() && i < got.size(); i++) m = std::max(m, std::fabs(got[i] - ref[i]));
+        CHECK(m < 2e-4f, fmsg("dpgrnn matches scalar denoiser_core dpgrnn", fused));
+    }
 }
 
 // Generic CPU-backend runner for a resolver-driven graph builder.
@@ -660,14 +743,16 @@ static void test_ctfa() {
     std::vector<float> x((size_t) C * T * F);
     rand_fill(x, rng);
     std::vector<float> ref = ref_ctfa(x, C, T, F, "ct", bag, r);
-    std::vector<float> got = run_graph(x, F, T, C, bag,
-                                       [&](ggml_context * ctx, ggml_tensor * tx, const detail::WResolver & Wr) {
-                                           return detail::ctfa(ctx, tx, "ct", Wr, r);
-                                       });
-    float m = 0.0f;
-    CHECK(got.size() == ref.size(), "ctfa output size");
-    for (size_t i = 0; i < ref.size() && i < got.size(); i++) m = std::max(m, std::fabs(got[i] - ref[i]));
-    CHECK(m < 2e-4f, "ctfa matches scalar denoiser_core ctfa");
+    for (bool fused : { true, false }) {
+        std::vector<float> got = run_graph(x, F, T, C, bag,
+                                           [&](ggml_context * ctx, ggml_tensor * tx, const detail::WResolver & Wr) {
+                                               return detail::ctfa(ctx, tx, "ct", Wr, r, fused);
+                                           });
+        float m = 0.0f;
+        CHECK(got.size() == ref.size(), fmsg("ctfa output size", fused));
+        for (size_t i = 0; i < ref.size() && i < got.size(); i++) m = std::max(m, std::fabs(got[i] - ref[i]));
+        CHECK(m < 2e-4f, fmsg("ctfa matches scalar denoiser_core ctfa", fused));
+    }
 }
 
 // End-to-end parity: DenoiserGgml::chunk_forward (ggml-CPU) vs scalar
@@ -930,14 +1015,68 @@ static void test_batch_synthetic() {
     CHECK(m < 1e-4f, "synthetic batch_forward matches per-chunk chunk_forward");
 }
 
+// Pipeline parity: denoise_with_batch_core must be BIT-EXACT vs denoise_with_core
+// when both wrap the same element-wise core (metadata-only weights, no tensors).
+static void test_pipeline_batch_parity() {
+    DenoiserWeights w; // defaults = shipped model: 512/256 STFT, F=257, chunk 63/21, 16 kHz
+
+    auto elemwise = [](const std::vector<float> & re, const std::vector<float> & im,
+                       std::vector<float> & orr, std::vector<float> & oii) {
+        orr.resize(re.size());
+        oii.resize(im.size());
+        for (size_t i = 0; i < re.size(); i++) {
+            orr[i] = 0.5f * re[i] - 0.25f * im[i];
+            oii[i] = 0.5f * im[i] + 0.25f * re[i];
+        }
+    };
+    DenoiseChunkCore chunk_core = [&](const std::vector<float> & re, const std::vector<float> & im,
+                                      int /*L*/, std::vector<float> & orr, std::vector<float> & oii) {
+        elemwise(re, im, orr, oii);
+    };
+    DenoiseBatchCore batch_core = [&](const std::vector<float> & re, const std::vector<float> & im,
+                                      int /*L*/, int /*n_chunks*/,
+                                      std::vector<float> & orr, std::vector<float> & oii) {
+        elemwise(re, im, orr, oii);
+    };
+
+    struct Run { int n, sr; const char * name; };
+    const Run runs[] = {
+        { 32500, 16000, "multi-chunk forced-tail" }, // T=127: starts 0,21,42,63 + forced 64
+        { 4000, 16000, "single-chunk T<=L" },        // T=16 <= 63
+        { 48000, 24000, "resampled 24kHz" },         // real resampling; T=126 multi-chunk
+    };
+    for (const Run & r : runs) {
+        std::vector<float> pcm((size_t) r.n);
+        for (int i = 0; i < r.n; i++) {
+            const double ph = 2.0 * 3.14159265358979323846 * i / r.sr;
+            pcm[i] = (float) (0.5 * std::sin(ph * 440.0) + 0.3 * std::sin(ph * 1337.0) +
+                              0.2 * std::sin(ph * 3200.0));
+        }
+        const std::vector<float> a = denoise_with_core(w, pcm, r.sr, chunk_core);
+        const std::vector<float> b = denoise_with_batch_core(w, pcm, r.sr, batch_core);
+        CHECK(a.size() == pcm.size(), "pipeline parity: output length preserved");
+        CHECK(a.size() == b.size(), "pipeline parity: sizes equal");
+        float m = 0.0f;
+        for (size_t i = 0; i < a.size() && i < b.size(); i++) m = std::max(m, std::fabs(a[i] - b[i]));
+        const bool bitexact = a.size() == b.size() &&
+                              std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+        std::printf("pipeline-parity %s: n=%zu bitexact=%d max_abs=%.3e\n",
+                    r.name, a.size(), bitexact ? 1 : 0, m);
+        CHECK(bitexact, "denoise_with_batch_core bit-exact vs denoise_with_core");
+    }
+}
+
 int main(int argc, char ** argv) {
     test_gru_batched();
     test_conv2d();
     test_conv_transpose2d();
+    test_affine_prelu();
+    test_shuffle2();
     test_dpgrnn();
     test_ctfa();
     test_e2e_synthetic();
     test_batch_synthetic();
+    test_pipeline_batch_parity();
     if (argc > 1) { test_e2e(argv[1]); test_batch(argv[1]); }
     if (g_failures == 0) {
         std::printf("OK: all LavaSR denoiser ggml tests passed\n");

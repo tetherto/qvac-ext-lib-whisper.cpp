@@ -286,8 +286,8 @@ static ggml_tensor * batchnorm(ggml_context * ctx, ggml_tensor * x, ggml_tensor 
 }
 
 // Per-(c,f) affine + per-channel PReLU.  aw,ab: ggml [F,C] (PyTorch [C,F]); slope [C].
-static ggml_tensor * affine_prelu(ggml_context * ctx, ggml_tensor * x, ggml_tensor * aw,
-                                  ggml_tensor * ab, ggml_tensor * slope, bool fused) {
+ggml_tensor * affine_prelu(ggml_context * ctx, ggml_tensor * x, ggml_tensor * aw,
+                           ggml_tensor * ab, ggml_tensor * slope, bool fused) {
     if (fused) return ggml_affine_prelu(ctx, x, aw, ab, slope);  // one fused op vs 7 elementwise
     const int64_t F = x->ne[0], C = x->ne[2];
     ggml_tensor * relu   = ggml_relu(ctx, x);
@@ -300,7 +300,7 @@ static ggml_tensor * affine_prelu(ggml_context * ctx, ggml_tensor * x, ggml_tens
 
 // Channel shuffle (2 groups): o[2c]=x[c], o[2c+1]=x[half+c].  x:[F,T,C,Bc].  The
 // non-channel axes fold to one so the (group,idx) transpose fits ggml's 4D limit.
-static ggml_tensor * shuffle2(ggml_context * ctx, ggml_tensor * x, bool fused) {
+ggml_tensor * shuffle2(ggml_context * ctx, ggml_tensor * x, bool fused) {
     if (fused) return ggml_channel_shuffle(ctx, x, 2);  // one plane-copy op vs 3 permute-conts
     const int64_t F = x->ne[0], T = x->ne[1], C = x->ne[2], Bc = x->ne[3], half = C / 2;
     const int64_t S  = T * F * Bc;
@@ -390,6 +390,66 @@ std::vector<float> reindex_ct(const std::vector<float> & Wt, int Cin, int Coutg,
     return Wc;
 }
 
+struct Pend { std::string name; std::vector<float> data; int64_t ne[4]; int nd; };
+
+struct GraphIO { ggml_tensor * feat_in, * re, * ie, * ro, * io; };
+
+constexpr int MAX_NODES = 262144;
+
+// Stage all weights host-side: raw F32 tensors, BatchNorms folded to per-channel
+// scale/shift, decoder transpose-conv kernels reindexed for conv_transpose2d.
+std::vector<Pend> stage_weights(const DenoiserWeights & w) {
+    std::vector<Pend> pend;
+    auto push = [&](const std::string & name, std::vector<float> data, const std::vector<int> & cshape) {
+        Pend p; p.name = name; p.data = std::move(data);
+        p.nd = cshape.empty() ? 1 : (int) cshape.size();
+        for (int i = 0; i < 4; i++) p.ne[i] = 1;
+        for (int i = 0; i < (int) cshape.size(); i++) p.ne[i] = cshape[(int) cshape.size() - 1 - i];
+        pend.push_back(std::move(p));
+    };
+    for (const auto & kv : w.t) push(kv.first, kv.second.data, kv.second.shape);
+
+    const std::string suf = ".running_var";
+    for (const auto & kv : w.t) {
+        const std::string & n = kv.first;
+        if (n.size() <= suf.size() || n.compare(n.size() - suf.size(), suf.size(), suf) != 0) continue;
+        const std::string    p  = n.substr(0, n.size() - suf.size());
+        const std::vector<float> &g = w.get(p + ".weight").data, &b = w.get(p + ".bias").data;
+        const std::vector<float> &rm = w.get(p + ".running_mean").data, &rv = kv.second.data;
+        const int C = (int) rv.size();
+        std::vector<float> scale(C), shift(C);
+        for (int c = 0; c < C; c++) { float s = g[c] / std::sqrt(rv[c] + w.bn_eps); scale[c] = s; shift[c] = b[c] - rm[c] * s; }
+        push(p + ".bn_scale", scale, { C }); push(p + ".bn_shift", shift, { C });
+    }
+
+    auto add_ct = [&](const std::string & wn, int groups) {
+        const DnTensor & Wt = w.get(wn + ".weight");                       // [Cin, Cout/g, kt, kf]
+        const int        Cin = Wt.shape[0], Coutg = Wt.shape[1], kt = Wt.shape[2], kf = Wt.shape[3];
+        push(wn + ".ct", reindex_ct(Wt.data, Cin, Coutg, kt, kf, groups),
+             { Coutg * groups, Cin / groups, kt, kf });
+    };
+    { int j = 0;
+      for (int i = 4; i >= 1; i--, j++)
+          add_ct("decoder.de_convs." + std::to_string(j) + ".dconv.1", kChans[i - 1]); // depthwise groups=cout
+      add_ct("decoder.de_convs." + std::to_string(j) + ".ops.1", kGroups[0]);          // final XConv groups=1
+    }
+    return pend;
+}
+
+// log-magnitude feature on the host (no LOG kernel on OpenCL; trivial per-element work).
+// Bit-identical to denoiser_net_forward.
+std::vector<float> compute_log_features(const std::vector<float> & real_in,
+                                        const std::vector<float> & imag_in, size_t n) {
+    std::vector<float> feat(n);
+    for (size_t i = 0; i < n; i++) {
+        const float rr = real_in[i], ii = imag_in[i];
+        float       mg = std::sqrt(rr * rr + ii * ii);
+        if (mg < 1e-12f) mg = 1e-12f;
+        feat[i] = std::log10(mg);
+    }
+    return feat;
+}
+
 } // namespace
 
 struct DenoiserGgml::Impl {
@@ -407,6 +467,15 @@ struct DenoiserGgml::Impl {
         auto it = wt.find(n);
         return it == wt.end() ? nullptr : it->second;
     }
+
+    void    init_backend(int n_gpu_layers, bool verbose);
+    void    upload_weights(const std::vector<Pend> & pend);
+    GraphIO build_graph(ggml_context * ctx, ggml_cgraph * gf, int L, int Bc) const;
+    void    preflight_ops(ggml_cgraph * gf) const;
+    void    run(ggml_cgraph * gf, const GraphIO & gio, const std::vector<float> & feat_host,
+                const std::vector<float> & real_in, const std::vector<float> & imag_in,
+                int L, int Bc, std::vector<float> & real_out, std::vector<float> & imag_out);
+
     ~Impl() {
         if (galloc) ggml_gallocr_free(galloc);
         if (wbuf) ggml_backend_buffer_free(wbuf);
@@ -415,117 +484,48 @@ struct DenoiserGgml::Impl {
     }
 };
 
-DenoiserGgml::DenoiserGgml() : impl_(std::make_unique<Impl>()) {}
-DenoiserGgml::~DenoiserGgml() = default;
-
-std::unique_ptr<DenoiserGgml> DenoiserGgml::create(const DenoiserWeights & w, int n_gpu_layers, bool verbose) {
-    std::unique_ptr<DenoiserGgml> e(new DenoiserGgml());
-    Impl & im = *e->impl_;
-    im.spec_bins = w.spec_bins; im.erb_low = w.erb_low; im.erb_high = w.erb_high;
-    im.freq_comp_ratio = w.freq_comp_ratio; im.chunk_frames = w.chunk_frames;
-    im.bn_eps = w.bn_eps; im.ln_eps = w.ln_eps;
-
+void DenoiserGgml::Impl::init_backend(int n_gpu_layers, bool verbose) {
     if (n_gpu_layers > 0) {
         bool unused = false;
-        im.backend  = ::tts_cpp::detail::init_gpu_backend(n_gpu_layers, verbose, "lavasr-dn", 0, false, &unused);
-        im.gpu      = im.backend != nullptr;
+        backend = ::tts_cpp::detail::init_gpu_backend(n_gpu_layers, verbose, "lavasr-dn", 0, false, &unused);
+        gpu     = backend != nullptr;
     }
-    if (!im.backend) { im.backend = ::tts_cpp::detail::init_cpu_backend(); im.gpu = false; }
-    if (!im.backend) throw std::runtime_error("denoiser_ggml: no backend available");
-    im.opencl = ::tts_cpp::detail::backend_is_opencl(im.backend);
+    if (!backend) { backend = ::tts_cpp::detail::init_cpu_backend(); gpu = false; }
+    if (!backend) throw std::runtime_error("denoiser_ggml: no backend available");
+    opencl = ::tts_cpp::detail::backend_is_opencl(backend);
+}
 
-    struct Pend { std::string name; std::vector<float> data; int64_t ne[4]; int nd; };
-    std::vector<Pend> pend;
-    auto push = [&](const std::string & name, std::vector<float> data, const std::vector<int> & cshape) {
-        Pend p; p.name = name; p.data = std::move(data);
-        p.nd = cshape.empty() ? 1 : (int) cshape.size();
-        for (int i = 0; i < 4; i++) p.ne[i] = 1;
-        for (int i = 0; i < (int) cshape.size(); i++) p.ne[i] = cshape[(int) cshape.size() - 1 - i];
-        pend.push_back(std::move(p));
-    };
-    // raw weights (already F32 in host memory).
-    for (const auto & kv : w.t) push(kv.first, kv.second.data, kv.second.shape);
-    // BatchNorm fold -> per-channel scale/shift.
-    const std::string suf = ".running_var";
-    for (const auto & kv : w.t) {
-        const std::string & n = kv.first;
-        if (n.size() <= suf.size() || n.compare(n.size() - suf.size(), suf.size(), suf) != 0) continue;
-        const std::string    p  = n.substr(0, n.size() - suf.size());
-        const std::vector<float> &g = w.get(p + ".weight").data, &b = w.get(p + ".bias").data;
-        const std::vector<float> &rm = w.get(p + ".running_mean").data, &rv = kv.second.data;
-        const int C = (int) rv.size();
-        std::vector<float> scale(C), shift(C);
-        for (int c = 0; c < C; c++) { float s = g[c] / std::sqrt(rv[c] + im.bn_eps); scale[c] = s; shift[c] = b[c] - rm[c] * s; }
-        push(p + ".bn_scale", scale, { C }); push(p + ".bn_shift", shift, { C });
-    }
-    // Decoder transpose-conv kernels reindexed for conv_transpose2d.
-    auto add_ct = [&](const std::string & wn, int groups) {
-        const DnTensor & Wt = w.get(wn + ".weight");                       // [Cin, Cout/g, kt, kf]
-        const int        Cin = Wt.shape[0], Coutg = Wt.shape[1], kt = Wt.shape[2], kf = Wt.shape[3];
-        push(wn + ".ct", reindex_ct(Wt.data, Cin, Coutg, kt, kf, groups),
-             { Coutg * groups, Cin / groups, kt, kf });
-    };
-    { int j = 0;
-      for (int i = 4; i >= 1; i--, j++)
-          add_ct("decoder.de_convs." + std::to_string(j) + ".dconv.1", kChans[i - 1]); // depthwise groups=cout
-      add_ct("decoder.de_convs." + std::to_string(j) + ".ops.1", kGroups[0]);          // final XConv groups=1
-    }
-
-    const size_t overhead = ggml_tensor_overhead() * (pend.size() + 8);
-    ggml_init_params wp = { overhead, nullptr, true };
-    im.wctx = ggml_init(wp);
-    if (!im.wctx) throw std::runtime_error("denoiser_ggml: ggml_init(weights) failed");
+void DenoiserGgml::Impl::upload_weights(const std::vector<Pend> & pend) {
+    const size_t     overhead = ggml_tensor_overhead() * (pend.size() + 8);
+    ggml_init_params wp       = { overhead, nullptr, true };
+    wctx = ggml_init(wp);
+    if (!wctx) throw std::runtime_error("denoiser_ggml: ggml_init(weights) failed");
     for (const auto & p : pend) {
-        ggml_tensor * t = ggml_new_tensor(im.wctx, GGML_TYPE_F32, p.nd, p.ne);
+        ggml_tensor * t = ggml_new_tensor(wctx, GGML_TYPE_F32, p.nd, p.ne);
         ggml_set_name(t, p.name.c_str());
-        im.wt[p.name] = t;
+        wt[p.name] = t;
     }
-    im.wbuf = ggml_backend_alloc_ctx_tensors(im.wctx, im.backend);
-    if (!im.wbuf) throw std::runtime_error("denoiser_ggml: weight buffer alloc failed");
+    wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+    if (!wbuf) throw std::runtime_error("denoiser_ggml: weight buffer alloc failed");
     for (const auto & p : pend)
-        ggml_backend_tensor_set(im.wt[p.name], p.data.data(), 0, ggml_nbytes(im.wt[p.name]));
-    im.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
-    if (!im.galloc) throw std::runtime_error("denoiser_ggml: gallocr_new failed");
-    return e;
+        ggml_backend_tensor_set(wt[p.name], p.data.data(), 0, ggml_nbytes(wt[p.name]));
+    galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!galloc) throw std::runtime_error("denoiser_ggml: gallocr_new failed");
 }
 
-void DenoiserGgml::chunk_forward(const std::vector<float> & real_in, const std::vector<float> & imag_in,
-                                 int L, std::vector<float> & real_out, std::vector<float> & imag_out) {
-    batch_forward(real_in, imag_in, L, 1, real_out, imag_out);
-}
-
-void DenoiserGgml::batch_forward(const std::vector<float> & real_in, const std::vector<float> & imag_in,
-                                 int L, int Bc, std::vector<float> & real_out, std::vector<float> & imag_out) {
-    Impl &    im = *impl_;
-    const int F  = im.spec_bins, r = im.freq_comp_ratio;
+GraphIO DenoiserGgml::Impl::build_graph(ggml_context * ctx, ggml_cgraph * gf, int L, int Bc) const {
+    const int F = spec_bins, r = freq_comp_ratio;
     // Fused ops where the backend implements them (OpenCL + CPU); Metal/Vulkan use the
-    // standard-op fallback, which the supports_op preflight below would otherwise reject.
-    const bool fused = im.opencl || !im.gpu;
+    // standard-op fallback, which the supports_op preflight would otherwise reject.
+    const bool fused = opencl || !gpu;
+    auto       W     = [this](const std::string & n) { return this->W(n); };
 
-    constexpr int MAX_NODES = 262144;
-    const size_t  buf_size  = ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
-    std::vector<uint8_t> buf(buf_size);
-    ggml_init_params     gp = { buf_size, buf.data(), true };
-    ggml_context *       ctx = ggml_init(gp);
-    if (!ctx) throw std::runtime_error("denoiser_ggml: ggml_init(graph) failed");
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
-    auto          W  = [&](const std::string & n) { return im.W(n); };
-
-    // log-magnitude feature on the host (no LOG kernel on OpenCL; trivial per-element work).
-    // Bit-identical to denoiser_net_forward.
-    std::vector<float> feat_host((size_t) L * F * Bc);
-    for (size_t i = 0; i < feat_host.size(); i++) {
-        const float rr = real_in[i], ii = imag_in[i];
-        float       mg = std::sqrt(rr * rr + ii * ii);
-        if (mg < 1e-12f) mg = 1e-12f;
-        feat_host[i] = std::log10(mg);
-    }
-
+    // Inputs must come from the graph ctx so gallocr assigns them backing buffers.
     ggml_tensor * feat_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, F, L, 1, Bc); ggml_set_input(feat_in);
     ggml_tensor * re      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, F, L, 1, Bc); ggml_set_input(re);
     ggml_tensor * ie      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, F, L, 1, Bc); ggml_set_input(ie);
 
-    ggml_tensor * x = detail::erb_bm(ctx, feat_in, W("erb.erb_fc.weight"), im.erb_low, im.erb_high);
+    ggml_tensor * x = detail::erb_bm(ctx, feat_in, W("erb.erb_fc.weight"), erb_low, erb_high);
 
     std::vector<ggml_tensor *> en;
     for (int i = 0; i < 5; i++) {
@@ -533,8 +533,8 @@ void DenoiserGgml::batch_forward(const std::vector<float> & real_in, const std::
                               kKf[i], kStrides[i], kGroups[i], false, false, W, r, fused);
         en.push_back(x);
     }
-    x = detail::dpgrnn(ctx, x, "dpgrnn.0", W, im.ln_eps, fused);
-    x = detail::dpgrnn(ctx, x, "dpgrnn.1", W, im.ln_eps, fused);
+    x = detail::dpgrnn(ctx, x, "dpgrnn.0", W, ln_eps, fused);
+    x = detail::dpgrnn(ctx, x, "dpgrnn.1", W, ln_eps, fused);
 
     int j = 0;
     for (int i = 4; i >= 1; i--, j++) {
@@ -546,40 +546,81 @@ void DenoiserGgml::batch_forward(const std::vector<float> & real_in, const std::
     x = detail::run_block(ctx, x, "decoder.de_convs." + std::to_string(j), kTypes[0], 1,
                           kKf[0], kStrides[0], kGroups[0], true, true, W, r, fused);
 
-    x               = ggml_sigmoid(ctx, x);                                         // ratio mask [129, L, 1]
-    ggml_tensor * m = detail::erb_bs(ctx, x, W("erb.ierb_fc.weight"), im.erb_low, im.erb_high); // [F, L, 1]
+    x                = ggml_sigmoid(ctx, x);                                        // ratio mask [129, L, 1]
+    ggml_tensor * m  = detail::erb_bs(ctx, x, W("erb.ierb_fc.weight"), erb_low, erb_high); // [F, L, 1]
     ggml_tensor * ro = ggml_mul(ctx, re, m);
     ggml_tensor * io = ggml_mul(ctx, ie, m);
     ggml_set_output(ro); ggml_set_output(io);
     ggml_build_forward_expand(gf, ro);
     ggml_build_forward_expand(gf, io);
+    return { feat_in, re, ie, ro, io };
+}
 
+void DenoiserGgml::Impl::preflight_ops(ggml_cgraph * gf) const {
     const int n_nodes = ggml_graph_n_nodes(gf);
     for (int i = 0; i < n_nodes; ++i) {
         ggml_tensor * node = ggml_graph_node(gf, i);
-        if (!ggml_backend_supports_op(im.backend, node)) {
-            std::string msg = std::string("denoiser_ggml: op '") + ggml_op_name(node->op) +
-                              "' unsupported on backend '" + backend_name() + "'";
-            ggml_free(ctx);
-            throw std::runtime_error(msg);
-        }
+        if (!ggml_backend_supports_op(backend, node))
+            throw std::runtime_error(std::string("denoiser_ggml: op '") + ggml_op_name(node->op) +
+                                     "' unsupported on backend '" + ggml_backend_name(backend) + "'");
     }
-    if (!ggml_gallocr_alloc_graph(im.galloc, gf)) {
-        ggml_free(ctx);
+}
+
+void DenoiserGgml::Impl::run(ggml_cgraph * gf, const GraphIO & gio, const std::vector<float> & feat_host,
+                             const std::vector<float> & real_in, const std::vector<float> & imag_in,
+                             int L, int Bc, std::vector<float> & real_out, std::vector<float> & imag_out) {
+    // Input uploads are only valid after gallocr has assigned the graph's buffers.
+    if (!ggml_gallocr_alloc_graph(galloc, gf))
         throw std::runtime_error("denoiser_ggml: gallocr_alloc_graph failed");
-    }
-    ggml_backend_tensor_set(feat_in, feat_host.data(), 0, feat_host.size() * sizeof(float));
-    ggml_backend_tensor_set(re, real_in.data(), 0, (size_t) L * F * Bc * sizeof(float));
-    ggml_backend_tensor_set(ie, imag_in.data(), 0, (size_t) L * F * Bc * sizeof(float));
-    if (ggml_backend_graph_compute(im.backend, gf) != GGML_STATUS_SUCCESS) {
-        ggml_free(ctx);
+    const size_t n = (size_t) L * spec_bins * Bc;
+    ggml_backend_tensor_set(gio.feat_in, feat_host.data(), 0, feat_host.size() * sizeof(float));
+    ggml_backend_tensor_set(gio.re, real_in.data(), 0, n * sizeof(float));
+    ggml_backend_tensor_set(gio.ie, imag_in.data(), 0, n * sizeof(float));
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("denoiser_ggml: graph_compute failed");
-    }
-    real_out.resize((size_t) L * F * Bc);
-    imag_out.resize((size_t) L * F * Bc);
-    ggml_backend_tensor_get(ro, real_out.data(), 0, real_out.size() * sizeof(float));
-    ggml_backend_tensor_get(io, imag_out.data(), 0, imag_out.size() * sizeof(float));
-    ggml_free(ctx);
+    real_out.resize(n);
+    imag_out.resize(n);
+    ggml_backend_tensor_get(gio.ro, real_out.data(), 0, real_out.size() * sizeof(float));
+    ggml_backend_tensor_get(gio.io, imag_out.data(), 0, imag_out.size() * sizeof(float));
+}
+
+DenoiserGgml::DenoiserGgml() : impl_(std::make_unique<Impl>()) {}
+DenoiserGgml::~DenoiserGgml() = default;
+
+std::unique_ptr<DenoiserGgml> DenoiserGgml::create(const DenoiserWeights & w, int n_gpu_layers, bool verbose) {
+    std::unique_ptr<DenoiserGgml> e(new DenoiserGgml());
+    Impl & im = *e->impl_;
+    im.spec_bins = w.spec_bins; im.erb_low = w.erb_low; im.erb_high = w.erb_high;
+    im.freq_comp_ratio = w.freq_comp_ratio; im.chunk_frames = w.chunk_frames;
+    im.bn_eps = w.bn_eps; im.ln_eps = w.ln_eps;
+
+    im.init_backend(n_gpu_layers, verbose);
+    im.upload_weights(stage_weights(w));
+    return e;
+}
+
+void DenoiserGgml::chunk_forward(const std::vector<float> & real_in, const std::vector<float> & imag_in,
+                                 int L, std::vector<float> & real_out, std::vector<float> & imag_out) {
+    batch_forward(real_in, imag_in, L, 1, real_out, imag_out);
+}
+
+void DenoiserGgml::batch_forward(const std::vector<float> & real_in, const std::vector<float> & imag_in,
+                                 int L, int Bc, std::vector<float> & real_out, std::vector<float> & imag_out) {
+    Impl & im = *impl_;
+
+    std::vector<float> feat_host = compute_log_features(real_in, imag_in, (size_t) L * im.spec_bins * Bc);
+
+    const size_t         buf_size = ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
+    std::vector<uint8_t> buf(buf_size);
+    ggml_init_params     gp  = { buf_size, buf.data(), true };
+    ggml_context *       ctx = ggml_init(gp);
+    if (!ctx) throw std::runtime_error("denoiser_ggml: ggml_init(graph) failed");
+    std::unique_ptr<ggml_context, void (*)(ggml_context *)> guard(ctx, ggml_free);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+
+    const GraphIO gio = im.build_graph(ctx, gf, L, Bc);
+    im.preflight_ops(gf);
+    im.run(gf, gio, feat_host, real_in, imag_in, L, Bc, real_out, imag_out);
 }
 
 bool         DenoiserGgml::is_gpu() const { return impl_->gpu; }

@@ -35,6 +35,13 @@ ggml_tensor * conv2d(ggml_context * ctx, ggml_tensor * x, ggml_tensor * W,
 ggml_tensor * conv_transpose2d(ggml_context * ctx, ggml_tensor * x, ggml_tensor * Wc,
                                ggml_tensor * bias, int stride_f, int pad_f, int groups, bool fused = true);
 
+// Per-(c,f) affine + per-channel PReLU.  aw,ab: ggml [F,C] (PyTorch [C,F]); slope:[C].
+ggml_tensor * affine_prelu(ggml_context * ctx, ggml_tensor * x, ggml_tensor * aw,
+                           ggml_tensor * ab, ggml_tensor * slope, bool fused = true);
+
+// Channel shuffle (2 groups): o[2c]=x[c], o[2c+1]=x[half+c].  x:[F,T,C,Bc].
+ggml_tensor * shuffle2(ggml_context * ctx, ggml_tensor * x, bool fused = true);
+
 // Resolves a weight tensor by name; returns nullptr if absent (mirrors Runner::Wopt).
 using WResolver = std::function<ggml_tensor *(const std::string &)>;
 
