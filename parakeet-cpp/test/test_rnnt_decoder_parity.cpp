@@ -16,6 +16,7 @@
 #include "mel_preprocess.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -49,6 +50,12 @@ int load_npy_i32(const std::string & path,
 
     std::string header(header_len, '\0');
     f.read(header.data(), header_len);
+
+    // Little-endian int32, C order only -- a reference saved without
+    // .astype(np.int32) (numpy defaults to int64) would otherwise parse
+    // "successfully" and compare as interleaved garbage.
+    if (header.find("'descr': '<i4'") == std::string::npos) return 6;
+    if (header.find("'fortran_order': False") == std::string::npos) return 7;
 
     const size_t shp_s = header.find("'shape':");
     if (shp_s == std::string::npos) return 3;
@@ -108,6 +115,13 @@ int transcribe_rnnt(const std::string & gguf_path,
     if (int rc = load_wav_mono_f32(wav_path, samples, sr); rc != 0) {
         std::fprintf(stderr, "  load_wav failed rc=%d\n", rc);
         return 120 + rc;
+    }
+    if (sr != model.mel_cfg.sample_rate) {
+        std::fprintf(stderr,
+                     "  error: wav is %d Hz but the model expects %d Hz "
+                     "(this harness does not resample)\n",
+                     sr, model.mel_cfg.sample_rate);
+        return 125;
     }
 
     std::vector<float> mel;
@@ -174,8 +188,9 @@ int main(int argc, char ** argv) {
             "    `scripts/dump-rnnt-reference.py --wav <wav>`\n"
             "  to compare against the NeMo greedy reference.\n"
             "\n"
-            "Always cross-checks n_gpu_layers=0 (scalar CPU fallback) against\n"
-            "n_gpu_layers=1 (ggml graph path) so neither path regresses.\n",
+            "Always cross-checks n_gpu_layers=0 against n_gpu_layers=1 (encoder\n"
+            "on the compiled-in GPU backend when one is available; the RNN-T\n"
+            "greedy decode itself is scalar CPU in both configurations).\n",
             argv[0]);
         return 2;
     }
@@ -194,7 +209,7 @@ int main(int argc, char ** argv) {
                  ids_cpu.size(), text_cpu.c_str(),
                  text_cpu.size() > 80 ? "..." : "");
 
-    std::fprintf(stderr, "[rnnt-decode-parity] running graph path (n_gpu_layers=1)...\n");
+    std::fprintf(stderr, "[rnnt-decode-parity] running GPU-offloaded encoder (n_gpu_layers=1)...\n");
     std::vector<int32_t> ids_gpu;
     std::string text_gpu;
     if (int rc = transcribe_rnnt(gguf_path, wav_path, 1, ids_gpu, text_gpu); rc != 0) {
@@ -208,22 +223,26 @@ int main(int argc, char ** argv) {
     if (ids_cpu.size() != ids_gpu.size() ||
         !std::equal(ids_cpu.begin(), ids_cpu.end(), ids_gpu.begin())) {
         std::fprintf(stderr,
-            "[rnnt-decode-parity] FAIL: CPU vs graph token IDs differ\n");
+            "[rnnt-decode-parity] FAIL: CPU vs GPU-encoder token IDs differ\n");
         print_first_diff(ids_cpu, ids_gpu);
         ok = false;
     } else {
         std::fprintf(stderr,
-            "[rnnt-decode-parity] PASS: CPU vs graph token IDs match (%zu tokens)\n",
+            "[rnnt-decode-parity] PASS: CPU vs GPU-encoder token IDs match (%zu tokens)\n",
             ids_cpu.size());
     }
 
     if (!ref_dir.empty()) {
         std::vector<int32_t> ids_ref;
         const std::string p = ref_dir + "/token_ids.npy";
-        if (load_npy_i32(p, ids_ref) != 0) {
+        if (int rc = load_npy_i32(p, ids_ref); rc != 0) {
+            // A ref-dir was explicitly requested: an unreadable reference is
+            // a failure, not a skip -- otherwise a typo'd path silently
+            // un-asserts the only NeMo comparison this harness exists for.
             std::fprintf(stderr,
-                "[rnnt-decode-parity] WARN: could not load %s; skipping NeMo reference check\n",
-                p.c_str());
+                "[rnnt-decode-parity] FAIL: could not load %s (rc=%d)\n",
+                p.c_str(), rc);
+            ok = false;
         } else {
             if (ids_ref.size() != ids_gpu.size() ||
                 !std::equal(ids_ref.begin(), ids_ref.end(), ids_gpu.begin())) {

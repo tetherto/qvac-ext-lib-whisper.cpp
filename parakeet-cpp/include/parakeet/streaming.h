@@ -17,7 +17,7 @@ namespace parakeet {
 // Optional StreamEvent callback: VadStateChanged and EndOfTurn alongside segment text.
 //
 // EOU models emit EndOfTurn when `<EOU>` fires. Sortformer emits VadStateChanged from
-// speaker_probs vs threshold. CTC/TDT can use optional RMS EnergyVad when enabled.
+// speaker_probs vs threshold. CTC/TDT/RNNT can use optional RMS EnergyVad when enabled.
 
 enum class VadState : int {
     Unknown  = 0,
@@ -67,12 +67,12 @@ struct StreamingOptions {
     // Optional; nullptr disables StreamEvent delivery (segment-only streaming).
     StreamEventCallback on_event = nullptr;
 
-    // Energy-VAD fallback. When true, CTC / TDT sessions will compute a
-    // simple RMS-thresholded VAD over the input PCM and fire
+    // Energy-VAD fallback. When true, CTC / TDT / RNNT sessions will compute
+    // a simple RMS-thresholded VAD over the input PCM and fire
     // `StreamEventType::VadStateChanged` events on transitions. Always-on
     // for sessions whose underlying engine (EOU, Sortformer) has its own
     // native VAD source -- those engines' events take priority. Default
-    // off; opt-in for CTC/TDT consumers that want VadState events.
+    // off; opt-in for CTC/TDT/RNNT consumers that want VadState events.
     bool  enable_energy_vad = false;
 
     // Energy-VAD knobs (dB-scale; applies only when enable_energy_vad).
@@ -109,7 +109,7 @@ struct StreamingSegment {
     // segment whose token list is empty (defensive default).
     bool   starts_word = true;
 
-    // EOU-only: true when this segment ends on `<EOU>`. For CTC/TDT use StreamEvent
+    // EOU-only: true when this segment ends on `<EOU>`. For CTC/TDT/RNNT use StreamEvent
     // EndOfTurn via `on_event` instead; those engines leave this flag false here.
     bool   is_eou_boundary = false;
     float  eot_confidence  = 0.0f;

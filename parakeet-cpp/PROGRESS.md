@@ -3470,3 +3470,91 @@ doesn't flake the test.
   binary. Surfacing it through downstream addon wrappers
   (e.g. `transcription-parakeet`'s `runStreaming()` JS API) requires
   separate plumbing work on those wrappers — not in this phase.
+
+## Phase 18 — plain RNN-T (Transducer) head  _(done)_
+
+### 18.0 — scope and design decision
+
+Duration-less Transducer checkpoints had no working path: the converter
+mis-tagged them `tdt` and crashed on the absent
+`model_defaults.tdt_durations`; the TDT loader assumes duration logits
+(`V+1+num_durations` joint rows); the EOU decoder is itself a plain
+RNN-T but hard-wires `<EOU>`/`<EOB>` semantics (and its `eou_id`
+fallback `vocab_size-2` would alias real BPE ids on a model without
+those tokens). Target checkpoint family: the RNN-T branch of hybrid
+`EncDecHybridRNNTCTCBPEModel` models, concretely
+`nvidia/stt_ka_fastconformer_hybrid_large_pc` (Georgian).
+
+Design: plain RNN-T is structurally EOU minus the special tokens, so
+the head reuses the EOU predictor/joint runtime (`EouRuntimeWeights`,
+`eou_prepare_runtime`, `eou_decode_window`, `eou_greedy_decode`) with a
+new `EouDecodeOptions.disable_special_tokens` flag instead of adding a
+fourth decoder implementation. In plain mode the greedy inner loop
+breaks only on the transducer blank — matching NeMo greedy RNN-T —
+and `eou_id`/`eob_id` are forced to `-1` (never valid ids).
+
+### 18.1 — converter
+
+`--head {auto,ctc,tdt,rnnt,eou,sortformer}` override;
+`detect_model_type()` now routes RNN-T checkpoints with neither TDT
+durations nor an `<EOU>` label to `rnnt` instead of crashing as `tdt`.
+Emits `parakeet.rnnt.{vocab_size,blank_id,pred_hidden,pred_rnn_layers,
+joint_hidden,max_symbols_per_step}` (blank_as_pad: `blank_id ==
+vocab_size`) + `rnnt.predict.*` / `rnnt.joint.*` tensors; the hybrid's
+CTC aux head (`ctc_decoder.*`) is not exported. Guards: joint output
+rows must equal `vocab+1` (a TDT-shaped joint forced through `--head
+rnnt` fails at convert time, not at decode time), and
+`joint.num_classes` must equal `decoder.vocab_size`.
+
+### 18.2 — loader + Engine dispatch
+
+`ParakeetModelType::RNNT`; `rnnt.*` tensors load into the shared EOU
+weight slots. Decode arms in `Engine::transcribe_samples`, both
+streaming paths (`transcribe_samples_stream`, `StreamSession`
+`process_window` — mirrors the EOU arms with the plain flag and
+persistent decode state), `stream_start` state init, and the CLI.
+`is_transcription_model()` includes RNNT; `model_type()` returns
+`"rnnt"`. Plain RNNT has no native end-pointing signal, so streaming
+sessions take the same opt-in RMS energy VAD as CTC/TDT.
+
+### 18.3 — parity validation
+
+`scripts/dump-rnnt-reference.py` (forces
+`change_decoding_strategy(decoder_type="rnnt")` on the hybrid, dumps
+greedy `token_ids.npy` + transcript + optional `encoder_out.npy`) and
+`test/test_rnnt_decoder_parity.cpp` (CPU vs GPU-offloaded-encoder run,
+plus bit-exact token-id comparison against the NeMo dump; int32 C-order
+`.npy` enforced; wav sample rate validated against the model).
+
+Measured 2026-06-09 on `nvidia/stt_ka_fastconformer_hybrid_large_pc`:
+C++ greedy decode reproduces NeMo greedy token ids **75/75 bit-for-bit**
+on a FLEURS `ka` clip; CPU == Metal at f16; Metal == NeMo at q8_0;
+FLEURS `ka` WER within **0.31 %** of NeMo. The ctest entry
+(`test-rnnt-decoder-parity`, label `fixture`) registers via `REQUIRES`
+and stays DISABLED until the external GGUF + wav + ref dump are placed
+under the fixture dirs (no public checkpoint for this head).
+
+### 18.4 — files touched
+
+- `scripts/convert-nemo-to-gguf.py` — `--head`, rnnt detection +
+  metadata + tensors + shape guards.
+- `scripts/dump-rnnt-reference.py` (new) — NeMo greedy reference dump.
+- `src/parakeet_ctc.{h,cpp}` — `ParakeetModelType::RNNT`, rnnt GGUF
+  loader arm, model summary.
+- `src/parakeet_eou.{h,cpp}` — `disable_special_tokens` plain mode;
+  RNNT accepted by `eou_prepare_runtime` with `-1` sentinel ids.
+- `src/parakeet_engine.cpp` — offline + Mode 2 + Mode 3 dispatch,
+  `stream_start` init, energy-VAD comment scope.
+- `src/main.cpp` — CLI decode arm + usage text.
+- `test/test_rnnt_decoder_parity.cpp` (new) + `CMakeLists.txt`
+  fixture vars and `parakeet_register_test` entry.
+
+### 18.5 — follow-ups
+
+- Streaming-window decode (Mode 2/3) has no dedicated parity harness
+  yet; it reuses the EOU state machinery verified in §12 but a
+  windowed-vs-offline token-id cross-check on a long clip would close
+  the gap.
+- Decode is scalar-CPU (like EOU). If the fused TDT Metal decoder
+  (§15) ever generalises to `num_durations == 0`, plain RNNT can ride
+  the same graph path.

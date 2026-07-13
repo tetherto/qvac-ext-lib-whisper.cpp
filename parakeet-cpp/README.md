@@ -1,6 +1,6 @@
 # parakeet.cpp
 
-**Parakeet** (NVIDIA FastConformer ASR family, CC-BY-4.0) ported to [`ggml`](https://github.com/ggml-org/ggml). Pure C++ inference on **CPU** and **GPU** (Metal / Vulkan / OpenCL); no Python, PyTorch, or onnxruntime at runtime. One **`parakeet::Engine`** loads **CTC**, **TDT**, **EOU**, or **Sortformer** GGUFs and dispatches by metadata.
+**Parakeet** (NVIDIA FastConformer ASR family, CC-BY-4.0) ported to [`ggml`](https://github.com/ggml-org/ggml). Pure C++ inference on **CPU** and **GPU** (Metal / Vulkan / OpenCL); no Python, PyTorch, or onnxruntime at runtime. One **`parakeet::Engine`** loads **CTC**, **TDT**, **RNNT**, **EOU**, or **Sortformer** GGUFs and dispatches by metadata.
 
 ## Supported checkpoints
 
@@ -17,22 +17,24 @@
 
 Encoder topology is selected from GGUF metadata (`conv_norm_type`, causal subsampling, chunked-limited attention, etc.), so EOU shares the same C++ graph path as CTC/TDT where weights allow.
 
+Plain **RNN-T** (`parakeet.model.type = "rnnt"`) covers duration-less Transducer heads — e.g. the RNN-T branch of a hybrid `EncDecHybridRNNTCTCBPEModel` checkpoint (`--head rnnt` in the converter; the hybrid's CTC aux head is ignored). There is no public checkpoint in the fixture set; the head is verified against NeMo greedy decoding on `nvidia/stt_ka_fastconformer_hybrid_large_pc` (Georgian) via `test-rnnt-decoder-parity` + `scripts/dump-rnnt-reference.py`. The decoder reuses the EOU predictor/joint runtime (scalar CPU) with special-token handling disabled.
+
 ## API overview
 
 | Surface | Role |
 |---------|------|
-| `Engine::transcribe` | One-shot wav → text (CTC / TDT / EOU) or segments (Sortformer) |
+| `Engine::transcribe` | One-shot wav → text (CTC / TDT / RNNT / EOU) or segments (Sortformer) |
 | `Engine::transcribe_stream` | Mode 2: full encode once, stream segments |
 | `Engine::stream_start` → `StreamSession` | Mode 3: live duplex / cache-aware chunks |
 | `Engine::diarize` / `diarize_start` | Sortformer offline / live streaming (v1: sliding-history; v2.1: speaker-cache / AOSC) |
 | `transcribe_with_speakers` | Sortformer + ASR → attributed transcript |
 
-EOU streaming segments expose `is_eou_boundary`. **`StreamEvent`** (optional callbacks) covers end-of-turn (EOU) and VAD-style signals (Sortformer threshold, optional energy VAD on CTC/TDT). **`Engine::backend_device`** / **`backend_name`** reflect the backend actually used after the load-time cascade.
+EOU streaming segments expose `is_eou_boundary`. **`StreamEvent`** (optional callbacks) covers end-of-turn (EOU) and VAD-style signals (Sortformer threshold, optional energy VAD on CTC/TDT/RNNT). **`Engine::backend_device`** / **`backend_name`** reflect the backend actually used after the load-time cascade.
 
 ## Pipeline
 
 ```
-wav → log-mel → FastConformer encoder → CTC / TDT / EOU / Sortformer decoder
+wav → log-mel → FastConformer encoder → CTC / TDT / RNNT / EOU / Sortformer decoder
 ```
 
 Each GGUF bundles weights, mel filterbank, and tokenizer as needed.
@@ -107,6 +109,8 @@ python scripts/convert-nemo-to-gguf.py \
 
 **Important:** for non-default checkpoints set **`--hf-repo`** (e.g. `nvidia/parakeet-tdt-0.6b-v3`) — the script otherwise defaults to the CTC repo and may download the wrong weights. Use `scripts/download-all-models.sh` to prefetch `.nemo` files.
 
+The head is auto-detected from `cfg['target']`; **`--head {ctc,tdt,rnnt,eou,sortformer}`** overrides it. Hybrid transducer+CTC checkpoints (`EncDecHybridRNNTCTCBPEModel`) export their plain RNN-T branch as `--head rnnt` (also the auto-detect result when the checkpoint has neither TDT durations nor an `<EOU>` token); the hybrid's CTC aux head is ignored.
+
 Default **`--quant`** is **`q8_0`**. Use **`f16`** for parity-calibrated harnesses (noise from q8 swamps NeMo FP32 references).
 
 ### Quantization tiers (CTC 0.6B, M4 Air CPU)
@@ -150,7 +154,7 @@ CMake builds the main binary as target **`parakeet-cli`** with **`OUTPUT_NAME pa
 
 **Synopsis:** `parakeet --model <.gguf> (--wav <.wav> | --pcm-in <.raw>) [options]`
 
-The GGUF picks the engine (CTC / TDT / EOU transcription vs Sortformer diarization). Optional **`--diarization-model <sortformer.gguf>`** adds speaker labels when **`--model`** is a CTC/TDT GGUF (“who said what”).
+The GGUF picks the engine (CTC / TDT / RNNT / EOU transcription vs Sortformer diarization). Optional **`--diarization-model <sortformer.gguf>`** adds speaker labels when **`--model`** is a CTC/TDT/RNNT GGUF (“who said what”).
 
 | Topic | Flags |
 |------|--------|
@@ -259,6 +263,8 @@ python scripts/dump-ctc-reference.py --wav test/samples/jfk.wav
 python scripts/dump-tdt-reference.py --wav test/samples/jfk.wav
 python scripts/dump-eou-reference.py --wav test/samples/jfk.wav
 python scripts/dump-sortformer-reference.py --wav test/samples/diarization-sample-16k.wav
+# rnnt: no fixture wav in-repo; point --wav at your own 16 kHz clip
+python scripts/dump-rnnt-reference.py --nemo-model <hybrid.nemo> --wav <clip-16k.wav>
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j

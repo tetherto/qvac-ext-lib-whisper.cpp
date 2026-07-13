@@ -79,16 +79,17 @@ int main(int argc, char ** argv) {
     }
 
     // Capture-parity gate works on any model type. CTC GGUFs populate
-    // both `encoder_out` and `logits`; TDT/EOU/Sortformer GGUFs only
+    // both `encoder_out` and `logits`; TDT/RNNT/EOU/Sortformer GGUFs only
     // populate `encoder_out` (their decoders consume `encoder_out` and
     // produce their own logits separately). For those, `logits` is
     // empty in BOTH calls, so the byte-equal check trivially holds —
     // we keep it in the assertion path so any future change that
-    // accidentally starts populating logits on a TDT/EOU/Sortformer
+    // accidentally starts populating logits on a TDT/RNNT/EOU/Sortformer
     // path will be caught.
     const char * mt_name =
         model.model_type == ParakeetModelType::CTC        ? "ctc"
       : model.model_type == ParakeetModelType::TDT        ? "tdt"
+      : model.model_type == ParakeetModelType::RNNT       ? "rnnt"
       : model.model_type == ParakeetModelType::EOU        ? "eou"
       : model.model_type == ParakeetModelType::SORTFORMER ? "sortformer"
       : "unknown";

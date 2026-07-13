@@ -917,7 +917,7 @@ struct StreamSession::Impl {
     bool finalized = false;
     bool cancelled = false;
 
-    // Optional EnergyVad for CTC/TDT when enable_energy_vad and no native VAD exists.
+    // Optional EnergyVad for CTC/TDT/RNNT when enable_energy_vad and no native VAD exists.
     std::unique_ptr<EnergyVad> energy_vad;
     int64_t total_pcm_seen = 0;
 
@@ -1250,7 +1250,9 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
     if (pimpl_->model.model_type == ParakeetModelType::TDT) {
         tdt_init_state(pimpl_->tdt_rt, (int) pimpl_->model.blank_id, impl->tdt_state);
     }
-    // Optional EnergyVad for CTC/TDT only (EOU uses `<EOU>`; Sortformer uses SortformerStreamSession).
+    // Optional EnergyVad for CTC/TDT/RNNT (EOU uses `<EOU>`; Sortformer uses
+    // SortformerStreamSession). Plain RNNT has no native end-pointing signal,
+    // so it takes the same opt-in RMS VAD as CTC/TDT.
     if (opts.enable_energy_vad &&
         pimpl_->model.model_type != ParakeetModelType::EOU) {
         impl->energy_vad = std::make_unique<EnergyVad>(

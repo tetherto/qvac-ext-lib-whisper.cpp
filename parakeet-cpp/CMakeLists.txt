@@ -488,6 +488,9 @@ if (PARAKEET_BUILD_TESTS)
     set(_qvp_ctc_ref       "${PARAKEET_TEST_REF_DIR}/ctc-ref")
     set(_qvp_tdt_ref       "${PARAKEET_TEST_REF_DIR}/tdt-ref")
     set(_qvp_sf_ref        "${PARAKEET_TEST_REF_DIR}/sortformer-ref")
+    set(_qvp_rnnt_q8_gguf  "${PARAKEET_TEST_MODEL_DIR}/stt_ka_fastconformer_hybrid_large_pc.q8_0.gguf")
+    set(_qvp_rnnt_wav      "${PARAKEET_TEST_AUDIO_DIR}/rnnt-ka-16k.wav")
+    set(_qvp_rnnt_ref      "${PARAKEET_TEST_REF_DIR}/rnnt-ref")
 
     add_executable(test-mel
         test/test_mel.cpp
@@ -747,8 +750,11 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_fr_multipiece_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_fr_multipiece_wav}")
 
-    # Plain RNN-T greedy decoder parity (run manually: <rnnt.gguf> <wav> [ref-dir]).
-    # No repo fixture yet (Georgian rnnt GGUF is external), so not auto-registered.
+    # Plain RNN-T greedy decoder parity: <rnnt.gguf> <wav> [ref-dir]. The
+    # rnnt GGUF has no public checkpoint in the fixture set (converted from
+    # a hybrid NeMo checkpoint, e.g. the Georgian model), so the test is
+    # registered with REQUIRES: it shows in `ctest -N` and stays DISABLED
+    # until the fixture files are dropped in place.
     add_executable(test-rnnt-decoder-parity
         test/test_rnnt_decoder_parity.cpp
         src/parakeet_ctc.cpp
@@ -763,6 +769,10 @@ if (PARAKEET_BUILD_TESTS)
     target_link_libraries(test-rnnt-decoder-parity PRIVATE ggml parakeet-backend-defs)
     target_include_directories(test-rnnt-decoder-parity PRIVATE include src ggml/include)
     parakeet_apply_backend_defs(test-rnnt-decoder-parity)
+    parakeet_register_test(test-rnnt-decoder-parity
+        LABEL    "fixture"
+        ARGS     "${_qvp_rnnt_q8_gguf}" "${_qvp_rnnt_wav}" "${_qvp_rnnt_ref}"
+        REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_rnnt_wav}" "${_qvp_rnnt_ref}/token_ids.npy")
 
     add_executable(test-sortformer-parity
         test/test_sortformer_parity.cpp

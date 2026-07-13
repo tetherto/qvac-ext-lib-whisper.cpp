@@ -3,7 +3,7 @@
 // Loaded GGUF inference: transcribe, stream, diarize, and backend metadata behind one Engine class.
 //
 // Loads weights once; subsequent calls pay mel + encoder + decode only. Model kind (CTC, TDT,
-// EOU, Sortformer) comes from GGUF metadata.
+// RNNT, EOU, Sortformer) comes from GGUF metadata.
 //
 // Transcription:
 //   - transcribe / transcribe_samples — one-shot wav or PCM to text.
@@ -230,7 +230,7 @@ public:
 
     const EngineOptions & options() const;
 
-    // "ctc", "tdt", "eou", or "sortformer", reflecting the
+    // "ctc", "tdt", "rnnt", "eou", or "sortformer", reflecting the
     // parakeet.model.type metadata of the loaded GGUF.
     std::string model_type() const;
 
