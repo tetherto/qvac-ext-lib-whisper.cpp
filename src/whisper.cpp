@@ -1172,19 +1172,6 @@ static void whisper_kv_cache_seq_cp(
 }
 
 static uint32_t whisper_kv_cache_get_padding(const struct whisper_context & wctx) {
-    // [qvac-21623] Opt-in stable KV padding for the OpenCL recordable-queue decoder path
-    // (stable n_kv -> stable decoder graph topology/allocation for record-once/replay).
-    // Gated behind an env var while under development; independent of flash_attn.
-    if (wctx.params.use_gpu) {
-        static const uint32_t kv_pad_env = []{
-            const char * s = getenv("WHISPER_KV_PAD");
-            return s ? (uint32_t) atoi(s) : 0u;
-        }();
-        if (kv_pad_env > 0) {
-            return kv_pad_env;
-        }
-    }
-
     if (!wctx.params.flash_attn || !wctx.params.use_gpu) {
         return 1u;
     }
@@ -1802,9 +1789,8 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         return tensor;
     };
 
-    // fused weight allocated in the same buft ctx as its op, but NOT registered in model.tensors:
-    // it is not present in the GGUF (built at load from existing weights), so the loader's
-    // n_loaded == tensors.size() check must not count it.
+    // fused weight built at load from existing weights (not in the GGUF), so it must NOT be
+    // registered in model.tensors or the loader's n_loaded == tensors.size() check would fail.
     auto create_tensor_fused = [&](ggml_tensor * meta, ggml_op op) -> ggml_tensor * {
         ggml_backend_buffer_type_t buft = select_weight_buft(hparams, meta, op, buft_list);
         if (!buft) {
@@ -2035,10 +2021,8 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         }
     }
 
-    // build the fused Q+K+V decoder weights from the loaded per-projection q8_0 weights. q8_0 rows are
-    // self-contained blocks, so concatenating attn_q_w, attn_k_w and attn_v_w along ne[1] is a byte-
-    // concat of their canonical row-major data (bit-exact). get_tensor reverses the backend's SOA split
-    // back to canonical q8_0; set_tensor re-applies it to the fused weight.
+    // build the fused Q+K+V decoder weight: byte-concat the per-projection q8_0 rows along ne[1]
+    // (bit-exact; get_tensor reverses the backend SOA split, set_tensor re-applies it to the fused weight).
     if (model.n_loaded > 0) {
         std::vector<char> qkv_buf;
         for (auto & layer : model.layers_decoder) {
@@ -2945,9 +2929,8 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                 model.d_ln_b);
     }
 
-    // compute logits only for the tokens that request them (batch.logits flags form a
-    // suffix: the prompt eval flags just the last token) — the vocab matmul is by far
-    // the largest op in the decode graph, so slicing the unused rows off matters
+    // compute logits only for the tokens that request them (batch.logits flags a trailing
+    // suffix) — the vocab matmul is the largest decode op, so slicing unused rows off matters
     {
         int i0 = 0;
         while (i0 < n_tokens && batch.logits[i0] == 0) {
@@ -2991,13 +2974,6 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 //   - n_tokens:   number of tokens in the prompt
 //   - n_past:     number of past tokens to prefix the prompt with
 //
-// [qvac-21623] decode-overhead instrumentation (env WHISPER_DECODE_PROFILE, not shipped)
-static const bool g_wdp = (getenv("WHISPER_DECODE_PROFILE") != nullptr);
-static int64_t g_wdp_build_us = 0, g_wdp_alloc_us = 0, g_wdp_input_us = 0, g_wdp_compute_us = 0, g_wdp_readback_us = 0;
-static int     g_wdp_calls = 0;
-static long    g_wdp_splits = 0;
-static int64_t g_wdp_enq_us = 0, g_wdp_sync_us = 0; // decode-phase enqueue/sync (needs WHISPER_CL_ENQ_PROFILE too)
-extern "C" void ggml_cl_prof_snapshot(int64_t *, int64_t *, int64_t *, int64_t *);
 static bool whisper_decode_internal(
         whisper_context & wctx,
           whisper_state & wstate,
@@ -3037,49 +3013,11 @@ static bool whisper_decode_internal(
     {
         auto & sched = wstate.sched_decode.sched;
 
-        const int64_t t_b0 = g_wdp ? ggml_time_us() : 0;
         ggml_cgraph * gf = whisper_build_graph_decoder(wctx, wstate, batch, save_alignment_heads_QKs, false);
-        const int64_t t_b1 = g_wdp ? ggml_time_us() : 0;
 
         if (!ggml_backend_sched_alloc_graph(sched, gf)) {
             // should never happen as we pre-allocate the memory
             return false;
-        }
-
-        const int64_t t_b2 = g_wdp ? ggml_time_us() : 0;
-        if (g_wdp) { g_wdp_splits += ggml_backend_sched_get_n_splits(sched); }
-
-        // [qvac-21623] graph-stability probe: is the decoder graph topology + allocation stable
-        // across single-token decodes? (precondition for the recordable-queue record-once/replay path)
-        if (getenv("WHISPER_GRAPH_PROBE")) {
-            static int gp_calls = 0;
-            const int n_nodes = ggml_graph_n_nodes(gf);
-            uintptr_t xr = 0;
-            for (int i = 0; i < n_nodes; ++i) {
-                xr ^= ((uintptr_t) ggml_graph_node(gf, i)->data) + (uintptr_t) i * 1000003u;
-            }
-            if (gp_calls < 16) {
-                fprintf(stderr, "[graph-probe] call=%d n_tokens=%d n_nodes=%d n_kv=%d splits=%d dataptr_xor=%016zx\n",
-                        gp_calls, (int) n_tokens, n_nodes, (int) wstate.kv_self.n,
-                        ggml_backend_sched_get_n_splits(sched), (size_t) xr);
-            }
-            gp_calls++;
-        }
-
-        // [qvac-21623] per-eval assignment probe: how many of this eval's nodes did sched
-        // place on each backend? (localizes which evals actually run on the GPU)
-        if (getenv("WHISPER_GRAPH_PROBE2")) {
-            static int gp2_calls = 0;
-            const int n_nodes = ggml_graph_n_nodes(gf);
-            int n_gpu = 0, n_cpu = 0;
-            for (int i = 0; i < n_nodes; ++i) {
-                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched, ggml_graph_node(gf, i));
-                const char * bn = b ? ggml_backend_name(b) : "?";
-                if (bn[0] == 'C') { n_cpu++; } else { n_gpu++; }
-            }
-            fprintf(stderr, "[graph-probe2] call=%d n_tokens=%d n_kv=%d splits=%d nodes=%d gpu=%d cpu=%d\n",
-                    gp2_calls++, (int) n_tokens, (int) wstate.kv_self.n,
-                    ggml_backend_sched_get_n_splits(sched), n_nodes, n_gpu, n_cpu);
         }
 
         // set the inputs
@@ -3130,28 +3068,13 @@ static bool whisper_decode_internal(
             ggml_backend_tensor_set(KQ_mask, wstate.inp_mask.data(), 0, ggml_nelements(KQ_mask)*sizeof(float));
         }
 
-        const int64_t t_b3 = g_wdp ? ggml_time_us() : 0;
-        int64_t e0 = 0, s0 = 0; if (g_wdp) ggml_cl_prof_snapshot(&e0, &s0, nullptr, nullptr);
-
         logits = ggml_graph_node(gf, -1);
 
         if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
             return false;
         }
-        const int64_t t_b4 = g_wdp ? ggml_time_us() : 0;
-        int64_t e1 = 0, s1 = 0; if (g_wdp) ggml_cl_prof_snapshot(&e1, &s1, nullptr, nullptr);
-        if (g_wdp && n_tokens == 1) { // single-token autoregressive decode only
-            g_wdp_build_us   += t_b1 - t_b0;
-            g_wdp_alloc_us   += t_b2 - t_b1;
-            g_wdp_input_us   += t_b3 - t_b2;
-            g_wdp_compute_us += t_b4 - t_b3;
-            g_wdp_enq_us     += e1 - e0;
-            g_wdp_sync_us    += s1 - s0;
-            g_wdp_calls++;
-        }
     }
 
-    const int64_t t_r0 = g_wdp ? ggml_time_us() : 0;
     logits_out.resize(n_tokens*n_vocab);
     const int n_logits_rows = (int) logits->ne[1]; // < n_tokens when the graph sliced unused rows off
     for (int i = 0; i < n_tokens; i++) {
@@ -3161,7 +3084,6 @@ static bool whisper_decode_internal(
         const int src_row = i - (n_tokens - n_logits_rows);
         ggml_backend_tensor_get(logits, logits_out.data() + (n_vocab*i), sizeof(float)*(n_vocab*src_row), sizeof(float)*n_vocab);
     }
-    if (g_wdp && n_tokens == 1) { g_wdp_readback_us += ggml_time_us() - t_r0; }
 
     if (batch.n_tokens > 1) {
         //printf("%s: used_mem = %f MB, %f MB, %f MB %f MB %f MB\n", __func__,
@@ -4509,18 +4431,6 @@ void whisper_print_timings(struct whisper_context * ctx) {
         WHISPER_LOG_INFO("%s:   decode time = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * ctx->state->t_decode_us, n_decode, 1e-3f * ctx->state->t_decode_us / n_decode);
         WHISPER_LOG_INFO("%s:   batchd time = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * ctx->state->t_batchd_us, n_batchd, 1e-3f * ctx->state->t_batchd_us / n_batchd);
         WHISPER_LOG_INFO("%s:   prompt time = %8.2f ms / %5d runs ( %8.2f ms per run)\n", __func__, 1e-3f * ctx->state->t_prompt_us, n_prompt, 1e-3f * ctx->state->t_prompt_us / n_prompt);
-    }
-    if (g_wdp && g_wdp_calls > 0) {
-        const float c = (float) g_wdp_calls;
-        WHISPER_LOG_INFO("%s: [decode-prof] calls=%d  totals(ms): build=%.1f alloc=%.1f input=%.1f compute=%.1f readback=%.1f\n",
-            __func__, g_wdp_calls, g_wdp_build_us/1e3f, g_wdp_alloc_us/1e3f, g_wdp_input_us/1e3f, g_wdp_compute_us/1e3f, g_wdp_readback_us/1e3f);
-        WHISPER_LOG_INFO("%s: [decode-prof] per-call(us): build=%.1f alloc=%.1f input=%.1f compute=%.1f readback=%.1f  (compute incl host-enqueue+GPU+sync)\n",
-            __func__, g_wdp_build_us/c, g_wdp_alloc_us/c, g_wdp_input_us/c, g_wdp_compute_us/c, g_wdp_readback_us/c);
-        WHISPER_LOG_INFO("%s: [decode-prof] sched splits: total=%ld  per-call=%.2f  (each cross-backend split forces a GPU flush)\n",
-            __func__, g_wdp_splits, g_wdp_splits/c);
-        const int64_t disp_us = g_wdp_compute_us - g_wdp_enq_us - g_wdp_sync_us; // host arg-setup + GPU (hidden in sync waits)
-        WHISPER_LOG_INFO("%s: [decode-prof] compute split(ms): host-enqueue=%.1f sync-barrier=%.1f dispatch+gpu=%.1f  (of compute=%.1f)\n",
-            __func__, g_wdp_enq_us/1e3f, g_wdp_sync_us/1e3f, disp_us/1e3f, g_wdp_compute_us/1e3f);
     }
     WHISPER_LOG_INFO("%s:    total time = %8.2f ms\n", __func__, (t_end_us - ctx->t_start_us)/1000.0f);
 }
@@ -9271,7 +9181,7 @@ static void whisper_log_callback_default(ggml_log_level level, const char * text
     (void) level;
     (void) user_data;
 #ifndef WHISPER_DEBUG
-    if (level == GGML_LOG_LEVEL_DEBUG && !getenv("WHISPER_SHOW_DEBUG")) { // [qvac-21623] instrumentation, not shipped
+    if (level == GGML_LOG_LEVEL_DEBUG) {
         return;
     }
 #endif
