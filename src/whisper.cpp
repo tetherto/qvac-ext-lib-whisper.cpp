@@ -2910,10 +2910,22 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                 model.d_ln_b);
     }
 
-    // compute logits only for the last token
-    // comment this line to compute logits for all n_tokens
-    // might be useful in the future
-    //cur = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], (cur->ne[1] - 1)*cur->nb[1]);
+    // compute logits only for the tokens that request them (batch.logits flags form a
+    // suffix: the prompt eval flags just the last token) — the vocab matmul is by far
+    // the largest op in the decode graph, so slicing the unused rows off matters
+    {
+        int i0 = 0;
+        while (i0 < n_tokens && batch.logits[i0] == 0) {
+            i0++;
+        }
+        bool suffix = i0 < n_tokens;
+        for (int i = i0; i < n_tokens; ++i) {
+            suffix = suffix && batch.logits[i] != 0;
+        }
+        if (suffix && i0 > 0) {
+            cur = ggml_view_2d(ctx0, cur, cur->ne[0], n_tokens - i0, cur->nb[1], i0*cur->nb[1]);
+        }
+    }
 
     struct ggml_tensor * logits = ggml_mul_mat(ctx0, model.d_te, cur);
 
@@ -3019,6 +3031,22 @@ static bool whisper_decode_internal(
             gp_calls++;
         }
 
+        // [qvac-21623] per-eval assignment probe: how many of this eval's nodes did sched
+        // place on each backend? (localizes which evals actually run on the GPU)
+        if (getenv("WHISPER_GRAPH_PROBE2")) {
+            static int gp2_calls = 0;
+            const int n_nodes = ggml_graph_n_nodes(gf);
+            int n_gpu = 0, n_cpu = 0;
+            for (int i = 0; i < n_nodes; ++i) {
+                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched, ggml_graph_node(gf, i));
+                const char * bn = b ? ggml_backend_name(b) : "?";
+                if (bn[0] == 'C') { n_cpu++; } else { n_gpu++; }
+            }
+            fprintf(stderr, "[graph-probe2] call=%d n_tokens=%d n_kv=%d splits=%d nodes=%d gpu=%d cpu=%d\n",
+                    gp2_calls++, (int) n_tokens, (int) wstate.kv_self.n,
+                    ggml_backend_sched_get_n_splits(sched), n_nodes, n_gpu, n_cpu);
+        }
+
         // set the inputs
         {
             struct ggml_tensor * embd = ggml_graph_get_tensor(gf, "embd");
@@ -3090,11 +3118,13 @@ static bool whisper_decode_internal(
 
     const int64_t t_r0 = g_wdp ? ggml_time_us() : 0;
     logits_out.resize(n_tokens*n_vocab);
+    const int n_logits_rows = (int) logits->ne[1]; // < n_tokens when the graph sliced unused rows off
     for (int i = 0; i < n_tokens; i++) {
         if (batch.logits[i] == 0) {
             continue;
         }
-        ggml_backend_tensor_get(logits, logits_out.data() + (n_vocab*i), sizeof(float)*(n_vocab*i), sizeof(float)*n_vocab);
+        const int src_row = i - (n_tokens - n_logits_rows);
+        ggml_backend_tensor_get(logits, logits_out.data() + (n_vocab*i), sizeof(float)*(n_vocab*src_row), sizeof(float)*n_vocab);
     }
     if (g_wdp && n_tokens == 1) { g_wdp_readback_us += ggml_time_us() - t_r0; }
 
@@ -3672,6 +3702,12 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
                     const int n_past   = 0;
 
                     whisper_batch_prep_legacy(state->batch, nullptr, n_tokens, n_past, 0);
+
+                    // worst case: every row requests logits (beam-search batches flag all rows),
+                    // so the measured graph must keep the full-width vocab matmul
+                    for (int i = 0; i < n_tokens; ++i) {
+                        state->batch.logits[i] = 1;
+                    }
 
                     return whisper_build_graph_decoder(*ctx, *state, state->batch, ctx->params.dtw_token_timestamps, true);
                 });
