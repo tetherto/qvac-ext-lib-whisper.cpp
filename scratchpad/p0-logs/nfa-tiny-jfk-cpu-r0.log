@@ -1,0 +1,137 @@
+ggml_opencl: selected platform: 'QUALCOMM Snapdragon(TM)'
+
+ggml_opencl: device: 'QUALCOMM Adreno(TM) (OpenCL 3.0 Adreno(TM) 740)'
+ggml_opencl: OpenCL driver: OpenCL 3.0 QUALCOMM build: 0676.76.1 Compiler E031.41.03.64
+ggml_opencl: vector subgroup broadcast support: false
+ggml_opencl: device FP16 support: true
+ggml_opencl: mem base addr align: 128
+ggml_opencl: max mem alloc size: 1024 MB
+ggml_opencl: device max image buffer size (pixels): 134217728
+ggml_opencl: device max image2d size: 16384 x 16384
+ggml_opencl: device max workgroup size: 1024
+ggml_opencl: SVM coarse grain buffer support: true
+ggml_opencl: SVM fine grain buffer support: true
+ggml_opencl: SVM fine grain system support: false
+ggml_opencl: SVM atomics support: true
+ggml_opencl: flattening quantized weights representation as struct of arrays (GGML_OPENCL_SOA_Q)
+ggml_opencl: using kernels optimized for Adreno (GGML_OPENCL_USE_ADRENO_KERNELS)
+ggml_opencl: loading OpenCL kernels.............................................................................................................................
+ggml_opencl: default device: 'QUALCOMM Adreno(TM) (OpenCL 3.0 Adreno(TM) 740)'
+ggml_backend_load_all_from_path: no Adreno GPU detected (-2); skipping OpenCL, relying on Vulkan/CPU
+whisper_init_from_file_with_params_no_state: loading model from 'ggml-tiny-q8_0.bin'
+whisper_init_with_params_no_state: use gpu    = 0
+whisper_init_with_params_no_state: flash attn = 0
+whisper_init_with_params_no_state: gpu_device = 0
+whisper_init_with_params_no_state: dtw        = 0
+whisper_init_with_params_no_state: devices    = 2
+whisper_init_with_params_no_state: backends   = 2
+whisper_model_load: loading model
+whisper_model_load: n_vocab       = 51865
+whisper_model_load: n_audio_ctx   = 1500
+whisper_model_load: n_audio_state = 384
+whisper_model_load: n_audio_head  = 6
+whisper_model_load: n_audio_layer = 4
+whisper_model_load: n_text_ctx    = 448
+whisper_model_load: n_text_state  = 384
+whisper_model_load: n_text_head   = 6
+whisper_model_load: n_text_layer  = 4
+whisper_model_load: n_mels        = 80
+whisper_model_load: ftype         = 7
+whisper_model_load: qntvr         = 2
+whisper_model_load: type          = 1 (tiny)
+whisper_model_load: adding 1608 extra tokens
+whisper_model_load: n_langs       = 99
+whisper_model_load:          CPU total size =    25.41 MB
+whisper_model_load:   CPU_REPACK total size =    17.55 MB
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+repack: repack tensor  with q8_0_4x8
+whisper_model_load: model size    =   42.96 MB
+whisper_backend_init_gpu: no GPU found
+whisper_init_state: kv self size  =    3.15 MB
+whisper_init_state: kv cross size =    9.44 MB
+whisper_init_state: kv pad  size  =    2.36 MB
+whisper_init_state: compute buffer (conv)   =   13.21 MB
+whisper_init_state: compute buffer (encode) =   64.81 MB
+whisper_init_state: compute buffer (cross)  =    3.89 MB
+whisper_init_state: compute buffer (decode) =   95.91 MB
+read_audio_data: reading audio data from 'jfk.wav' ...
+read_audio_data: trying to decode with miniaudio
+
+system_info: n_threads = 4 / 8 | WHISPER : COREML = 0 | OPENVINO = 0 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | MATMUL_INT8 = 1 | DOTPROD = 1 | REPACK = 1 | 
+
+main: processing 'jfk.wav' (176000 samples, 11.0 sec), 4 threads, 1 processors, 5 beams + best of 5, lang = en, task = transcribe, timestamps = 1 ...
+
+
+[00:00:00.000 --> 00:00:10.560]   And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.
+
+whisper_print_timings:     load time =    93.29 ms
+whisper_print_timings:     fallbacks =   0 p /   0 h
+whisper_print_timings:      mel time =    21.04 ms
+whisper_print_timings:   sample time =   154.74 ms /   136 runs (     1.14 ms per run)
+whisper_print_timings:   encode time =   503.77 ms /     1 runs (   503.77 ms per run)
+whisper_print_timings:   decode time =     3.76 ms /     1 runs (     3.76 ms per run)
+whisper_print_timings:   batchd time =   253.13 ms /   133 runs (     1.90 ms per run)
+whisper_print_timings:   prompt time =     0.00 ms /     1 runs (     0.00 ms per run)
+whisper_print_timings:    total time =  1069.84 ms
