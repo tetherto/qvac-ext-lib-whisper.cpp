@@ -661,6 +661,9 @@ struct whisper_layer_decoder {
     struct ggml_tensor * attn_v_w;
     struct ggml_tensor * attn_v_b;
 
+    // fused Q+V projection weight (attn_q_w rows ++ attn_v_w rows); one matmul instead of two
+    struct ggml_tensor * attn_qv_w;
+
     // decoder.blocks.*.cross_attn_ln
     struct ggml_tensor * cross_attn_ln_0_w;
     struct ggml_tensor * cross_attn_ln_0_b;
@@ -1755,7 +1758,7 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
     const int n_audio_layer = hparams.n_audio_layer;
     const int n_text_layer  = hparams.n_text_layer;
 
-    const size_t n_tensors = 10 /* input */ + 15 + 15*n_audio_layer + 24*n_text_layer;
+    const size_t n_tensors = 10 /* input */ + 15 + 15*n_audio_layer + 25*n_text_layer;
 
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
     auto get_ctx = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
@@ -1797,6 +1800,17 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         model.tensors[format(ASR_TENSOR_NAMES.at(system).at(type), layer)] = tensor;
 
         return tensor;
+    };
+
+    // fused weight allocated in the same buft ctx as its op, but NOT registered in model.tensors:
+    // it is not present in the GGUF (built at load from existing weights), so the loader's
+    // n_loaded == tensors.size() check must not count it.
+    auto create_tensor_fused = [&](ggml_tensor * meta, ggml_op op) -> ggml_tensor * {
+        ggml_backend_buffer_type_t buft = select_weight_buft(hparams, meta, op, buft_list);
+        if (!buft) {
+            throw std::runtime_error("failed to find a compatible buffer type for fused tensor");
+        }
+        return ggml_dup_tensor(get_ctx(buft), meta);
     };
 
 
@@ -1896,6 +1910,8 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
 
             layer.attn_v_w = create_tensor(ASR_TENSOR_ATTN_VALUE_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
             layer.attn_v_b = create_tensor(ASR_TENSOR_ATTN_VALUE_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+
+            layer.attn_qv_w = create_tensor_fused(ggml_new_tensor_2d(ctx, wtype, n_text_state, 2*n_text_state), ASR_TENSOR_INFO.at(ASR_TENSOR_ATTN_QUERY_WEIGHT));
 
             layer.attn_ln_1_w = create_tensor(ASR_TENSOR_ATTN_OUT_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
             layer.attn_ln_1_b = create_tensor(ASR_TENSOR_ATTN_OUT_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
@@ -2016,6 +2032,21 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         } else if (model.n_loaded != (int) model.tensors.size()) {
             WHISPER_LOG_ERROR("%s: ERROR not all tensors loaded from model file - expected %zu, got %d\n", __func__, model.tensors.size(), model.n_loaded);
             return false;
+        }
+    }
+
+    // build the fused Q+V decoder weights from the loaded per-projection q8_0 weights. q8_0 rows are
+    // self-contained blocks, so concatenating attn_q_w and attn_v_w along ne[1] is a byte-concat of
+    // their canonical row-major data (bit-exact). get_tensor reverses the backend's SOA split back to
+    // canonical q8_0; set_tensor re-applies it to the fused weight.
+    if (model.n_loaded > 0) {
+        std::vector<char> qv_buf;
+        for (auto & layer : model.layers_decoder) {
+            const size_t nb_w = ggml_nbytes(layer.attn_q_w);
+            qv_buf.resize(2*nb_w);
+            ggml_backend_tensor_get(layer.attn_q_w, qv_buf.data(),        0, nb_w);
+            ggml_backend_tensor_get(layer.attn_v_w, qv_buf.data() + nb_w, 0, nb_w);
+            ggml_backend_tensor_set(layer.attn_qv_w, qv_buf.data(), 0, 2*nb_w);
         }
     }
 
@@ -2638,9 +2669,13 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
         // self-attention
         {
-            struct ggml_tensor * Qcur = ggml_mul_mat(ctx0,
-                    layer.attn_q_w,
+            // fused Q+V projection: one matmul, then split into Q (rows [0,n_state)) and V (rows [n_state,2*n_state))
+            struct ggml_tensor * QVcur = ggml_mul_mat(ctx0,
+                    layer.attn_qv_w,
                     cur);
+
+            struct ggml_tensor * Qcur = ggml_view_2d(ctx0, QVcur, n_state, n_tokens,
+                    QVcur->nb[1], 0);
 
             Qcur = ggml_add(ctx0,
                         Qcur,
@@ -2657,9 +2692,8 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
             // store key and value to memory
             {
-                struct ggml_tensor * Vcur = ggml_mul_mat(ctx0,
-                        layer.attn_v_w,
-                        cur);
+                struct ggml_tensor * Vcur = ggml_view_2d(ctx0, QVcur, n_state, n_tokens,
+                        QVcur->nb[1], n_state*QVcur->nb[0]);
 
                 Vcur = ggml_add(ctx0,
                             Vcur,
