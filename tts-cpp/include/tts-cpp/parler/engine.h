@@ -32,8 +32,7 @@ struct EngineOptions {
     // takes the description per call. Empty + one-argument call throws.
     std::string default_description;
 
-    int n_threads    = 0;   // 0 => min(hardware_concurrency, 4)
-    int n_gpu_layers = 0;   // reserved; CPU is the validated backend
+    int n_threads = 0;   // 0 => min(hardware_concurrency, 4)
 
     // Sampling. Parler's HF defaults (do_sample, temperature 1.0, top_k 50)
     // are stored in the GGUF; zero values defer to them. greedy forces

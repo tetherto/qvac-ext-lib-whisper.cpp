@@ -145,6 +145,7 @@ bool parler_encode_description(parler_model & model,
     // (re)allocate the persistent cross-KV tensors for this description length
     if (model.buffer_cross) { ggml_backend_buffer_free(model.buffer_cross); model.buffer_cross = nullptr; }
     if (model.ctx_cross)    { ggml_free(model.ctx_cross); model.ctx_cross = nullptr; }
+    model.cross_len = 0; // previous cross-KV is gone; any early return below must not leave it usable
     {
         ggml_init_params ip = { (size_t)(2 * hp.dec_n_layer + 2) * ggml_tensor_overhead(),
                                 nullptr, /*no_alloc=*/ true };

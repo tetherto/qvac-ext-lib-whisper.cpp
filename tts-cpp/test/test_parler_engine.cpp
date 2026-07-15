@@ -41,14 +41,28 @@ int main(int argc, char ** argv) {
     }, nullptr);
 
     if (argc > 2) {
-        try {
-            EngineOptions o;
-            o.model_gguf_path = argv[2];
-            Engine e(o);
-            fprintf(stderr, "FAIL: wrong-arch GGUF did not throw\n");
-            failures++;
-        } catch (const std::exception & e) {
-            fprintf(stderr, "  ok: wrong-arch GGUF -> %s\n", e.what());
+        // only meaningful when the fixture is actually staged: a missing file
+        // also throws, which would pass this check for the wrong reason
+        FILE * probe = fopen(argv[2], "rb");
+        if (!probe) {
+            fprintf(stderr, "  skip: wrong-arch fixture not staged (%s)\n", argv[2]);
+        } else {
+            fclose(probe);
+            try {
+                EngineOptions o;
+                o.model_gguf_path = argv[2];
+                Engine e(o);
+                fprintf(stderr, "FAIL: wrong-arch GGUF did not throw\n");
+                failures++;
+            } catch (const std::exception & e) {
+                if (std::string(e.what()).find("parler.arch") == std::string::npos) {
+                    fprintf(stderr, "FAIL: wrong-arch GGUF threw, but not the arch check: %s\n",
+                            e.what());
+                    failures++;
+                } else {
+                    fprintf(stderr, "  ok: wrong-arch GGUF -> %s\n", e.what());
+                }
+            }
         }
     }
 
@@ -80,6 +94,18 @@ int main(int argc, char ** argv) {
         failures++;
     } catch (const std::exception & e) {
         fprintf(stderr, "  ok: empty description -> %s\n", e.what());
+    }
+    // max_frames below n_codebooks+1 can never yield a frame; must throw
+    // instead of aborting in the delay module (assert) or dying late
+    try {
+        EngineOptions tiny = opts;
+        tiny.max_frames = 1;
+        Engine e(tiny);
+        e.synthesize("hello", "a voice");
+        fprintf(stderr, "FAIL: max_frames=1 did not throw\n");
+        failures++;
+    } catch (const std::exception & e) {
+        fprintf(stderr, "  ok: max_frames=1 -> %s\n", e.what());
     }
 
     // consecutive syntheses: same description (cross-KV cache reuse), then a

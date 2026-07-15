@@ -904,9 +904,17 @@ static int run_parler_cli_path(const cli_params & params) {
     opts.n_threads = params.n_threads;
 
     auto result = tts_cpp::parler::synthesize(opts, params.text, params.parler_description);
-    stream_write_wav(params.out_wav, result.pcm, result.sample_rate);
-    fprintf(stderr, "wrote %s (%.2fs @ %d Hz, %zu samples)\n",
-            params.out_wav.c_str(), result.duration_s, result.sample_rate, result.pcm.size());
+    const int osr = params.output_sample_rate;
+    if (osr > 0 && osr != result.sample_rate) {
+        std::vector<float> resampled = resample_sinc(result.pcm, result.sample_rate, osr);
+        stream_write_wav(params.out_wav, resampled, osr);
+        fprintf(stderr, "wrote %s (%.2fs @ %d Hz, %zu samples)\n",
+                params.out_wav.c_str(), result.duration_s, osr, resampled.size());
+    } else {
+        stream_write_wav(params.out_wav, result.pcm, result.sample_rate);
+        fprintf(stderr, "wrote %s (%.2fs @ %d Hz, %zu samples)\n",
+                params.out_wav.c_str(), result.duration_s, result.sample_rate, result.pcm.size());
+    }
     return 0;
 }
 

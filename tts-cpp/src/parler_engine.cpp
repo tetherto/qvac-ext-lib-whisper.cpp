@@ -51,6 +51,11 @@ struct Engine::Impl {
         }
         cancel_requested.store(false, std::memory_order_relaxed);
         const parler_hparams & hp = model.hparams;
+        if (opts.max_frames > 0 && opts.max_frames <= hp.n_codebooks) {
+            throw std::runtime_error("parler: max_frames must be 0 or > " +
+                                     std::to_string(hp.n_codebooks) +
+                                     " (fewer delayed steps cannot yield one audio frame)");
+        }
         const int n_threads = resolve_threads();
 
         const std::vector<int32_t> prompt_ids = tokenizer.encode(prompt);
@@ -63,6 +68,9 @@ struct Engine::Impl {
             if (desc_ids.empty()) {
                 throw std::runtime_error("parler: description tokenized to zero tokens");
             }
+            // re-encoding destroys the previous cross-KV state up front, so the
+            // cache must be invalidated even if the encode below fails
+            has_cached_description = false;
             if (!parler_encode_description(model, desc_ids, n_threads, nullptr)) {
                 throw std::runtime_error("parler: description encoding failed");
             }

@@ -354,7 +354,7 @@ def main():
         meta["cases"].append({
             "name": name, "description": case["description"], "prompt": case["prompt"],
             "desc_len": int(desc_ids.shape[1]), "prompt_len": int(prompt_ids.shape[1]),
-            "delayed_len": int(gen.sequences.shape[1]), "frames": int(codes.shape[2]),
+            "delayed_len": int(seqs.shape[1]), "frames": int(codes.shape[2]),
             "wav_samples": int(len(wav_np)),
         })
 
