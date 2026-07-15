@@ -89,6 +89,49 @@ def main():
     ).eval()
     tok = AutoTokenizer.from_pretrained(args.model_id)
 
+    # Sharded checkpoints (large-v1) hit a transformers low-mem loading bug:
+    # weight-norm parametrizations (parametrizations.weight.original0/1) are
+    # left at their init values instead of the checkpoint's weight_g/weight_v.
+    # Detect by comparing one probe tensor and repair ALL of them from the
+    # safetensors ground truth so the fixtures reflect the real codec.
+    def _repair_weight_norm(model, model_id):
+        from huggingface_hub import snapshot_download
+        from safetensors import safe_open
+        snap = snapshot_download(model_id)
+        handles = {}
+        if os.path.exists(os.path.join(snap, "model.safetensors.index.json")):
+            wmap = json.load(open(os.path.join(snap, "model.safetensors.index.json")))["weight_map"]
+            def get(name):
+                f = handles.setdefault(wmap[name], safe_open(os.path.join(snap, wmap[name]), framework="pt"))
+                return f.get_tensor(name)
+            names = set(wmap)
+        else:
+            f = safe_open(os.path.join(snap, "model.safetensors"), framework="pt")
+            def get(name):
+                return f.get_tensor(name)
+            names = set(f.keys())
+        sd = dict(model.named_parameters())
+        fixed = 0
+        with torch.no_grad():
+            for pname, param in sd.items():
+                if pname.endswith("parametrizations.weight.original0"):
+                    base = pname[: -len("parametrizations.weight.original0")]
+                    g_name = base + "weight_g"
+                    v_name = base + "weight_v"
+                    if g_name in names and v_name in names:
+                        g_ref = get(g_name).to(param.dtype)
+                        if not torch.equal(param.cpu(), g_ref):
+                            param.copy_(g_ref)
+                            sd[base + "parametrizations.weight.original1"].copy_(
+                                get(v_name).to(param.dtype))
+                            fixed += 1
+        if fixed:
+            print(f"REPAIRED {fixed} weight-norm parametrizations from safetensors "
+                  f"(transformers sharded-load bug)")
+        return fixed
+
+    _repair_weight_norm(model, args.model_id)
+
     cfg = model.config
     dec_cfg = cfg.decoder
     t5_cfg = model.text_encoder.config
@@ -236,6 +279,23 @@ def main():
                 prefill_capture["h"] = out.detach().clone()
         h = model.decoder.model.decoder.layer_norm.register_forward_hook(hook)
 
+        # The ParlerTTSLogitsProcessor mutates scores IN PLACE; when it is the
+        # first processor (large-v1 has no min_new_tokens, so nothing clones
+        # before it) the "raw" logits captured by output_logits get the -inf
+        # EOS mask stamped into them. Prepend a semantics-neutral cloning
+        # processor so the dumped logits stay truly raw.
+        from transformers import LogitsProcessor, LogitsProcessorList
+
+        class _CloneScores(LogitsProcessor):
+            def __call__(self, input_ids, scores):
+                return scores.clone()
+
+        proc_list = LogitsProcessorList([
+            _CloneScores(),
+            ParlerTTSLogitsProcessor(eos_id, num_codebooks, batch_size=1,
+                                     device=desc_ids.device),
+        ])
+
         torch.manual_seed(args.seed)
         with torch.no_grad():
             gen = model.generate(
@@ -247,6 +307,7 @@ def main():
                 return_dict_in_generate=True,
                 output_logits=True,
                 output_scores=True,
+                logits_processor=proc_list,
             )
         h.remove()
 
