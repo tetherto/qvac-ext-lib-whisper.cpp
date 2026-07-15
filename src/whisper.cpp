@@ -1,5 +1,6 @@
 #include "whisper.h"
 #include "whisper-arch.h"
+#include "whisper-logits-slice.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -1933,6 +1934,15 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         }
     }
 
+    // stage plain file bytes of the decoder q/k/v weights so the fused attn_qkv_w can be built with
+    // set_tensor alone (get_tensor is null on the CPU repack buffer q8_0 uses -> a readback segfaults).
+    std::map<const ggml_tensor *, std::vector<char>> qkv_src_bytes;
+    for (auto & layer : model.layers_decoder) {
+        qkv_src_bytes.emplace(layer.attn_q_w, std::vector<char>());
+        qkv_src_bytes.emplace(layer.attn_k_w, std::vector<char>());
+        qkv_src_bytes.emplace(layer.attn_v_w, std::vector<char>());
+    }
+
     // load weights
     {
         size_t total_size = 0;
@@ -1998,11 +2008,21 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
                 // for the CPU and Metal backend, we can read directly into the tensor
                 loader->read(loader->context, tensor->data, ggml_nbytes(tensor));
                 BYTESWAP_TENSOR(tensor);
+
+                auto qit = qkv_src_bytes.find(tensor);
+                if (qit != qkv_src_bytes.end()) {
+                    qit->second.assign((const char *) tensor->data, (const char *) tensor->data + ggml_nbytes(tensor));
+                }
             } else {
                 // read into a temporary buffer first, then copy to device memory
                 read_buf.resize(ggml_nbytes(tensor));
 
                 loader->read(loader->context, read_buf.data(), read_buf.size());
+
+                auto qit = qkv_src_bytes.find(tensor);
+                if (qit != qkv_src_bytes.end()) {
+                    qit->second.assign(read_buf.begin(), read_buf.begin() + ggml_nbytes(tensor));
+                }
 
                 ggml_backend_tensor_set(tensor, read_buf.data(), 0, ggml_nbytes(tensor));
             }
@@ -2021,16 +2041,16 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         }
     }
 
-    // build the fused Q+K+V decoder weight: byte-concat the per-projection q8_0 rows along ne[1]
-    // (bit-exact; get_tensor reverses the backend SOA split, set_tensor re-applies it to the fused weight).
+    // assemble the fused Q+K+V decoder weight from the staged plain bytes: byte-concat the per-projection
+    // rows along ne[1] and set once (set_tensor re-applies the destination buffer layout; bit-exact).
     if (model.n_loaded > 0) {
         std::vector<char> qkv_buf;
         for (auto & layer : model.layers_decoder) {
             const size_t nb_w = ggml_nbytes(layer.attn_q_w);
             qkv_buf.resize(3*nb_w);
-            ggml_backend_tensor_get(layer.attn_q_w, qkv_buf.data(),            0, nb_w);
-            ggml_backend_tensor_get(layer.attn_k_w, qkv_buf.data() +   nb_w,   0, nb_w);
-            ggml_backend_tensor_get(layer.attn_v_w, qkv_buf.data() + 2*nb_w,   0, nb_w);
+            memcpy(qkv_buf.data(),          qkv_src_bytes[layer.attn_q_w].data(), nb_w);
+            memcpy(qkv_buf.data() +   nb_w, qkv_src_bytes[layer.attn_k_w].data(), nb_w);
+            memcpy(qkv_buf.data() + 2*nb_w, qkv_src_bytes[layer.attn_v_w].data(), nb_w);
             ggml_backend_tensor_set(layer.attn_qkv_w, qkv_buf.data(), 0, 3*nb_w);
         }
     }
@@ -2932,15 +2952,8 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
     // compute logits only for the tokens that request them (batch.logits flags a trailing
     // suffix) — the vocab matmul is the largest decode op, so slicing unused rows off matters
     {
-        int i0 = 0;
-        while (i0 < n_tokens && batch.logits[i0] == 0) {
-            i0++;
-        }
-        bool suffix = i0 < n_tokens;
-        for (int i = i0; i < n_tokens; ++i) {
-            suffix = suffix && batch.logits[i] != 0;
-        }
-        if (suffix && i0 > 0) {
+        const int i0 = whisper_logits_suffix_offset(batch.logits, n_tokens);
+        if (i0 > 0) {
             cur = ggml_view_2d(ctx0, cur, cur->ne[0], n_tokens - i0, cur->nb[1], i0*cur->nb[1]);
         }
     }
