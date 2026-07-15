@@ -176,6 +176,45 @@ Supertonic engine.
 One binary, one invocation, end to end — `scripts/synthesize.sh` is a
 thin convenience wrapper that fills in the two GGUF paths.
 
+## Parler-TTS (CPU)
+
+Description-conditioned TTS: the transcript (`--text`) is spoken in a voice
+controlled by a natural-language description (`--description`).  Supports
+`parler-tts/parler-tts-mini-v1` and `parler-tts/parler-tts-large-v1`;
+mini/large differences are pure GGUF metadata (`parler.*` keys), no code
+branching.  Pipeline: Flan-T5 encoder (description → cross-attention K/V,
+precomputed once and cached per description) → delay-pattern decoder LM
+(9 DAC codebooks, MusicGen-style stagger, HF-faithful EOS gating) → DAC
+codec decode → 44.1 kHz mono PCM.  CPU is the validated backend; the graph
+dispatch uses the shared `sched_dispatch` dual path like the other engines.
+
+```sh
+# convert (single GGUF: T5 + decoder + DAC + tokenizer; ~3.4 GB f32)
+python3 tts-cpp/scripts/convert-parler-to-gguf.py \
+    --model-id parler-tts/parler-tts-mini-v1 --dtype f32 \
+    --out tts-cpp/models/parler-mini-v1-f32.gguf
+
+# synthesize (also autodetected by tts-cli via parler.arch + --description)
+./build/parler-cli --model tts-cpp/models/parler-mini-v1-f32.gguf \
+    --text "Hey, how are you doing today?" \
+    --description "A female speaker with a calm, clear voice, close up." \
+    --out out.wav
+```
+
+`--dtype f16` (~2.5 GB) casts only the decoder matmul weights and
+embeddings; the T5 encoder stays f32 (Flan-T5 activations overflow the
+f16 range — the well-known T5 fp16 trap), as do norms, biases, snake
+alphas, the positional table and all DAC tensors.
+
+Verification: `ctest -R test-parler` runs tokenizer/T5/decoder/delay/DAC/
+e2e parity against `.npy` fixtures produced by
+`scripts/dump-parler-reference.py` (HF PyTorch reference, greedy).  The
+greedy token trace matches HF exactly; the DAC waveform matches at
+>120 dB SNR.  Default decoding is sampled (temperature 1.0, top-k 50, from
+`generation_config.json`); `--greedy` gives the deterministic parity path.
+Streaming synthesis is not offered yet (frames complete 8 steps late under
+the delay pattern and DAC decode is whole-sequence).
+
 ## Experimental: Supertonic GGUF / CPU
 
 This branch also contains an experimental Supertonic path.  It is
