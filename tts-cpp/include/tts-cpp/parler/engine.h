@@ -51,6 +51,10 @@ struct EngineOptions {
     // -1 => GGUF default (mini: 10; large: disabled).
     int min_new_tokens = -1;
 
+    // Expand digits in the prompt to English words before tokenization
+    // (parler-v1 voices raw digits badly). Deliberate divergence from HF.
+    bool normalize_numbers = true;
+
     // Directory for dynamically-loaded ggml backends (GGML_BACKEND_DL
     // builds); empty keeps the default search behaviour.
     std::string backends_dir;

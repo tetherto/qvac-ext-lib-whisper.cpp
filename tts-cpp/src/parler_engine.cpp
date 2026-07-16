@@ -2,6 +2,7 @@
 
 #include "parler_internal.h"
 #include "parler_tokenizer.h"
+#include "parler_text_norm.h"
 #include "parler_delay.h"
 #include "parler_sampler.h"
 #include "backend_selection.h"
@@ -58,7 +59,9 @@ struct Engine::Impl {
         }
         const int n_threads = resolve_threads();
 
-        const std::vector<int32_t> prompt_ids = tokenizer.encode(prompt);
+        const std::string spoken_prompt = opts.normalize_numbers
+            ? normalize_numbers_en(prompt) : prompt;
+        const std::vector<int32_t> prompt_ids = tokenizer.encode(spoken_prompt);
         if (prompt_ids.empty()) {
             throw std::runtime_error("parler: prompt tokenized to zero tokens");
         }

@@ -217,6 +217,14 @@ output diverges from the f32 parity fixtures by construction — validate by
 ear; `PARLER_TEST_REPORT_ONLY=1 test-parler-{t5,decoder}` prints the stage
 metrics without enforcing the f32 tolerance bars.
 
+Digits in the prompt are expanded to English words before tokenization
+("12" → "twelve"): parler-v1 ships no text front-end and voices raw digits
+badly, so this deliberately diverges from stock HF.  English cardinals
+(incl. thousands separators), decimals and ordinals are covered; times,
+currency and units are not.  Opt out with `--no-normalize-numbers`
+(`EngineOptions::normalize_numbers = false`); the description is never
+rewritten.
+
 Verification: `ctest -R test-parler` runs tokenizer/T5/decoder/delay/DAC/
 e2e parity against `.npy` fixtures produced by
 `scripts/dump-parler-reference.py` (HF PyTorch reference, greedy).  The

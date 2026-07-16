@@ -21,6 +21,8 @@ void usage(const char * argv0) {
         "          [--max-frames N] (cap generation length in decoder steps,\n"
         "                      ~86 steps per second of audio; 0 = model default ~30 s)\n"
         "          [--min-new-tokens N] (-1 = model default)\n"
+        "          [--no-normalize-numbers] (keep raw digits in the prompt;\n"
+        "                      by default digits are expanded to English words)\n"
         "          [--backends-dir DIR]\n",
         argv0);
 }
@@ -77,6 +79,7 @@ int main(int argc, char ** argv) {
         else if (a == "--top-p")          opts.top_p = (float) atof(next());
         else if (a == "--max-frames")     opts.max_frames = atoi(next());
         else if (a == "--min-new-tokens") opts.min_new_tokens = atoi(next());
+        else if (a == "--no-normalize-numbers") opts.normalize_numbers = false;
         else if (a == "--backends-dir")   opts.backends_dir = next();
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
         else {

@@ -273,6 +273,7 @@ set(TTS_CPP_LIB_SOURCES
     src/lavasr/denoiser_ggml.cpp
     # Parler-TTS engine (T5 encoder + delay-pattern decoder LM + DAC codec).
     src/parler_gguf.cpp
+    src/parler_text_norm.cpp
     src/parler_tokenizer.cpp
     src/parler_t5.cpp
     src/parler_decoder.cpp
@@ -571,6 +572,12 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_parler_ref}"
         REQUIRES "${_tcb_parler_ref}/delay_mask_len24.npy")
 
+    add_executable(test-parler-text-norm test/test_parler_text_norm.cpp
+        src/parler_text_norm.cpp)
+    target_include_directories(test-parler-text-norm PRIVATE src)
+    tts_cpp_apply_ccache(test-parler-text-norm)
+    tts_cpp_register_test(test-parler-text-norm)
+
     add_executable(test-parler-tokenizer test/test_parler_tokenizer.cpp src/parler_tokenizer.cpp)
     target_link_libraries(test-parler-tokenizer PRIVATE ggml)
     target_include_directories(test-parler-tokenizer PRIVATE ggml/include src)
@@ -614,7 +621,7 @@ if (TTS_CPP_BUILD_TESTS)
     add_executable(test-parler-e2e test/test_parler_e2e.cpp
         src/parler_t5.cpp src/parler_decoder.cpp src/parler_delay.cpp
         src/parler_dac.cpp src/parler_sampler.cpp src/parler_tokenizer.cpp
-        src/parler_engine.cpp ${_tcb_parler_core_srcs})
+        src/parler_text_norm.cpp src/parler_engine.cpp ${_tcb_parler_core_srcs})
     target_link_libraries(test-parler-e2e PRIVATE ggml)
     target_include_directories(test-parler-e2e PRIVATE ggml/include include src)
     tts_cpp_apply_ccache(test-parler-e2e)
