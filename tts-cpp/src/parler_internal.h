@@ -146,6 +146,15 @@ struct parler_model {
     int  tok_unk_id  = 2;
     int  tok_eos_id  = 1;
     bool tok_add_eos = true;
+
+    // optional separate BPE prompt tokenizer (indic-class checkpoints);
+    // absent => the unigram tokenizer above serves prompts too
+    bool has_prompt_tok = false;
+    std::vector<std::string> ptok_pieces;
+    std::vector<std::string> ptok_merges;
+    int  ptok_unk_id  = 0;
+    int  ptok_bos_id  = 1;
+    bool ptok_add_bos = true;
 };
 
 // ---- parler_gguf.cpp ----

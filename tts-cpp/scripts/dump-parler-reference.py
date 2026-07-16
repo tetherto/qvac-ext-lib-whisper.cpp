@@ -52,6 +52,33 @@ TOKENIZER_CORPUS = [
     "don't can't won't it's",
 ]
 
+# corpus for the separate BPE PROMPT tokenizer (indic-class models); exercises
+# Metaspace prepend, byte fallback, danda/ZWJ clusters, digits, mixed scripts.
+# Must not contain literal <s>/</s>/<unk> (special-token matching is out of
+# scope in the C++ encoder).
+PROMPT_TOKENIZER_CORPUS = [
+    "मेरा नाम प्रतीक है। नमस्ते।",
+    "મારું નામ પ્રતિક છે. કેમ છો?",
+    "Hey, how are you doing today?",
+    "आज १२ तारीख़ है और 12 बज रहे हैं।",
+    "કુલ ૨૫ રૂપિયા થયા, બરાબર 25.",
+    "हिन्दी में क्षत्रिय और ज्ञान जैसे संयुक्ताक्षर।",
+    "  multiple   spaces\tand\nnewlines  ",
+    " leading space",
+    "▁starts with the metaspace marker",
+    "emoji \U0001f600 and CJK 你好世界 mixed",
+    "English वाक्य के बीच में Hindi mixed sentence.",
+    "A",
+    "",
+    "\t",
+    "3.14159, 42 and 1,000,000!",
+    "தமிழ் வணக்கம், తెలుగు నమస్కారం, ಕನ್ನಡ ನಮಸ್ಕಾರ",
+    "বাংলা বাক্য এবং ওড়িয়া ମିଶ୍ରଣ",
+    "پاکستان اور اردو زبان کا جملہ",
+    "don't can't won't it's",
+    "श्री२। ॐ नमः शिवाय॥",
+]
+
 
 def npy_save(out_dir, name, arr):
     if hasattr(arr, "detach"):
@@ -63,14 +90,22 @@ def npy_save(out_dir, name, arr):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-id", default="parler-tts/parler-tts-mini-v1")
+    ap.add_argument("--model-id", default="parler-tts/parler-tts-mini-v1",
+                    help="HF repo id or a local snapshot directory")
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-step-logits", type=int, default=20)
     ap.add_argument("--max-new-frames", type=int, default=430,
                     help="cap greedy generation length (delayed steps) to keep fixtures small; "
                          "430 steps ~= 5s audio")
+    ap.add_argument("--cases-json", default=None,
+                    help="JSON list of {name, description, prompt} overriding the built-in cases")
     args = ap.parse_args()
+
+    global CASES
+    if args.cases_json:
+        with open(args.cases_json) as f:
+            CASES = json.load(f)
 
     os.makedirs(args.out, exist_ok=True)
     torch.manual_seed(args.seed)
@@ -87,7 +122,16 @@ def main():
     model = ParlerTTSForConditionalGeneration.from_pretrained(
         args.model_id, torch_dtype=torch.float32, attn_implementation="eager"
     ).eval()
+    # repo tokenizer serves the PROMPT; T5-family repo tokenizers (mini/large)
+    # also serve the description, otherwise (indic-class BPE) the description
+    # tokenizer comes from the text encoder's own repo — mirrors the model card.
     tok = AutoTokenizer.from_pretrained(args.model_id)
+    shared_tok = "T5" in type(tok).__name__
+    desc_tok = tok if shared_tok else AutoTokenizer.from_pretrained(
+        model.config.text_encoder._name_or_path)
+    if not shared_tok:
+        print(f"separate prompt tokenizer: {type(tok).__name__} "
+              f"(descriptions via {model.config.text_encoder._name_or_path})")
 
     # Sharded checkpoints (large-v1) hit a transformers low-mem loading bug:
     # weight-norm parametrizations (parametrizations.weight.original0/1) are
@@ -97,7 +141,7 @@ def main():
     def _repair_weight_norm(model, model_id):
         from huggingface_hub import snapshot_download
         from safetensors import safe_open
-        snap = snapshot_download(model_id)
+        snap = model_id if os.path.isdir(model_id) else snapshot_download(model_id)
         handles = {}
         if os.path.exists(os.path.join(snap, "model.safetensors.index.json")):
             wmap = json.load(open(os.path.join(snap, "model.safetensors.index.json")))["weight_map"]
@@ -153,15 +197,19 @@ def main():
     risk["R3_decoder_ln_eps"] = ln.eps
     risk["R3_decoder_attn_bias_keys"] = [k for k in sd_keys if ".self_attn.q_proj.bias" in k][:2]
     risk["R3_t5_rms_eps"] = t5_cfg.layer_norm_epsilon
-    desc_ids_specials = tok(CASES[0]["description"]).input_ids
-    desc_ids_plain = tok(CASES[0]["description"], add_special_tokens=False).input_ids
+    desc_ids_specials = desc_tok(CASES[0]["description"]).input_ids
+    desc_ids_plain = desc_tok(CASES[0]["description"], add_special_tokens=False).input_ids
     prompt_ids_specials = tok(CASES[0]["prompt"]).input_ids
     prompt_ids_plain = tok(CASES[0]["prompt"], add_special_tokens=False).input_ids
     risk["R8_description_appends_eos"] = desc_ids_specials[-1] == t5_cfg.eos_token_id and \
         len(desc_ids_specials) == len(desc_ids_plain) + 1
     risk["R8_prompt_appends_eos"] = prompt_ids_specials[-1] == t5_cfg.eos_token_id and \
         len(prompt_ids_specials) == len(prompt_ids_plain) + 1
-    ru_conv1 = dac.model.decoder.model[1].block[2].block[1]
+    risk["R8_prompt_prepends_bos"] = len(prompt_ids_specials) == len(prompt_ids_plain) + 1 and \
+        prompt_ids_specials[0] != prompt_ids_plain[0]
+    dac_core = dac.model if hasattr(dac, "model") else dac  # descript wrapper vs DacModel
+    ru_conv1 = (dac_core.decoder.model[1].block[2].block[1] if hasattr(dac_core.decoder, "model")
+                else dac_core.decoder.block[0].res_unit1.conv1)
     risk["R11_dac_residual_conv1_weight_shape"] = list(ru_conv1.weight.shape)
     risk["enc_to_dec_proj_applied"] = (
         t5_cfg.hidden_size != dec_cfg.hidden_size and dec_cfg.cross_attention_hidden_size is None
@@ -170,11 +218,18 @@ def main():
     risk["dec_num_layers"] = dec_cfg.num_hidden_layers
     print("RISK ANSWERS:", json.dumps(risk, indent=2, default=str))
 
-    # ---------------- tokenizer corpus ----------------
-    tok_ids = [tok(t).input_ids for t in TOKENIZER_CORPUS]
+    # ---------------- tokenizer corpora ----------------
+    # tokenizer_corpus.json always reflects the DESCRIPTION (T5) tokenizer —
+    # that is what tokenizer.ggml.* in the GGUF encodes.
+    tok_ids = [desc_tok(t).input_ids for t in TOKENIZER_CORPUS]
     with open(os.path.join(args.out, "tokenizer_corpus.json"), "w") as f:
         json.dump({"texts": TOKENIZER_CORPUS, "ids": tok_ids}, f, indent=1)
     print(f"  wrote tokenizer_corpus.json ({len(TOKENIZER_CORPUS)} cases)")
+    if not shared_tok:
+        p_ids = [tok(t).input_ids for t in PROMPT_TOKENIZER_CORPUS]
+        with open(os.path.join(args.out, "prompt_tokenizer_corpus.json"), "w") as f:
+            json.dump({"texts": PROMPT_TOKENIZER_CORPUS, "ids": p_ids}, f, indent=1)
+        print(f"  wrote prompt_tokenizer_corpus.json ({len(PROMPT_TOKENIZER_CORPUS)} cases)")
 
     # ---------------- delay-pattern fixture (compact, model-free) ----------------
     start = torch.full((num_codebooks, 1), bos_id, dtype=torch.long)
@@ -244,16 +299,21 @@ def main():
                     "min_new_tokens": getattr(gen_cfg, "min_new_tokens", None),
                     "do_sample": gen_cfg.do_sample},
             "dac": {"sr": dac.config.sampling_rate, "hop": int(np.prod([8, 8, 4, 2])),
-                    "n_q": dac.config.num_codebooks, "codebook_size": dac.config.codebook_size,
-                    "latent": dac.config.latent_dim},
+                    "n_q": getattr(dac.config, "num_codebooks", None) or dac.config.n_codebooks,
+                    "codebook_size": dac.config.codebook_size,
+                    "latent": getattr(dac.config, "latent_dim", None) or dac.config.hidden_size},
         },
         "cases": [],
     }
 
+    def dac_decode(z_q):
+        out = dac_core.decode(z_q)
+        return out if torch.is_tensor(out) else out.audio_values
+
     for case in CASES:
         name = case["name"]
         print(f"case {name}: '{case['prompt'][:40]}...'")
-        desc_ids = tok(case["description"], return_tensors="pt").input_ids
+        desc_ids = desc_tok(case["description"], return_tensors="pt").input_ids
         prompt_ids = tok(case["prompt"], return_tensors="pt").input_ids
         npy_save(args.out, f"{name}_desc_ids", desc_ids.numpy().astype(np.int64))
         npy_save(args.out, f"{name}_prompt_ids", prompt_ids.numpy().astype(np.int64))
@@ -338,9 +398,9 @@ def main():
         npy_save(args.out, f"{name}_codes", codes.numpy().astype(np.int64))
 
         with torch.no_grad():
-            z_q = dac.model.quantizer.from_codes(codes)[0]
+            z_q = dac_core.quantizer.from_codes(codes)[0]
             npy_save(args.out, f"{name}_dac_latent", z_q.numpy())
-            wav = dac.model.decode(z_q)
+            wav = dac_decode(z_q)
         wav_np = wav.squeeze().numpy()
         # the composite generate's own waveform must match our reconstruction
         gen_wav = gen.sequences.squeeze().numpy()
@@ -362,8 +422,8 @@ def main():
     gr = torch.Generator().manual_seed(777)
     rnd_codes = torch.randint(0, dac.config.codebook_size, (1, num_codebooks, 40), generator=gr)
     with torch.no_grad():
-        z_q = dac.model.quantizer.from_codes(rnd_codes)[0]
-        wav = dac.model.decode(z_q)
+        z_q = dac_core.quantizer.from_codes(rnd_codes)[0]
+        wav = dac_decode(z_q)
     npy_save(args.out, "dacrand_codes", rnd_codes.numpy().astype(np.int64))
     npy_save(args.out, "dacrand_latent", z_q.numpy())
     npy_save(args.out, "dacrand_wav", wav.squeeze().numpy())

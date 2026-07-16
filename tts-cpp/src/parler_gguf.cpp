@@ -145,6 +145,30 @@ bool parler_load_gguf(const std::string & path, parler_model & model, std::strin
         if (kv_bool(g, "parler.tokenizer.add_eos", b, nullptr)) model.tok_add_eos = b;
     }
 
+    // ---- optional BPE prompt tokenizer (indic-class checkpoints) ----
+    if (gguf_find_key(g, "parler.prompt_tokenizer.model") >= 0) {
+        int64_t id = gguf_find_key(g, "parler.prompt_tokenizer.tokens");
+        if (id < 0) return fail("missing parler.prompt_tokenizer.tokens");
+        const int n = (int) gguf_get_arr_n(g, id);
+        model.ptok_pieces.resize(n);
+        for (int i = 0; i < n; ++i) {
+            model.ptok_pieces[i] = gguf_get_arr_str(g, id, i);
+        }
+        id = gguf_find_key(g, "parler.prompt_tokenizer.merges");
+        if (id < 0) return fail("missing parler.prompt_tokenizer.merges");
+        const int nm = (int) gguf_get_arr_n(g, id);
+        model.ptok_merges.resize(nm);
+        for (int i = 0; i < nm; ++i) {
+            model.ptok_merges[i] = gguf_get_arr_str(g, id, i);
+        }
+        int v = 0;
+        if (kv_u32(g, "parler.prompt_tokenizer.unknown_token_id", v, nullptr)) model.ptok_unk_id = v;
+        if (kv_u32(g, "parler.prompt_tokenizer.bos_token_id", v, nullptr)) model.ptok_bos_id = v;
+        bool b = true;
+        if (kv_bool(g, "parler.prompt_tokenizer.add_bos", b, nullptr)) model.ptok_add_bos = b;
+        model.has_prompt_tok = true;
+    }
+
     // ---- weights: dup metadata tensors into ctx_w, alloc, stream ----
     const int64_t n_tensors = gguf_get_n_tensors(g);
     {
@@ -286,6 +310,11 @@ bool parler_load_gguf(const std::string & path, parler_model & model, std::strin
     if (model.embed_positions->ne[0] != hp.dec_d_model ||
         model.embed_positions->ne[1] != hp.max_position) {
         return fail("dec.embed_positions shape mismatch");
+    }
+    if (model.embed_prompts->ne[0] != hp.dec_d_model ||
+        model.embed_prompts->ne[1] < (int64_t) (model.has_prompt_tok ? model.ptok_pieces.size()
+                                                                     : model.tok_pieces.size())) {
+        return fail("dec.embed_prompts smaller than the prompt tokenizer vocab");
     }
 
     // ---- decoder self-KV cache slabs ----

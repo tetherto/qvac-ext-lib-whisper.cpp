@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Convert a Parler-TTS checkpoint (mini-v1 / large-v1) to a single tts-cpp GGUF.
+"""Convert a Parler-TTS checkpoint (mini-v1 / large-v1 / indic) to a tts-cpp GGUF.
 
 Contains: T5 text encoder, Parler decoder LM, DAC decoder (decode path only),
 T5 unigram tokenizer (tokens + scores). DAC/quantizer weight-norm (weight_g /
 weight_v) is folded into plain weights at convert time. The DAC encoder and the
 quantizer in_proj tensors are intentionally dropped (encode path unused).
+
+Indic-class checkpoints (e.g. ai4bharat/indic-parler-tts) differ in three
+storage details, all handled here: the repo tokenizer is a SentencePiece-BPE
+PROMPT tokenizer (descriptions keep the text encoder's T5 unigram tokenizer,
+fetched from its repo), the nine LM heads are stored fused as one matrix, and
+the DAC uses transformers-DacModel tensor names with weight-norm pre-folded.
 
 Two-sided completeness: every source tensor must be either consumed or on the
 explicit ignore list, and every expected destination must be produced —
@@ -33,6 +39,70 @@ def fold_weight_norm(g, v):
     g = np.asarray(g, dtype=np.float32).reshape(v.shape[0], *([1] * (v.ndim - 1)))
     norm = np.sqrt(np.sum(v.astype(np.float64) ** 2, axis=tuple(range(1, v.ndim)), keepdims=True))
     return (v * (g / norm.astype(np.float32))).astype(np.float32)
+
+
+def parse_unigram(tj):
+    """tokenizer.json (fast Unigram) -> (tokens, scores, charsmap, unk_id)."""
+    assert tj["model"]["type"] == "Unigram", tj["model"]["type"]
+    norm = tj.get("normalizer") or {}
+    norms = norm.get("normalizers", [norm]) if norm else []
+    charsmap = b""
+    for nn in norms:
+        if nn.get("type") == "Precompiled":
+            import base64
+            charsmap = base64.b64decode(nn["precompiled_charsmap"])
+    vocab = tj["model"]["vocab"]          # [[piece, score], ...]
+    unk_id = tj["model"]["unk_id"]
+    tokens = [p for p, _ in vocab]
+    scores = [float(s) for _, s in vocab]
+    for at in tj.get("added_tokens", []):
+        if at["id"] >= len(tokens):
+            tokens.extend([""] * (at["id"] + 1 - len(tokens)))
+            scores.extend([-1e9] * (at["id"] + 1 - len(scores)))
+        tokens[at["id"]] = at["content"]
+    return tokens, scores, charsmap, unk_id
+
+
+def parse_bpe(tj):
+    """tokenizer.json (fast BPE, llama-style SentencePiece flavour) ->
+    dict(tokens, merges, unk_id, bos_id, add_bos). Asserts pin the exact
+    configuration the C++ prompt tokenizer implements."""
+    m = tj["model"]
+    assert m.get("byte_fallback") is True, "BPE without byte_fallback unsupported"
+    assert not m.get("continuing_subword_prefix"), "GPT2-style BPE unsupported"
+    assert not m.get("ignore_merges"), "ignore_merges unsupported"
+    assert tj.get("normalizer") is None, tj.get("normalizer")
+    pre = tj.get("pre_tokenizer") or {}
+    assert (pre.get("type") == "Metaspace" and pre.get("split") is False
+            and pre.get("prepend_scheme") == "first"), pre
+
+    vocab = m["vocab"]                    # {piece: id}
+    tokens = [None] * len(vocab)
+    for piece, idx in vocab.items():
+        assert 0 <= idx < len(tokens) and tokens[idx] is None, \
+            f"non-contiguous BPE vocab id {idx}"
+        tokens[idx] = piece
+    for at in tj.get("added_tokens", []):
+        assert at["id"] < len(tokens), f"added token beyond vocab: {at}"
+        tokens[at["id"]] = at["content"]
+
+    merges = []
+    for mg in m["merges"]:                # "l r" strings or [l, r] pairs
+        pair = mg.split(" ") if isinstance(mg, str) else list(mg)
+        assert len(pair) == 2 and all(" " not in p for p in pair), mg
+        merges.append((pair[0], pair[1]))
+
+    post = tj.get("post_processor") or {}
+    assert post.get("type") == "TemplateProcessing", post.get("type")
+    single = post["single"]
+    seq_at = [i for i, e in enumerate(single) if "Sequence" in e]
+    assert seq_at == [len(single) - 1], f"unsupported template: {single}"
+    specials = [e["SpecialToken"]["id"] for e in single[:-1]]
+    assert len(specials) <= 1, f"unsupported template: {single}"
+    add_bos = bool(specials)
+    bos_id = post["special_tokens"][specials[0]]["ids"][0] if add_bos else 0
+    return dict(tokens=tokens, merges=merges, unk_id=vocab[m["unk_token"]],
+                bos_id=bos_id, add_bos=add_bos)
 
 
 def find_ggml_lib():
@@ -116,7 +186,10 @@ class Converter:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-id", default="parler-tts/parler-tts-mini-v1")
+    ap.add_argument("--model-id", default="parler-tts/parler-tts-mini-v1",
+                    help="HF repo id or a local snapshot directory")
+    ap.add_argument("--reference-repo", default=None,
+                    help="provenance string when --model-id is a local directory")
     ap.add_argument("--dtype", choices=["f32", "f16", "q8_0", "q6_k"], default="f32")
     ap.add_argument("--ggml-lib", default=None,
                     help="ggml-base shared lib for ggml-side encoding (k-quants / --imatrix; "
@@ -134,7 +207,7 @@ def main():
     from safetensors import safe_open
     import gguf
 
-    snap = snapshot_download(args.model_id)
+    snap = args.model_id if os.path.isdir(args.model_id) else snapshot_download(args.model_id)
     log(f"snapshot: {snap}")
 
     with open(os.path.join(snap, "config.json")) as f:
@@ -195,7 +268,17 @@ def main():
     cv.move("dec.embed_positions.weight", "decoder.model.decoder.embed_positions.weights")
     for k in range(n_cb):
         cv.move(f"dec.embed_tokens.{k}.weight", f"decoder.model.decoder.embed_tokens.{k}.weight")
-        cv.move(f"dec.lm_heads.{k}.weight", f"decoder.lm_heads.{k}.weight")
+    if cv.has("decoder.lm_heads.weight"):
+        # use_fused_lm_heads checkpoints stack the heads codebook-major:
+        # logits.view(..., num_codebooks, vocab) => rows k*V:(k+1)*V = head k
+        fused = cv.take("decoder.lm_heads.weight")
+        v = dec["vocab_size"]
+        assert fused.shape[0] == n_cb * v, (fused.shape, n_cb, v)
+        for k in range(n_cb):
+            cv.emit(f"dec.lm_heads.{k}.weight", fused[k * v:(k + 1) * v])
+    else:
+        for k in range(n_cb):
+            cv.move(f"dec.lm_heads.{k}.weight", f"decoder.lm_heads.{k}.weight")
     for i in range(n_dec):
         b = f"decoder.model.decoder.layers.{i}"
         d = f"dec.blk.{i}"
@@ -215,37 +298,74 @@ def main():
     cv.move("dec.output_norm.bias", "decoder.model.decoder.layer_norm.bias")
 
     # ---------------- DAC (decode path) ----------------
-    n_q = cfg["audio_encoder"]["num_codebooks"]
-    for k in range(n_q):
-        q = f"audio_encoder.model.quantizer.quantizers.{k}"
-        cv.move(f"dac.quant.{k}.codebook.weight", f"{q}.codebook.weight")
-        cv.move_folded(f"dac.quant.{k}.out_proj", f"{q}.out_proj")
+    ae = cfg["audio_encoder"]
+    n_q = ae.get("num_codebooks", ae.get("n_codebooks"))
+    if cv.has("audio_encoder.decoder.block.0.res_unit1.conv1.weight"):
+        # transformers-DacModel naming; weight-norm is already folded upstream
+        for k in range(n_q):
+            q = f"audio_encoder.quantizer.quantizers.{k}"
+            cv.move(f"dac.quant.{k}.codebook.weight", f"{q}.codebook.weight")
+            cv.move(f"dac.quant.{k}.out_proj.weight", f"{q}.out_proj.weight")
+            cv.move(f"dac.quant.{k}.out_proj.bias", f"{q}.out_proj.bias")
 
-    dacm = "audio_encoder.model.decoder.model"
-    cv.move_folded("dac.dec.conv_in", f"{dacm}.0")
+        dacm = "audio_encoder.decoder"
+        cv.move("dac.dec.conv_in.weight", f"{dacm}.conv1.weight")
+        cv.move("dac.dec.conv_in.bias", f"{dacm}.conv1.bias")
+        rates = []
+        n_blocks = 0
+        while cv.has(f"{dacm}.block.{n_blocks}.conv_t1.weight"):
+            n_blocks += 1
+        for i in range(n_blocks):
+            blk = f"{dacm}.block.{i}"
+            d = f"dac.dec.blk.{i}"
+            cv.move(f"{d}.snake.alpha", f"{blk}.snake1.alpha")
+            cv.move(f"{d}.convt.weight", f"{blk}.conv_t1.weight")
+            cv.move(f"{d}.convt.bias", f"{blk}.conv_t1.bias")
+            k = cv.out[f"{d}.convt.weight"].shape[2]
+            assert k % 2 == 0, f"convT kernel {k} not 2*stride"
+            rates.append(k // 2)
+            for j in range(3):
+                ru = f"{blk}.res_unit{1 + j}"
+                cv.move(f"{d}.res.{j}.snake1.alpha", f"{ru}.snake1.alpha")
+                cv.move(f"{d}.res.{j}.conv1.weight", f"{ru}.conv1.weight")
+                cv.move(f"{d}.res.{j}.conv1.bias", f"{ru}.conv1.bias")
+                cv.move(f"{d}.res.{j}.snake2.alpha", f"{ru}.snake2.alpha")
+                cv.move(f"{d}.res.{j}.conv2.weight", f"{ru}.conv2.weight")
+                cv.move(f"{d}.res.{j}.conv2.bias", f"{ru}.conv2.bias")
+        cv.move("dac.dec.snake_out.alpha", f"{dacm}.snake1.alpha")
+        cv.move("dac.dec.conv_out.weight", f"{dacm}.conv2.weight")
+        cv.move("dac.dec.conv_out.bias", f"{dacm}.conv2.bias")
+    else:
+        for k in range(n_q):
+            q = f"audio_encoder.model.quantizer.quantizers.{k}"
+            cv.move(f"dac.quant.{k}.codebook.weight", f"{q}.codebook.weight")
+            cv.move_folded(f"dac.quant.{k}.out_proj", f"{q}.out_proj")
+
+        dacm = "audio_encoder.model.decoder.model"
+        cv.move_folded("dac.dec.conv_in", f"{dacm}.0")
+        rates = []
+        n_blocks = 0
+        while cv.has(f"{dacm}.{1 + n_blocks}.block.1.weight_v"):
+            n_blocks += 1
+        for i in range(n_blocks):
+            blk = f"{dacm}.{1 + i}"
+            d = f"dac.dec.blk.{i}"
+            cv.move(f"{d}.snake.alpha", f"{blk}.block.0.alpha")
+            cv.move_folded(f"{d}.convt", f"{blk}.block.1")
+            k = cv.out[f"{d}.convt.weight"].shape[2]
+            assert k % 2 == 0, f"convT kernel {k} not 2*stride"
+            rates.append(k // 2)
+            for j in range(3):
+                ru = f"{blk}.block.{2 + j}.block"
+                cv.move(f"{d}.res.{j}.snake1.alpha", f"{ru}.0.alpha")
+                cv.move_folded(f"{d}.res.{j}.conv1", f"{ru}.1")
+                cv.move(f"{d}.res.{j}.snake2.alpha", f"{ru}.2.alpha")
+                cv.move_folded(f"{d}.res.{j}.conv2", f"{ru}.3")
+        cv.move(f"dac.dec.snake_out.alpha", f"{dacm}.{1 + n_blocks}.alpha")
+        cv.move_folded("dac.dec.conv_out", f"{dacm}.{2 + n_blocks}")
+
     conv_in_w = cv.out["dac.dec.conv_in.weight"]
     dac_latent, dac_decoder_dim = conv_in_w.shape[1], conv_in_w.shape[0]
-
-    rates = []
-    n_blocks = 0
-    while cv.has(f"{dacm}.{1 + n_blocks}.block.1.weight_v"):
-        n_blocks += 1
-    for i in range(n_blocks):
-        blk = f"{dacm}.{1 + i}"
-        d = f"dac.dec.blk.{i}"
-        cv.move(f"{d}.snake.alpha", f"{blk}.block.0.alpha")
-        cv.move_folded(f"{d}.convt", f"{blk}.block.1")
-        k = cv.out[f"{d}.convt.weight"].shape[2]
-        assert k % 2 == 0, f"convT kernel {k} not 2*stride"
-        rates.append(k // 2)
-        for j in range(3):
-            ru = f"{blk}.block.{2 + j}.block"
-            cv.move(f"{d}.res.{j}.snake1.alpha", f"{ru}.0.alpha")
-            cv.move_folded(f"{d}.res.{j}.conv1", f"{ru}.1")
-            cv.move(f"{d}.res.{j}.snake2.alpha", f"{ru}.2.alpha")
-            cv.move_folded(f"{d}.res.{j}.conv2", f"{ru}.3")
-    cv.move(f"dac.dec.snake_out.alpha", f"{dacm}.{1 + n_blocks}.alpha")
-    cv.move_folded("dac.dec.conv_out", f"{dacm}.{2 + n_blocks}")
     hop = int(np.prod(rates))
     log(f"DAC: latent={dac_latent} decoder_dim={dac_decoder_dim} rates={rates} hop={hop}")
     assert cv.out["dac.dec.conv_out.weight"].shape[0] == 1, "conv_out must emit mono"
@@ -253,6 +373,7 @@ def main():
     # ---------------- completeness check ----------------
     IGNORE_PREFIXES = (
         "audio_encoder.model.encoder.",          # encode path unused
+        "audio_encoder.encoder.",                # same, transformers-DacModel naming
     )
     IGNORE_SUBSTR = (
         ".in_proj.",                             # quantizer encode-side proj
@@ -266,32 +387,32 @@ def main():
     log(f"consumed {len(cv.consumed)}/{len(cv.src_names)} source tensors "
         f"({len(cv.src_names) - len(cv.consumed)} intentionally ignored), {len(cv.out)} dest tensors")
 
-    # ---------------- tokenizer (fast unigram from tokenizer.json) ----------------
-    assert tok_json["model"]["type"] == "Unigram", tok_json["model"]["type"]
-    norm = tok_json.get("normalizer") or {}
-    norms = norm.get("normalizers", [norm]) if norm else []
-    charsmap = b""
-    for nn in norms:
-        if nn.get("type") == "Precompiled":
-            import base64
-            charsmap = base64.b64decode(nn["precompiled_charsmap"])
-    vocab = tok_json["model"]["vocab"]          # [[piece, score], ...]
-    unk_id = tok_json["model"]["unk_id"]
-    tokens = [p for p, _ in vocab]
-    scores = [float(s) for _, s in vocab]
-    for at in tok_json.get("added_tokens", []):
-        if at["id"] >= len(tokens):
-            tokens.extend([""] * (at["id"] + 1 - len(tokens)))
-            scores.extend([-1e9] * (at["id"] + 1 - len(scores)))
-        tokens[at["id"]] = at["content"]
+    # ---------------- tokenizer(s) ----------------
+    # mini/large: the repo tokenizer is a T5 unigram shared by prompt and
+    # description. Indic-class: the repo tokenizer is a SentencePiece-BPE
+    # PROMPT tokenizer; descriptions use the text encoder's own T5 tokenizer.
+    prompt_bpe = None
+    if tok_json["model"]["type"] == "BPE":
+        prompt_bpe = parse_bpe(tok_json)
+        assert len(prompt_bpe["tokens"]) == cfg["vocab_size"], \
+            (len(prompt_bpe["tokens"]), cfg["vocab_size"])
+        from huggingface_hub import hf_hub_download
+        desc_repo = t5["_name_or_path"]
+        with open(hf_hub_download(desc_repo, "tokenizer.json")) as f:
+            desc_tok_json = json.load(f)
+        log(f"prompt tokenizer: BPE, {len(prompt_bpe['tokens'])} pieces, "
+            f"{len(prompt_bpe['merges'])} merges; description tokenizer from {desc_repo}")
+    else:
+        desc_tok_json = tok_json
+    tokens, scores, charsmap, unk_id = parse_unigram(desc_tok_json)
     log(f"tokenizer: {len(tokens)} pieces, unk_id={unk_id}")
 
     # ---------------- write GGUF ----------------
     w = gguf.GGUFWriter(args.out, "parler")
     w.add_string("parler.arch", "parler-tts")
-    variant = args.model_id.rsplit("/", 1)[-1]
+    variant = args.model_id.rstrip("/").rsplit("/", 1)[-1]
     w.add_string("parler.variant", variant)
-    w.add_string("parler.reference_repo", args.model_id)
+    w.add_string("parler.reference_repo", args.reference_repo or args.model_id)
     ftype = args.dtype + (f":{args.recipe}" if args.recipe else "") \
                        + (":imatrix" if args.imatrix else "")
     w.add_string("parler.ftype", ftype)
@@ -346,6 +467,15 @@ def main():
     w.add_uint32("tokenizer.ggml.eos_token_id", 1)
     w.add_uint32("tokenizer.ggml.padding_token_id", 0)
     w.add_bool("parler.tokenizer.add_eos", True)  # T5 appends </s>; verified in reference dump
+
+    if prompt_bpe:
+        w.add_string("parler.prompt_tokenizer.model", "bpe")
+        w.add_array("parler.prompt_tokenizer.tokens", prompt_bpe["tokens"])
+        w.add_array("parler.prompt_tokenizer.merges",
+                    [f"{l} {r}" for l, r in prompt_bpe["merges"]])
+        w.add_uint32("parler.prompt_tokenizer.unknown_token_id", prompt_bpe["unk_id"])
+        w.add_uint32("parler.prompt_tokenizer.bos_token_id", prompt_bpe["bos_id"])
+        w.add_bool("parler.prompt_tokenizer.add_bos", prompt_bpe["add_bos"])
 
     # dtype policy. Numerically delicate tensors always stay f32: norms,
     # biases, alphas, rel-pos bias, positional table, all DAC tensors.

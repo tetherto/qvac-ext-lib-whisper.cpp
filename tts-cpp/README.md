@@ -180,13 +180,23 @@ thin convenience wrapper that fills in the two GGUF paths.
 
 Description-conditioned TTS: the transcript (`--text`) is spoken in a voice
 controlled by a natural-language description (`--description`).  Supports
-`parler-tts/parler-tts-mini-v1` and `parler-tts/parler-tts-large-v1`;
-mini/large differences are pure GGUF metadata (`parler.*` keys), no code
+`parler-tts/parler-tts-mini-v1`, `parler-tts/parler-tts-large-v1` and
+`ai4bharat/indic-parler-tts` (21 languages incl. Hindi/Gujarati);
+model differences are pure GGUF metadata (`parler.*` keys), no code
 branching.  Pipeline: Flan-T5 encoder (description → cross-attention K/V,
 precomputed once and cached per description) → delay-pattern decoder LM
 (9 DAC codebooks, MusicGen-style stagger, HF-faithful EOS gating) → DAC
 codec decode → 44.1 kHz mono PCM.  CPU is the validated backend; the graph
 dispatch uses the shared `sched_dispatch` dual path like the other engines.
+
+Indic-class checkpoints ship a second, SentencePiece-BPE **prompt**
+tokenizer (90k vocab covering the Indic scripts, byte fallback) alongside
+the Flan-T5 description tokenizer; the converter embeds both
+(`parler.prompt_tokenizer.*` keys) and the engine routes prompts through
+the BPE tokenizer when present.  mini/large GGUFs are unaffected (one
+shared tokenizer, byte-identical output).  The language is auto-detected
+from the prompt script; descriptions stay English (name a recommended
+voice — e.g. Rohit for Hindi, Yash for Gujarati — for stable speakers).
 
 ```sh
 # convert (single GGUF: T5 + decoder + DAC + tokenizer; ~3.4 GB f32)
@@ -200,6 +210,10 @@ python3 tts-cpp/scripts/convert-parler-to-gguf.py \
     --description "A female speaker with a calm, clear voice, close up." \
     --out out.wav
 ```
+
+The indic checkpoint is gated on HF (`gated: auto` — any account gets
+instant access); pass a downloaded snapshot directory as `--model-id`
+with `--reference-repo ai4bharat/indic-parler-tts` for provenance.
 
 `--dtype f16` (~2.5 GB) casts only the decoder matmul weights and
 embeddings; the T5 encoder stays f32 (Flan-T5 activations overflow the
@@ -237,7 +251,10 @@ badly, so this deliberately diverges from stock HF.  English cardinals
 (incl. thousands separators), decimals and ordinals are covered; times,
 currency and units are not.  Opt out with `--no-normalize-numbers`
 (`EngineOptions::normalize_numbers = false`); the description is never
-rewritten.
+rewritten.  Note the expansion is English-only: ASCII digits inside an
+Indic-script prompt still become English words, and native numerals
+(१२, ૨૫) pass through untouched — disable it for Indic prompts if the
+mixed-language reading is unwanted.
 
 Verification: `ctest -R test-parler` runs tokenizer/T5/decoder/delay/DAC/
 e2e parity against `.npy` fixtures produced by

@@ -10,21 +10,38 @@
 #include "parler_internal.h"
 #include "parler_delay.h"
 #include "parler_tokenizer.h"
+#include "parler_bpe_tokenizer.h"
 #include "tts-cpp/parler/engine.h"
+#include "json.hpp"
 #include "npy.h"
 
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
 
 using namespace tts_cpp::parler::detail;
 
-static const char * kDescription =
-    "A female speaker delivers a slightly expressive and animated speech "
-    "with a moderate speed and pitch. The recording is of very high quality, "
-    "with the speaker's voice sounding clear and very close up.";
-static const char * kPrompt = "Hey, how are you doing today?";
+// case0's texts come from the fixture dir's meta.json (written by
+// dump-parler-reference.py), so the binary serves every model's fixtures.
+static bool load_case0_texts(const std::string & ref_dir,
+                             std::string & description, std::string & prompt) {
+    std::ifstream ifs(ref_dir + "/meta.json");
+    if (!ifs) {
+        fprintf(stderr, "cannot open %s/meta.json\n", ref_dir.c_str());
+        return false;
+    }
+    nlohmann::json j = nlohmann::json::parse(ifs, nullptr, /*allow_exceptions*/ false);
+    if (j.is_discarded() || !j.contains("cases") || !j["cases"].is_array() ||
+        j["cases"].empty()) {
+        fprintf(stderr, "malformed meta.json in %s\n", ref_dir.c_str());
+        return false;
+    }
+    description = j["cases"][0]["description"].get<std::string>();
+    prompt      = j["cases"][0]["prompt"].get<std::string>();
+    return true;
+}
 
 static std::vector<int32_t> load_ids(const std::string & path) {
     npy_array a = npy_load(path);
@@ -44,6 +61,11 @@ int main(int argc, char ** argv) {
     const std::string out_dir = argc > 3 ? argv[3] : "";
     const int n_threads = 4;
 
+    std::string kDescription, kPrompt;
+    if (!load_case0_texts(ref_dir, kDescription, kPrompt)) {
+        return 1;
+    }
+
     parler_model model;
     std::string err;
     if (!parler_load_gguf(model_path, model, &err)) {
@@ -62,8 +84,16 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "tokenizer load failed\n");
             break;
         }
+        parler_bpe_tokenizer ptok;
+        if (model.has_prompt_tok &&
+            !ptok.load(model.ptok_pieces, model.ptok_merges, model.ptok_unk_id,
+                       model.ptok_bos_id, model.ptok_add_bos)) {
+            fprintf(stderr, "prompt tokenizer load failed\n");
+            break;
+        }
         const std::vector<int32_t> desc_ids = tok.encode(kDescription);
-        const std::vector<int32_t> prompt_ids = tok.encode(kPrompt);
+        const std::vector<int32_t> prompt_ids = model.has_prompt_tok
+            ? ptok.encode(kPrompt) : tok.encode(kPrompt);
         if (desc_ids != load_ids(ref_dir + "/case0_desc_ids.npy") ||
             prompt_ids != load_ids(ref_dir + "/case0_prompt_ids.npy")) {
             fprintf(stderr, "FAIL: tokenized ids differ from fixtures\n");

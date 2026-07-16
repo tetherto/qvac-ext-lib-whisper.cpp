@@ -2,6 +2,7 @@
 
 #include "parler_internal.h"
 #include "parler_tokenizer.h"
+#include "parler_bpe_tokenizer.h"
 #include "parler_text_norm.h"
 #include "parler_delay.h"
 #include "parler_sampler.h"
@@ -18,10 +19,11 @@ namespace parler {
 using namespace ::tts_cpp::parler::detail;
 
 struct Engine::Impl {
-    EngineOptions      opts;
-    parler_model       model;
-    parler_tokenizer   tokenizer;
-    ggml_gallocr_t     allocr = nullptr;
+    EngineOptions        opts;
+    parler_model         model;
+    parler_tokenizer     tokenizer;         // descriptions (and prompts when shared)
+    parler_bpe_tokenizer prompt_tokenizer;  // prompts, iff the GGUF ships one
+    ggml_gallocr_t       allocr = nullptr;
     std::string        cached_description;
     bool               has_cached_description = false;
     std::atomic<bool>  cancel_requested{false};
@@ -61,7 +63,9 @@ struct Engine::Impl {
 
         const std::string spoken_prompt = opts.normalize_numbers
             ? normalize_numbers_en(prompt) : prompt;
-        const std::vector<int32_t> prompt_ids = tokenizer.encode(spoken_prompt);
+        const std::vector<int32_t> prompt_ids = model.has_prompt_tok
+            ? prompt_tokenizer.encode(spoken_prompt)
+            : tokenizer.encode(spoken_prompt);
         if (prompt_ids.empty()) {
             throw std::runtime_error("parler: prompt tokenized to zero tokens");
         }
@@ -151,6 +155,12 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(new Impl()) {
                                 pimpl_->model.tok_charsmap, pimpl_->model.tok_unk_id,
                                 pimpl_->model.tok_eos_id, pimpl_->model.tok_add_eos)) {
         throw std::runtime_error("parler: tokenizer load failed");
+    }
+    if (pimpl_->model.has_prompt_tok &&
+        !pimpl_->prompt_tokenizer.load(pimpl_->model.ptok_pieces, pimpl_->model.ptok_merges,
+                                       pimpl_->model.ptok_unk_id, pimpl_->model.ptok_bos_id,
+                                       pimpl_->model.ptok_add_bos)) {
+        throw std::runtime_error("parler: prompt tokenizer load failed");
     }
     pimpl_->allocr = ggml_gallocr_new(
         ggml_backend_get_default_buffer_type(pimpl_->model.backend));
