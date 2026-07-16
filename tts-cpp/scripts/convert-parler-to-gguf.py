@@ -61,15 +61,21 @@ def make_ggml_quantizer(lib_path):
     fn.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_float), ctypes.c_void_p,
                    ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
 
-    def quantize(arr, qtype):
+    def quantize(arr, qtype, imatrix=None):
         blk, typesz = gguf.GGML_QUANT_SIZES[qtype]
         nrows = int(np.prod(arr.shape[:-1]))
         n_per_row = arr.shape[-1]
         assert n_per_row % blk == 0, (arr.shape, qtype)
         arr = np.ascontiguousarray(arr, dtype=np.float32)
         dst = np.zeros(nrows * (n_per_row // blk) * typesz, dtype=np.uint8)
+        im_ptr = None
+        if imatrix is not None:
+            # ggml quant_weights: one float per column, shared by all rows
+            im = np.ascontiguousarray(imatrix, dtype=np.float32)
+            assert im.size == n_per_row, (im.size, n_per_row)
+            im_ptr = im.ctypes.data_as(ctypes.c_void_p)
         n = fn(int(qtype.value), arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-               dst.ctypes.data_as(ctypes.c_void_p), 0, nrows, n_per_row, None)
+               dst.ctypes.data_as(ctypes.c_void_p), 0, nrows, n_per_row, im_ptr)
         assert n == dst.nbytes, f"ggml_quantize_chunk wrote {n} != {dst.nbytes}"
         return dst.reshape(*arr.shape[:-1], (n_per_row // blk) * typesz)
 
@@ -82,6 +88,7 @@ class Converter:
         self.src_names = set(src_names)
         self.consumed = set()
         self.out = {}                       # dest name -> np.ndarray (f32)
+        self.src_of_dest = {}               # dest name -> HF source name
 
     def take(self, src):
         if src not in self.src_names:
@@ -98,6 +105,7 @@ class Converter:
 
     def move(self, dest, src):
         self.emit(dest, self.take(src))
+        self.src_of_dest[dest] = src
 
     def move_folded(self, dest, src_prefix):
         g = self.take(src_prefix + ".weight_g")
@@ -109,9 +117,17 @@ class Converter:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-id", default="parler-tts/parler-tts-mini-v1")
-    ap.add_argument("--dtype", choices=["f32", "f16", "q8_0", "q4_k_m", "q4_0"], default="f32")
+    ap.add_argument("--dtype", choices=["f32", "f16", "q8_0", "q6_k", "q5_0", "q4_k_m"],
+                    default="f32")
     ap.add_argument("--ggml-lib", default=None,
-                    help="ggml-base shared lib for k-quant encoding (q4_k_m only; auto-detected from build dirs)")
+                    help="ggml-base shared lib for ggml-side encoding (k-quants / --imatrix; "
+                         "auto-detected from build dirs)")
+    ap.add_argument("--imatrix", default=None,
+                    help="npz of per-column importance vectors keyed by HF weight name "
+                         "(scripts/compute-parler-imatrix.py); used by k-quants and q4_0/q5_0")
+    ap.add_argument("--recipe", default=None,
+                    help="override quant tiers, e.g. bulk=Q5_K,tables=F16,heads=Q8_0,t5=Q8_0 "
+                         "(requires a quant --dtype; unlisted tiers keep the dtype's defaults)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -277,7 +293,9 @@ def main():
     variant = args.model_id.rsplit("/", 1)[-1]
     w.add_string("parler.variant", variant)
     w.add_string("parler.reference_repo", args.model_id)
-    w.add_string("parler.ftype", args.dtype)
+    ftype = args.dtype + (f":{args.recipe}" if args.recipe else "") \
+                       + (":imatrix" if args.imatrix else "")
+    w.add_string("parler.ftype", ftype)
 
     w.add_uint32("parler.t5.n_layer", t5["num_layers"])
     w.add_uint32("parler.t5.d_model", t5["d_model"])
@@ -342,17 +360,34 @@ def main():
     # activations overflow the f16 range, and ggml's f16 mul_mat converts
     # activation rows to f16 for the dot product -> encoder output NaN.
     # Quantized dots don't share that trap (activations are re-quantized
-    # per 32/256-block with independent scales), so quant recipes take T5
-    # weights to q8_0. The 9 LM heads stay q8_0 in EVERY recipe: they feed
-    # the logits directly, and 6-bit heads (3x the q8_0 noise) were shown
-    # to derail the sampled trajectory on large-v1 (argmax agreement
-    # 44%->17%, EOS never fires). Embedding tables tolerate q6_K fine.
+    # per 32/256-block with independent scales), so every recipe takes T5
+    # weights to q8_0 — never F16. Decoder-side F16 tiers are safe (the
+    # all-f16 GGUF passes strict parity). The 9 LM heads never go BELOW
+    # q8_0: they feed the logits directly, and 6-bit heads derailed the
+    # sampled trajectory on large-v1 (EOS never fires). Tier choices below
+    # follow a 200-step teacher-forced argmax grid search (mini): F16 heads
+    # are the dominant lever at 8/6-bit bulk (+3.4pt for +10 MB at q8_0);
+    # embedding tables matter least.
     Q = gguf.GGMLQuantizationType
     RECIPES = {  # dtype -> (bulk dec matmuls, embed tables, lm heads, t5 matmuls)
-        "q8_0":   (Q.Q8_0, Q.Q8_0, Q.Q8_0, Q.Q8_0),
+        "q8_0":   (Q.Q8_0, Q.F16,  Q.F16,  Q.Q8_0),
+        "q6_k":   (Q.Q6_K, Q.Q6_K, Q.F16,  Q.Q8_0),
+        "q5_0":   (Q.Q5_0, Q.Q6_K, Q.Q8_0, Q.Q8_0),
         "q4_k_m": (Q.Q4_K, Q.Q6_K, Q.Q8_0, Q.Q8_0),
-        "q4_0":   (Q.Q4_0, Q.Q8_0, Q.Q8_0, Q.Q8_0),
     }
+
+    TIER_NAMES = ("bulk", "tables", "heads", "t5")
+    tiers = dict(zip(TIER_NAMES, RECIPES.get(args.dtype, ())))
+    if args.recipe:
+        if not tiers:
+            raise SystemExit("--recipe requires a quant --dtype (q8_0/q4_k_m/q4_0)")
+        for kv in args.recipe.split(","):
+            k, _, v = kv.partition("=")
+            k = k.strip()
+            if k not in tiers:
+                raise SystemExit(f"--recipe: unknown tier '{k}' (use {'/'.join(TIER_NAMES)})")
+            tiers[k] = Q[v.strip().upper()]
+        log("recipe override: " + ", ".join(f"{k}={t.name}" for k, t in tiers.items()))
 
     def is_embed_table(name):
         return (name.startswith("dec.embed_tokens.")
@@ -363,27 +398,40 @@ def main():
             return None
         if args.dtype == "f16":
             return None if name.startswith("t5.") else Q.F16
-        bulk, tables, heads, t5q = RECIPES[args.dtype]
-        qt = (tables if is_embed_table(name)
-              else heads if name.startswith("dec.lm_heads.")
-              else t5q if name.startswith(("t5.", "enc_to_dec.")) else bulk)
+        qt = (tiers["tables"] if is_embed_table(name)
+              else tiers["heads"] if name.startswith("dec.lm_heads.")
+              else tiers["t5"] if name.startswith(("t5.", "enc_to_dec.")) else tiers["bulk"])
+        if qt == Q.F16:
+            return qt
         if arr.ndim != 2 or arr.shape[-1] % gguf.GGML_QUANT_SIZES[qt][0] != 0:
             log(f"keep f32 (shape {arr.shape} not blockable for {qt.name}): {name}")
             return None
         return qt
 
+    imatrix = None
+    if args.imatrix:
+        imatrix = dict(np.load(args.imatrix).items())
+        log(f"imatrix: {len(imatrix)} importance vectors from {args.imatrix}")
+
+    # gguf-py's Python encoder covers Q8_0/Q4_0 (and cannot take an imatrix);
+    # every other type — and any imatrix-weighted encode — goes through ggml.
     from gguf import quants as gq
+    GQ_TYPES = (Q.Q8_0, Q.Q4_0)
+    need_lib = imatrix is not None or any(
+        t not in GQ_TYPES + (Q.F16,) for t in tiers.values())
     kquantize = None
-    if args.dtype == "q4_k_m":
+    if need_lib:
         lib = args.ggml_lib or find_ggml_lib()
         if not lib:
-            raise SystemExit("q4_k_m needs a built ggml-base shared lib for k-quant "
+            raise SystemExit("this recipe needs a built ggml-base shared lib for "
                              "encoding; build tts-cpp first or pass --ggml-lib")
-        log(f"k-quant encoder: {lib}")
+        log(f"ggml encoder: {lib}")
         kquantize = make_ggml_quantizer(lib)
 
     counts = {}
     roundtrip = []  # (rel_rmse, name, qtype name) self-check per quantized tensor
+    im_hits, im_misses = 0, []
+    parity_checked = False
     for name in sorted(cv.out):
         arr = cv.out[name]
         qt = target_type(name, arr)
@@ -394,13 +442,34 @@ def main():
             w.add_tensor(name, arr.astype(np.float16))
             counts["f16"] = counts.get("f16", 0) + 1
         else:
-            qdata = kquantize(arr, qt) if qt in (Q.Q4_K, Q.Q6_K) else gq.quantize(arr, qt)
+            im = None
+            if imatrix is not None:
+                im = imatrix.get(cv.src_of_dest.get(name, ""))
+                if im is None:
+                    im_misses.append(name)
+                else:
+                    im_hits += 1
+            if im is not None or qt not in GQ_TYPES:
+                qdata = kquantize(arr, qt, im)
+                if not parity_checked and qt == Q.Q8_0:
+                    # q8_0 ignores quant_weights, so ggml and gguf-py (both
+                    # reference RTN) must agree byte-for-byte — informational
+                    same = qdata.tobytes() == gq.quantize(arr, qt).tobytes()
+                    log(f"q8_0 byte parity ggml vs gguf-py: "
+                        f"{'OK' if same else 'DIFFERS'} ({name})")
+                    parity_checked = True
+            else:
+                qdata = gq.quantize(arr, qt)
             dq = gq.dequantize(qdata, qt).astype(np.float64)
             denom = float(np.sqrt(np.mean(arr.astype(np.float64) ** 2))) or 1.0
             rel = float(np.sqrt(np.mean((arr.astype(np.float64) - dq) ** 2))) / denom
             roundtrip.append((rel, name, qt.name))
             w.add_tensor(name, qdata, raw_dtype=qt)
             counts[qt.name] = counts.get(qt.name, 0) + 1
+    if imatrix is not None:
+        log(f"imatrix applied to {im_hits} tensors; missing for {len(im_misses)}")
+        for name in im_misses:
+            log(f"  no imatrix (quantized unweighted): {name}")
     log(f"tensors: {len(cv.out)} total, types: "
         + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     if roundtrip:

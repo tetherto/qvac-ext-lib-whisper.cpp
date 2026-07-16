@@ -206,15 +206,28 @@ embeddings; the T5 encoder stays f32 (Flan-T5 activations overflow the
 f16 range — the well-known T5 fp16 trap), as do norms, biases, snake
 alphas, the positional table and all DAC tensors.
 
-Quantized recipes: `--dtype q8_0` (~1.0 GB), `q4_k_m` (~0.82 GB) and
-`q4_0` (~0.84 GB, mini).  All keep the f32 set above untouched and the T5
-matmuls at q8_0 (quantized dot products re-quantize activations per block,
-so the f16 trap does not apply); embedding tables and the 9 LM heads get
-q6_K (`q4_k_m`) / q8_0 (others) rather than 4-bit.  `q4_k_m` encodes
-k-quants through the built ggml library (`ggml_quantize_chunk` via ctypes;
-auto-located, or pass `--ggml-lib`), so build tts-cpp first.  Quantized
-output diverges from the f32 parity fixtures by construction — validate by
-ear; `PARLER_TEST_REPORT_ONLY=1 test-parler-{t5,decoder}` prints the stage
+Quantized recipes (mini sizes; argmax agreement vs the f32 fixtures over a
+200-step teacher-forced trace, f16 scoring 99.6%):
+
+| `--dtype` | size | agree | bulk / tables / heads / T5 |
+|---|---|---|---|
+| `q8_0`   | ~1.16 GB | 98.1% | q8_0 / f16 / f16 / q8_0 |
+| `q6_k`   | ~0.98 GB | 94.9% | q6_K / q6_K / f16 / q8_0 |
+| `q5_0`   | ~0.91 GB | 90.4% | q5_0 / q6_K / q8_0 / q8_0 |
+| `q4_k_m` | ~0.86 GB | 83.1% | q4_K / q6_K / q8_0 / q8_0 |
+
+All keep the f32 set above untouched and the T5 matmuls at q8_0 (quantized
+dot products re-quantize activations per block, so the f16 trap does not
+apply — T5 must never go f16).  The 9 LM heads never drop below q8_0 (6-bit
+heads derail sampled decoding); the top tiers lift heads/tables to f16 —
+the dominant quality lever found by grid search
+(`scripts/parler-quant-grid.py`; per-tier override via `--recipe`, optional
+activation-weighted quantization via `scripts/compute-parler-imatrix.py` +
+`--imatrix`).  Non-trivial encodes go through the built ggml library
+(`ggml_quantize_chunk` via ctypes; auto-located, or pass `--ggml-lib`), so
+build tts-cpp first.  Quantized output diverges from the f32 parity
+fixtures by construction — validate by ear;
+`PARLER_TEST_REPORT_ONLY=1 test-parler-{t5,decoder}` prints the stage
 metrics without enforcing the f32 tolerance bars.
 
 Digits in the prompt are expanded to English words before tokenization
