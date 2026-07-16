@@ -206,6 +206,17 @@ embeddings; the T5 encoder stays f32 (Flan-T5 activations overflow the
 f16 range — the well-known T5 fp16 trap), as do norms, biases, snake
 alphas, the positional table and all DAC tensors.
 
+Quantized recipes: `--dtype q8_0` (~1.0 GB), `q4_k_m` (~0.82 GB) and
+`q4_0` (~0.84 GB, mini).  All keep the f32 set above untouched and the T5
+matmuls at q8_0 (quantized dot products re-quantize activations per block,
+so the f16 trap does not apply); embedding tables and the 9 LM heads get
+q6_K (`q4_k_m`) / q8_0 (others) rather than 4-bit.  `q4_k_m` encodes
+k-quants through the built ggml library (`ggml_quantize_chunk` via ctypes;
+auto-located, or pass `--ggml-lib`), so build tts-cpp first.  Quantized
+output diverges from the f32 parity fixtures by construction — validate by
+ear; `PARLER_TEST_REPORT_ONLY=1 test-parler-{t5,decoder}` prints the stage
+metrics without enforcing the f32 tolerance bars.
+
 Verification: `ctest -R test-parler` runs tokenizer/T5/decoder/delay/DAC/
 e2e parity against `.npy` fixtures produced by
 `scripts/dump-parler-reference.py` (HF PyTorch reference, greedy).  The

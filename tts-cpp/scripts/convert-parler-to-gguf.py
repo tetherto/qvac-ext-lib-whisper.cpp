@@ -35,6 +35,47 @@ def fold_weight_norm(g, v):
     return (v * (g / norm.astype(np.float32))).astype(np.float32)
 
 
+def find_ggml_lib():
+    """Locate a built ggml-base shared lib (for k-quant encoding)."""
+    import glob
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    for pat in ("build*/ggml/src/libqvac-speech-ggml-base.*",
+                "build*/ggml/src/libggml-base.*"):
+        hits = [h for h in sorted(glob.glob(os.path.join(root, pat)))
+                if h.endswith((".dylib", ".so"))
+                and "san" not in os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(h))))]
+        if hits:
+            return hits[0]
+    return None
+
+
+def make_ggml_quantizer(lib_path):
+    """ctypes binding to ggml_quantize_chunk for types gguf-py cannot encode
+    (Q4_K/Q6_K are dequantize-only in Python) — upstream gguf-py tests use the
+    same route, and it is the exact encoder inference runs against."""
+    import ctypes
+    import gguf
+    lib = ctypes.CDLL(lib_path)
+    fn = lib.ggml_quantize_chunk
+    fn.restype = ctypes.c_size_t
+    fn.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_float), ctypes.c_void_p,
+                   ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
+
+    def quantize(arr, qtype):
+        blk, typesz = gguf.GGML_QUANT_SIZES[qtype]
+        nrows = int(np.prod(arr.shape[:-1]))
+        n_per_row = arr.shape[-1]
+        assert n_per_row % blk == 0, (arr.shape, qtype)
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        dst = np.zeros(nrows * (n_per_row // blk) * typesz, dtype=np.uint8)
+        n = fn(int(qtype.value), arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+               dst.ctypes.data_as(ctypes.c_void_p), 0, nrows, n_per_row, None)
+        assert n == dst.nbytes, f"ggml_quantize_chunk wrote {n} != {dst.nbytes}"
+        return dst.reshape(*arr.shape[:-1], (n_per_row // blk) * typesz)
+
+    return quantize
+
+
 class Converter:
     def __init__(self, get, src_names):
         self.get = get                      # name -> np.ndarray
@@ -68,7 +109,9 @@ class Converter:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-id", default="parler-tts/parler-tts-mini-v1")
-    ap.add_argument("--dtype", choices=["f32", "f16"], default="f32")
+    ap.add_argument("--dtype", choices=["f32", "f16", "q8_0", "q4_k_m", "q4_0"], default="f32")
+    ap.add_argument("--ggml-lib", default=None,
+                    help="ggml-base shared lib for k-quant encoding (q4_k_m only; auto-detected from build dirs)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -287,27 +330,83 @@ def main():
     w.add_uint32("tokenizer.ggml.padding_token_id", 0)
     w.add_bool("parler.tokenizer.add_eos", True)  # T5 appends </s>; verified in reference dump
 
-    # dtype policy: f16 only for decoder matmul weights / embeddings.
-    # Numerically delicate tensors stay f32: norms, biases, alphas, rel-pos
-    # bias, positional table, all DAC tensors — and the ENTIRE T5 encoder:
-    # flan-T5 activations overflow the f16 range (the well-known T5 fp16
-    # trap), and ggml's f16 mul_mat converts activation rows to f16 for the
-    # dot product, which turns the encoder output into NaN.
+    # dtype policy. Numerically delicate tensors always stay f32: norms,
+    # biases, alphas, rel-pos bias, positional table, all DAC tensors.
     def keep_f32(name):
         return (name.endswith(".bias") or ".alpha" in name or "norm" in name
-                or name.startswith("t5.")
+                or name == "t5.blk.0.attn_rel_b.weight"
                 or name == "dec.embed_positions.weight"
                 or name.startswith("dac."))
 
-    n_f16 = 0
+    # Under f16 the ENTIRE T5 encoder additionally stays f32: flan-T5
+    # activations overflow the f16 range, and ggml's f16 mul_mat converts
+    # activation rows to f16 for the dot product -> encoder output NaN.
+    # Quantized dots don't share that trap (activations are re-quantized
+    # per 32/256-block with independent scales), so quant recipes take T5
+    # weights to q8_0; lookup tables + LM heads keep more bits than bulk
+    # decoder matmuls.
+    Q = gguf.GGMLQuantizationType
+    RECIPES = {  # dtype -> (bulk dec matmuls, tables + lm heads, t5 matmuls)
+        "q8_0":   (Q.Q8_0, Q.Q8_0, Q.Q8_0),
+        "q4_k_m": (Q.Q4_K, Q.Q6_K, Q.Q8_0),
+        "q4_0":   (Q.Q4_0, Q.Q8_0, Q.Q8_0),
+    }
+
+    def is_table_or_head(name):
+        return (name.startswith(("dec.embed_tokens.", "dec.lm_heads."))
+                or name in ("dec.embed_prompts.weight", "t5.embed_tokens.weight"))
+
+    def target_type(name, arr):
+        if args.dtype == "f32" or keep_f32(name):
+            return None
+        if args.dtype == "f16":
+            return None if name.startswith("t5.") else Q.F16
+        bulk, tables, t5q = RECIPES[args.dtype]
+        qt = (tables if is_table_or_head(name)
+              else t5q if name.startswith(("t5.", "enc_to_dec.")) else bulk)
+        if arr.ndim != 2 or arr.shape[-1] % gguf.GGML_QUANT_SIZES[qt][0] != 0:
+            log(f"keep f32 (shape {arr.shape} not blockable for {qt.name}): {name}")
+            return None
+        return qt
+
+    from gguf import quants as gq
+    kquantize = None
+    if args.dtype == "q4_k_m":
+        lib = args.ggml_lib or find_ggml_lib()
+        if not lib:
+            raise SystemExit("q4_k_m needs a built ggml-base shared lib for k-quant "
+                             "encoding; build tts-cpp first or pass --ggml-lib")
+        log(f"k-quant encoder: {lib}")
+        kquantize = make_ggml_quantizer(lib)
+
+    counts = {}
+    roundtrip = []  # (rel_rmse, name, qtype name) self-check per quantized tensor
     for name in sorted(cv.out):
         arr = cv.out[name]
-        if args.dtype == "f16" and not keep_f32(name):
-            w.add_tensor(name, arr.astype(np.float16))
-            n_f16 += 1
-        else:
+        qt = target_type(name, arr)
+        if qt is None:
             w.add_tensor(name, arr)
-    log(f"tensors: {len(cv.out)} total, {n_f16} cast to f16")
+            counts["f32"] = counts.get("f32", 0) + 1
+        elif qt == Q.F16:
+            w.add_tensor(name, arr.astype(np.float16))
+            counts["f16"] = counts.get("f16", 0) + 1
+        else:
+            qdata = kquantize(arr, qt) if qt in (Q.Q4_K, Q.Q6_K) else gq.quantize(arr, qt)
+            dq = gq.dequantize(qdata, qt).astype(np.float64)
+            denom = float(np.sqrt(np.mean(arr.astype(np.float64) ** 2))) or 1.0
+            rel = float(np.sqrt(np.mean((arr.astype(np.float64) - dq) ** 2))) / denom
+            roundtrip.append((rel, name, qt.name))
+            w.add_tensor(name, qdata, raw_dtype=qt)
+            counts[qt.name] = counts.get(qt.name, 0) + 1
+    log(f"tensors: {len(cv.out)} total, types: "
+        + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    if roundtrip:
+        roundtrip.sort(reverse=True)
+        log("worst dequantize-roundtrip rel-RMSE:")
+        for rel, name, qn in roundtrip[:8]:
+            log(f"  {rel:.4e}  {qn:5s}  {name}")
+        # sanity net against catastrophic misquantization, NOT a quality bar
+        assert roundtrip[0][0] < 0.25, "suspiciously large quantization error"
 
     w.write_header_to_file()
     w.write_kv_data_to_file()

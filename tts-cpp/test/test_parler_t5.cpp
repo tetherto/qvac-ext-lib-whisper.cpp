@@ -9,6 +9,10 @@
 
 using namespace tts_cpp::parler::detail;
 
+// PARLER_TEST_REPORT_ONLY=1: print metrics without enforcing the tolerance
+// bars (for measuring quantized GGUFs). Non-finite output still fails.
+static bool g_report_only = false;
+
 static bool run_case(parler_model & model, const std::string & ref_dir, const char * name) {
     npy_array ids_npy = npy_load(ref_dir + "/" + name + "_desc_ids.npy");
     if (ids_npy.dtype != "<i8") {
@@ -41,6 +45,11 @@ static bool run_case(parler_model & model, const std::string & ref_dir, const ch
         return false;
     }
     if (s.max_abs_err > 2e-3 || s.rel_err > 2e-3) {
+        if (g_report_only) {
+            fprintf(stderr, "%s: REPORT over-tolerance (max_abs %.3e rel %.3e)\n",
+                    name, s.max_abs_err, s.rel_err);
+            return true;
+        }
         fprintf(stderr, "%s: FAIL tolerance (max_abs %.3e rel %.3e)\n",
                 name, s.max_abs_err, s.rel_err);
         return false;
@@ -53,6 +62,8 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "usage: %s MODEL.gguf REF_DIR\n", argv[0]);
         return 2;
     }
+    g_report_only = getenv("PARLER_TEST_REPORT_ONLY") != nullptr;
+    if (g_report_only) fprintf(stderr, "REPORT-ONLY MODE: tolerance bars not enforced\n");
     parler_model model;
     std::string err;
     if (!parler_load_gguf(argv[1], model, &err)) {
@@ -63,6 +74,6 @@ int main(int argc, char ** argv) {
     if (!run_case(model, argv[2], "case0")) rc = 1;
     if (!run_case(model, argv[2], "case1")) rc = 1;
     parler_free_model(model);
-    if (rc == 0) fprintf(stderr, "parler t5: PASS\n");
+    if (rc == 0) fprintf(stderr, g_report_only ? "parler t5: REPORT DONE\n" : "parler t5: PASS\n");
     return rc;
 }

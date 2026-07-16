@@ -12,6 +12,11 @@
 
 using namespace tts_cpp::parler::detail;
 
+// PARLER_TEST_REPORT_ONLY=1: print metrics + argmax agreement without
+// enforcing the bars (for measuring quantized GGUFs). NaN still fails.
+static bool g_report_only = false;
+static long g_agree = 0, g_total = 0;
+
 static std::vector<int32_t> load_ids(const std::string & path) {
     npy_array a = npy_load(path);
     const int64_t * p = reinterpret_cast<const int64_t *>(a.data.data());
@@ -28,20 +33,28 @@ static bool check_logits(const char * tag, const std::vector<float> & got,
         fprintf(stderr, "%s: FAIL non-finite logits\n", tag);
         return false;
     }
-    if (s.max_abs_err > 5e-3) {
+    if (s.max_abs_err > 5e-3 && !g_report_only) {
         fprintf(stderr, "%s: FAIL logits tolerance\n", tag);
         return false;
     }
+    int agree = 0;
     for (int k = 0; k < n_cb; ++k) {
         int ag = 0, ar = 0;
         for (int v = 1; v < vocab; ++v) {
             if (got[(size_t) k * vocab + v] > got[(size_t) k * vocab + ag]) ag = v;
             if (ref[(size_t) k * vocab + v] > ref[(size_t) k * vocab + ar]) ar = v;
         }
-        if (ag != ar) {
+        if (ag == ar) {
+            agree++;
+        } else if (!g_report_only) {
             fprintf(stderr, "%s: FAIL argmax codebook %d: got %d ref %d\n", tag, k, ag, ar);
             return false;
         }
+    }
+    g_agree += agree;
+    g_total += n_cb;
+    if (g_report_only && agree != n_cb) {
+        fprintf(stderr, "%s: REPORT argmax agree %d/%d\n", tag, agree, n_cb);
     }
     return true;
 }
@@ -52,6 +65,8 @@ int main(int argc, char ** argv) {
         return 2;
     }
     const std::string ref_dir = argv[2];
+    g_report_only = getenv("PARLER_TEST_REPORT_ONLY") != nullptr;
+    if (g_report_only) fprintf(stderr, "REPORT-ONLY MODE: tolerance bars not enforced\n");
 
     parler_model model;
     std::string err;
@@ -128,6 +143,11 @@ int main(int argc, char ** argv) {
 
     ggml_gallocr_free(allocr);
     parler_free_model(model);
-    if (rc == 0) fprintf(stderr, "parler decoder: PASS\n");
+    if (g_total > 0) {
+        fprintf(stderr, "argmax agreement: %ld/%ld (%.2f%%)\n",
+                g_agree, g_total, 100.0 * (double) g_agree / (double) g_total);
+    }
+    if (rc == 0) fprintf(stderr, g_report_only ? "parler decoder: REPORT DONE\n"
+                                               : "parler decoder: PASS\n");
     return rc;
 }
