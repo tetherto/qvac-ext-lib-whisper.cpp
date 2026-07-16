@@ -211,16 +211,17 @@ Quantized recipes (mini sizes; argmax agreement vs the f32 fixtures over a
 
 | `--dtype` | size | agree | bulk / tables / heads / T5 |
 |---|---|---|---|
-| `q8_0`   | ~1.16 GB | 98.1% | q8_0 / f16 / f16 / q8_0 |
-| `q6_k`   | ~0.98 GB | 94.9% | q6_K / q6_K / f16 / q8_0 |
-| `q5_0`   | ~0.91 GB | 90.4% | q5_0 / q6_K / q8_0 / q8_0 |
-| `q4_k_m` | ~0.86 GB | 83.1% | q4_K / q6_K / q8_0 / q8_0 |
+| `q8_0` | ~1.16 GB | 98.1% | q8_0 / f16 / f16 / q8_0 |
+| `q6_k` | ~0.98 GB | 94.9% | q6_K / q6_K / f16 / q8_0 |
 
-All keep the f32 set above untouched and the T5 matmuls at q8_0 (quantized
-dot products re-quantize activations per block, so the f16 trap does not
-apply — T5 must never go f16).  The 9 LM heads never drop below q8_0 (6-bit
-heads derail sampled decoding); the top tiers lift heads/tables to f16 —
-the dominant quality lever found by grid search
+Sub-q6 tiers measured well below this quality floor (q5_0 90.4%, q4_k_m
+83.1% on mini; 70.0% / 65.9% on large) and are deliberately not shipped —
+reproduce them via `--recipe` if ever needed.  All recipes keep the f32
+set above untouched and the T5 matmuls at q8_0 (quantized dot products
+re-quantize activations per block, so the f16 trap does not apply — T5
+must never go f16).  The 9 LM heads never drop below q8_0 (6-bit heads
+derail sampled decoding); both tiers lift heads (q8_0 also tables) to
+f16 — the dominant quality lever found by grid search
 (`scripts/parler-quant-grid.py`; per-tier override via `--recipe`, optional
 activation-weighted quantization via `scripts/compute-parler-imatrix.py` +
 `--imatrix`).  Non-trivial encodes go through the built ggml library

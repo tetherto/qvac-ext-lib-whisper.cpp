@@ -117,8 +117,7 @@ class Converter:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-id", default="parler-tts/parler-tts-mini-v1")
-    ap.add_argument("--dtype", choices=["f32", "f16", "q8_0", "q6_k", "q5_0", "q4_k_m"],
-                    default="f32")
+    ap.add_argument("--dtype", choices=["f32", "f16", "q8_0", "q6_k"], default="f32")
     ap.add_argument("--ggml-lib", default=None,
                     help="ggml-base shared lib for ggml-side encoding (k-quants / --imatrix; "
                          "auto-detected from build dirs)")
@@ -368,12 +367,12 @@ def main():
     # follow a 200-step teacher-forced argmax grid search (mini): F16 heads
     # are the dominant lever at 8/6-bit bulk (+3.4pt for +10 MB at q8_0);
     # embedding tables matter least.
+    # Sub-q6 tiers are deliberately not shipped (quality floor); explore
+    # them via --recipe overrides on a q6_k/q8_0 base if ever needed.
     Q = gguf.GGMLQuantizationType
     RECIPES = {  # dtype -> (bulk dec matmuls, embed tables, lm heads, t5 matmuls)
-        "q8_0":   (Q.Q8_0, Q.F16,  Q.F16,  Q.Q8_0),
-        "q6_k":   (Q.Q6_K, Q.Q6_K, Q.F16,  Q.Q8_0),
-        "q5_0":   (Q.Q5_0, Q.Q6_K, Q.Q8_0, Q.Q8_0),
-        "q4_k_m": (Q.Q4_K, Q.Q6_K, Q.Q8_0, Q.Q8_0),
+        "q8_0": (Q.Q8_0, Q.F16,  Q.F16, Q.Q8_0),
+        "q6_k": (Q.Q6_K, Q.Q6_K, Q.F16, Q.Q8_0),
     }
 
     TIER_NAMES = ("bulk", "tables", "heads", "t5")

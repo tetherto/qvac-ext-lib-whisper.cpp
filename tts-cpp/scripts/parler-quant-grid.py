@@ -34,25 +34,18 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONVERTER = os.path.join(SCRIPT_DIR, "convert-parler-to-gguf.py")
 
 # (label, dtype, recipe override or None, use imatrix)
-# Round-1 findings (TSV 2026-07-16): heads=F16 dominates (+3.4pt at q8-class
-# for +10 MB), tables < +1pt, bulk ladder Q4_K 83.1 < IQ4_NL 85.8 < Q5_K 89.8
-# ~ Q5_0 90.4 < Q6_K ? < Q8_0 94.4 (f16 ceiling 99.61). Round 2 crosses
-# heads=F16 with the bulk ladder and adds the imatrix arms.
+# 2026-07-16 findings (full tables in the results TSV / PROGRESS ledger):
+# heads=F16 dominates (+3.4pt at q8-class for +10 MB), tables < +1pt, bulk
+# ladder Q4_K 83.1 < IQ4_NL 85.8 < Q5_K 89.8 ~ Q5_0 90.4 < Q6_K+headF16
+# 94.9 < Q8_0+tab/headF16 98.1 (f16 ceiling 99.61). Shipped recipes are
+# q6_k/q8_0 only; the overrides below reproduce dropped sub-q6 tiers for
+# future research (e.g. an imatrix pass — never yet measured).
 GRID = [
-    ("q4k+headF16",      "q4_k_m", "heads=F16",               False),
-    ("iq4nl+headF16",    "q4_k_m", "bulk=IQ4_NL,heads=F16",   False),
-    ("q5_0+headF16",     "q4_k_m", "bulk=Q5_0,heads=F16",     False),
-    ("q5k+headF16",      "q4_k_m", "bulk=Q5_K,heads=F16",     False),
-    ("q6k+headF16",      "q4_k_m", "bulk=Q6_K,heads=F16",     False),
-    # imatrix arms (skipped unless --imatrix is given)
-    ("q4_k_m+im",        "q4_k_m", None,                      True),
-    ("q5_k+im",          "q4_k_m", "bulk=Q5_K",               True),
-    ("q5_0+im",          "q4_k_m", "bulk=Q5_0",               True),
-    ("iq4_nl+im",        "q4_k_m", "bulk=IQ4_NL",             True),
-    ("q4k+headF16+im",   "q4_k_m", "heads=F16",               True),
-    ("iq4nl+headF16+im", "q4_k_m", "bulk=IQ4_NL,heads=F16",   True),
-    ("q5_0+headF16+im",  "q4_k_m", "bulk=Q5_0,heads=F16",     True),
-    ("q6k+headF16+im",   "q4_k_m", "bulk=Q6_K,heads=F16",     True),
+    ("q6_k+im",   "q6_k", None,                     True),
+    ("q4_k_m+im", "q6_k", "bulk=Q4_K,heads=Q8_0",   True),
+    ("q5_0+im",   "q6_k", "bulk=Q5_0,heads=Q8_0",   True),
+    ("q5_k+im",   "q6_k", "bulk=Q5_K,heads=Q8_0",   True),
+    ("iq4_nl+im", "q6_k", "bulk=IQ4_NL,heads=Q8_0", True),
 ]
 
 AGREE_RE = re.compile(r"argmax agreement: (\d+)/(\d+) \(([\d.]+)%\)")
