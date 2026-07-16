@@ -343,17 +343,19 @@ def main():
     # activation rows to f16 for the dot product -> encoder output NaN.
     # Quantized dots don't share that trap (activations are re-quantized
     # per 32/256-block with independent scales), so quant recipes take T5
-    # weights to q8_0; lookup tables + LM heads keep more bits than bulk
-    # decoder matmuls.
+    # weights to q8_0. The 9 LM heads stay q8_0 in EVERY recipe: they feed
+    # the logits directly, and 6-bit heads (3x the q8_0 noise) were shown
+    # to derail the sampled trajectory on large-v1 (argmax agreement
+    # 44%->17%, EOS never fires). Embedding tables tolerate q6_K fine.
     Q = gguf.GGMLQuantizationType
-    RECIPES = {  # dtype -> (bulk dec matmuls, tables + lm heads, t5 matmuls)
-        "q8_0":   (Q.Q8_0, Q.Q8_0, Q.Q8_0),
-        "q4_k_m": (Q.Q4_K, Q.Q6_K, Q.Q8_0),
-        "q4_0":   (Q.Q4_0, Q.Q8_0, Q.Q8_0),
+    RECIPES = {  # dtype -> (bulk dec matmuls, embed tables, lm heads, t5 matmuls)
+        "q8_0":   (Q.Q8_0, Q.Q8_0, Q.Q8_0, Q.Q8_0),
+        "q4_k_m": (Q.Q4_K, Q.Q6_K, Q.Q8_0, Q.Q8_0),
+        "q4_0":   (Q.Q4_0, Q.Q8_0, Q.Q8_0, Q.Q8_0),
     }
 
-    def is_table_or_head(name):
-        return (name.startswith(("dec.embed_tokens.", "dec.lm_heads."))
+    def is_embed_table(name):
+        return (name.startswith("dec.embed_tokens.")
                 or name in ("dec.embed_prompts.weight", "t5.embed_tokens.weight"))
 
     def target_type(name, arr):
@@ -361,8 +363,9 @@ def main():
             return None
         if args.dtype == "f16":
             return None if name.startswith("t5.") else Q.F16
-        bulk, tables, t5q = RECIPES[args.dtype]
-        qt = (tables if is_table_or_head(name)
+        bulk, tables, heads, t5q = RECIPES[args.dtype]
+        qt = (tables if is_embed_table(name)
+              else heads if name.startswith("dec.lm_heads.")
               else t5q if name.startswith(("t5.", "enc_to_dec.")) else bulk)
         if arr.ndim != 2 or arr.shape[-1] % gguf.GGML_QUANT_SIZES[qt][0] != 0:
             log(f"keep f32 (shape {arr.shape} not blockable for {qt.name}): {name}")
