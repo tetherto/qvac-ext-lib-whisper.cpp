@@ -3,7 +3,7 @@
 // in artifacts/parler-ref/tokenizer_corpus.json. Charsmap walk follows the
 // XCDA scheme used by sentencepiece / llama.cpp's ugm tokenizer.
 
-#include "parler_tokenizer.h"
+#include "tokenizer.h"
 
 #include <algorithm>
 #include <cfloat>

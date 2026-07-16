@@ -6,7 +6,7 @@
 // enc_to_dec projection exists only when t5.d_model != dec.d_model (large);
 // mini's checkpoint does not even ship it.
 
-#include "parler_internal.h"
+#include "internal.h"
 
 #include <cmath>
 #include <cstdio>

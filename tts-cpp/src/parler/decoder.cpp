@@ -8,7 +8,7 @@
 // LayerNorm (weight + bias, eps from GGUF); self-attn q scaled by
 // head_dim^-0.5; FFN uses exact-erf GELU ("gelu"); logits = 9 separate heads.
 
-#include "parler_internal.h"
+#include "internal.h"
 
 #include <algorithm>
 #include <cmath>

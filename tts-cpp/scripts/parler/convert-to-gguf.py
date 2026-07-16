@@ -17,7 +17,7 @@ explicit ignore list, and every expected destination must be produced —
 otherwise the converter aborts.
 
 Usage:
-  python3 convert-parler-to-gguf.py --model-id parler-tts/parler-tts-mini-v1 \
+  python3 convert-to-gguf.py --model-id parler-tts/parler-tts-mini-v1 \
       --dtype f32 --out tts-cpp/models/parler-mini-v1-f32.gguf
 """
 
@@ -108,7 +108,7 @@ def parse_bpe(tj):
 def find_ggml_lib():
     """Locate a built ggml-base shared lib (for k-quant encoding)."""
     import glob
-    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     for pat in ("build*/ggml/src/libqvac-speech-ggml-base.*",
                 "build*/ggml/src/libggml-base.*"):
         hits = [h for h in sorted(glob.glob(os.path.join(root, pat)))
@@ -196,7 +196,7 @@ def main():
                          "auto-detected from build dirs)")
     ap.add_argument("--imatrix", default=None,
                     help="npz of per-column importance vectors keyed by HF weight name "
-                         "(scripts/compute-parler-imatrix.py); used by k-quants and q4_0/q5_0")
+                         "(scripts/parler/compute-imatrix.py); used by k-quants and q4_0/q5_0")
     ap.add_argument("--recipe", default=None,
                     help="override quant tiers, e.g. bulk=Q5_K,tables=F16,heads=Q8_0,t5=Q8_0 "
                          "(requires a quant --dtype; unlisted tiers keep the dtype's defaults)")

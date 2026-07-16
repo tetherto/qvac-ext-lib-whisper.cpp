@@ -200,7 +200,7 @@ voice — e.g. Rohit for Hindi, Yash for Gujarati — for stable speakers).
 
 ```sh
 # convert (single GGUF: T5 + decoder + DAC + tokenizer; ~3.4 GB f32)
-python3 tts-cpp/scripts/convert-parler-to-gguf.py \
+python3 tts-cpp/scripts/parler/convert-to-gguf.py \
     --model-id parler-tts/parler-tts-mini-v1 --dtype f32 \
     --out tts-cpp/models/parler-mini-v1-f32.gguf
 
@@ -238,8 +238,8 @@ re-quantize activations per block, so the f16 trap does not apply — T5
 must never go f16).  The 9 LM heads never drop below q8_0 (6-bit heads
 derail sampled decoding); both tiers lift heads (q8_0 also tables) to
 f16 — the dominant quality lever found by grid search
-(`scripts/parler-quant-grid.py`; per-tier override via `--recipe`, optional
-activation-weighted quantization via `scripts/compute-parler-imatrix.py` +
+(`scripts/parler/quant-grid.py`; per-tier override via `--recipe`, optional
+activation-weighted quantization via `scripts/parler/compute-imatrix.py` +
 `--imatrix`).  Non-trivial encodes go through the built ggml library
 (`ggml_quantize_chunk` via ctypes; auto-located, or pass `--ggml-lib`), so
 build tts-cpp first.  Quantized output diverges from the f32 parity
@@ -265,7 +265,7 @@ the prompt language is known.
 
 Verification: `ctest -R test-parler` runs tokenizer/T5/decoder/delay/DAC/
 e2e parity against `.npy` fixtures produced by
-`scripts/dump-parler-reference.py` (HF PyTorch reference, greedy).  The
+`scripts/parler/dump-reference.py` (HF PyTorch reference, greedy).  The
 greedy token trace matches HF exactly; the DAC waveform matches at
 >120 dB SNR.  Default decoding is sampled (temperature 1.0, top-k 50, from
 `generation_config.json`); `--greedy` gives the deterministic parity path.

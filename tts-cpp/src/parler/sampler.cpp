@@ -1,4 +1,4 @@
-#include "parler_sampler.h"
+#include "sampler.h"
 
 #include <algorithm>
 #include <cmath>

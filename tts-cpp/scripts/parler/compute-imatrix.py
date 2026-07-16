@@ -6,10 +6,10 @@ and accumulates, for every nn.Linear weight, the mean squared activation per
 input column — the `quant_weights` vector ggml_quantize_chunk uses to weight
 per-column quantization error. Output: an .npz keyed by HF state-dict weight
 name (e.g. "decoder.model.decoder.layers.0.self_attn.q_proj.weight"),
-consumed by convert-parler-to-gguf.py --imatrix (which maps HF names to GGUF
+consumed by convert-to-gguf.py --imatrix (which maps HF names to GGUF
 tensor names itself).
 
-The calibration texts deliberately EXCLUDE the dump-parler-reference.py
+The calibration texts deliberately EXCLUDE the dump-reference.py
 fixture prompts/descriptions, so fixture-based argmax agreement stays a
 held-out metric. Numbers are written as words, matching what the engine's
 prompt normalizer feeds the model.
@@ -20,7 +20,7 @@ hooked (not nn.Linear) and never quantized, and DAC runs after the decoder
 so it cannot influence any hooked activation.
 
 Usage:
-  python3 compute-parler-imatrix.py --model-id parler-tts/parler-tts-mini-v1 \
+  python3 compute-imatrix.py --model-id parler-tts/parler-tts-mini-v1 \
       --out tts-cpp/models/parler-mini-v1-imatrix.npz
 """
 

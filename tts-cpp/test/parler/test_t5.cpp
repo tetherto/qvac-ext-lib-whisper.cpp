@@ -1,6 +1,6 @@
 // T5 encoder parity vs HF fixtures (case*_desc_ids -> case*_cross_states).
 
-#include "parler_internal.h"
+#include "parler/internal.h"
 #include "npy.h"
 
 #include <cstdio>

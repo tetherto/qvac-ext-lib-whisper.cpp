@@ -5,7 +5,7 @@
 
 #include "gguf.h"
 #include "json.hpp"
-#include "parler_tokenizer.h"
+#include "parler/tokenizer.h"
 
 #include <cstdint>
 #include <cstdio>

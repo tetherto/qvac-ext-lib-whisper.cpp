@@ -7,10 +7,10 @@
 // margin is < 1e-3 (a numerical near-tie); then the prefix is compared and
 // the trace check ends there, but the DAC/wav comparison is skipped.
 
-#include "parler_internal.h"
-#include "parler_delay.h"
-#include "parler_tokenizer.h"
-#include "parler_bpe_tokenizer.h"
+#include "parler/internal.h"
+#include "parler/delay.h"
+#include "parler/tokenizer.h"
+#include "parler/bpe_tokenizer.h"
 #include "tts-cpp/parler/engine.h"
 #include "json.hpp"
 #include "npy.h"
@@ -24,7 +24,7 @@
 using namespace tts_cpp::parler::detail;
 
 // case0's texts come from the fixture dir's meta.json (written by
-// dump-parler-reference.py), so the binary serves every model's fixtures.
+// dump-reference.py), so the binary serves every model's fixtures.
 static bool load_case0_texts(const std::string & ref_dir,
                              std::string & description, std::string & prompt) {
     std::ifstream ifs(ref_dir + "/meta.json");

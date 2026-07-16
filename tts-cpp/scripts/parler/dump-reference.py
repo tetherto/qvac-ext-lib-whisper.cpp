@@ -6,7 +6,7 @@ greedy decoding) and dumps per-stage .npy fixtures consumed by the
 test_parler_* C++ tests, plus reference wavs for by-ear verification.
 
 Usage:
-  python3 dump-parler-reference.py --model-id parler-tts/parler-tts-mini-v1 \
+  python3 dump-reference.py --model-id parler-tts/parler-tts-mini-v1 \
       --out tts-cpp/artifacts/parler-ref
 """
 

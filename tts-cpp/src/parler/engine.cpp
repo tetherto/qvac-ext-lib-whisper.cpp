@@ -1,11 +1,11 @@
 #include "tts-cpp/parler/engine.h"
 
-#include "parler_internal.h"
-#include "parler_tokenizer.h"
-#include "parler_bpe_tokenizer.h"
-#include "parler_text_norm.h"
-#include "parler_delay.h"
-#include "parler_sampler.h"
+#include "internal.h"
+#include "tokenizer.h"
+#include "bpe_tokenizer.h"
+#include "text_norm.h"
+#include "delay.h"
+#include "sampler.h"
 #include "backend_selection.h"
 
 #include <atomic>

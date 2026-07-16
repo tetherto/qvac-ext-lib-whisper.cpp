@@ -3,8 +3,8 @@
 // KV cache, positions and the delay-mask input path together).
 // Bars: L_inf <= 5e-3 AND per-codebook argmax equality.
 
-#include "parler_internal.h"
-#include "parler_delay.h"
+#include "parler/internal.h"
+#include "parler/delay.h"
 #include "npy.h"
 
 #include <cstdio>

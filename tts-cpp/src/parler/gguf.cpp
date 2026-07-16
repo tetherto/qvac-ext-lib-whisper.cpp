@@ -1,4 +1,4 @@
-#include "parler_internal.h"
+#include "internal.h"
 
 #include "backend_selection.h"
 #include "gguf_stream.h"

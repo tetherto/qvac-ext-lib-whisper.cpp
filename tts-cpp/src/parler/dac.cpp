@@ -1,4 +1,4 @@
-#include "parler_internal.h"
+#include "internal.h"
 
 #include "ggml-alloc.h"
 

@@ -1,4 +1,4 @@
-#include "parler_bpe_tokenizer.h"
+#include "bpe_tokenizer.h"
 
 #include <cstdio>
 #include <queue>

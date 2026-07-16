@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Grid-search Parler quant recipes by teacher-forced argmax agreement.
 
-For each variant: convert a temp GGUF (convert-parler-to-gguf.py), run
+For each variant: convert a temp GGUF (convert-to-gguf.py), run
 test-parler-decoder in PARLER_TEST_REPORT_ONLY mode against the fixtures,
 parse the aggregate "argmax agreement" line, append a row to a TSV, delete
 the GGUF (unless --keep-ggufs). Baselines measure existing GGUFs directly.
@@ -16,7 +16,7 @@ GGUF passes strict parity. LM heads never go below Q8_0 (6-bit heads were
 shown to derail sampled decoding on large-v1).
 
 Usage:
-  python3 parler-quant-grid.py --ref artifacts/parler-ref \
+  python3 quant-grid.py --ref artifacts/parler-ref \
       --decoder build-parler/test-parler-decoder \
       --baseline f16=models/parler-mini-v1-f16.gguf \
       [--imatrix models/parler-mini-v1-imatrix.npz] \
@@ -31,7 +31,7 @@ import sys
 import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONVERTER = os.path.join(SCRIPT_DIR, "convert-parler-to-gguf.py")
+CONVERTER = os.path.join(SCRIPT_DIR, "convert-to-gguf.py")
 
 # (label, dtype, recipe override or None, use imatrix)
 # 2026-07-16 findings (full tables in the results TSV / PROGRESS ledger):

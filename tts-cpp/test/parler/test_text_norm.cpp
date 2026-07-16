@@ -1,7 +1,7 @@
 // Table-driven checks of the number normalizers used on Parler prompts
 // before tokenization (English words + Indic script-native digits).
 
-#include "parler_text_norm.h"
+#include "parler/text_norm.h"
 
 #include <cstdio>
 #include <string>
