@@ -230,7 +230,9 @@ Quantized recipes (mini sizes; argmax agreement vs the f32 fixtures over a
 
 Sub-q6 tiers measured well below this quality floor (q5_0 90.4%, q4_k_m
 83.1% on mini; 70.0% / 65.9% on large) and are deliberately not shipped —
-reproduce them via `--recipe` if ever needed.  All recipes keep the f32
+reproduce them via `--recipe` if ever needed.  The recipes transfer to
+the indic checkpoint unchanged (its own 200-step fixtures: f16 99.6%,
+q8_0 98.3%; f32 scores 100%).  All recipes keep the f32
 set above untouched and the T5 matmuls at q8_0 (quantized dot products
 re-quantize activations per block, so the f16 trap does not apply — T5
 must never go f16).  The 9 LM heads never drop below q8_0 (6-bit heads
