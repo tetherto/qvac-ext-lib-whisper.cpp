@@ -253,10 +253,15 @@ badly, so this deliberately diverges from stock HF.  English cardinals
 (incl. thousands separators), decimals and ordinals are covered; times,
 currency and units are not.  Opt out with `--no-normalize-numbers`
 (`EngineOptions::normalize_numbers = false`); the description is never
-rewritten.  Note the expansion is English-only: ASCII digits inside an
-Indic-script prompt still become English words, and native numerals
-(१२, ૨૫) pass through untouched — disable it for Indic prompts if the
-mixed-language reading is unwanted.
+rewritten.  On indic-class models, ASCII digit runs whose nearest letter
+context is an Indic script are instead transliterated to that script's
+native digits ("कमरा 12" → "कमरा १२"; all 13 digit-bearing scripts of the
+21 languages covered); Latin-context runs still become English words, and
+native numerals always pass through untouched.  Best effort by design:
+the model only voices native numerals for scripts whose numerals were
+frequent in its training text (Devanagari yes; e.g. Gujarati no —
+verified by ear); full per-language number-words belong upstream where
+the prompt language is known.
 
 Verification: `ctest -R test-parler` runs tokenizer/T5/decoder/delay/DAC/
 e2e parity against `.npy` fixtures produced by

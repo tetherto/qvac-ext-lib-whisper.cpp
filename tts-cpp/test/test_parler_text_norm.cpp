@@ -1,5 +1,5 @@
-// Table-driven checks of the English number normalizer used on Parler
-// prompts before tokenization.
+// Table-driven checks of the number normalizers used on Parler prompts
+// before tokenization (English words + Indic script-native digits).
 
 #include "parler_text_norm.h"
 
@@ -7,6 +7,7 @@
 #include <string>
 
 using tts_cpp::parler::detail::normalize_numbers_en;
+using tts_cpp::parler::detail::normalize_numbers_indic;
 
 static int g_failures = 0;
 
@@ -14,6 +15,15 @@ static void expect(const std::string & in, const std::string & want) {
     const std::string got = normalize_numbers_en(in);
     if (got != want) {
         fprintf(stderr, "FAIL: \"%s\"\n  got:  \"%s\"\n  want: \"%s\"\n",
+                in.c_str(), got.c_str(), want.c_str());
+        ++g_failures;
+    }
+}
+
+static void expect_indic(const std::string & in, const std::string & want) {
+    const std::string got = normalize_numbers_indic(in);
+    if (got != want) {
+        fprintf(stderr, "FAIL(indic): \"%s\"\n  got:  \"%s\"\n  want: \"%s\"\n",
                 in.c_str(), got.c_str(), want.c_str());
         ++g_failures;
     }
@@ -97,6 +107,51 @@ int main() {
         const std::string twice = normalize_numbers_en(once);
         if (once != twice) {
             fprintf(stderr, "FAIL: not idempotent: \"%s\" -> \"%s\"\n",
+                    once.c_str(), twice.c_str());
+            ++g_failures;
+        }
+    }
+
+    // ---- indic variant: script-native digit transliteration ----
+    // Hindi / Devanagari context
+    expect_indic("कमरा 12 में", "कमरा १२ में");
+    expect_indic("आज १२ तारीख़ है और 12 बज रहे हैं।",
+                 "आज १२ तारीख़ है और १२ बज रहे हैं।");
+    // Gujarati / Tamil / Urdu contexts
+    expect_indic("કુલ 25 રૂપિયા", "કુલ ૨૫ રૂપિયા");
+    expect_indic("மொத்தம் 25", "மொத்தம் ௨௫");
+    expect_indic("کل 25 روپے", "کل ۲۵ روپے");
+    // context from a preceding NATIVE digit (digits live in script blocks)
+    expect_indic("१२, 34", "१२, ३४");
+    // right-context rescue when nothing scripted precedes
+    expect_indic("12 बजे", "१२ बजे");
+    // danda is SHARED punctuation (encoded in the Devanagari block) — it must
+    // not resolve script context; the Bengali letter beyond it wins
+    expect_indic("আজ সোমবার। 12 তারিখ", "আজ সোমবার। ১২ তারিখ");
+    expect_indic("ਕੁੱਲ। 45", "ਕੁੱਲ। ੪੫");
+    // multiplication sign is not a Latin letter; the Devanagari context wins
+    expect_indic("5×3 बजे", "५×३ बजे");
+    // malformed UTF-8 bytes pass through and carry no context
+    expect_indic("\xE0 12 \xE0\xA4\xAC\xE0\xA4\x9C\xE0\xA5\x87",
+                 "\xE0 १२ \xE0\xA4\xAC\xE0\xA4\x9C\xE0\xA5\x87");
+    // Latin context falls through to English words; per-run resolution
+    expect_indic("Meeting at 12 tomorrow", "Meeting at twelve tomorrow");
+    expect_indic("English 12 और हिंदी में 34",
+                 "English twelve और हिंदी में ३४");
+    // standalone digits have no script context -> English words
+    expect_indic("12", "twelve");
+    // decimals and separators keep punctuation, digits go native
+    expect_indic("कीमत 3.14 है", "कीमत ३.१४ है");
+    expect_indic("कुल 1,234 लोग", "कुल १,२३४ लोग");
+    // digit-free text is byte-identical
+    expect_indic("મારું નામ પ્રતિક છે. કેમ છો?", "મારું નામ પ્રતિક છે. કેમ છો?");
+    expect_indic("", "");
+    // idempotence: no ASCII digits remain after the pass
+    {
+        const std::string once  = normalize_numbers_indic("कमरा 12, room 34");
+        const std::string twice = normalize_numbers_indic(once);
+        if (once != twice) {
+            fprintf(stderr, "FAIL(indic): not idempotent: \"%s\" -> \"%s\"\n",
                     once.c_str(), twice.c_str());
             ++g_failures;
         }

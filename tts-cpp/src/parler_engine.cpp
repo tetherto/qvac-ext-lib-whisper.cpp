@@ -61,8 +61,9 @@ struct Engine::Impl {
         }
         const int n_threads = resolve_threads();
 
-        const std::string spoken_prompt = opts.normalize_numbers
-            ? normalize_numbers_en(prompt) : prompt;
+        const std::string spoken_prompt = !opts.normalize_numbers ? prompt
+            : model.has_prompt_tok ? normalize_numbers_indic(prompt)
+                                   : normalize_numbers_en(prompt);
         const std::vector<int32_t> prompt_ids = model.has_prompt_tok
             ? prompt_tokenizer.encode(spoken_prompt)
             : tokenizer.encode(spoken_prompt);
