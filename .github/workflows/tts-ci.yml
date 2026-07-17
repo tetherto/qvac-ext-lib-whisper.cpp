@@ -103,7 +103,13 @@ jobs:
       # Excludes gpu (no GPU on hosted runners) and perf (timing gates are
       # meaningless on shared runners). Model-dependent tests are DISABLED
       # at configure time when fixtures are absent and report as "Not Run".
+      # LD_LIBRARY_PATH: the ggml install ships libqvac-speech-ggml.so whose
+      # own dependency on the ggml-cpu/base siblings is resolved transitively
+      # — Linux RUNPATH doesn't apply to transitive loads, so the loader
+      # needs the directory explicitly (macOS @rpath chains handle it).
       - name: Test (non-GPU)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
         run: ctest --test-dir build -LE 'gpu|perf' --output-on-failure --timeout 600
 
   # GPU lane stub: opt-in until self-hosted GPU runners exist. Trial note:
