@@ -589,7 +589,8 @@ if (TTS_CPP_BUILD_TESTS)
 
     add_executable(test-campplus
         test/test_campplus.cpp
-        src/campplus.cpp)
+        src/campplus.cpp
+        src/backend_selection.cpp)
     target_link_libraries(test-campplus PRIVATE ggml)
     target_include_directories(test-campplus PRIVATE ggml/include src)
     if (OpenMP_CXX_FOUND)
@@ -1165,7 +1166,8 @@ if (TTS_CPP_BUILD_TESTS)
     add_executable(test-campplus-backward-parity
         test/test_campplus_backward_parity.cpp
         src/campplus_backward.cpp
-        src/campplus.cpp)
+        src/campplus.cpp
+        src/backend_selection.cpp)
     target_link_libraries(test-campplus-backward-parity PRIVATE ggml)
     target_include_directories(test-campplus-backward-parity PRIVATE ggml/include src)
     if (OpenMP_CXX_FOUND)
