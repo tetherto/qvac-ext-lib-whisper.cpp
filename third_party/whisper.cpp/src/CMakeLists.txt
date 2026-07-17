@@ -118,6 +118,7 @@ add_library(whisper
             whisper.cpp
             )
 
+if (WHISPER_BUILD_PARAKEET) # QVAC patch, see PATCHES.md
 add_library(parakeet
             ../include/parakeet.h
             parakeet-arch.h
@@ -127,6 +128,7 @@ add_library(parakeet
 target_include_directories(parakeet PUBLIC . ../include)
 target_compile_features   (parakeet PUBLIC cxx_std_11)
 target_link_libraries(parakeet PUBLIC ggml Threads::Threads)
+endif()
 
 # Set the version numbers
 set_target_properties(whisper PROPERTIES
@@ -134,15 +136,19 @@ set_target_properties(whisper PROPERTIES
     SOVERSION ${SOVERSION}
 )
 
+if (WHISPER_BUILD_PARAKEET)
 set_target_properties(parakeet PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${SOVERSION}
 )
+endif()
 
 target_include_directories(
   whisper
   PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+    # PROJECT_SOURCE_DIR, not CMAKE_SOURCE_DIR: this tree builds as a
+    # subproject of the repo-root umbrella (third_party/whisper.cpp).
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/whisper>)
 target_compile_features   (whisper PUBLIC cxx_std_11) # don't bump
 
@@ -155,7 +161,7 @@ if (WHISPER_EXTRA_FLAGS)
     target_compile_options(whisper PRIVATE ${WHISPER_EXTRA_FLAGS})
 endif()
 
-if (PARAKEET_EXTRA_FLAGS)
+if (WHISPER_BUILD_PARAKEET AND PARAKEET_EXTRA_FLAGS)
     target_compile_options(parakeet PRIVATE ${PARAKEET_EXTRA_FLAGS})
 endif()
 
@@ -178,6 +184,8 @@ if (BUILD_SHARED_LIBS)
     set_target_properties(whisper PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(whisper PRIVATE WHISPER_SHARED WHISPER_BUILD)
 
-    set_target_properties(parakeet PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_compile_definitions(parakeet PRIVATE PARAKEET_SHARED PARAKEET_BUILD)
+    if (WHISPER_BUILD_PARAKEET)
+        set_target_properties(parakeet PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(parakeet PRIVATE PARAKEET_SHARED PARAKEET_BUILD)
+    endif()
 endif()

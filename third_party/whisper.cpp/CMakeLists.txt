@@ -33,8 +33,8 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         set(GIT_COMMIT_SUBJECT "unknown")
     endif()
 
-    if(EXISTS ${CMAKE_SOURCE_DIR}/bindings/javascript/package-tmpl.json)
-        configure_file(${CMAKE_SOURCE_DIR}/bindings/javascript/package-tmpl.json ${CMAKE_SOURCE_DIR}/bindings/javascript/package.json @ONLY)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bindings/javascript/package-tmpl.json)
+        configure_file(${CMAKE_CURRENT_SOURCE_DIR}/bindings/javascript/package-tmpl.json ${CMAKE_CURRENT_SOURCE_DIR}/bindings/javascript/package.json @ONLY)
     endif()
 else()
     set(WHISPER_STANDALONE OFF)
@@ -88,6 +88,11 @@ option(WHISPER_SANITIZE_UNDEFINED "whisper: enable undefined sanitizer" OFF)
 option(WHISPER_BUILD_TESTS    "whisper: build tests"          ${WHISPER_STANDALONE})
 option(WHISPER_BUILD_EXAMPLES "whisper: build examples"       ${WHISPER_STANDALONE})
 option(WHISPER_BUILD_SERVER   "whisper: build server example" ${WHISPER_STANDALONE})
+# QVAC patch (see PATCHES.md): gate the bundled parakeet library so the
+# umbrella superbuild can turn it off — its `parakeet`/`parakeet-cli`
+# target names collide with the engines/parakeet project. Default ON
+# preserves stock upstream behavior; candidate for upstreaming.
+option(WHISPER_BUILD_PARAKEET "whisper: build the bundled parakeet library" ON)
 
 # 3rd party libs
 option(WHISPER_CURL "whisper: use libcurl to download model from an URL" OFF)
@@ -210,12 +215,14 @@ target_compile_definitions(whisper PRIVATE
     WHISPER_VERSION="${PROJECT_VERSION}"
 )
 
+if (WHISPER_BUILD_PARAKEET) # QVAC patch, see PATCHES.md
 set_target_properties(parakeet PROPERTIES PUBLIC_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/include/parakeet.h)
 install(TARGETS parakeet LIBRARY PUBLIC_HEADER)
 
 target_compile_definitions(parakeet PRIVATE
     PARAKEET_VERSION="${PROJECT_VERSION}"
 )
+endif()
 
 configure_package_config_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/cmake/whisper-config.cmake.in
@@ -238,6 +245,7 @@ configure_file(cmake/whisper.pc.in
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/whisper.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
+if (WHISPER_BUILD_PARAKEET) # QVAC patch, see PATCHES.md
 set(PARAKEET_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Location of header  files")
 set(PARAKEET_LIB_INSTALL_DIR     ${CMAKE_INSTALL_LIBDIR}     CACHE PATH "Location of library files")
 set(PARAKEET_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location of binary  files")
@@ -266,6 +274,7 @@ configure_file(cmake/parakeet.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/parakeet.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+endif() # WHISPER_BUILD_PARAKEET
 
 #
 # programs, examples and tests

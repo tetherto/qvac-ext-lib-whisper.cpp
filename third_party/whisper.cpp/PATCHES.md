@@ -1,7 +1,8 @@
 # QVAC patches on vendored whisper.cpp
 
 This directory is a **git subtree** of [ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp),
-currently pinned at **v1.9.1** (`f049fff9`). It is *upstream-tracking,
+currently pinned at **v1.9.1** (`f049fff9`; machine-readable pin in
+`UPSTREAM_PIN`, consumed by the divergence-guard CI). It is *upstream-tracking,
 minimally divergent*: the only files that may differ from the pinned upstream
 tag are the ones listed below. CI enforces this (divergence-guard job) —
 if you change anything in this directory, either it's an upstream sync
@@ -25,6 +26,7 @@ which ships as the `ggml-speech` vcpkg port; the umbrella build forces
 | `CMakeLists.txt` | install/export + robustness | export `whisper-targets`, headers under `include/whisper/`; guard `git-vars`/js-bindings config steps so source-tarball (vcpkg) builds work |
 | `cmake/git-vars.cmake` | robustness | tolerate non-git source trees (vcpkg tarballs) |
 | `cmake/whisper-config.cmake.in` | config fixes | correct find_package config for system-ggml consumers |
+| `CMakeLists.txt`, `src/CMakeLists.txt`, `examples/CMakeLists.txt` | `WHISPER_BUILD_PARAKEET` option (default ON) | gate upstream's bundled parakeet: its `parakeet`/`parakeet-cli` target names collide with `engines/parakeet`; the umbrella sets it OFF. Upstreaming candidate |
 
 Marker convention: new QVAC code blocks carry a `QVAC` reference in a nearby
 comment where practical.
