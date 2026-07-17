@@ -215,6 +215,38 @@ The indic checkpoint is gated on HF (`gated: auto` — any account gets
 instant access); pass a downloaded snapshot directory as `--model-id`
 with `--reference-repo ai4bharat/indic-parler-tts` for provenance.
 
+Instead of writing a full `--description`, the voice can be configured
+through template flags (`build_description()` in
+`<tts-cpp/parler/description.h>` — the same renderer the downstream addon
+uses).  The rendered text follows the models' training-caption phrasing,
+and every flag has a working default — with no flags at all the engine
+uses the models' recommended fallback caption ("The speaker speaks
+naturally. The recording is very high quality with no background noise."):
+
+| flag | values (default first) | rendered as |
+|---|---|---|
+| `--voice` | free name, e.g. Rohit, Laura | sentence subject |
+| `--emotion` | one of the 12 below | tone clause + "The intended style is …" |
+| `--pitch` | unset, low, moderate, high | "with a low pitch" |
+| `--pace` | unset, slow, moderate, fast | "speaks slowly" / "at a fast pace" |
+| `--expressivity` | unset, monotone, slightly expressive, expressive | "in an expressive manner" |
+| `--noise` | clear, noisy | "with no/noticeable background noise" |
+| `--reverb` | close, distant | "distant-sounding" (close is implied) |
+| `--quality` | very high, high, basic | "The recording is … quality" |
+
+Emotions (case-insensitive, validated): command, anger, narration,
+conversation, disgust, fear, happy, neutral, proper noun, news, sad,
+surprise — the 12 speaking styles in the indic training set.  Each renders
+an in-distribution clause ("with an angry tone", "delivering the news",
+"perfect for narration") plus the trailing style anchor sentence the
+training captions used.  The indic card lists 10 officially emotion-tested
+languages (Assamese, Bengali, Bodo, Dogri, Kannada, Malayalam, Marathi,
+Sanskrit, Nepali, Tamil); elsewhere — including Hindi/Gujarati and the
+mini/large English checkpoints — emotion conditioning exists but is
+best-effort: validate by ear.  `--description` and the template flags are
+mutually exclusive (the CLI errors out rather than silently preferring
+one).
+
 `--dtype f16` (~2.5 GB) casts only the decoder matmul weights and
 embeddings; the T5 encoder stays f32 (Flan-T5 activations overflow the
 f16 range — the well-known T5 fp16 trap), as do norms, biases, snake

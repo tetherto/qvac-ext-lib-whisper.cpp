@@ -273,6 +273,7 @@ set(TTS_CPP_LIB_SOURCES
     src/lavasr/denoiser_ggml.cpp
     # Parler-TTS engine (T5 encoder + delay-pattern decoder LM + DAC codec).
     src/parler/gguf.cpp
+    src/parler/description.cpp
     src/parler/text_norm.cpp
     src/parler/tokenizer.cpp
     src/parler/bpe_tokenizer.cpp
@@ -580,6 +581,12 @@ if (TTS_CPP_BUILD_TESTS)
     target_include_directories(test-parler-text-norm PRIVATE src)
     tts_cpp_apply_ccache(test-parler-text-norm)
     tts_cpp_register_test(test-parler-text-norm)
+
+    add_executable(test-parler-description test/parler/test_description.cpp
+        src/parler/description.cpp)
+    target_include_directories(test-parler-description PRIVATE include)
+    tts_cpp_apply_ccache(test-parler-description)
+    tts_cpp_register_test(test-parler-description)
 
     add_executable(test-parler-tokenizer test/parler/test_tokenizer.cpp src/parler/tokenizer.cpp)
     target_link_libraries(test-parler-tokenizer PRIVATE ggml)

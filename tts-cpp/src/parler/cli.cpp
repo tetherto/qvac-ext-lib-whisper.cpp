@@ -1,3 +1,4 @@
+#include "tts-cpp/parler/description.h"
 #include "tts-cpp/parler/engine.h"
 
 #include <algorithm>
@@ -13,7 +14,15 @@ namespace {
 
 void usage(const char * argv0) {
     fprintf(stderr,
-        "usage: %s --model parler.gguf --text TEXT --description DESC --out out.wav\n"
+        "usage: %s --model parler.gguf --text TEXT --out out.wav\n"
+        "          [--description DESC] (full voice description; mutually\n"
+        "                      exclusive with the template flags below)\n"
+        "          [--voice NAME] [--emotion NAME] (one of the 12 speaking\n"
+        "                      styles, e.g. happy, sad, anger, news)\n"
+        "          [--pitch low|moderate|high] [--pace slow|moderate|fast]\n"
+        "          [--expressivity monotone|\"slightly expressive\"|expressive]\n"
+        "          [--noise clear|noisy] [--reverb close|distant]\n"
+        "          [--quality basic|high|\"very high\"]\n"
         "          [--seed 42] [--threads N]\n"
         "          [--greedy] (deterministic argmax decoding; default is the\n"
         "                      model's sampled decoding: temp 1.0, top-k 50)\n"
@@ -55,7 +64,10 @@ void write_wav(const std::string & path, const std::vector<float> & wav, int sr)
 
 int main(int argc, char ** argv) {
     tts_cpp::parler::EngineOptions opts;
+    tts_cpp::parler::DescriptionSpec spec;
     std::string text, out;
+    bool have_description = false;
+    bool have_template_flag = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -69,7 +81,15 @@ int main(int argc, char ** argv) {
         };
         if      (a == "--model")          opts.model_gguf_path = next();
         else if (a == "--text")           text = next();
-        else if (a == "--description")    opts.default_description = next();
+        else if (a == "--description")  { opts.default_description = next(); have_description = true; }
+        else if (a == "--voice")        { spec.voice        = next(); have_template_flag = true; }
+        else if (a == "--emotion")      { spec.emotion      = next(); have_template_flag = true; }
+        else if (a == "--pitch")        { spec.pitch        = next(); have_template_flag = true; }
+        else if (a == "--pace")         { spec.pace         = next(); have_template_flag = true; }
+        else if (a == "--expressivity") { spec.expressivity = next(); have_template_flag = true; }
+        else if (a == "--noise")        { spec.noise        = next(); have_template_flag = true; }
+        else if (a == "--reverb")       { spec.reverb       = next(); have_template_flag = true; }
+        else if (a == "--quality")      { spec.quality      = next(); have_template_flag = true; }
         else if (a == "--out")            out = next();
         else if (a == "--seed")           opts.seed = atoi(next());
         else if (a == "--threads")        opts.n_threads = atoi(next());
@@ -88,10 +108,29 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
-    if (opts.model_gguf_path.empty() || text.empty() ||
-        opts.default_description.empty() || out.empty()) {
+    if (opts.model_gguf_path.empty() || text.empty() || out.empty()) {
         usage(argv[0]);
         return 2;
+    }
+    if (have_description && have_template_flag) {
+        fprintf(stderr, "--description is mutually exclusive with the template "
+                        "flags (--voice/--emotion/...)\n");
+        return 2;
+    }
+    if (have_description && opts.default_description.empty()) {
+        fprintf(stderr, "--description must not be empty (omit it for the "
+                        "default template)\n");
+        return 2;
+    }
+    if (!have_description) {
+        try {
+            opts.default_description = tts_cpp::parler::build_description(spec);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "%s\n", e.what());
+            return 2;
+        }
+        fprintf(stderr, "parler-cli: description: %s\n",
+                opts.default_description.c_str());
     }
 
     try {
