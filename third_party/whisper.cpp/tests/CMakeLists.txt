@@ -96,6 +96,13 @@ target_link_libraries(${UTF8_TEST} PRIVATE common)
 add_test(NAME ${UTF8_TEST} COMMAND ${UTF8_TEST})
 set_tests_properties(${UTF8_TEST} PROPERTIES LABELS "unit")
 
+# decoder logits-slice suffix-offset unit test (header-only, no model needed)
+set(LOGITS_SLICE_TEST test-whisper-logits-slice)
+add_executable(${LOGITS_SLICE_TEST} ${LOGITS_SLICE_TEST}.cpp)
+target_include_directories(${LOGITS_SLICE_TEST} PRIVATE ../src)
+add_test(NAME ${LOGITS_SLICE_TEST} COMMAND ${LOGITS_SLICE_TEST})
+set_tests_properties(${LOGITS_SLICE_TEST} PROPERTIES LABELS "unit;gh")
+
 # VAD test tests VAD in isolation
 set(VAD_TEST test-vad)
 add_executable(${VAD_TEST} ${VAD_TEST}.cpp)
@@ -119,6 +126,22 @@ target_compile_definitions(${VAD_TEST} PRIVATE
 add_test(NAME ${VAD_TEST} COMMAND ${VAD_TEST})
 set_tests_properties(${VAD_TEST} PROPERTIES LABELS "base;en")
 
+# Streaming VAD test pins the upstream PR #3677 contract:
+# whisper_vad_detect_speech_no_reset + whisper_vad_reset_state must
+# combine to yield exactly the same per-chunk probabilities as the
+# original whisper_vad_detect_speech call. Uses only the silero VAD
+# model (no whisper transcribe model needed).
+set(VAD_TEST test-vad-streaming)
+add_executable(${VAD_TEST} ${VAD_TEST}.cpp)
+target_include_directories(${VAD_TEST} PRIVATE ../include ../ggml/include ../examples)
+target_link_libraries(${VAD_TEST} PRIVATE common)
+target_compile_definitions(${VAD_TEST} PRIVATE
+    VAD_MODEL_PATH="${PROJECT_SOURCE_DIR}/models/for-tests-silero-v6.2.0-ggml.bin"
+    SAMPLE_PATH="${PROJECT_SOURCE_DIR}/samples/jfk.wav")
+add_test(NAME ${VAD_TEST} COMMAND ${VAD_TEST})
+set_tests_properties(${VAD_TEST} PROPERTIES LABELS "unit;vad")
+
+if (WHISPER_BUILD_PARAKEET) # QVAC patch, see PATCHES.md: these link the gated `parakeet` target
 # Parakeet model loading test
 set(PARAKEET_TEST test-parakeet)
 add_executable(${PARAKEET_TEST} ${PARAKEET_TEST}.cpp)
@@ -176,4 +199,5 @@ add_parakeet_transcription_test(
     samples/diffusion2023-07-03.flac
     tests/parakeet-expected-diffusion-output.txt
     0.95)
+endif() # WHISPER_BUILD_PARAKEET
 

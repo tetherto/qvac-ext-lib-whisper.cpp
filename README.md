@@ -95,9 +95,10 @@ those for methodology, hardware, and how to reproduce; `RTF =
 inference_time / audio_duration`, lower is better).
 
 **Parakeet** ([full table + methodology](engines/parakeet/README.md#ci-benchmarks-latest-ggml-speech-linux-x86-64),
-CI on Linux x86-64, q8_0, 1 warmup + 5 timed runs):
+q8_0, 1 warmup + 5 timed runs, benchmark host `qvac-ubuntu2204-x64-gpu`
+— GPU: NVIDIA RTX 4000 SFF Ada, Vulkan):
 
-| Model | CPU RTF | Vulkan RTF |
+| Model | CPU RTF (x86-64 host CPU) | GPU RTF (RTX 4000 SFF Ada) |
 |---|--:|--:|
 | CTC | 0.078 | 0.0023 |
 | TDT | 0.083 | 0.0035 |
@@ -107,11 +108,11 @@ CI on Linux x86-64, q8_0, 1 warmup + 5 timed runs):
 **Chatterbox TTS** ([full table](engines/tts/README.md#performance), Q4_0,
 higher `vs real-time` is better):
 
-| Backend / platform | RTF | vs real-time |
+| Backend / hardware | RTF | vs real-time |
 |---|--:|--:|
-| Vulkan (CI, Linux x86-64) | 0.090 | 11.1× |
-| Metal (Mac Studio M3 Ultra) | 0.16 | 6.4× |
-| CPU (CI, Linux x86-64) | 1.25 | 0.80× |
+| Vulkan — NVIDIA RTX 4000 SFF Ada (Linux x86-64) | 0.090 | 11.1× |
+| Metal — Mac Studio M3 Ultra | 0.16 | 6.4× |
+| CPU — x86-64 host of the RTX 4000 runner | 1.25 | 0.80× |
 
 Supertonic and multilingual Chatterbox numbers (Apple M-series Metal, mobile
 GPU paths) live in the [tts performance section](engines/tts/README.md#performance);

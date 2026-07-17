@@ -16,6 +16,7 @@ option(SPEECH_BUILD_WHISPER     "speech: build the whisper engine (third_party/w
 option(SPEECH_BUILD_PARAKEET    "speech: build the parakeet engine (engines/parakeet)"       ON)
 option(SPEECH_BUILD_TTS         "speech: build the TTS engines (engines/tts)"                ON)
 option(SPEECH_BUILD_TESTS       "speech: build the engines' test harnesses"                  OFF)
+option(SPEECH_BUILD_WHISPER_TESTS "speech: build whisper's test harnesses too (fixture-only tests run model-free; the transcription tests additionally need downloaded whisper models — filter by label)" OFF)
 option(SPEECH_BUILD_EXECUTABLES "speech: build the engines' CLI executables"                 ON)
 
 if (SPEECH_BUILD_TESTS)
@@ -35,7 +36,7 @@ if (SPEECH_BUILD_WHISPER)
     # leaves CMP0077 OLD in its scope, so its option() defaults would clobber
     # plain normal-variable set()s on the first configure.
     set(WHISPER_USE_SYSTEM_GGML ON  CACHE BOOL "umbrella: one shared system ggml" FORCE)
-    set(WHISPER_BUILD_TESTS     OFF CACHE BOOL "umbrella: upstream tests need models; whisper-ci smokes instead" FORCE)
+    set(WHISPER_BUILD_TESTS     ${SPEECH_BUILD_WHISPER_TESTS} CACHE BOOL "umbrella: see SPEECH_BUILD_WHISPER_TESTS" FORCE)
     set(WHISPER_BUILD_EXAMPLES  ${SPEECH_BUILD_EXECUTABLES} CACHE BOOL "umbrella: whisper-cli lives in examples/" FORCE)
     # Upstream ships its own C-API parakeet (target names `parakeet`,
     # `parakeet-cli`) which collides with engines/parakeet — gate it off

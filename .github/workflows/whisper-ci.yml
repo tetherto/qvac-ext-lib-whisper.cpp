@@ -89,20 +89,26 @@ jobs:
           cmake --install ggml-src/build
 
       # All engines + whisper in one configure: the shared-ggml invariant.
+      # SPEECH_BUILD_WHISPER_TESTS also builds whisper's test harnesses —
+      # the fixture-only ones (logits-slice, VAD contract tests) run below.
       - name: Configure umbrella (all engines, one ggml)
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DSPEECH_BUILD_TESTS=ON \
+            -DSPEECH_BUILD_WHISPER_TESTS=ON \
             -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
 
       - name: Build
         run: cmake --build build -j4
 
-      - name: Engine tests (non-GPU)
+      # Excludes gpu/perf (runner limits) and whisper's transcription tests
+      # (tiny/base/... labels need downloaded whisper models); whisper's
+      # fixture-only unit tests (logits-slice, VAD contract) run here.
+      - name: Tests (non-GPU, model-free)
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
-        run: ctest --test-dir build -LE 'gpu|perf' --output-on-failure --timeout 600
+        run: ctest --test-dir build -LE 'gpu|perf|tiny|base|small|medium|large' --output-on-failure --timeout 600
 
       - name: Cache whisper tiny model
         id: model-cache
@@ -111,12 +117,16 @@ jobs:
           path: models-cache
           key: whisper-tiny-en-v1
 
+      # -f: fail on HTTP errors instead of writing the error page into the
+      # model file. URL pinned to a fixed HF revision + sha256-verified so
+      # the smoke can't silently drift with upstream re-uploads.
       - name: Fetch ggml-tiny.en
         if: steps.model-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p models-cache
-          curl -L -o models-cache/ggml-tiny.en.bin \
-            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
+          curl -fL -o models-cache/ggml-tiny.en.bin \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.en.bin
+          echo "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f  models-cache/ggml-tiny.en.bin" | shasum -a 256 -c -
 
       - name: whisper-cli transcription smoke (jfk.wav)
         env:
