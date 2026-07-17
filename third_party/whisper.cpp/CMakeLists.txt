@@ -174,13 +174,17 @@ if (NOT TARGET ggml)
     endif()
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
+# QVAC patch (see PATCHES.md): GNUInstallDirs must be included before
+# add_subdirectory(src) — src/ expands ${CMAKE_INSTALL_INCLUDEDIR} in the
+# whisper INSTALL_INTERFACE; when unset it exports a bogus "/whisper"
+# include path that breaks install-tree find_package(whisper) consumers.
+include(GNUInstallDirs)
 add_subdirectory(src)
 
 #
 # install
 #
 
-include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 set(WHISPER_BUILD_NUMBER        ${BUILD_NUMBER})

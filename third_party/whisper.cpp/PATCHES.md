@@ -27,6 +27,7 @@ which ships as the `ggml-speech` vcpkg port; the umbrella build forces
 | `cmake/git-vars.cmake` | robustness | tolerate non-git source trees (vcpkg tarballs) |
 | `cmake/whisper-config.cmake.in` | config fixes | correct find_package config for system-ggml consumers |
 | `CMakeLists.txt`, `src/CMakeLists.txt`, `examples/CMakeLists.txt` | `WHISPER_BUILD_PARAKEET` option (default ON) | gate upstream's bundled parakeet: its `parakeet`/`parakeet-cli` target names collide with `engines/parakeet`; the umbrella sets it OFF. Upstreaming candidate |
+| `CMakeLists.txt` | `include(GNUInstallDirs)` moved before `add_subdirectory(src)` | the whisper INSTALL_INTERFACE expands `${CMAKE_INSTALL_INCLUDEDIR}`; unset it exports a bogus `/whisper` path breaking install-tree `find_package(whisper)`. Absorbed from the registry port's patch. Upstreaming candidate |
 
 Marker convention: new QVAC code blocks carry a `QVAC` reference in a nearby
 comment where practical.
