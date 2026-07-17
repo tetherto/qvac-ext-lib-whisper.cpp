@@ -31,6 +31,17 @@ exists, so the manifest is meaningful without access to any tracker.
 | `cmake/whisper-config.cmake.in` | config fixes | correct find_package config for system-ggml consumers |
 | `CMakeLists.txt`, `src/CMakeLists.txt`, `examples/CMakeLists.txt` | `WHISPER_BUILD_PARAKEET` option (default ON) | gate upstream's bundled parakeet: its `parakeet`/`parakeet-cli` target names collide with `engines/parakeet`; the umbrella sets it OFF. Upstreaming candidate |
 | `CMakeLists.txt` | `include(GNUInstallDirs)` moved before `add_subdirectory(src)` | the whisper INSTALL_INTERFACE expands `${CMAKE_INSTALL_INCLUDEDIR}`; unset it exports a bogus `/whisper` path breaking install-tree `find_package(whisper)`. Absorbed from the registry port's patch. Upstreaming candidate |
+| `tests/test-whisper-logits-slice.cpp` | new file | header-only unit test for the vocab-logits slice patch (suffix-offset arithmetic); needs no model |
+| `tests/test-vad-streaming.cpp` | new file | pins the streaming-VAD contract: `whisper_vad_detect_speech_no_reset` + `whisper_vad_reset_state` must reproduce `whisper_vad_detect_speech` per-chunk probabilities exactly; uses only the committed silero test fixture |
+| `tests/CMakeLists.txt` | register the two tests above; gate the parakeet tests behind `WHISPER_BUILD_PARAKEET` | the new tests carry `unit` labels so they run model-free in CI; the upstream parakeet tests link the gated `parakeet` target and must follow its option |
+| `bindings/java/src/main/java/io/github/ggerganov/whispercpp/params/WhisperFullParams.java`, `bindings/java/src/main/java/io/github/ggerganov/whispercpp/params/WhisperVadParams.java` | VAD parameters exposed to the Java binding | keeps the Java surface in step with the VAD options in whisper_full_params |
+
+**Deliberately dropped from the pre-subtree fork** (not upstream, not restored):
+`examples/talk-llama/llama-hparams.{h,cpp}` carried a stray `kv_only_nextn`
+MTP-head hunk referencing `nextn_predict_layers`, which does not exist in
+the talk-llama snapshot upstream ships with v1.9.1 — it did not compile and
+was the cause of the `ubuntu-22-*` failures in the (now inert) upstream
+`build.yml` on every master push. The demo builds clean without it.
 
 Marker convention: new QVAC code blocks carry a `QVAC` reference in a nearby
 comment where practical.
