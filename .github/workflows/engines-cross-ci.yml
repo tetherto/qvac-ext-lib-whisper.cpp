@@ -71,7 +71,12 @@ jobs:
       - name: Build ggml (MSVC, static, CPU-only)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 --branch "$GGML_BRANCH" "$GGML_REPO" ggml-src
+          # Fetch the exact SHA the cache key was derived from (the branch
+          # tip may advance between ls-remote and this step).
+          git init -q ggml-src
+          git -C ggml-src remote add origin "$GGML_REPO"
+          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
+          git -C ggml-src checkout -q FETCH_HEAD
           cmake -S ggml-src -B ggml-src/build -A x64 \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_BUILD_TESTS=OFF \
@@ -123,7 +128,12 @@ jobs:
       - name: Build ggml (NDK arm64-v8a, static, CPU-only)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 --branch "$GGML_BRANCH" "$GGML_REPO" ggml-src
+          # Fetch the exact SHA the cache key was derived from (the branch
+          # tip may advance between ls-remote and this step).
+          git init -q ggml-src
+          git -C ggml-src remote add origin "$GGML_REPO"
+          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
+          git -C ggml-src checkout -q FETCH_HEAD
           cmake -S ggml-src -B ggml-src/build \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
@@ -183,7 +193,12 @@ jobs:
       - name: Build ggml (iOS device arm64, static, Metal embedded)
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 --branch "$GGML_BRANCH" "$GGML_REPO" ggml-src
+          # Fetch the exact SHA the cache key was derived from (the branch
+          # tip may advance between ls-remote and this step).
+          git init -q ggml-src
+          git -C ggml-src remote add origin "$GGML_REPO"
+          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
+          git -C ggml-src checkout -q FETCH_HEAD
           cmake -S ggml-src -B ggml-src/build \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=iphoneos \

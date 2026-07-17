@@ -78,8 +78,14 @@ jobs:
       - name: Build ggml (system ggml, qvac-ext-ggml@${{ env.GGML_BRANCH }})
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 --branch "$GGML_BRANCH" "$GGML_REPO" ggml-src
-          git -C ggml-src checkout ${{ steps.ggml.outputs.sha }} || true
+          # Fetch the exact SHA the cache key was derived from — the branch
+          # tip may have advanced since the ls-remote resolution, and a
+          # tip-only shallow clone would then silently build (and cache)
+          # a different commit than the key claims.
+          git init -q ggml-src
+          git -C ggml-src remote add origin "$GGML_REPO"
+          git -C ggml-src fetch --depth 1 origin ${{ steps.ggml.outputs.sha }}
+          git -C ggml-src checkout -q FETCH_HEAD
           cmake -S ggml-src -B ggml-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
@@ -121,10 +127,16 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      # GGML_VULKAN=ON is the backend the -L gpu suites primarily target
+      # (test_vk_vs_cpu et al); Metal is on by default on Apple hosts.
+      # Revisit the flag set (OpenCL? CUDA?) when the GPU runner fleet is
+      # provisioned — a CPU-only ggml here would skip or falsely pass the
+      # GPU suites.
       - name: Build ggml + engine (native backends) and run GPU suites
         run: |
           git clone --depth 1 --branch "$GGML_BRANCH" "$GGML_REPO" ggml-src
           cmake -S ggml-src -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DGGML_VULKAN=ON \
             -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
           cmake --build ggml-src/build -j && cmake --install ggml-src/build
           cmake -S tts-cpp -B build -DCMAKE_BUILD_TYPE=Release \

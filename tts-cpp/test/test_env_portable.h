@@ -6,7 +6,12 @@
 #include <initializer_list>
 #include <string>
 #ifdef _MSC_VER
-inline int setenv(const char * name, const char * value, int /*overwrite*/) {
+inline int setenv(const char * name, const char * value, int overwrite) {
+    // POSIX: with overwrite=0 an existing variable must be left untouched
+    // (and 0 returned) — don't let the shim diverge from that silently.
+    if (!overwrite && std::getenv(name) != nullptr) {
+        return 0;
+    }
     return _putenv_s(name, value);
 }
 inline int unsetenv(const char * name) {
