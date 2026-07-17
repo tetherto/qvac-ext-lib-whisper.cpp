@@ -64,7 +64,7 @@ qvac-ext-lib-whisper.cpp/           (rename deferred — see Out of scope)
 *Upstream-tracking, minimally divergent* — not "pristine":
 
 - Upstream lands via `git subtree pull --prefix third_party/whisper.cpp upstream <tag> --squash`. Subtree does a real 3-way merge, so conflicts occur **only on the handful of files we touch** (today: `src/whisper.cpp`, `src/CMakeLists.txt`, `include/whisper.h`), instead of today's whole-tree re-apply.
-- Every QVAC change inside the prefix must be listed in `third_party/whisper.cpp/PATCHES.md` (file, ticket, rationale) and marked in code with `// QVAC:` comments where practical.
+- Every QVAC change inside the prefix must be listed in `third_party/whisper.cpp/PATCHES.md` (file + a self-contained rationale — each row must explain what the patch does and why without relying on tracker links) and marked in code with `// QVAC:` comments where practical.
 - **A CI guard job diffs the subtree against the pinned upstream tag and fails if any file outside the manifest differs.** This is what actually keeps divergence honest — not a convention in a doc.
 - **ggml divergence is banned in this repo.** All ggml patches go to `qvac-ext-ggml` (`speech` branch), which feeds the `ggml-speech` port. The umbrella build forces system ggml (`WHISPER_USE_SYSTEM_GGML=ON` and the engines' equivalents), so the vendored `ggml/` is never compiled in our builds. The existing in-tree `ggml-backend-reg.cpp` / `ggml-vulkan.cpp` deltas must be confirmed present in `qvac-ext-ggml/speech` (or ported there) during migration, then dropped from the subtree.
 - Whisper-core patches should be considered for upstreaming when generic; QVAC-specific ones (logits slice, QKV fusion) stay in the manifest.
@@ -99,6 +99,7 @@ Ordered to de-risk: CI first (so the moves are protected), then pure renames (re
 2. `git subtree add --prefix third_party/whisper.cpp upstream v1.9.1 --squash` — creates proper subtree metadata so future `git subtree pull` works.
 3. Re-apply our whisper delta as **one commit** ("QVAC patches on vendored whisper.cpp", cherry-picked from the pre-conversion tree) + commit `PATCHES.md`. One auditable divergence commit; the ggml deltas are *not* re-applied (routed to `qvac-ext-ggml` instead, verified first).
 4. Add the new root umbrella `CMakeLists.txt` + prune root `.github/workflows` down to our own.
+5. New root `README.md` covering the whole stack: every engine and the models it supports, install/build instructions, verified run commands per engine, and representative cross-platform performance tables (sourced from and linking to the per-engine READMEs for methodology/reproduction).
 - Trade-off, stated plainly: blame *inside* the vendored tree points at the squash commit rather than per-line upstream history (acceptable for vendored code — upstream history lives upstream); our delta stays visible as its own commit + manifest.
 
 **PR 3 — sync docs + guard.** `docs/UPSTREAM-SYNC.md` (the subtree pull runbook: remote setup, `git subtree pull … --squash`, expected conflict files, post-pull checklist incl. re-verifying `PATCHES.md`), plus the CI divergence-guard job.
@@ -115,16 +116,25 @@ Everything below runs against the engines as they exist today; the reorg only ch
 
 | Job | Runner | What it does |
 |---|---|---|
-| `parakeet build-test` | `ubuntu-24.04`, `macos-14` | Build `qvac-ext-ggml@speech` (CPU-only, shared cache keyed by branch SHA) → configure `PARAKEET_USE_SYSTEM_GGML=ON` + `PARAKEET_BUILD_TESTS=ON` → build → `ctest -LE 'gpu\|perf'` |
-| `tts build-test` | same | Same ggml install → `TTS_CPP_BUILD_TESTS=ON` (system ggml already mandatory in-tree) → `ctest -LE 'gpu\|perf'` — 68 tests pass model-free today |
+| `parakeet build-test` | `ubuntu-24.04`, `macos-14`, `windows-2022` | Build `qvac-ext-ggml@speech` (CPU-only, shared cache keyed by branch SHA) → configure `PARAKEET_USE_SYSTEM_GGML=ON` + `PARAKEET_BUILD_TESTS=ON` → build → `ctest -LE 'gpu\|perf'` (Windows: MSVC, static ggml, in `engines-cross-ci.yml`) |
+| `tts build-test` | same three | Same ggml install → `TTS_CPP_BUILD_TESTS=ON` (system ggml already mandatory in-tree) → `ctest -LE 'gpu\|perf'` — 68 tests pass model-free today (all three OSes) |
+| `android` / `ios` (both engines) | `ubuntu-24.04` / `macos-14` | Cross-compile smokes: NDK arm64-v8a and iOS device arm64 (Metal embedded, flags mirror `build-xcframework.sh`) — catches cross-compile/link breaks before the registry pin chain (in `engines-cross-ci.yml`) |
 | `gpu` (both files) | `[self-hosted, gpu]` | Stub behind `workflow_dispatch` input until runners exist; runs `ctest -L gpu` |
+
+*Implementation note: the Windows/Android/iOS lanes shipped in PR 0 as `engines-cross-ci.yml` and are green — the first Windows-with-tests builds surfaced (and fixed) real portability bugs: POSIX `setenv`/`unsetenv` and hardcoded `/tmp` in tts test files, GCC-style warning flags reaching MSVC in examples.*
 
 - **Test filter:** the suites label tests `unit`/`fixture`/`cpu`/`gpu`/`perf`/`mtl-*`; the CI lane runs `-LE 'gpu|perf'` (GPU absent on hosted runners, perf gates meaningless on shared ones).
 - **Path filters:** `parakeet-cpp/**` and `tts-cpp/**` respectively (post-reorg: `engines/parakeet/**`, `engines/tts/**`; `third_party/**` → all).
-- **ggml provisioning:** both repos are public, so CI builds `qvac-ext-ggml@speech` directly (shallow clone, `actions/cache` on the install dir keyed by the branch tip SHA) — no vcpkg/registry auth in the loop. This *is* the production ggml source (`ggml-speech` port ships the same branch). The vcpkg overlay-pin variant moves to the port-smoke follow-up.
+- **ggml provisioning:** both repos are public, so CI builds `qvac-ext-ggml@speech` directly (shallow clone, `actions/cache` on the install dir keyed by the branch tip SHA) — no vcpkg/registry auth in the loop. This *is* the production ggml source (`ggml-speech` port ships the same branch). Port-level consumption is exercised by the downstream overlay-port gate below.
 - **Models/fixtures:** committed fixtures are tiny (13 MB parakeet, 40 KB tts) and drive the lane above. The parity suites need converted GGUFs — `download-all-models.sh` pulls **~14.5 GiB of `.nemo` checkpoints requiring Python conversion**, which is not CI-viable. Both harnesses already accept pre-staged fixture roots (`PARAKEET_TEST_{MODEL,REF}_DIR` cache paths) and auto-`DISABLE` (→ "Not Run") when files are absent, so the enablement path is clear: host the small q8_0 GGUFs + `.npy` reference dumps on HF/S3 and restore them via `actions/cache` (follow-up, not PR 0).
 
-**`port-smoke.yml`** (follow-up to PR 0 — needs the registry portfiles as input) — packages repo HEAD as a vcpkg source tarball (codeload-style) into overlay ports for `parakeet-cpp`/`tts-cpp` and builds a minimal consumer. Catches "the port will break" *before* the registry PR, removing the most common failure of the 3-PR chain.
+**Downstream overlay-port validation (required gate for engine changes).** In-repo ctests are *not* sufficient to approve a change to a C++ engine. Any PR that changes engine behavior (as opposed to docs/CI plumbing) must additionally be validated downstream before the registry pin bump, by opening a draft PR on `tetherto/qvac` that overlays the affected port(s) onto the feature branch:
+
+1. Pin the branch tip in overlay `portfile.cmake`s (`REF` + codeload-tarball `SHA512`) under `packages/<addon>/vcpkg-overlay-ports/`, and add `"overlay-ports": ["./vcpkg-overlay-ports"]` to the addon's `vcpkg-configuration.json`.
+2. Open the qvac draft PR (`DO NOT MERGE`), label it `verified` + `run-cpp-addon-tests` + `run-desktop-addon-tests` — the CI router runs prebuilds (all targets), C++ addon tests, and desktop integration across all platforms/addons.
+3. Mobile e2e: dispatch `integration-mobile-test-<addon>` with `ref=<branch>` (Device Farm; use the granular `run-mobile-addon-tests` label instead if the PR flavor is preferred).
+
+This flow was executed for this reorg as [qvac#3310](https://github.com/tetherto/qvac/pull/3310): 3/3 addons passed mobile e2e on-device, tts desktop 7/7 platforms, whisper 6/7 (the linux-arm64 failure is the known pre-existing CPU-variants issue), parakeet desktop blocked only by an unrelated JS test bug — the overlay PR doubles as a tested preview of the eventual registry pin bump.
 
 **Whisper build job** — deferred to PR 2: upstream's (adapted) `build.yml` still runs at root today, so adding another whisper build now would duplicate it. PR 2 replaces it with a targeted build + `whisper-cli` smoke job when the upstream workflows go inert.
 
@@ -138,7 +148,7 @@ Everything below runs against the engines as they exist today; the reorg only ch
 
 ### What stays downstream
 
-`tetherto/qvac` e2e (`on-pr-tts-ggml`) remains the integration gate — this QIP doesn't replace it, it front-loads the failures that today only surface there.
+`tetherto/qvac` e2e remains the integration gate — this QIP doesn't replace it, it front-loads the failures that today only surface there *and* makes the downstream check reachable pre-merge via the overlay-port flow above (no registry PR needed to test a feature branch across all platforms and addons).
 
 ## Alternatives considered
 
@@ -151,7 +161,7 @@ Everything below runs against the engines as they exist today; the reorg only ch
 ## Consequences
 
 1. Symmetric engine layout; upstream pulls become 3-way merges touching ~3 known files instead of whole-tree re-applies; one in-repo upstream pin shared by all engines.
-2. Engine regressions surface on the PR in minutes (`ctest -L cpu`) instead of days later in `qvac` e2e.
+2. Engine regressions surface on the PR in minutes (`ctest -LE 'gpu|perf'`) instead of days later in `qvac` e2e.
 3. Divergence from upstream is explicit (manifest + guard) instead of implicit (scattered through a root tree that looks upstream-owned).
 4. ggml patching gets a single home (`qvac-ext-ggml/speech`), removing today's silent two-copy skew.
 5. Costs: blame inside the vendored tree coarsens to the squash/sync commits; a one-time freeze window for the moves; registry ports need a coordinated path bump; the team must learn one rule — *"don't touch `third_party/` outside a sync or manifest PR"* — with CI enforcing it.
