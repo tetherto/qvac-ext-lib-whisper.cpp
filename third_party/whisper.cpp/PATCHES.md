@@ -17,11 +17,14 @@ which ships as the `ggml-speech` vcpkg port; the umbrella build forces
 
 ## Manifest
 
+Each row must be self-contained: state what the change does and why it
+exists, so the manifest is meaningful without access to any tracker.
+
 | File | Change | Why |
 |---|---|---|
-| `src/whisper.cpp` | vocab-logits slice + decoder QKV matmul fusion | QVAC-21623: Adreno q8 decode perf; slices the vocab logits matmul and fuses the decoder QKV matmuls |
-| `src/whisper-logits-slice.h` | new file | QVAC-21623: logits-slice helper |
-| `include/whisper.h` | API additions | QVAC-21623: expose logits-slice controls |
+| `src/whisper.cpp` | vocab-logits slice + decoder QKV matmul fusion | decode-time perf on mobile GPUs (quantized decode on Adreno-class hardware): the vocab-logits matmul is sliced to only the rows sampling actually needs instead of the full vocab, and the decoder's three Q/K/V matmuls are fused into one — upstream does neither |
+| `src/whisper-logits-slice.h` | new file | helper implementing the vocab-logits slice above |
+| `include/whisper.h` | API additions | public controls for the logits-slice behavior so bindings/addons can opt in per-decode |
 | `src/CMakeLists.txt` | build glue | wire whisper-logits-slice.h; install/export adjustments for the vcpkg port |
 | `CMakeLists.txt` | install/export + robustness | export `whisper-targets`, headers under `include/whisper/`; guard `git-vars`/js-bindings config steps so source-tarball (vcpkg) builds work |
 | `cmake/git-vars.cmake` | robustness | tolerate non-git source trees (vcpkg tarballs) |
