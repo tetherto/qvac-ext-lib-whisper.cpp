@@ -44,7 +44,7 @@ jobs:
         include:
           - engine: parakeet
             src: engines/parakeet
-            cmake_flags: -DPARAKEET_USE_SYSTEM_GGML=ON -DPARAKEET_BUILD_TESTS=ON
+            cmake_flags: -DPARAKEET_USE_SYSTEM_GGML=ON -DPARAKEET_BUILD_TESTS=ON -DPARAKEET_BUILD_EXAMPLES=OFF
           - engine: tts
             src: engines/tts
             cmake_flags: -DTTS_CPP_BUILD_TESTS=ON
@@ -100,7 +100,7 @@ jobs:
         include:
           - engine: parakeet
             src: engines/parakeet
-            cmake_flags: -DPARAKEET_USE_SYSTEM_GGML=ON -DPARAKEET_BUILD_TESTS=OFF
+            cmake_flags: -DPARAKEET_USE_SYSTEM_GGML=ON -DPARAKEET_BUILD_TESTS=OFF -DPARAKEET_BUILD_EXAMPLES=OFF
           - engine: tts
             src: engines/tts
             cmake_flags: -DTTS_CPP_BUILD_TESTS=OFF
@@ -159,7 +159,7 @@ jobs:
         include:
           - engine: parakeet
             src: engines/parakeet
-            cmake_flags: -DPARAKEET_USE_SYSTEM_GGML=ON -DPARAKEET_BUILD_TESTS=OFF
+            cmake_flags: -DPARAKEET_USE_SYSTEM_GGML=ON -DPARAKEET_BUILD_TESTS=OFF -DPARAKEET_BUILD_EXAMPLES=OFF
           - engine: tts
             src: engines/tts
             cmake_flags: -DTTS_CPP_BUILD_TESTS=OFF
