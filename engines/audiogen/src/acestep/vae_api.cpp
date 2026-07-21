@@ -66,10 +66,11 @@ std::unique_ptr<Vae> Vae::load(const std::string & gguf_path, const VaeOptions &
     return v;
 }
 
-std::vector<float> Vae::decode(const std::vector<float> & latent, int T_latent) const {
+std::vector<float> Vae::decode(const std::vector<float> & latent, int T_latent,
+                               const ProgressCb & on_progress) const {
     std::vector<float> pcm;
     if (T_latent <= 0 || (int) latent.size() < T_latent * 64) return {};
-    int T_audio = vae_model_decode(impl_->model, latent.data(), T_latent, pcm);
+    int T_audio = vae_model_decode(impl_->model, latent.data(), T_latent, pcm, on_progress);
     if (T_audio < 0) return {};
     return pcm;
 }

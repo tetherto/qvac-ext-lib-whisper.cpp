@@ -454,8 +454,15 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
 #endif
 
     // ---- 8. VAE decode -> stereo 48 kHz PCM ----
+    // The decode reports per-node graph progress so the (otherwise opaque) VAE
+    // stage advances the bar instead of freezing at the last DiT step.
     if (!report("vae", 0, 1)) return result;
-    result.pcm = m->vae->decode(latent, T);
+    bool vae_ok = true;
+    result.pcm  = m->vae->decode(latent, T, [&](int done, int total) {
+        vae_ok = report("vae", done, total);
+        return vae_ok;
+    });
+    if (!vae_ok) return result;  // cancelled mid-decode
     if (result.pcm.empty()) throw std::runtime_error("acestep engine: VAE decode failed");
     report("vae", 1, 1);
 

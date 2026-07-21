@@ -12,6 +12,7 @@
 
 #include "ggml-backend.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -29,7 +30,11 @@ size_t     vae_model_weight_bytes(const VaeModel * m);
 
 // Decode a 64-ch latent (time-major, latent[t*64 + c]) into interleaved stereo
 // 48 kHz PCM. Returns T_audio frames (= T_latent * 1920) or -1 on failure.
-int vae_model_decode(VaeModel * m, const float * latent, int T_latent, std::vector<float> & pcm_out);
+//
+// `on_node` (optional) fires once per computed graph node with (done, total)
+// node counts, for VAE-stage progress; return false to cancel (returns -1).
+int vae_model_decode(VaeModel * m, const float * latent, int T_latent, std::vector<float> & pcm_out,
+                     const std::function<bool(int done, int total)> & on_node = {});
 
 // Encode interleaved stereo PCM (frames*2 samples, 48 kHz) into the 64-ch mean
 // latent (time-major, out[t*64 + c]). Returns T_latent or -1 on failure.

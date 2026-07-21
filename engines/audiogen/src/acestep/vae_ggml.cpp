@@ -274,7 +274,35 @@ void vae_model_free(VaeModel * m) {
 bool   vae_model_has_encoder(const VaeModel * m) { return m && m->has_enc; }
 size_t vae_model_weight_bytes(const VaeModel * m) { return (m && m->weight_buf) ? ggml_backend_buffer_get_size(m->weight_buf) : 0; }
 
-int vae_model_decode(VaeModel * m, const float * latent, int T_latent, std::vector<float> & pcm_out) {
+// Per-node progress state for the decode scheduler's eval callback. The callback
+// fires once per computed node; we throttle the user callback to ~1% steps so the
+// VAE stage reports fine-grained progress without spamming.
+namespace {
+struct VaeNodeProg {
+    int total;
+    int done;
+    int last_pct;
+    const std::function<bool(int, int)> * cb;
+    bool keep_going;
+};
+
+bool vae_eval_cb(ggml_tensor * /*t*/, bool ask, void * ud) {
+    if (ask) return true;  // observe every node (ask=false will follow)
+    auto * p = static_cast<VaeNodeProg *>(ud);
+    p->done++;
+    if (p->cb && *p->cb) {
+        int pct = p->total > 0 ? (int) ((long long) p->done * 100 / p->total) : 0;
+        if (pct != p->last_pct) {
+            p->last_pct   = pct;
+            p->keep_going = (*p->cb)(p->done, p->total);
+        }
+    }
+    return p->keep_going;  // false -> scheduler cancels the compute
+}
+} // namespace
+
+int vae_model_decode(VaeModel * m, const float * latent, int T_latent, std::vector<float> & pcm_out,
+                     const std::function<bool(int, int)> & on_node) {
     ggml_init_params gp{ ggml_tensor_overhead() * 1024 + ggml_graph_overhead_custom(8192, false), nullptr, true };
     ggml_context * ctx = ggml_init(gp);
 
@@ -323,10 +351,38 @@ int vae_model_decode(VaeModel * m, const float * latent, int T_latent, std::vect
         }
     }
 
-    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
-    if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
+    // Run the decode graph through a scheduler (instead of a bare
+    // ggml_backend_graph_compute) so we can hook an eval callback that fires once
+    // per computed node -> real, fine-grained VAE progress. ggml_backend_sched
+    // requires the LAST backend to be a CPU backend (it's the mandatory
+    // fallback), so when m->backend is a GPU we pass [GPU, CPU]; when it's
+    // already CPU we pass just [CPU]. With op_offload=false and every VAE op
+    // supported on the GPU (snake / col2im_1d have Metal kernels), nothing
+    // actually falls back to the CPU slot, so this is numerically identical to
+    // computing on m->backend directly.
+    const bool backend_is_cpu =
+        ggml_backend_dev_type(ggml_backend_get_device(m->backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    ggml_backend_t cpu_fallback = backend_is_cpu ? nullptr : ggml_backend_cpu_init();
+    ggml_backend_t backends[2]  = { m->backend, cpu_fallback };
+    const int      n_backends   = backend_is_cpu ? 1 : 2;
+
+    ggml_backend_sched_t sched =
+        ggml_backend_sched_new(backends, nullptr, n_backends, /*graph_size=*/8192,
+                               /*parallel=*/false, /*op_offload=*/false);
+    if (!sched) {
+        fprintf(stderr, "[acestep-vae] decode sched init failed (T_latent=%d)\n", T_latent);
+        if (cpu_fallback) ggml_backend_free(cpu_fallback);
+        ggml_free(ctx);
+        return -1;
+    }
+
+    VaeNodeProg prog{ ggml_graph_n_nodes(gf), 0, -1, &on_node, true };
+    ggml_backend_sched_set_eval_callback(sched, vae_eval_cb, &prog);
+
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
         fprintf(stderr, "[acestep-vae] decode alloc failed (T_latent=%d)\n", T_latent);
-        if (ga) ggml_gallocr_free(ga);
+        ggml_backend_sched_free(sched);
+        if (cpu_fallback) ggml_backend_free(cpu_fallback);
         ggml_free(ctx);
         return -1;
     }
@@ -337,8 +393,14 @@ int vae_model_decode(VaeModel * m, const float * latent, int T_latent, std::vect
         for (int t = 0; t < T_latent; ++t) lin[(size_t) c * T_latent + t] = latent[(size_t) t * 64 + c];
     ggml_backend_tensor_set(lat, lin.data(), 0, lin.size() * sizeof(float));
 
-    int rc = ggml_backend_graph_compute(m->backend, gf);
-    if (rc != GGML_STATUS_SUCCESS) { ggml_gallocr_free(ga); ggml_free(ctx); return -1; }
+    // GGML_STATUS_ABORTED here means the caller cancelled via on_node.
+    ggml_status rc = ggml_backend_sched_graph_compute(sched, gf);
+    if (rc != GGML_STATUS_SUCCESS) {
+        ggml_backend_sched_free(sched);
+        if (cpu_fallback) ggml_backend_free(cpu_fallback);
+        ggml_free(ctx);
+        return -1;
+    }
 
     const int T_audio = (int) out->ne[0];
     std::vector<float> planar((size_t) T_audio * 2);
@@ -350,7 +412,8 @@ int vae_model_decode(VaeModel * m, const float * latent, int T_latent, std::vect
         pcm_out[(size_t) t * 2 + 1] = planar[(size_t) T_audio + t];
     }
 
-    ggml_gallocr_free(ga);
+    ggml_backend_sched_free(sched);
+    if (cpu_fallback) ggml_backend_free(cpu_fallback);
     ggml_free(ctx);
     return T_audio;
 }

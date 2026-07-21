@@ -23,6 +23,7 @@
 
 #include "audiogen-cpp/export.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -51,7 +52,14 @@ public:
 
     // Decode a 64-channel latent (time-major, latent[t*64 + c]) into interleaved
     // stereo 48 kHz PCM (2 * T_latent * 1920 samples). Empty on failure.
-    std::vector<float> decode(const std::vector<float> & latent, int T_latent) const;
+    //
+    // `on_progress` (optional) is invoked as the decode graph executes, once per
+    // computed node, with (done, total) node counts -> fine-grained progress for
+    // the otherwise-opaque VAE stage. Return false to cancel the decode (yields
+    // an empty result). Throttled internally to ~1% steps.
+    using ProgressCb = std::function<bool(int done, int total)>;
+    std::vector<float> decode(const std::vector<float> & latent, int T_latent,
+                              const ProgressCb & on_progress = {}) const;
 
     // Encode interleaved stereo 48 kHz PCM (frames*2 samples) into the 64-channel
     // mean latent (time-major). Sets *T_latent_out. Empty on failure or if the
