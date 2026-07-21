@@ -103,6 +103,14 @@ struct parler_model {
     ggml_backend_buffer_t buffer_w = nullptr;
     mutable ::tts_cpp::detail::sched_fallback sched_fb;
 
+    // GPU flash-attention self-attn path (F16 KV). Probed at load; CPU keeps
+    // the validated manual F32 path so the reference parity tests are exact.
+    bool      use_fa  = false;
+    ggml_type kv_type = GGML_TYPE_F32;
+    // On a GPU backend the DAC upsampling runs conv_transpose_1d as phase-matmuls
+    // (Metal's conv_transpose kernel is ~an order slower); CPU keeps the direct op.
+    bool      on_gpu  = false;
+
     // t5
     ggml_tensor * t5_embed = nullptr;
     ggml_tensor * t5_rel_b = nullptr;          // [n_head, rel_buckets]
@@ -159,7 +167,7 @@ struct parler_model {
 
 // ---- parler_gguf.cpp ----
 bool parler_load_gguf(const std::string & path, parler_model & model,
-                      std::string * error = nullptr);
+                      int n_gpu_layers = 0, std::string * error = nullptr);
 void parler_free_model(parler_model & model);
 
 // Dual-path graph dispatch honoring the sched_dispatch contract (gf must be

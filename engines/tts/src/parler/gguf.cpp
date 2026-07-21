@@ -1,11 +1,13 @@
 #include "internal.h"
 
 #include "backend_selection.h"
+#include "backend_util.h"
 #include "gguf_stream.h"
 #include "gguf.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace tts_cpp {
@@ -44,9 +46,26 @@ bool kv_bool(const gguf_context * g, const char * key, bool & out, std::string *
     return true;
 }
 
+// FA probe: build a representative flash_attn_ext node and ask the backend if
+// it supports it. CPU returns false so it keeps the validated manual F32 path.
+bool parler_probe_fa_f16(ggml_backend_t backend, int head_dim, int n_heads) {
+    if (::tts_cpp::detail::backend_is_cpu(backend)) return false;
+    ggml_init_params ip = { 8 * ggml_tensor_overhead(), nullptr, /*no_alloc=*/ true };
+    ggml_context * c = ggml_init(ip);
+    if (!c) return false;
+    ggml_tensor * q = ggml_new_tensor_3d(c, GGML_TYPE_F32, head_dim, 16, n_heads);
+    ggml_tensor * k = ggml_new_tensor_3d(c, GGML_TYPE_F16, head_dim, 16, n_heads);
+    ggml_tensor * v = ggml_new_tensor_3d(c, GGML_TYPE_F16, head_dim, 16, n_heads);
+    ggml_tensor * op = ggml_flash_attn_ext(c, q, k, v, nullptr, 1.0f / (float) head_dim, 0.0f, 0.0f);
+    const bool ok = op && ggml_backend_supports_op(backend, op);
+    ggml_free(c);
+    return ok;
+}
+
 } // namespace
 
-bool parler_load_gguf(const std::string & path, parler_model & model, std::string * error) {
+bool parler_load_gguf(const std::string & path, parler_model & model,
+                      int n_gpu_layers, std::string * error) {
     ggml_context * ctx_meta = nullptr;
     gguf_init_params gp = { /*.no_alloc=*/ true, /*.ctx=*/ &ctx_meta };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
@@ -183,8 +202,14 @@ bool parler_load_gguf(const std::string & path, parler_model & model, std::strin
     }
 
     ::tts_cpp::detail::ensure_backends_loaded();
-    model.backend = ::tts_cpp::detail::init_cpu_backend();
-    if (!model.backend) return fail("failed to init CPU backend");
+    model.backend = ::tts_cpp::detail::init_gpu_backend(n_gpu_layers, /*verbose=*/false, "parler");
+    if (!model.backend) model.backend = ::tts_cpp::detail::init_cpu_backend();
+    if (!model.backend) return fail("failed to init backend");
+
+    model.on_gpu  = !::tts_cpp::detail::backend_is_cpu(model.backend);
+    model.use_fa  = parler_probe_fa_f16(model.backend, hp.dec_d_model / hp.dec_n_head, hp.dec_n_head)
+                    && std::getenv("PARLER_NO_FA") == nullptr;
+    model.kv_type = model.use_fa ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     model.buffer_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
     if (!model.buffer_w) return fail("failed to allocate weight buffer");
@@ -323,8 +348,8 @@ bool parler_load_gguf(const std::string & path, parler_model & model, std::strin
         model.ctx_kv = ggml_init(ip);
         if (!model.ctx_kv) return fail("ggml_init(ctx_kv) failed");
         const int64_t rows = (int64_t) hp.n_ctx * hp.dec_n_layer;
-        model.memory_k = ggml_new_tensor_2d(model.ctx_kv, GGML_TYPE_F32, hp.dec_d_model, rows);
-        model.memory_v = ggml_new_tensor_2d(model.ctx_kv, GGML_TYPE_F32, hp.dec_d_model, rows);
+        model.memory_k = ggml_new_tensor_2d(model.ctx_kv, model.kv_type, hp.dec_d_model, rows);
+        model.memory_v = ggml_new_tensor_2d(model.ctx_kv, model.kv_type, hp.dec_d_model, rows);
         ggml_set_name(model.memory_k, "parler_kv_k");
         ggml_set_name(model.memory_v, "parler_kv_v");
         model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);

@@ -1,4 +1,5 @@
 // Decoder parity vs HF fixtures: prefill hidden states + prefill logits +
+#include <cstdlib>
 // the fixture's teacher-forced step trace, on both fixture cases (exercises
 // KV cache, positions and the delay-mask input path together).
 // Bars: L_inf <= 5e-3 AND per-codebook argmax equality.
@@ -135,7 +136,8 @@ int main(int argc, char ** argv) {
 
     parler_model model;
     std::string err;
-    if (!parler_load_gguf(argv[1], model, &err)) {
+    const int ngl = std::getenv("PARLER_TEST_GPU") ? 99 : 0;
+    if (!parler_load_gguf(argv[1], model, ngl, &err)) {
         fprintf(stderr, "load failed: %s\n", err.c_str());
         return 1;
     }

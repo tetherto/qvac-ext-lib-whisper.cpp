@@ -7,6 +7,7 @@
 #include "delay.h"
 #include "sampler.h"
 #include "backend_selection.h"
+#include "backend_util.h"
 
 #include <atomic>
 #include <random>
@@ -149,7 +150,7 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(new Impl()) {
         ::tts_cpp::detail::set_backends_directory(opts.backends_dir);
     }
     std::string err;
-    if (!parler_load_gguf(opts.model_gguf_path, pimpl_->model, &err)) {
+    if (!parler_load_gguf(opts.model_gguf_path, pimpl_->model, opts.n_gpu_layers, &err)) {
         throw std::runtime_error("parler: " + err);
     }
     if (!pimpl_->tokenizer.load(pimpl_->model.tok_pieces, pimpl_->model.tok_scores,
@@ -199,7 +200,8 @@ std::string Engine::backend_name() const {
 }
 
 BackendDevice Engine::backend_device() const {
-    return BackendDevice::CPU; // CPU is the validated backend for parler
+    return ::tts_cpp::detail::backend_is_cpu(pimpl_->model.backend)
+        ? BackendDevice::CPU : BackendDevice::GPU;
 }
 
 SynthesisResult synthesize(const EngineOptions & opts, const std::string & prompt,

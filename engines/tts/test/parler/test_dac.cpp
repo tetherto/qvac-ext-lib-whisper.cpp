@@ -1,4 +1,5 @@
 #include "parler/internal.h"
+#include <cstdlib>
 #include "npy.h"
 
 #include "ggml-alloc.h"
@@ -133,7 +134,8 @@ int main(int argc, char ** argv) {
 
     parler_model model;
     std::string error;
-    if (!parler_load_gguf(argv[1], model, &error)) {
+    const int ngl = std::getenv("PARLER_TEST_GPU") ? 99 : 0;
+    if (!parler_load_gguf(argv[1], model, ngl, &error)) {
         fprintf(stderr, "parler_load_gguf failed: %s\n", error.c_str());
         return 1;
     }

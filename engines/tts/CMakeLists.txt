@@ -453,6 +453,11 @@ if (TTS_CPP_BUILD_EXECUTABLES)
     target_link_libraries(parler-cli PRIVATE tts-cpp)
     tts_cpp_apply_ccache(parler-cli)
 
+    add_executable(parler-bench src/parler/bench.cpp)
+    target_link_libraries(parler-bench PRIVATE tts-cpp)
+    target_include_directories(parler-bench PRIVATE ggml/include src src/parler include)
+    tts_cpp_apply_ccache(parler-bench)
+
     # LavaSR two-stage (denoiser -> enhancer) bench + by-ear harness.
     add_executable(lavasr-bench src/lavasr/lavasr_bench.cpp)
     target_link_libraries(lavasr-bench PRIVATE tts-cpp)

@@ -34,6 +34,10 @@ struct EngineOptions {
 
     int n_threads = 0;   // 0 => min(hardware_concurrency, 4)
 
+    // GPU layers to offload (Metal/Vulkan/...); 0 = CPU. >0 selects the best
+    // available GPU and falls back to CPU when none is present.
+    int n_gpu_layers = 0;
+
     // Sampling. Parler's HF defaults (do_sample, temperature 1.0, top_k 50)
     // are stored in the GGUF; zero values defer to them. greedy forces
     // deterministic argmax decoding regardless of the GGUF default.
