@@ -60,7 +60,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ggml-install
-          key: ggml-install-${{ matrix.os }}-${{ steps.ggml.outputs.sha }}
+          key: ggml-install-portable-${{ matrix.os }}-${{ steps.ggml.outputs.sha }}
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -81,6 +81,7 @@ jobs:
           cmake -S ggml-src -B ggml-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
             -DGGML_METAL=OFF \
             -DGGML_BUILD_TESTS=OFF \
             -DGGML_BUILD_EXAMPLES=OFF \
