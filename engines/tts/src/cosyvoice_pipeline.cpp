@@ -253,7 +253,7 @@ static std::vector<float> qwen_step_kv(model_ctx & m, const qwen_hp & hp,
         ggml_tensor * vt = ggml_cont(c, ggml_permute(c, vh, 1,0,2,3)); // [Lk, HD, 1, NKV]
         ggml_tensor * o = ggml_mul_mat(c, vt, sc);           // [HD, Lq, G, NKV]
         o = ggml_cont(c, ggml_permute(c, o, 0,3,1,2));       // [HD, G, NKV, Lq]
-        o = ggml_reshape_2d(c, o, HD * NH, Lq);
+        o = ggml_reshape_2d(c, o, static_cast<int64_t>(HD) * NH, Lq);
         o = ggml_mul_mat(c, G(m, lb(i,"o_proj/weight")), o);
         xx = ggml_add(c, xx, o);
         ggml_tensor * hn = rmsnorm(c, xx, G(m, lb(i,"post_ln/weight")), hp.eps);
