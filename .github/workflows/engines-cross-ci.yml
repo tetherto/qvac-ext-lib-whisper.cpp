@@ -65,7 +65,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ggml-install
-          key: ggml-install-windows-2022-msvc-static-${{ steps.ggml.outputs.sha }}
+          key: ggml-install-portable-windows-2022-msvc-static-${{ steps.ggml.outputs.sha }}
 
       # Static ggml on Windows sidesteps DLL discovery for the test exes.
       - name: Build ggml (MSVC, static, CPU-only)
@@ -79,6 +79,7 @@ jobs:
           git -C ggml-src checkout -q FETCH_HEAD
           cmake -S ggml-src -B ggml-src/build -A x64 \
             -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
             -DGGML_BUILD_TESTS=OFF \
             -DGGML_BUILD_EXAMPLES=OFF \
             -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
