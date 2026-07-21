@@ -175,7 +175,7 @@ ggml_tensor * build_qwen(ggml_context * c, const model_ctx & m, const qwen_hp & 
         ggml_tensor * o = ggml_mul_mat(c, vt, sc);
         o = ggml_cont(c, ggml_permute(c, o, 0, 3, 1, 2));
         o = ggml_reshape_3d(c, o, HD, NH, L);
-        o = ggml_reshape_2d(c, o, HD * NH, L);
+        o = ggml_reshape_2d(c, o, static_cast<int64_t>(HD) * NH, L);
         o = ggml_mul_mat(c, G(m, lb(i, "o_proj/weight")), o);
         x = ggml_add(c, x, o);
         ggml_tensor * hn = rmsnorm(c, x, G(m, lb(i, "post_ln/weight")), hp.eps);
