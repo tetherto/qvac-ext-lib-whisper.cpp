@@ -290,8 +290,12 @@ bool vae_eval_cb(ggml_tensor * /*t*/, bool ask, void * ud) {
     if (ask) return true;  // observe every node (ask=false will follow)
     auto * p = static_cast<VaeNodeProg *>(ud);
     p->done++;
+    // The scheduler can fire this more than ggml_graph_n_nodes(gf) times (copy/
+    // split nodes on a GPU+CPU backend list), so clamp the reported node count
+    // too and derive a bounded, monotone percentage via vae_progress_pct.
+    if (p->done > p->total) p->done = p->total;
     if (p->cb && *p->cb) {
-        int pct = p->total > 0 ? (int) ((long long) p->done * 100 / p->total) : 0;
+        int pct = vae_progress_pct(p->done, p->total);
         if (pct != p->last_pct) {
             p->last_pct   = pct;
             p->keep_going = (*p->cb)(p->done, p->total);

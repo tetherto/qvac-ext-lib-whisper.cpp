@@ -524,7 +524,15 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
     sp.on_step         = [&](int step, int total) { return report("dit", step, total); };
 
     std::vector<float> latent;
-    if (!dit_sample(m->dit, sp, latent)) throw std::runtime_error("acestep engine: DiT sample failed");
+    if (!dit_sample(m->dit, sp, latent)) {
+        // dit_sample returns false for BOTH a real compute failure and a
+        // cooperative cancel (its on_step -> report() returned false). Tell them
+        // apart via cancel_flag: on cancel honour the engine contract (empty pcm,
+        // no throw) like the LM and VAE stages; only a genuine failure throws, so
+        // a cancelling ProgressFn never raises across the addon boundary.
+        if (m->cancel_flag.load()) return result;
+        throw std::runtime_error("acestep engine: DiT sample failed");
+    }
     if (!report("dit", n_steps, n_steps)) return result;
 
 #ifdef ACESTEP_PARITY_DEBUG

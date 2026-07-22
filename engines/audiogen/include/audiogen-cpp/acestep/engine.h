@@ -53,10 +53,10 @@ struct EngineOptions {
     int  n_threads     = 0;   // 0 = hardware concurrency
     int  n_gpu_layers  = 0;   // 0 = CPU-only (CPU target)
     bool verbose       = false;
-
-    // VAE tiling for bounded memory on long tracks (see vae.h decode path).
-    int vae_chunk   = 1024;
-    int vae_overlap = 64;
+    // NOTE: VAE tiling (windowed decode for bounded memory on long tracks) is
+    // handled internally by vae_model_decode with values tuned to the Metal
+    // buffer limit; it is intentionally not exposed as config to avoid a footgun
+    // (a bad window size reintroduces the iOS decode OOM/segfault).
 };
 
 struct GenerateParams {

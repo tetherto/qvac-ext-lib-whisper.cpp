@@ -40,4 +40,16 @@ int vae_model_decode(VaeModel * m, const float * latent, int T_latent, std::vect
 // latent (time-major, out[t*64 + c]). Returns T_latent or -1 on failure.
 int vae_model_encode(VaeModel * m, const float * pcm, int frames, std::vector<float> & latent_out);
 
+// Decode-progress percentage from the per-node eval callback. `total` is
+// ggml_graph_n_nodes(gf), but a GPU+CPU scheduler can insert extra copy/split
+// nodes, so `done` may exceed `total`; both are clamped so the reported value is
+// monotone and bounded to [0, 100] (no progress-bar overshoot). Pure + header-
+// only so the throttle/clamp logic is unit-tested without a GGUF fixture.
+inline int vae_progress_pct(int done, int total) {
+    if (total <= 0) return 0;
+    if (done < 0) done = 0;
+    if (done > total) done = total;
+    return (int) ((long long) done * 100 / total);
+}
+
 } // namespace tts_cpp::acestep

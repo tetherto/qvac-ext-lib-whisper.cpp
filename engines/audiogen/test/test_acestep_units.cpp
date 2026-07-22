@@ -15,6 +15,7 @@
 #include "detok_ggml.h"
 #include "lm_pipeline.h"
 #include "philox.h"
+#include "vae_ggml.h"
 
 #include <cmath>
 #include <cstdio>
@@ -152,6 +153,45 @@ void test_sampler() {
     }
 }
 
+// 5. vae_progress_pct --------------------------------------------------------
+// The VAE decode reports progress per computed graph node. A GPU+CPU scheduler
+// can insert extra copy/split nodes, so the callback may fire MORE than
+// ggml_graph_n_nodes(gf) times; the percentage must stay monotone and bounded
+// to [0, 100] (no progress-bar overshoot). This locks that clamp/throttle math.
+void test_vae_progress() {
+    using tts_cpp::acestep::vae_progress_pct;
+
+    // Endpoints and a midpoint.
+    CHECK(vae_progress_pct(0, 200) == 0);
+    CHECK(vae_progress_pct(100, 200) == 50);
+    CHECK(vae_progress_pct(200, 200) == 100);
+
+    // Overshoot: the scheduler fires past `total` -> clamped to 100, never more.
+    CHECK(vae_progress_pct(201, 200) == 100);
+    CHECK(vae_progress_pct(10000, 200) == 100);
+
+    // Degenerate inputs are safe (no div-by-zero, no negative pct).
+    CHECK(vae_progress_pct(5, 0) == 0);
+    CHECK(vae_progress_pct(5, -1) == 0);
+    CHECK(vae_progress_pct(-3, 200) == 0);
+
+    // Monotone non-decreasing and bounded across a full sweep that overshoots,
+    // mirroring the eval callback incrementing `done` once per fired node.
+    const int total = 137;  // odd, to exercise integer division
+    int       prev  = -1;
+    int       last_emitted = -1;
+    for (int done = 1; done <= total + 25; ++done) {  // +25 => simulate extra copy/split nodes
+        int pct = vae_progress_pct(done, total);
+        CHECK(pct >= 0 && pct <= 100);
+        CHECK(pct >= prev);  // never goes backwards
+        prev = pct;
+        // Throttle: only distinct percentages would be surfaced to the user cb.
+        if (pct != last_emitted) last_emitted = pct;
+    }
+    CHECK(prev == 100);          // ends exactly at 100
+    CHECK(last_emitted == 100);  // the final surfaced value is 100
+}
+
 }  // namespace
 
 int main() {
@@ -159,6 +199,7 @@ int main() {
     test_philox();
     test_fsq();
     test_sampler();
+    test_vae_progress();
 
     std::fprintf(stderr, "[test-acestep-units] %d/%d checks passed\n", g_checks - g_failures, g_checks);
     return g_failures == 0 ? 0 : 1;
