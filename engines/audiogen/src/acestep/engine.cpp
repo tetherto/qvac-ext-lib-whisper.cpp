@@ -88,8 +88,10 @@ namespace fs = std::filesystem;
 struct Engine::Impl {
     EngineOptions opts;
 
-    ggml_backend_t backend     = nullptr;  // primary backend (GPU or CPU) for textenc/LM/cond/DiT
+    ggml_backend_t backend     = nullptr;  // primary backend (GPU or CPU) for textenc/cond/DiT
     ggml_backend_t backend_cpu = nullptr;  // CPU backend for detok (uses a CPY variant Metal lacks); null when primary is CPU
+    ggml_backend_t backend_lm  = nullptr;  // backend the LM loads on (CPU when on GPU; see create)
+    ggml_backend_t backend_enc = nullptr;  // backend for textenc + cond (CPU when on GPU; see create)
 
     TextEncModel * textenc = nullptr;
     LMModel *      lm      = nullptr;
@@ -188,7 +190,7 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     if (!m->backend) m->backend = ggml_backend_cpu_init();
     if (!m->backend) throw std::runtime_error("acestep engine: backend init failed");
     if (on_gpu) {
-        if (v) fprintf(stderr, "[acestep-engine] textenc/LM/cond/DiT on GPU backend: %s\n", ggml_backend_name(m->backend));
+        if (v) fprintf(stderr, "[acestep-engine] DiT/VAE on GPU backend: %s\n", ggml_backend_name(m->backend));
         // The FSQ detokenizer emits a CPY variant our Metal backend lacks a
         // kernel for, so it always runs on a dedicated CPU backend.
         m->backend_cpu = ggml_backend_cpu_init();
@@ -199,14 +201,36 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
         m->backend_cpu = m->backend;  // single CPU backend serves every stage
     }
 
-    m->textenc = textenc_model_load(opts.text_enc_model_path, m->backend, v);
+    // Backend layout when a GPU is active. Almost everything runs on the GPU, but
+    // the autoregressive LM is the exception: on iOS A-series Metal it produces
+    // empty/garbage logits -> the sampler yields zero audio codes ("LM produced
+    // no audio codes"), while the SAME weights decode correctly on CPU. This is a
+    // NUMERICAL issue, not memory (unified RAM doesn't help), confirmed by testing
+    // the full-GPU path on device. So the LM defaults to the CPU backend whenever
+    // a GPU is active; the one-shot text/cond encoders stay on the GPU with the
+    // DiT + VAE. Env escape hatches (no rebuild needed):
+    //   ACESTEP_LM_GPU=1        -> force the LM back onto the GPU (desktop bench)
+    //   ACESTEP_ENCODERS_CPU=1  -> move the encoders to the CPU (trim wired mem)
+    ggml_backend_t enc_backend = m->backend;
+    ggml_backend_t lm_backend  = m->backend;
+    if (on_gpu) {
+        lm_backend = m->backend_cpu;  // A-series Metal LM is numerically broken
+        if (std::getenv("ACESTEP_LM_GPU"))       lm_backend  = m->backend;
+        if (std::getenv("ACESTEP_ENCODERS_CPU")) enc_backend = m->backend_cpu;
+        if (v) fprintf(stderr, "[acestep-engine] backends: enc=%s lm=%s dit/vae=%s\n",
+                       ggml_backend_name(enc_backend), ggml_backend_name(lm_backend), ggml_backend_name(m->backend));
+    }
+    m->backend_enc = enc_backend;
+    m->backend_lm  = lm_backend;
+
+    m->textenc = textenc_model_load(opts.text_enc_model_path, enc_backend, v);
     if (!m->textenc) throw std::runtime_error("acestep engine: text-encoder load failed");
 
     // 2 KV sets: cond + uncond for classifier-free guidance on Phase-2 codes.
-    m->lm = lm_model_load(opts.lm_model_path, m->backend, /*max_seq_len=*/2048, v, /*n_kv_sets=*/2);
+    m->lm = lm_model_load(opts.lm_model_path, lm_backend, /*max_seq_len=*/2048, v, /*n_kv_sets=*/2);
     if (!m->lm) throw std::runtime_error("acestep engine: LM load failed");
 
-    m->cond = cond_model_load(opts.dit_model_path, m->backend, v);
+    m->cond = cond_model_load(opts.dit_model_path, enc_backend, v);
     if (!m->cond) throw std::runtime_error("acestep engine: cond-encoder load failed");
 
     m->detok = detok_model_load(opts.dit_model_path, m->backend_cpu, v);
@@ -267,6 +291,42 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
         return !m->cancel_flag.load();
     };
 
+    // Low-memory mode: free each stage model as soon as it is no longer needed so
+    // the peak resident set stays small enough for memory-constrained devices
+    // (e.g. iOS, where the whole system shares ~8 GB of unified RAM and jetsam
+    // kills the app on a system-wide page shortage — Metal weight buffers are
+    // wired/non-pageable). The LM (Phase 1/2) and the text-encoder + cond-encoder
+    // are only used up front (codes + DiT conditioning); freeing them before the
+    // DiT/VAE run frees ~2 GB. They are lazily reloaded at the top of the next
+    // generate(). Opt out with ACESTEP_KEEP_STAGES=1 (e.g. servers that generate
+    // back-to-back and prefer to avoid the per-call reload).
+    const bool keep_stages = [] {
+        const char * e = std::getenv("ACESTEP_KEEP_STAGES");
+        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+    }();
+    const bool low_mem = !keep_stages;
+
+    // Reload any stage model a previous low-mem generation freed. On the first
+    // generate() after create() everything is still resident, so this is a no-op.
+    {
+        const bool vv = m->opts.verbose;
+        if (!m->textenc) {
+            if (vv) fprintf(stderr, "[acestep-engine] reloading text-encoder\n");
+            m->textenc = textenc_model_load(m->opts.text_enc_model_path, m->backend_enc, vv);
+            if (!m->textenc) throw std::runtime_error("acestep engine: text-encoder reload failed");
+        }
+        if (!m->lm) {
+            if (vv) fprintf(stderr, "[acestep-engine] reloading LM\n");
+            m->lm = lm_model_load(m->opts.lm_model_path, m->backend_lm, /*max_seq_len=*/2048, vv, /*n_kv_sets=*/2);
+            if (!m->lm) throw std::runtime_error("acestep engine: LM reload failed");
+        }
+        if (!m->cond) {
+            if (vv) fprintf(stderr, "[acestep-engine] reloading cond-encoder\n");
+            m->cond = cond_model_load(m->opts.dit_model_path, m->backend_enc, vv);
+            if (!m->cond) throw std::runtime_error("acestep engine: cond-encoder reload failed");
+        }
+    }
+
     long long seed = params.seed;
     if (seed < 0) { std::random_device rd; seed = (long long) rd(); }
 
@@ -317,6 +377,14 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
             throw std::runtime_error("acestep engine: LM produced no audio codes");
     }
     if (!report("lm", 1, 1)) return result;
+
+    // The LM is done (codes in hand). Free it now so its weights + KV (~1.1 GB)
+    // are not resident during the DiT/VAE. Reloaded on the next generate().
+    if (low_mem && m->lm) {
+        if (m->opts.verbose) fprintf(stderr, "[acestep-engine] freeing LM (low-mem)\n");
+        lm_model_free(m->lm);
+        m->lm = nullptr;
+    }
 
     // ---- 2. FSQ detok: codes -> context latents [64, T_25Hz] ----
     const int          T_5Hz  = (int) codes.size();
@@ -399,6 +467,23 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
                             timbre_S_ref, enc_hidden, &enc_S))
         throw std::runtime_error("acestep engine: cond-encoder forward failed");
     const int H_enc = (int) (enc_hidden.size() / (size_t) enc_S);  // 2048
+
+    // Cross-attention conditioning (enc_hidden) is now materialised on the host,
+    // so the text-encoder (~742 MB, GPU) and cond-encoder (~352 MB) are no longer
+    // needed. Free them before the DiT/VAE so their (wired) buffers don't count
+    // against the device memory ceiling. Reloaded on the next generate().
+    if (low_mem) {
+        if (m->textenc) {
+            if (m->opts.verbose) fprintf(stderr, "[acestep-engine] freeing text-encoder (low-mem)\n");
+            textenc_model_free(m->textenc);
+            m->textenc = nullptr;
+        }
+        if (m->cond) {
+            if (m->opts.verbose) fprintf(stderr, "[acestep-engine] freeing cond-encoder (low-mem)\n");
+            cond_model_free(m->cond);
+            m->cond = nullptr;
+        }
+    }
 
     // ---- 6. noise [64, T] (Philox, torch.randn parity) ----
     std::vector<float> noise((size_t) Oc * T);

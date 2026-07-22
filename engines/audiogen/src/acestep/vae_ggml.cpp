@@ -301,8 +301,11 @@ bool vae_eval_cb(ggml_tensor * /*t*/, bool ask, void * ud) {
 }
 } // namespace
 
-int vae_model_decode(VaeModel * m, const float * latent, int T_latent, std::vector<float> & pcm_out,
-                     const std::function<bool(int, int)> & on_node) {
+// Decode ONE latent window [T_latent x 64] (layout idx = t*64 + c) into an
+// interleaved stereo PCM buffer. This is the full-graph decode; vae_model_decode
+// below calls it directly for short latents and once per chunk for long ones.
+static int vae_decode_window(VaeModel * m, const float * latent, int T_latent, std::vector<float> & pcm_out,
+                             const std::function<bool(int, int)> & on_node) {
     ggml_init_params gp{ ggml_tensor_overhead() * 1024 + ggml_graph_overhead_custom(8192, false), nullptr, true };
     ggml_context * ctx = ggml_init(gp);
 
@@ -416,6 +419,69 @@ int vae_model_decode(VaeModel * m, const float * latent, int T_latent, std::vect
     if (cpu_fallback) ggml_backend_free(cpu_fallback);
     ggml_free(ctx);
     return T_audio;
+}
+
+int vae_model_decode(VaeModel * m, const float * latent, int T_latent, std::vector<float> & pcm_out,
+                     const std::function<bool(int, int)> & on_node) {
+    // The Oobleck decoder upsamples the latent by a fixed 1920x; its compute
+    // graph allocates ONE arena buffer whose size grows linearly with T_latent
+    // (intermediate activations reach several GB for a full song). On iOS that
+    // single buffer exceeds Metal's max buffer length / device budget, so
+    // ggml_gallocr gets a null buffer back and segfaults. Decode long latents in
+    // overlapping time windows and stitch the audio: the decoder is fully
+    // convolutional with a small latent-domain receptive field, so a window with
+    // enough context on each side reproduces the full decode inside the trimmed
+    // core. Short latents (<= WIN_CORE, e.g. parity clips) stay a single window
+    // and are numerically identical to the non-chunked path.
+    constexpr int WIN_CORE = 256;  // latent frames decoded AND kept per chunk (~arena 1.2 GB peak)
+    constexpr int WIN_OV   = 48;   // context frames on each side (>> decoder RF ~6 frames)
+
+    if (T_latent <= WIN_CORE)
+        return vae_decode_window(m, latent, T_latent, pcm_out, on_node);
+
+    const int    n_chunks = (T_latent + WIN_CORE - 1) / WIN_CORE;
+    const size_t total_samples = (size_t) T_latent * UPSAMPLE * 2;  // interleaved stereo
+    pcm_out.assign(total_samples, 0.0f);
+
+    if (std::getenv("AUDIOGEN_VERBOSE"))
+        fprintf(stderr, "[acestep-vae] chunked decode: T_latent=%d -> %d chunks (core=%d overlap=%d)\n",
+                T_latent, n_chunks, WIN_CORE, WIN_OV);
+
+    std::vector<float> pcm_win;
+    for (int ci = 0; ci < n_chunks; ++ci) {
+        const int core_a = ci * WIN_CORE;
+        const int core_b = std::min(core_a + WIN_CORE, T_latent);
+        const int win_a  = std::max(0, core_a - WIN_OV);
+        const int win_b  = std::min(T_latent, core_b + WIN_OV);
+        const int T_win  = win_b - win_a;
+
+        // Map this chunk's per-node progress onto a single global 0..100% VAE bar.
+        auto win_cb = [&on_node, ci, n_chunks](int done, int total) -> bool {
+            if (!on_node) return true;
+            const long long g_total = (long long) total * n_chunks;
+            const long long g_done  = (long long) total * ci + done;
+            return on_node((int) g_done, (int) g_total);
+        };
+
+        pcm_win.clear();
+        const int T_audio_win = vae_decode_window(m, latent + (size_t) win_a * 64, T_win, pcm_win, win_cb);
+        if (T_audio_win < 0) return -1;  // decode failed or cancelled via on_node
+
+        // Keep only the core region (drop the overlap context). Clamp defensively
+        // in case the window output length differs from the expected T_win*UP.
+        const int    avail    = (int) (pcm_win.size() / 2);
+        int          core_off = (core_a - win_a) * UPSAMPLE;
+        int          core_len = (core_b - core_a) * UPSAMPLE;
+        if (core_off > avail) core_off = avail;
+        if (core_off + core_len > avail) core_len = avail - core_off;
+
+        const size_t dst = (size_t) core_a * UPSAMPLE * 2;
+        for (int t = 0; t < core_len; ++t) {
+            pcm_out[dst + (size_t) t * 2 + 0] = pcm_win[(size_t) (core_off + t) * 2 + 0];
+            pcm_out[dst + (size_t) t * 2 + 1] = pcm_win[(size_t) (core_off + t) * 2 + 1];
+        }
+    }
+    return T_latent * UPSAMPLE;
 }
 
 int vae_model_encode(VaeModel * m, const float * pcm, int frames, std::vector<float> & latent_out) {
