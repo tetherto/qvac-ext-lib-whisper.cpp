@@ -50,9 +50,26 @@ ggml_tensor * build_dec_core(ggml_context * ctx, ggml_cgraph * gf,
 
         // ---- self attention ----
         ggml_tensor * cur = layer_norm(ctx, inpL, l.attn_norm_w, l.attn_norm_b, hp.dec_ln_eps);
-        ggml_tensor * q = ggml_mul_mat(ctx, l.q, cur); // [d, N]
-        ggml_tensor * k = ggml_mul_mat(ctx, l.k, cur);
-        ggml_tensor * v = ggml_mul_mat(ctx, l.v, cur);
+        ggml_tensor * q, * k, * v;
+        if (l.qkv) {
+            // one fused mul_mat -> [3d, N], split back into q|k|v (byte-exact).
+            ggml_tensor * qkv = ggml_mul_mat(ctx, l.qkv, cur);
+            if (N == 1) {
+                ggml_tensor * r = ggml_reshape_2d(ctx, qkv, d, 3);          // contiguous columns
+                q = ggml_view_2d(ctx, r, d, 1, r->nb[1], 0);
+                k = ggml_view_2d(ctx, r, d, 1, r->nb[1], (size_t) r->nb[1]);
+                v = ggml_view_2d(ctx, r, d, 1, r->nb[1], (size_t) 2 * r->nb[1]);
+            } else {
+                ggml_tensor * r = ggml_reshape_3d(ctx, qkv, d, 3, N);       // [d,3,N] strided split
+                q = ggml_cont(ctx, ggml_view_2d(ctx, r, d, N, r->nb[2], 0));
+                k = ggml_cont(ctx, ggml_view_2d(ctx, r, d, N, r->nb[2], (size_t) r->nb[1]));
+                v = ggml_cont(ctx, ggml_view_2d(ctx, r, d, N, r->nb[2], (size_t) 2 * r->nb[1]));
+            }
+        } else {
+            q = ggml_mul_mat(ctx, l.q, cur); // [d, N]
+            k = ggml_mul_mat(ctx, l.k, cur);
+            v = ggml_mul_mat(ctx, l.v, cur);
+        }
 
         const size_t layer_off = (size_t) il * kv_layer;
         {
@@ -137,10 +154,17 @@ void build_dec_heads(ggml_context * ctx, ggml_cgraph * gf,
     ggml_tensor * last = ggml_view_2d(ctx, hidden, hp.dec_d_model, 1, hidden->nb[1],
                                       (size_t) (N - 1) * hidden->nb[1]);
     last = ggml_cont(ctx, last);
-    ggml_tensor * logits = nullptr;
-    for (int k = 0; k < hp.n_codebooks; ++k) {
-        ggml_tensor * lk = ggml_mul_mat(ctx, model.lm_heads[k], last); // [vocab, 1]
-        logits = logits ? ggml_concat(ctx, logits, lk, 1) : lk;
+    ggml_tensor * logits;
+    if (model.lm_head_stacked) {
+        // one stacked mul_mat -> [vocab*n_codebooks, 1] -> [vocab, n_codebooks] (byte-exact).
+        logits = ggml_mul_mat(ctx, model.lm_head_stacked, last);
+        logits = ggml_reshape_2d(ctx, logits, hp.dec_vocab, hp.n_codebooks);
+    } else {
+        logits = nullptr;
+        for (int k = 0; k < hp.n_codebooks; ++k) {
+            ggml_tensor * lk = ggml_mul_mat(ctx, model.lm_heads[k], last); // [vocab, 1]
+            logits = logits ? ggml_concat(ctx, logits, lk, 1) : lk;
+        }
     }
     ggml_set_name(logits, "logits");
     ggml_set_output(logits);

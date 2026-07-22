@@ -74,6 +74,7 @@ struct parler_dec_layer {
     ggml_tensor * cq = nullptr, * ck = nullptr, * cv = nullptr, * co = nullptr;
     ggml_tensor * ffn_norm_w = nullptr, * ffn_norm_b = nullptr;
     ggml_tensor * up = nullptr, * down = nullptr;
+    ggml_tensor * qkv = nullptr; // GPU: fused [d_model, 3*d_model] of q|k|v (one mul_mat)
 };
 
 struct parler_dac_residual {
@@ -123,8 +124,12 @@ struct parler_model {
     ggml_tensor * embed_positions = nullptr;   // [d_model, max_position]
     std::vector<ggml_tensor *> dec_embed;      // n_codebooks tables
     std::vector<ggml_tensor *> lm_heads;       // n_codebooks heads
+    ggml_tensor * lm_head_stacked = nullptr;   // GPU: [d_model, vocab*n_codebooks] (one mul_mat)
     ggml_tensor * dec_output_norm_w = nullptr, * dec_output_norm_b = nullptr;
     std::vector<parler_dec_layer> dec_layers;
+    // GPU-only fused-weight buffer (qkv per layer + stacked lm heads)
+    ggml_context        * ctx_fused    = nullptr;
+    ggml_backend_buffer_t buffer_fused = nullptr;
     // dac
     std::vector<parler_dac_quant> dac_quant;
     ggml_tensor * dac_conv_in_w = nullptr, * dac_conv_in_b = nullptr;
@@ -139,8 +144,9 @@ struct parler_model {
     ggml_tensor * memory_k = nullptr;
     ggml_tensor * memory_v = nullptr;
 
-    // per-description cross-attention K/V (rebuilt when the description
-    // changes): cross_k[l] = [d_model, T], cross_v_t[l] = [T, d_model].
+    // per-description cross-attention K/V (rebuilt when the description changes).
+    // cross_k[l]=[d_model,T]; cross_v_t[l]=[d_model,T] F16 non-transposed under FA,
+    // else [T,d_model] F32 transposed.
     ggml_context        * ctx_cross    = nullptr;
     ggml_backend_buffer_t buffer_cross = nullptr;
     std::vector<ggml_tensor *> cross_k;

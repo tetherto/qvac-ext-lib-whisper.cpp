@@ -37,11 +37,8 @@ ggml_tensor * conv_transpose_1d_trim(ggml_context * ctx, ggml_tensor * kernel,
     return ggml_cont(ctx, v);
 }
 
-// Transposed conv1d (kernel K = 2*stride) as two phase-GEMMs + interleave +
-// shifted overlap-add, trimmed stride/2 each end. Matches conv_transpose_1d_trim
-// to float precision but runs on the fast matmul path (ggml's conv_transpose_1d
-// Metal kernel is ~an order slower for the DAC's large output shapes).
-// kernel ne=[K, OC, IC]; input ne=[IL, IC, 1]; returns [IL*stride, OC, 1].
+// Transposed conv1d (K=2*stride) as two phase-GEMMs + shifted overlap-add on the
+// fast matmul path. kernel ne=[K,OC,IC]; input ne=[IL,IC,1]; returns [IL*stride,OC,1].
 ggml_tensor * conv_transpose_1d_matmul(ggml_context * ctx, ggml_tensor * kernel,
                                        ggml_tensor * input, int stride) {
     const int64_t K  = kernel->ne[0];
@@ -50,6 +47,7 @@ ggml_tensor * conv_transpose_1d_matmul(ggml_context * ctx, ggml_tensor * kernel,
     const int64_t IL = input->ne[0];
     const int64_t s  = stride;
     GGML_ASSERT(K == 2 * s);
+    GGML_ASSERT(s % 2 == 0); // s/2 trim + IL*s length assume even stride (DAC rates 8,8,4,2)
 
     ggml_tensor * x2 = ggml_cont(ctx, ggml_transpose(ctx,
         ggml_reshape_2d(ctx, input, IL, IC)));                          // [IC, IL]

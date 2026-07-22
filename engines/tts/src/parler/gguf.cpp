@@ -356,6 +356,59 @@ bool parler_load_gguf(const std::string & path, parler_model & model,
         if (!model.buffer_kv) return fail("failed to allocate KV buffer");
     }
 
+    // ---- GPU: fused weights (fewer N=1 decode dispatches; byte-exact row concat) ----
+    // qkv[l] = q|k|v stacked on the output dim -> one mul_mat/layer; lm_head_stacked
+    // = the n_codebooks heads stacked -> one mul_mat/step. Gated on GPU; the CPU path
+    // keeps the separate weights so the reference parity tests stay byte-identical.
+    if (model.on_gpu) {
+        const int nl = hp.dec_n_layer, nq = hp.n_codebooks;
+        const int64_t d = hp.dec_d_model, vocab = model.lm_heads[0]->ne[1];
+        bool fuse_qkv = true;
+        for (int i = 0; i < nl; ++i) {
+            const auto & l = model.dec_layers[i];
+            if (l.q->type != l.k->type || l.q->type != l.v->type ||
+                l.q->ne[0] != d || l.q->ne[1] != d ||
+                l.k->ne[0] != d || l.k->ne[1] != d ||
+                l.v->ne[0] != d || l.v->ne[1] != d) { fuse_qkv = false; break; }
+        }
+        bool fuse_heads = true;
+        for (int k = 0; k < nq; ++k) {
+            if (model.lm_heads[k]->type != model.lm_heads[0]->type ||
+                model.lm_heads[k]->ne[0] != d || model.lm_heads[k]->ne[1] != vocab) { fuse_heads = false; break; }
+        }
+        ggml_init_params ip = { (size_t)(nl + 2) * ggml_tensor_overhead(), nullptr, /*no_alloc=*/ true };
+        model.ctx_fused = ggml_init(ip);
+        if (!model.ctx_fused) return fail("ggml_init(ctx_fused) failed");
+        std::vector<ggml_tensor *> qkv(nl, nullptr);
+        if (fuse_qkv) {
+            for (int i = 0; i < nl; ++i)
+                qkv[i] = ggml_new_tensor_2d(model.ctx_fused, model.dec_layers[i].q->type, d, 3 * d);
+        }
+        ggml_tensor * heads = fuse_heads
+            ? ggml_new_tensor_2d(model.ctx_fused, model.lm_heads[0]->type, d, vocab * nq) : nullptr;
+        model.buffer_fused = ggml_backend_alloc_ctx_tensors(model.ctx_fused, model.backend);
+        if (!model.buffer_fused) return fail("failed to allocate fused-weight buffer");
+        std::vector<uint8_t> tmp;
+        auto copy_into = [&](ggml_tensor * dst, size_t off, ggml_tensor * src) {
+            tmp.resize(ggml_nbytes(src));
+            ggml_backend_tensor_get(src, tmp.data(), 0, tmp.size());
+            ggml_backend_tensor_set(dst, tmp.data(), off, tmp.size());
+        };
+        if (fuse_qkv) {
+            for (int i = 0; i < nl; ++i) {
+                auto & l = model.dec_layers[i];
+                const size_t nb = ggml_nbytes(l.q);
+                copy_into(qkv[i], 0, l.q); copy_into(qkv[i], nb, l.k); copy_into(qkv[i], 2 * nb, l.v);
+                l.qkv = qkv[i];
+            }
+        }
+        if (fuse_heads) {
+            const size_t nb = ggml_nbytes(model.lm_heads[0]);
+            for (int k = 0; k < nq; ++k) copy_into(heads, (size_t) k * nb, model.lm_heads[k]);
+            model.lm_head_stacked = heads;
+        }
+    }
+
     gguf_free(g);
     ggml_free(ctx_meta);
     return true;
@@ -365,6 +418,8 @@ void parler_free_model(parler_model & model) {
     ::tts_cpp::detail::sched_fallback_free(model.sched_fb);
     if (model.buffer_cross) { ggml_backend_buffer_free(model.buffer_cross); model.buffer_cross = nullptr; }
     if (model.ctx_cross)    { ggml_free(model.ctx_cross); model.ctx_cross = nullptr; }
+    if (model.buffer_fused) { ggml_backend_buffer_free(model.buffer_fused); model.buffer_fused = nullptr; }
+    if (model.ctx_fused)    { ggml_free(model.ctx_fused); model.ctx_fused = nullptr; }
     if (model.buffer_kv)    { ggml_backend_buffer_free(model.buffer_kv); model.buffer_kv = nullptr; }
     if (model.ctx_kv)       { ggml_free(model.ctx_kv); model.ctx_kv = nullptr; }
     if (model.buffer_w)     { ggml_backend_buffer_free(model.buffer_w); model.buffer_w = nullptr; }
