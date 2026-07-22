@@ -37,7 +37,7 @@ static void write_wav(const std::string & path, const std::vector<float> & wav, 
 int main(int argc, char ** argv) {
     using namespace tts_cpp::cosyvoice;
     std::string model_dir, text = "Hello from a fully on-device C plus plus pipeline.";
-    std::string out = "cosyvoice_out.wav", prompt_text, instruct_text;
+    std::string out = "cosyvoice_out.wav", prompt_text, instruct_text, voice_gguf;
     int seed = 42;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -46,8 +46,9 @@ int main(int argc, char ** argv) {
         else if (a == "--out" && i + 1 < argc) out = argv[++i];
         else if (a == "--prompt-text" && i + 1 < argc) prompt_text = argv[++i];
         else if (a == "--instruct" && i + 1 < argc) instruct_text = argv[++i];
+        else if (a == "--voice-gguf" && i + 1 < argc) voice_gguf = argv[++i];
         else if (a == "--seed" && i + 1 < argc) seed = std::atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s --model-dir DIR [--text ...] [--instruct \"...\"] [--out out.wav] [--seed N]\n", argv[0]); return 1; }
+        else { fprintf(stderr, "usage: %s --model-dir DIR [--text ...] [--instruct \"...\"] [--voice-gguf voice.gguf] [--out out.wav] [--seed N]\n", argv[0]); return 1; }
     }
     if (model_dir.empty()) { fprintf(stderr, "need --model-dir\n"); return 1; }
 
@@ -56,6 +57,7 @@ int main(int argc, char ** argv) {
     opts.seed = seed;
     if (!prompt_text.empty()) opts.prompt_text = prompt_text;
     if (!instruct_text.empty()) opts.instruct_text = instruct_text;
+    if (!voice_gguf.empty()) opts.voice_gguf_path = voice_gguf;
 
     fprintf(stderr, "loading model from %s ...\n", model_dir.c_str());
     Engine engine(opts);
