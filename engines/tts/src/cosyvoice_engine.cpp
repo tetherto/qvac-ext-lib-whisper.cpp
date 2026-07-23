@@ -202,7 +202,7 @@ struct Engine::Impl {
         const int max_steps = 50 * ((int)tts_ids.size() + 1); // generous cap
         const bool greedy   = false;
 
-        qwen_hp hp;
+        qwen_hp hp = cosyvoice_qwen_hp(llm_m);
         std::vector<int> speech_tokens = cosyvoice_llm_generate(
             llm_m, hp, text_ids, lm_prompt_stok, max_steps, greedy, opts.seed, min_len);
         if (speech_tokens.empty()) {

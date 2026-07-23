@@ -19,6 +19,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -35,6 +36,11 @@ struct model_ctx {
     ggml_context *        ctx_w    = nullptr;
     ggml_backend_buffer_t buffer_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
+    // GGUF scalar metadata captured at load (e.g. cosyvoice3.llm.sos,
+    // cosyvoice3.llm.depth, ...), so the graph reads the ids/sizes the weights
+    // were converted with instead of trusting hardcoded constants.
+    std::map<std::string, int64_t> kv_i;   // uint/int-typed KV
+    std::map<std::string, float>   kv_f;   // float-typed KV
 };
 
 // Load a GGUF into a resident CPU model_ctx (all tensors materialised).
@@ -49,11 +55,23 @@ ggml_tensor * cosyvoice_get(const model_ctx & m, const std::string & name);
 std::string cosyvoice_gguf_meta_str(const std::string & path, const std::string & key,
                                     const std::string & fallback = "");
 
+// Read a scalar metadata value captured at load (see model_ctx::kv_i / kv_f).
+// Returns `fallback` when the key is absent — so an older GGUF written before
+// the key existed still loads with the historical constant.
+int64_t cosyvoice_meta_i(const model_ctx & m, const std::string & key, int64_t fallback);
+float   cosyvoice_meta_f(const model_ctx & m, const std::string & key, float fallback);
+
 // ---- hyper-parameters -----------------------------------------------------
 struct qwen_hp {
     int   depth = 24, hidden = 896, n_head = 14, n_kv = 2, head_dim = 64, inter = 4864;
     float theta = 1000000.0f, eps = 1e-6f;
 };
+
+// Build the Qwen2 hyper-parameters from a loaded LM GGUF's cosyvoice3.llm.* KV,
+// falling back to the struct defaults for any key the GGUF doesn't carry. Use
+// this instead of a default-constructed qwen_hp so the graph shape follows the
+// weights rather than hardcoded numbers.
+qwen_hp cosyvoice_qwen_hp(const model_ctx & m);
 struct dit_hp {
     int depth = 22, dim = 1024, heads = 16, dim_head = 64, ff_inner = 2048;
     int conv_k = 31, conv_groups = 16;

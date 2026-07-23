@@ -40,7 +40,7 @@ int main(int argc, char ** argv) {
     if (gguf.empty() || in_dir.empty()) { fprintf(stderr, "missing --llm-gguf / --in-dir\n"); return 2; }
 
     model_ctx m = cosyvoice_load_gguf(gguf);
-    qwen_hp hp;
+    qwen_hp hp = cosyvoice_qwen_hp(m);  // exercise the GGUF-KV hp path
 
     npy_array tid_a = npy_load(in_dir + "/text_ids.npy");
     npy_array ps_a  = npy_load(in_dir + "/prompt_stok.npy");

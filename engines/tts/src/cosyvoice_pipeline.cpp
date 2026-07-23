@@ -49,6 +49,23 @@ model_ctx cosyvoice_load_gguf(const std::string & path) {
         ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
         ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
     }
+    // Capture scalar KV metadata (architecture sizes + special-token ids the
+    // converter wrote) so downstream graphs read them instead of hardcoding.
+    for (int64_t i = 0, nkv = gguf_get_n_kv(g); i < nkv; ++i) {
+        const char * key = gguf_get_key(g, i);
+        switch (gguf_get_kv_type(g, i)) {
+            case GGUF_TYPE_UINT8:   m.kv_i[key] = gguf_get_val_u8(g, i);  break;
+            case GGUF_TYPE_INT8:    m.kv_i[key] = gguf_get_val_i8(g, i);  break;
+            case GGUF_TYPE_UINT16:  m.kv_i[key] = gguf_get_val_u16(g, i); break;
+            case GGUF_TYPE_INT16:   m.kv_i[key] = gguf_get_val_i16(g, i); break;
+            case GGUF_TYPE_UINT32:  m.kv_i[key] = gguf_get_val_u32(g, i); break;
+            case GGUF_TYPE_INT32:   m.kv_i[key] = gguf_get_val_i32(g, i); break;
+            case GGUF_TYPE_UINT64:  m.kv_i[key] = (int64_t)gguf_get_val_u64(g, i); break;
+            case GGUF_TYPE_INT64:   m.kv_i[key] = gguf_get_val_i64(g, i); break;
+            case GGUF_TYPE_FLOAT32: m.kv_f[key] = gguf_get_val_f32(g, i); break;
+            default: break;  // strings handled separately; arrays/bools ignored
+        }
+    }
     gguf_free(g);
     ggml_free(tmp_ctx);
     return m;
@@ -80,6 +97,29 @@ std::string cosyvoice_gguf_meta_str(const std::string & path, const std::string 
     }
     gguf_free(g);
     return out;
+}
+
+int64_t cosyvoice_meta_i(const model_ctx & m, const std::string & key, int64_t fallback) {
+    auto it = m.kv_i.find(key);
+    return it != m.kv_i.end() ? it->second : fallback;
+}
+
+float cosyvoice_meta_f(const model_ctx & m, const std::string & key, float fallback) {
+    auto it = m.kv_f.find(key);
+    return it != m.kv_f.end() ? it->second : fallback;
+}
+
+qwen_hp cosyvoice_qwen_hp(const model_ctx & m) {
+    qwen_hp hp;  // struct defaults are the per-field fallback
+    hp.depth    = (int)cosyvoice_meta_i(m, "cosyvoice3.llm.depth",    hp.depth);
+    hp.hidden   = (int)cosyvoice_meta_i(m, "cosyvoice3.llm.hidden",   hp.hidden);
+    hp.n_head   = (int)cosyvoice_meta_i(m, "cosyvoice3.llm.n_head",   hp.n_head);
+    hp.n_kv     = (int)cosyvoice_meta_i(m, "cosyvoice3.llm.n_kv",     hp.n_kv);
+    hp.head_dim = (int)cosyvoice_meta_i(m, "cosyvoice3.llm.head_dim", hp.head_dim);
+    hp.inter    = (int)cosyvoice_meta_i(m, "cosyvoice3.llm.inter",    hp.inter);
+    hp.theta    = cosyvoice_meta_f(m, "cosyvoice3.llm.rope_theta", hp.theta);
+    hp.eps      = cosyvoice_meta_f(m, "cosyvoice3.llm.rms_eps",    hp.eps);
+    return hp;
 }
 
 // short local aliases matching the CLI call sites
@@ -332,7 +372,8 @@ static std::vector<float> build_lm_input(model_ctx & m, const std::vector<int> &
     int D = (int)et->ne[0];
     const float * etd = (const float *)ggml_get_data(et);
     const float * sed = (const float *)ggml_get_data(se);
-    const int SOS = 6561, TASK = 6563;
+    const int SOS  = (int)cosyvoice_meta_i(m, "cosyvoice3.llm.sos",     6561);
+    const int TASK = (int)cosyvoice_meta_i(m, "cosyvoice3.llm.task_id", 6563);
     std::vector<float> seq;
     auto push_row = [&](const float * base, int row) { seq.insert(seq.end(), base + (size_t)row * D, base + (size_t)(row + 1) * D); };
     push_row(sed, SOS);
@@ -347,7 +388,11 @@ std::vector<int> cosyvoice_llm_generate(model_ctx & m, const qwen_hp & hp,
                                         const std::vector<int> & text_ids,
                                         const std::vector<int> & prompt_stok,
                                         int max_steps, bool greedy, int seed, int min_len) {
-    const int VS = 6761, STS = 6561;
+    // VS (LM output size) comes straight from the speech head's weight so the
+    // graph can't disagree with the tensor; STS (speech_token_size, the EOS
+    // threshold) from KV with the historical value as fallback.
+    const int VS  = (int)G(m, "lm/llm_decoder/weight")->ne[1];
+    const int STS = (int)cosyvoice_meta_i(m, "cosyvoice3.llm.speech_token_size", 6561);
     int L0 = 0, D = 0;
     std::vector<float> seq = build_lm_input(m, text_ids, prompt_stok, L0, D);
     ggml_tensor * se = G(m, "lm/speech_embedding/weight");
