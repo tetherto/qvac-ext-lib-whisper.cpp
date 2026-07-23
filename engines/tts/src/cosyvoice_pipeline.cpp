@@ -529,93 +529,69 @@ std::vector<float> sinus_time_emb(const std::vector<float> & t, int dim) {
     return out;
 }
 
-std::vector<float> cosyvoice_flow_run(model_ctx & m,
-                                      const std::vector<int> & prompt_token,
-                                      const std::vector<int> & speech_tokens,
-                                      const std::vector<float> & prompt_feat, int mel_len1,
-                                      const std::vector<float> & embedding, int & out_mel_len) {
-    dit_hp hp;
+// Flow front-end (DiT graph A): upsampled token features mu and the affine-
+// projected speaker vector.  tokids = prompt++speech token ids; on return
+// mu_host is [MEL,TM] channel-major-flattened (mel-fastest) and spks_host[MEL].
+static void build_flow_frontend(model_ctx & m, const std::vector<int32_t> & tokids,
+                                const std::vector<float> & embedding,
+                                int T_tok, int TM, int SPK,
+                                std::vector<float> & mu_host, std::vector<float> & spks_host) {
     const int MEL = 80;
-    int T_ptok = (int)prompt_token.size(), T_stok = (int)speech_tokens.size();
-    int T_tok = T_ptok + T_stok;
-    int TM = T_tok * 2;                       // token_mel_ratio = 2
-    int mel_len2 = TM - mel_len1;
-    int SPK = (int)embedding.size();
+    mu_host.assign((size_t)MEL * TM, 0.f);
+    spks_host.assign(MEL, 0.f);
+    size_t bs = (size_t)512 * 1024 * 1024;
+    std::vector<uint8_t> buf(bs);
+    ggml_init_params gp = { bs, buf.data(), true };
+    ggml_context * c = ggml_init(gp);
+    ggml_cgraph * gf = ggml_new_graph(c);
 
-    std::vector<int32_t> tokids(T_tok);
-    for (int i = 0; i < T_ptok; ++i) tokids[i] = prompt_token[i];
-    for (int i = 0; i < T_stok; ++i) tokids[T_ptok + i] = speech_tokens[i];
+    ggml_tensor * ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, T_tok); ggml_set_name(ids, "ids"); ggml_set_input(ids);
+    ggml_tensor * emb1d = ggml_new_tensor_1d(c, GGML_TYPE_F32, SPK); ggml_set_name(emb1d, "emb"); ggml_set_input(emb1d);
 
-    // ---- Front-end graph A: tokens + embedding -> mu[80,T], spks[80] ----
-    std::vector<float> mu_host((size_t)MEL * TM), spks_host(MEL);
-    {
-        size_t bs = (size_t)512 * 1024 * 1024;
-        std::vector<uint8_t> buf(bs);
-        ggml_init_params gp = { bs, buf.data(), true };
-        ggml_context * c = ggml_init(gp);
-        ggml_cgraph * gf = ggml_new_graph(c);
+    ggml_tensor * e = ggml_get_rows(c, T(m, "flow/input_embedding/weight"), ids);
+    ggml_tensor * x = ggml_cont(c, ggml_permute(c, e, 1, 0, 2, 3));
+    ggml_tensor * res = x;
+    ggml_tensor * xp = ggml_pad_ext(c, x, 0, 3, 0, 0, 0, 0, 0, 0);
+    ggml_tensor * h = conv1d_f32(c, T(m, "flow/pre_lookahead_layer/conv1/weight"), xp, 1, 0, 1);
+    h = ggml_add(c, h, ggml_reshape_2d(c, T(m, "flow/pre_lookahead_layer/conv1/bias"), 1, 1024));
+    h = ggml_leaky_relu(c, h, 0.01f, false);
+    ggml_tensor * hpad = ggml_pad_ext(c, h, 2, 0, 0, 0, 0, 0, 0, 0);
+    h = conv1d_f32(c, T(m, "flow/pre_lookahead_layer/conv2/weight"), hpad, 1, 0, 1);
+    h = ggml_add(c, h, ggml_reshape_2d(c, T(m, "flow/pre_lookahead_layer/conv2/bias"), 1, MEL));
+    h = ggml_add(c, h, res);
+    ggml_tensor * h3 = ggml_reshape_3d(c, h, 1, T_tok, MEL);
+    ggml_tensor * h2 = ggml_repeat(c, h3, ggml_new_tensor_3d(c, GGML_TYPE_F32, 2, T_tok, MEL));
+    ggml_tensor * up = ggml_reshape_2d(c, ggml_cont(c, h2), TM, MEL);
+    ggml_tensor * mu = ggml_cont(c, ggml_permute(c, up, 1, 0, 2, 3));
+    ggml_set_name(mu, "mu"); ggml_set_output(mu);
 
-        ggml_tensor * ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, T_tok); ggml_set_name(ids, "ids"); ggml_set_input(ids);
-        ggml_tensor * emb1d = ggml_new_tensor_1d(c, GGML_TYPE_F32, SPK); ggml_set_name(emb1d, "emb"); ggml_set_input(emb1d);
+    ggml_tensor * n = ggml_rms_norm(c, emb1d, 1e-12f);
+    n = ggml_scale(c, n, 1.0f / std::sqrt((float)SPK));
+    ggml_tensor * sp = ggml_mul_mat(c, T(m, "flow/spk_embed_affine_layer/weight"), n);
+    sp = ggml_add(c, sp, T(m, "flow/spk_embed_affine_layer/bias"));
+    ggml_set_name(sp, "spks"); ggml_set_output(sp);
 
-        ggml_tensor * e = ggml_get_rows(c, T(m, "flow/input_embedding/weight"), ids);
-        ggml_tensor * x = ggml_cont(c, ggml_permute(c, e, 1, 0, 2, 3));
-        ggml_tensor * res = x;
-        ggml_tensor * xp = ggml_pad_ext(c, x, 0, 3, 0, 0, 0, 0, 0, 0);
-        ggml_tensor * h = conv1d_f32(c, T(m, "flow/pre_lookahead_layer/conv1/weight"), xp, 1, 0, 1);
-        h = ggml_add(c, h, ggml_reshape_2d(c, T(m, "flow/pre_lookahead_layer/conv1/bias"), 1, 1024));
-        h = ggml_leaky_relu(c, h, 0.01f, false);
-        ggml_tensor * hpad = ggml_pad_ext(c, h, 2, 0, 0, 0, 0, 0, 0, 0);
-        h = conv1d_f32(c, T(m, "flow/pre_lookahead_layer/conv2/weight"), hpad, 1, 0, 1);
-        h = ggml_add(c, h, ggml_reshape_2d(c, T(m, "flow/pre_lookahead_layer/conv2/bias"), 1, MEL));
-        h = ggml_add(c, h, res);
-        ggml_tensor * h3 = ggml_reshape_3d(c, h, 1, T_tok, MEL);
-        ggml_tensor * h2 = ggml_repeat(c, h3, ggml_new_tensor_3d(c, GGML_TYPE_F32, 2, T_tok, MEL));
-        ggml_tensor * up = ggml_reshape_2d(c, ggml_cont(c, h2), TM, MEL);
-        ggml_tensor * mu = ggml_cont(c, ggml_permute(c, up, 1, 0, 2, 3));
-        ggml_set_name(mu, "mu"); ggml_set_output(mu);
+    ggml_build_forward_expand(gf, mu);
+    ggml_build_forward_expand(gf, sp);
+    ggml_gallocr_t al = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    ggml_gallocr_reserve(al, gf); ggml_gallocr_alloc_graph(al, gf);
+    ggml_backend_tensor_set(ids, tokids.data(), 0, tokids.size() * 4);
+    ggml_backend_tensor_set(emb1d, embedding.data(), 0, (size_t)SPK * 4);
+    ggml_backend_graph_compute(m.backend, gf);
+    ggml_backend_tensor_get(mu, mu_host.data(), 0, mu_host.size() * 4);
+    ggml_backend_tensor_get(sp, spks_host.data(), 0, spks_host.size() * 4);
+    ggml_gallocr_free(al); ggml_free(c);
+}
 
-        ggml_tensor * n = ggml_rms_norm(c, emb1d, 1e-12f);
-        n = ggml_scale(c, n, 1.0f / std::sqrt((float)SPK));
-        ggml_tensor * sp = ggml_mul_mat(c, T(m, "flow/spk_embed_affine_layer/weight"), n);
-        sp = ggml_add(c, sp, T(m, "flow/spk_embed_affine_layer/bias"));
-        ggml_set_name(sp, "spks"); ggml_set_output(sp);
-
-        ggml_build_forward_expand(gf, mu);
-        ggml_build_forward_expand(gf, sp);
-        ggml_gallocr_t al = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-        ggml_gallocr_reserve(al, gf); ggml_gallocr_alloc_graph(al, gf);
-        ggml_backend_tensor_set(ids, tokids.data(), 0, tokids.size() * 4);
-        ggml_backend_tensor_set(emb1d, embedding.data(), 0, (size_t)SPK * 4);
-        ggml_backend_graph_compute(m.backend, gf);
-        ggml_backend_tensor_get(mu, mu_host.data(), 0, mu_host.size() * 4);
-        ggml_backend_tensor_get(sp, spks_host.data(), 0, spks_host.size() * 4);
-        ggml_gallocr_free(al); ggml_free(c);
-    }
-
-    // cond[80,T]: first mel_len1 columns = prompt_feat, rest 0
-    std::vector<float> cond_host((size_t)MEL * TM, 0.f);
-    memcpy(cond_host.data(), prompt_feat.data(), (size_t)mel_len1 * MEL * 4);
-
-    // noise z[80,T] from baked rand_noise (ne=[15000,80] => rn[a,b]=rand_noise[ch=b,time=a])
-    ggml_tensor * rnt = T(m, "flow/rand_noise");
-    std::vector<float> rn_host(ggml_nelements(rnt));
-    ggml_backend_tensor_get(rnt, rn_host.data(), 0, rn_host.size() * 4);
-    int RNW = (int)rnt->ne[0];
-    // The baked rand_noise is [RNW=15000, 80]; the gather below reads time index
-    // t in [0,TM). PyTorch caps the CFM at the same 15000 frames, so refuse
-    // (rather than over-read the buffer) when the requested mel length exceeds
-    // what the baked noise covers — ~5 min of speech at token_mel_ratio=2.
-    if (TM > RNW) {
-        throw std::runtime_error(
-            "cosyvoice_flow_run: requested mel length " + std::to_string(TM) +
-            " exceeds baked rand_noise frames " + std::to_string(RNW) +
-            " (input too long; max ~" + std::to_string(RNW / 2) + " tokens)");
-    }
-    std::vector<float> x_host((size_t)MEL * TM);
-    for (int ch = 0; ch < MEL; ++ch) for (int t = 0; t < TM; ++t) x_host[(size_t)ch + (size_t)t * MEL] = rn_host[(size_t)t + (size_t)ch * RNW];
-
-    // ---- DiT graph B (batch 2), built once, run 10 Euler steps ----
+// CausalConditionalCFM: 10-step Euler integration of the DiT estimator with
+// classifier-free guidance (batch-2: conditional + unconditional).  Integrates
+// x_host [MEL,TM] channel-major-flattened in place over the cosine time schedule.
+static void run_euler_steps(model_ctx & m, const dit_hp & hp,
+                            const std::vector<float> & mu_host,
+                            const std::vector<float> & cond_host,
+                            const std::vector<float> & spks_host, int TM,
+                            std::vector<float> & x_host) {
+    const int MEL = 80;
     int B = 2, N = TM;
     size_t bs = (size_t)2 * 1024 * 1024 * 1024;
     std::vector<uint8_t> buf(bs);
@@ -667,11 +643,66 @@ std::vector<float> cosyvoice_flow_run(model_ctx & m,
         }
     }
     ggml_gallocr_free(al); ggml_free(ctx_const); ggml_free(c);
+}
 
-    // trim prompt part: mel = x_host[:, mel_len1:] -> [80, mel_len2] channel-major
+// Drop the prompt frames: mel = x_host[:, mel_len1:] laid out [MEL, mel_len2]
+// channel-major (mel[ch*T + t]), the layout the HiFT stage consumes.
+static std::vector<float> trim_prompt_mel(const std::vector<float> & x_host, int mel_len1, int mel_len2) {
+    const int MEL = 80;
     std::vector<float> mel((size_t)MEL * mel_len2);
     for (int ch = 0; ch < MEL; ++ch) for (int t = 0; t < mel_len2; ++t)
         mel[(size_t)ch * mel_len2 + t] = x_host[(size_t)ch + (size_t)(t + mel_len1) * MEL];
+    return mel;
+}
+
+std::vector<float> cosyvoice_flow_run(model_ctx & m,
+                                      const std::vector<int> & prompt_token,
+                                      const std::vector<int> & speech_tokens,
+                                      const std::vector<float> & prompt_feat, int mel_len1,
+                                      const std::vector<float> & embedding, int & out_mel_len) {
+    dit_hp hp;
+    const int MEL = 80;
+    int T_ptok = (int)prompt_token.size(), T_stok = (int)speech_tokens.size();
+    int T_tok = T_ptok + T_stok;
+    int TM = T_tok * 2;                       // token_mel_ratio = 2
+    int mel_len2 = TM - mel_len1;
+    int SPK = (int)embedding.size();
+
+    std::vector<int32_t> tokids(T_tok);
+    for (int i = 0; i < T_ptok; ++i) tokids[i] = prompt_token[i];
+    for (int i = 0; i < T_stok; ++i) tokids[T_ptok + i] = speech_tokens[i];
+
+    // Front-end graph A: tokens + embedding -> mu[80,TM], spks[80].
+    std::vector<float> mu_host, spks_host;
+    build_flow_frontend(m, tokids, embedding, T_tok, TM, SPK, mu_host, spks_host);
+
+    // cond[80,T]: first mel_len1 columns = prompt_feat, rest 0
+    std::vector<float> cond_host((size_t)MEL * TM, 0.f);
+    memcpy(cond_host.data(), prompt_feat.data(), (size_t)mel_len1 * MEL * 4);
+
+    // noise z[80,T] from baked rand_noise (ne=[15000,80] => rn[a,b]=rand_noise[ch=b,time=a])
+    ggml_tensor * rnt = T(m, "flow/rand_noise");
+    std::vector<float> rn_host(ggml_nelements(rnt));
+    ggml_backend_tensor_get(rnt, rn_host.data(), 0, rn_host.size() * 4);
+    int RNW = (int)rnt->ne[0];
+    // The baked rand_noise is [RNW=15000, 80]; the gather below reads time index
+    // t in [0,TM). PyTorch caps the CFM at the same 15000 frames, so refuse
+    // (rather than over-read the buffer) when the requested mel length exceeds
+    // what the baked noise covers — ~5 min of speech at token_mel_ratio=2.
+    if (TM > RNW) {
+        throw std::runtime_error(
+            "cosyvoice_flow_run: requested mel length " + std::to_string(TM) +
+            " exceeds baked rand_noise frames " + std::to_string(RNW) +
+            " (input too long; max ~" + std::to_string(RNW / 2) + " tokens)");
+    }
+    std::vector<float> x_host((size_t)MEL * TM);
+    for (int ch = 0; ch < MEL; ++ch) for (int t = 0; t < TM; ++t) x_host[(size_t)ch + (size_t)t * MEL] = rn_host[(size_t)t + (size_t)ch * RNW];
+
+    // DiT graph B: 10 Euler steps (integrates x_host in place).
+    run_euler_steps(m, hp, mu_host, cond_host, spks_host, TM, x_host);
+
+    // trim prompt part -> [80, mel_len2] channel-major
+    std::vector<float> mel = trim_prompt_mel(x_host, mel_len1, mel_len2);
     out_mel_len = mel_len2;
     return mel;
 }
