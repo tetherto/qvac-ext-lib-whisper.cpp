@@ -452,16 +452,16 @@ if (TTS_CPP_BUILD_EXECUTABLES)
 
     # CosyVoice3 CausalHiFTGenerator vocoder (mel -> 24 kHz wav). Same
     # HiFTGenerator lineage as Chatterbox's mel2wav with CosyVoice3's causal
-    # semantics + SineGen2. Validated at 0.989 log-mel corr (see
-    # PROGRESS_COSYVOICE.md, models_evaluation/CosyVoice).
+    # semantics + SineGen2. Validated at 0.989 log-mel corr vs the PyTorch
+    # reference (0.996 waveform corr after the source-excitation phase fix).
     add_executable(cosyvoice-hift src/cosyvoice_hift.cpp src/cosyvoice_pipeline.cpp)
     target_link_libraries(cosyvoice-hift PRIVATE ggml)
     target_include_directories(cosyvoice-hift PRIVATE ggml/include src)
     tts_cpp_apply_ccache(cosyvoice-hift)
 
     # CosyVoice3 flow (stage 4): 22-layer DiT + CFM Euler loop (speech tokens ->
-    # mel). Parity-gated against models_evaluation/CosyVoice (flow_mel cosine
-    # 1.000000). Uses only standard ggml ops. See PROGRESS_COSYVOICE.md.
+    # mel). Parity-gated against the PyTorch reference (flow_mel cosine
+    # 1.000000). Uses only standard ggml ops.
     add_executable(cosyvoice-flow src/cosyvoice_flow.cpp src/cosyvoice_pipeline.cpp)
     target_link_libraries(cosyvoice-flow PRIVATE ggml)
     target_include_directories(cosyvoice-flow PRIVATE ggml/include src)
@@ -469,7 +469,7 @@ if (TTS_CPP_BUILD_EXECUTABLES)
 
     # CosyVoice3 LLM (stage 5): Qwen2.5-0.5B speech LM (text -> speech tokens),
     # autoregressive decode + RAS sampling + Qwen2 BPE tokenizer (qwen_tokenizer.h).
-    # Prefill logits cosine 1.000000 vs PyTorch. See PROGRESS_COSYVOICE.md.
+    # Prefill logits cosine 1.000000 vs the PyTorch reference.
     add_executable(cosyvoice-llm src/cosyvoice_llm.cpp src/cosyvoice_pipeline.cpp)
     target_link_libraries(cosyvoice-llm PRIVATE ggml)
     target_include_directories(cosyvoice-llm PRIVATE ggml/include src)

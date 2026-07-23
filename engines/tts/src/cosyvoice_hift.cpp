@@ -4,7 +4,7 @@
 // lives in cosyvoice_pipeline.cpp (shared with the Engine); this CLI just loads
 // a mel .npy, runs cosyvoice_hift_synth(), and writes a WAV.
 //
-// Validated against the PyTorch reference (models_evaluation/CosyVoice): fed
+// Validated against the PyTorch reference: fed
 // hift_mel_in.npy, the output matches hift_wav.npy at 0.989 log-mel corr /
 // 0.999 energy-envelope corr.
 //

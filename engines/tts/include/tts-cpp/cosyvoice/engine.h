@@ -2,23 +2,19 @@
 
 // Persistent CosyVoice3 engine (Fun-CosyVoice3-0.5B / 1.5B).
 //
-// STATUS — ITERATION 1 (SCAFFOLD):
-//   This is the wiring skeleton for the CosyVoice3 sibling engine.  The
-//   public API, option plumbing, streaming contract and backend reporting
-//   are in place and match the Chatterbox / Supertonic engines so the JS
-//   addon + @qvac/sdk flow works end-to-end.  The real CPU inference graphs
-//   (Qwen2 LM -> supervised S3 speech tokenizer -> DiT flow-matching -> HiFT
-//   vocoder) are NOT implemented yet: synthesize() returns a clearly-marked
-//   placeholder waveform (a short marker tone + silence).  Do not mistake
-//   its output for real speech.  See PROGRESS_COSYVOICE.md for the staged
-//   bring-up plan.
+// Native C++/ggml, CPU implementation of the Fun-CosyVoice3 back-half, under the
+// same public API as the Chatterbox / Supertonic engines so the JS addon +
+// @qvac/sdk flow works end-to-end.  synthesize() returns real 24 kHz speech.
 //
-// Pipeline (once implemented, CPU path):
-//   text --(wetext frontend)--> Qwen2.5 LM --> speech tokens [0, 6561)
+// Pipeline (CPU path):
+//   text --(Qwen2 BPE tokenizer)--> Qwen2.5 LM --> speech tokens [0, 6561)
 //        --> DiT conditional-flow-matching (Euler ODE) --> mel
 //        --> CausalHiFT vocoder --> 24 kHz mono PCM
 //   Zero-shot voice cloning adds: reference audio --> S3 tokenizer (prompt
-//   tokens) + CAM++ (192-d speaker embedding).
+//   tokens) + CAM++ (192-d speaker embedding).  Iteration 1 uses a baked voice
+//   (voice.gguf); the native S3 tokenizer + CAM++ path is a follow-up.  Instruct
+//   mode (EngineOptions::instruct_text) selects a Chinese dialect / emotion /
+//   speed / volume, mirroring CosyVoice3 inference_instruct2.
 //
 // CosyVoice3 ships as a small set of GGUFs (llm / flow / hift / s3tok /
 // campplus / voices).  Point `model_dir` at the folder that holds them, or

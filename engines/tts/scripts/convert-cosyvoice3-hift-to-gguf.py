@@ -2,8 +2,8 @@
 """Convert the CosyVoice3 HiFT vocoder (hift.pt) to GGUF.
 
 First converter of the CosyVoice3 bring-up (the vocoder is the smallest,
-back-of-pipeline sub-model, validated first against
-models_evaluation/CosyVoice/artifacts/cv3-ref/{flow_mel,hift_wav}.npy).
+back-of-pipeline sub-model, validated first against the PyTorch reference
+dumps: {flow_mel,hift_wav}.npy).
 
 Resolves weight_norm (both the legacy `weight_g`/`weight_v` and the new
 `parametrizations.weight.original0/1` layouts) back to a plain `.weight`, then

@@ -3,7 +3,7 @@
 // The graph code here is lifted verbatim (numerically) from the validated
 // parity CLIs; only the I/O boundary changed (in-memory args/returns instead
 // of npy files).  Keep the ggml op sequences byte-for-byte identical to the
-// CLIs — the five bring-up bugs in PROGRESS_COSYVOICE.md were all subtle op
+// CLIs — the bring-up bugs found during validation were all subtle op
 // ordering / layout issues.
 
 #include "cosyvoice_pipeline.h"
@@ -133,7 +133,7 @@ static ggml_tensor * conv1d_grouped(ggml_context * c, ggml_tensor * w, ggml_tens
 }
 
 // Plain conv1d over time: input [Nlen, Cin, B] (ne0=time), weight [K, Cin, Cout].
-// im2col FIRST, kernel SECOND (see PROGRESS_COSYVOICE.md conv1d operand-order bug).
+// im2col FIRST, kernel SECOND (conv1d operand order matters here).
 static ggml_tensor * conv1d_f32(ggml_context * c, ggml_tensor * w, ggml_tensor * x,
                                 int stride, int padding, int dilation) {
     ggml_tensor * im = ggml_im2col(c, w, x, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
