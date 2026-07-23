@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -191,7 +192,11 @@ struct QwenTokenizer {
             if(end>pos){ std::string span=text.substr(pos,end-pos);
                 for(auto& pc: pretokenize(span)) for(auto& sym: bpe(pc)){
                     auto it=vocab.find(sym); if(it!=vocab.end()) ids.push_back(it->second);
-                    else fprintf(stderr,"[tok] OOV symbol '%s'\n", sym.c_str());
+                    // Byte-level BPE with a complete vocab makes every symbol
+                    // representable, so an OOV here means a bad/mismatched
+                    // vocab.json. Fail loudly rather than dropping a token and
+                    // silently corrupting the LM input (-> wrong audio).
+                    else throw std::runtime_error("qwen_tokenizer: OOV BPE symbol '" + sym + "' (vocab.json incomplete or mismatched)");
                 } }
             if(best==std::string::npos) break;
             ids.push_back(bid); pos=best+blen;
