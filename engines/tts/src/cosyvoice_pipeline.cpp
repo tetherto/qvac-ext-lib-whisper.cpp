@@ -978,7 +978,6 @@ static std::vector<float> run_stft(const model_ctx & m, const std::vector<float>
     const int hop = 4;
     const int F = n_fft / 2 + 1;
     int T_src = (int)src.size();
-    int T_stft = (T_src + n_fft - n_fft) / hop + 1;
     auto window = build_hann_window(n_fft, true);
     auto kernel = build_stft_kernel(n_fft, window);
     static size_t buf_size = 4 * 1024 * 1024;
@@ -1001,7 +1000,6 @@ static std::vector<float> run_stft(const model_ctx & m, const std::vector<float>
     ggml_backend_graph_compute(m.backend, gf);
     std::vector<float> out(ggml_nelements(spec));
     ggml_backend_tensor_get(spec, out.data(), 0, ggml_nbytes(spec));
-    (void)T_stft;
     ggml_gallocr_free(allocr); ggml_free(ctx);
     return out;
 }
