@@ -23,6 +23,12 @@
 #include <string>
 #include <vector>
 
+// Native output sample rate of the CausalHiFT vocoder (Hz). Single source of
+// truth for the native rate: the vocoder source module runs at it, and the
+// public engine re-exports it on SynthesisResult::sample_rate (a static_assert
+// in cosyvoice_engine.cpp keeps the public constant in lock-step with this one).
+constexpr int kCosyvoiceNativeSampleRate = 24000;
+
 // ---- resident model (weights + CPU backend) -------------------------------
 struct model_ctx {
     ggml_backend_t        backend  = nullptr;

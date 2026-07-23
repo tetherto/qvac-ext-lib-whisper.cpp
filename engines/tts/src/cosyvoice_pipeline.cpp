@@ -1007,7 +1007,7 @@ static std::vector<float> run_stft(const model_ctx & m, const std::vector<float>
 std::vector<float> cosyvoice_hift_synth(model_ctx & m,
                                         const std::vector<float> & mel, int mel_len, int seed) {
     const int T_mel = mel_len;
-    const int sampling_rate = 24000;
+    const int sampling_rate = kCosyvoiceNativeSampleRate;
     auto f0 = run_f0_predictor(m, mel, T_mel);
     int upsample = 8 * 5 * 3 * 4;  // prod(upsample_rates) * hop_len = 480
     int T_wav = T_mel * upsample;

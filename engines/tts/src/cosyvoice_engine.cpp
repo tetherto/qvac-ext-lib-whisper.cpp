@@ -31,9 +31,14 @@
 
 namespace tts_cpp::cosyvoice {
 
+// The public native rate (engine.h) must match the vocoder's internal rate
+// (cosyvoice_pipeline.h). This is the one place both are visible; assert they
+// agree so a change to either side fails the build instead of drifting.
+static_assert(kNativeSampleRate == kCosyvoiceNativeSampleRate,
+              "SynthesisResult sample rate must match the vocoder native rate");
+
 namespace {
 
-constexpr int kNativeSampleRate = 24000;
 // CosyVoice3 speech tokens run at 25 Hz -> 960 samples/token at 24 kHz.  Used
 // to size streaming chunks so the streaming contract keeps realistic cadence.
 constexpr int kSamplesPerToken = 960;

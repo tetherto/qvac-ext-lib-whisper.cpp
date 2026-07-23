@@ -150,9 +150,14 @@ struct EngineOptions {
 using StreamCallback = std::function<void(
     const float * pcm, std::size_t samples, int chunk_index, bool is_last)>;
 
+// Native sample rate (Hz) the CosyVoice3 CausalHiFT vocoder emits. Kept in
+// lock-step with the internal vocoder constant by a static_assert in
+// cosyvoice_engine.cpp, so this public value can't silently drift from it.
+constexpr int kNativeSampleRate = 24000;
+
 struct SynthesisResult {
     std::vector<float> pcm;
-    int   sample_rate = 24000;
+    int   sample_rate = kNativeSampleRate;
     float duration_s  = 0.0f;
 };
 
