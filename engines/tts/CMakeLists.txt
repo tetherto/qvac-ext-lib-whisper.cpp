@@ -597,6 +597,42 @@ if (TTS_CPP_BUILD_TESTS)
     set(_tcb_parler_indic_gguf  "${TTS_CPP_TEST_MODEL_DIR}/parler-indic-f32.gguf")
     set(_tcb_parler_indic_ref   "${TTS_CPP_TEST_REF_DIR}/parler-indic-ref")
 
+    # ---- CosyVoice3 per-stage parity tests --------------------------------
+    # Fixtures (f32 GGUFs + PyTorch reference .npy) are produced by
+    # scripts/dump-cosyvoice3-{reference,flow-reference,llm-reference}.py; the
+    # tests auto-disable when a fixture is missing (fresh checkout stays green).
+    set(_tcb_cosy_llm_gguf   "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-f32.gguf")
+    set(_tcb_cosy_flow_gguf  "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-flow-f32.gguf")
+    set(_tcb_cosy_hift_gguf  "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-hift-f32.gguf")
+    set(_tcb_cosy_ref        "${TTS_CPP_TEST_REF_DIR}/cosyvoice3-ref")
+
+    add_executable(test-cosyvoice-flow test/test_cosyvoice_flow.cpp src/cosyvoice_pipeline.cpp)
+    target_link_libraries(test-cosyvoice-flow PRIVATE ggml)
+    target_include_directories(test-cosyvoice-flow PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-cosyvoice-flow)
+    tts_cpp_register_test(test-cosyvoice-flow
+        LABEL    "fixture"
+        ARGS     "--flow-gguf" "${_tcb_cosy_flow_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+        REQUIRES "${_tcb_cosy_flow_gguf}" "${_tcb_cosy_ref}/flow_mel.npy")
+
+    add_executable(test-cosyvoice-llm test/test_cosyvoice_llm.cpp src/cosyvoice_pipeline.cpp)
+    target_link_libraries(test-cosyvoice-llm PRIVATE ggml)
+    target_include_directories(test-cosyvoice-llm PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-cosyvoice-llm)
+    tts_cpp_register_test(test-cosyvoice-llm
+        LABEL    "fixture"
+        ARGS     "--llm-gguf" "${_tcb_cosy_llm_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+        REQUIRES "${_tcb_cosy_llm_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
+
+    add_executable(test-cosyvoice-hift test/test_cosyvoice_hift.cpp src/cosyvoice_pipeline.cpp)
+    target_link_libraries(test-cosyvoice-hift PRIVATE ggml)
+    target_include_directories(test-cosyvoice-hift PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-cosyvoice-hift)
+    tts_cpp_register_test(test-cosyvoice-hift
+        LABEL    "fixture"
+        ARGS     "--hift-gguf" "${_tcb_cosy_hift_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+        REQUIRES "${_tcb_cosy_hift_gguf}" "${_tcb_cosy_ref}/hift_wav.npy")
+
     # ---- Parler-TTS tests (fixtures from scripts/parler/dump-reference.py) ----
     set(_tcb_parler_core_srcs
         src/parler/gguf.cpp
