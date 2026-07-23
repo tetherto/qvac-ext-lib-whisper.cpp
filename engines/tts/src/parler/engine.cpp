@@ -19,6 +19,10 @@ namespace parler {
 
 using namespace ::tts_cpp::parler::detail;
 
+// DAC right receptive field ~10 frames; the extra margin also covers the
+// near-EOS drop region so streamed chunks match the whole-sequence decode.
+static constexpr int kDacStreamRfMargin = 16;
+
 struct Engine::Impl {
     EngineOptions        opts;
     parler_model         model;
@@ -46,7 +50,8 @@ struct Engine::Impl {
         }
     }
 
-    SynthesisResult run(const std::string & prompt, const std::string & description) {
+    SynthesisResult run(const std::string & prompt, const std::string & description,
+                        const StreamCallback * on_chunk = nullptr) {
         if (prompt.empty()) {
             throw std::runtime_error("parler: prompt must not be empty");
         }
@@ -115,6 +120,34 @@ struct Engine::Impl {
             throw std::runtime_error("parler: decoder prefill failed");
         }
 
+        SynthesisResult res;
+        res.sample_rate = hp.dac_sample_rate;
+
+        // Streaming re-decodes the growing code prefix every stream_chunk_frames
+        // steps and emits the newly-stable samples (holding back the DAC right
+        // receptive field so each chunk matches the whole-sequence decode).
+        const bool streaming = on_chunk != nullptr && opts.stream_chunk_frames > 0;
+        int emitted_frames = 0;
+        int chunk_index    = 0;
+        auto emit = [&](bool final_flush) {
+            int nf = 0;
+            const std::vector<int32_t> c = st.undelay(hp.dac_codebook_size, &nf);
+            const int emit_end = final_flush ? nf : nf - kDacStreamRfMargin;
+            if (emit_end <= emitted_frames) return;
+            std::vector<float> pcm;
+            if (!parler_dac_decode(model, c.data(), nf, n_threads, pcm)) {
+                throw std::runtime_error("parler: DAC decode failed");
+            }
+            const std::size_t a = (std::size_t) emitted_frames * hp.dac_hop;
+            const std::size_t b = (std::size_t) emit_end       * hp.dac_hop;
+            (*on_chunk)(pcm.data() + a, b - a, chunk_index++, final_flush);
+            res.pcm.insert(res.pcm.end(), pcm.begin() + a, pcm.begin() + b);
+            emitted_frames = emit_end;
+        };
+
+        int step = 0;
+        int next_emit_at = opts.stream_first_chunk_frames > 0
+                         ? opts.stream_first_chunk_frames : opts.stream_chunk_frames;
         while (true) {
             check_cancel();
             st.process_logits(logits.data(), hp.dec_vocab);
@@ -124,6 +157,10 @@ struct Engine::Impl {
                 throw std::runtime_error("parler: decoder step failed");
             }
             n_past++;
+            if (streaming && ++step >= next_emit_at) {
+                emit(false);
+                next_emit_at = step + opts.stream_chunk_frames;
+            }
         }
 
         int n_frames = 0;
@@ -133,11 +170,16 @@ struct Engine::Impl {
         }
         check_cancel();
 
-        SynthesisResult res;
+        if (streaming) {
+            emit(true);
+            res.duration_s = res.pcm.empty() ? 0.0f
+                           : (float) res.pcm.size() / (float) hp.dac_sample_rate;
+            return res;
+        }
+
         if (!parler_dac_decode(model, codes.data(), n_frames, n_threads, res.pcm)) {
             throw std::runtime_error("parler: DAC decode failed");
         }
-        res.sample_rate = hp.dac_sample_rate;
         res.duration_s  = res.pcm.empty() ? 0.0f
                         : (float) res.pcm.size() / (float) hp.dac_sample_rate;
         return res;
@@ -186,6 +228,12 @@ SynthesisResult Engine::synthesize(const std::string & prompt) {
 SynthesisResult Engine::synthesize(const std::string & prompt,
                                    const std::string & description) {
     return pimpl_->run(prompt, description);
+}
+
+SynthesisResult Engine::synthesize(const std::string & prompt,
+                                   const std::string & description,
+                                   const StreamCallback & on_chunk) {
+    return pimpl_->run(prompt, description, &on_chunk);
 }
 
 void Engine::cancel() {
