@@ -598,9 +598,10 @@ if (TTS_CPP_BUILD_TESTS)
     set(_tcb_parler_indic_ref   "${TTS_CPP_TEST_REF_DIR}/parler-indic-ref")
 
     # ---- CosyVoice3 per-stage parity tests --------------------------------
-    # Fixtures (f32 GGUFs + PyTorch reference .npy) are produced by
-    # scripts/dump-cosyvoice3-{reference,flow-reference,llm-reference}.py; the
-    # tests auto-disable when a fixture is missing (fresh checkout stays green).
+    # Fixtures (f32 GGUFs + PyTorch reference .npy + HF tokenizer_ref.txt) are
+    # produced by scripts/dump-cosyvoice3-{reference,flow-reference,
+    # llm-reference,tokenizer-reference}.py; the tests auto-disable when a
+    # fixture is missing (fresh checkout stays green).
     set(_tcb_cosy_llm_gguf   "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-f32.gguf")
     set(_tcb_cosy_flow_gguf  "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-flow-f32.gguf")
     set(_tcb_cosy_hift_gguf  "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-hift-f32.gguf")
@@ -632,6 +633,20 @@ if (TTS_CPP_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "--hift-gguf" "${_tcb_cosy_hift_gguf}" "--in-dir" "${_tcb_cosy_ref}"
         REQUIRES "${_tcb_cosy_hift_gguf}" "${_tcb_cosy_ref}/hift_wav.npy")
+
+    # Qwen2 BPE tokenizer parity (header-only; no GGUF weights, just the Qwen2
+    # vocab.json/merges.txt bundled with the model + HF-reference ids from
+    # scripts/dump-cosyvoice3-tokenizer-reference.py).
+    set(_tcb_cosy_vocab  "${TTS_CPP_TEST_MODEL_DIR}/vocab.json")
+    set(_tcb_cosy_merges "${TTS_CPP_TEST_MODEL_DIR}/merges.txt")
+    add_executable(test-cosyvoice-tokenizer test/test_cosyvoice_tokenizer.cpp)
+    target_include_directories(test-cosyvoice-tokenizer PRIVATE src)
+    tts_cpp_apply_ccache(test-cosyvoice-tokenizer)
+    tts_cpp_register_test(test-cosyvoice-tokenizer
+        LABEL    "fixture"
+        ARGS     "--vocab" "${_tcb_cosy_vocab}" "--merges" "${_tcb_cosy_merges}"
+                 "--ref" "${_tcb_cosy_ref}/tokenizer_ref.txt"
+        REQUIRES "${_tcb_cosy_vocab}" "${_tcb_cosy_merges}" "${_tcb_cosy_ref}/tokenizer_ref.txt")
 
     # ---- Parler-TTS tests (fixtures from scripts/parler/dump-reference.py) ----
     set(_tcb_parler_core_srcs
