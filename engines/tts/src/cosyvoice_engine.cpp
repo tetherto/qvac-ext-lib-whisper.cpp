@@ -160,7 +160,9 @@ struct Engine::Impl {
     }
 
     int sample_rate() const {
-        return opts.output_sample_rate > 0 ? opts.output_sample_rate : kNativeSampleRate;
+        // output_sample_rate is reserved (no resampling yet) — always report the
+        // native rate we actually emit.
+        return kNativeSampleRate;
     }
 
     // Full text -> 24 kHz PCM pipeline.

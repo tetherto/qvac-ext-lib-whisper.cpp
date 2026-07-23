@@ -75,9 +75,10 @@ struct EngineOptions {
     std::string voice_gguf_path;
 
     // ---- Zero-shot voice cloning (optional) ----
-    // Reference audio (a few seconds of clean speech) + its transcript.
-    // CosyVoice3 conditions the LM on the prompt transcript and the flow /
-    // vocoder on the prompt speech tokens + speaker embedding.
+    // Reserved: cloning from arbitrary reference audio needs the native S3
+    // tokenizer + CAM++ port (s3tok/campplus GGUFs above), which is a follow-up.
+    // If set, iteration 1 logs a warning and falls back to the baked voice.
+    // reference_audio = a few seconds of clean speech; prompt_text = its transcript.
     std::string reference_audio;
     std::string prompt_text;
 
@@ -88,54 +89,53 @@ struct EngineOptions {
     // prompt speech tokens; the baked/selected voice still supplies the timbre.
     // Empty (default) = zero-shot (prompt_text / baked-voice transcript path).
     std::string instruct_text;
-    // Or select a voice baked into voices.gguf (mutually exclusive with the
-    // reference-audio path; reference audio wins when both are set).
+    // Reserved: named-voice selection from a multi-voice voices.gguf is not yet
+    // wired.  Use voice_gguf_path to point at a single baked voice.gguf.
     std::string voice;
 
-    // Language hint (CosyVoice3 is multilingual; used by the text frontend).
+    // Language hint.  Reserved: the text-normalization frontend (wetext) is not
+    // yet integrated, so this is currently accepted but not acted on.
     std::string language = "en";
 
     int seed         = 42;
-    int n_threads    = 0;   // 0 = library default (hardware concurrency)
+    int n_threads    = 0;   // Reserved: not yet forwarded to ggml (default pool).
     int n_gpu_layers = 0;   // 0 = CPU.  Iteration 1 is CPU-only; >0 reserved.
 
-    // Desired output sample rate in Hz.  CosyVoice3 is natively 24 kHz; a
-    // positive value other than 24000 resamples the final PCM and is reported
-    // on SynthesisResult::sample_rate.  0 keeps the native rate.
+    // Reserved: output resampling is not yet implemented.  CosyVoice3 output is
+    // always the native 24 kHz (reported on SynthesisResult::sample_rate),
+    // regardless of this value.
     int output_sample_rate = 0;
 
-    // Flow-matching Euler step count.  0 = model default (CosyVoice3 uses 10).
+    // Reserved: the DiT flow currently runs a fixed 10 Euler steps (the
+    // parity-validated schedule); this override is not yet honored.
     int cfm_steps = 0;
 
     // ---------------- Streaming synthesis ----------------------------
     //
-    // CosyVoice3 is natively a chunked / token-by-token streaming model: the
-    // Qwen2 LM emits speech tokens autoregressively and token2wav consumes
-    // them in hops (the DiT flow + CausalHiFT are causal), stitching chunks
-    // with mel overlap.  When `stream_chunk_tokens > 0` AND a non-empty
-    // callback is passed to synthesize(), the engine runs that chunked loop
-    // and invokes the callback with each chunk's 24 kHz PCM as it is produced.
-    // The returned SynthesisResult.pcm still contains the concatenated audio
-    // (the callback is an *addition*, not a replacement), so the documented
-    // `result.pcm == concat(callback chunks)` invariant holds.  Streaming is
-    // disabled (batch path) when stream_chunk_tokens == 0 OR the callback is
-    // empty.
+    // When `stream_chunk_tokens > 0` AND a non-empty callback is passed to
+    // synthesize(), the callback is driven progressively with 24 kHz PCM in
+    // chunks.  The returned SynthesisResult.pcm still holds the full concatenated
+    // audio (the callback is an *addition*, not a replacement), so
+    // `result.pcm == concat(callback chunks)` holds.  Batch path when
+    // stream_chunk_tokens == 0 OR the callback is empty.
     //
-    //   stream_chunk_tokens        Speech tokens per token2wav hop.
-    //                              0 = non-streaming (batch).
-    //   stream_first_chunk_tokens  Override for the *first* chunk so first
-    //                              audio lands early; 0 = same as
-    //                              stream_chunk_tokens.
-    //   stream_left_context_tokens Left context carried into each chunk to
-    //                              bound per-chunk cost (avoids O(N^2)).
+    // NOTE (iteration 1): the audio is computed in full first, then the callback
+    // is driven over it in chunks.  The native token-by-token token2wav loop that
+    // would make early chunks *arrive* early (true low first-audio latency), and
+    // stream_left_context_tokens (per-chunk cost bounding), are reserved and not
+    // yet realized.
+    //
+    //   stream_chunk_tokens        Speech tokens per emitted chunk (0 = batch).
+    //   stream_first_chunk_tokens  Size of the first emitted chunk (0 = same as
+    //                              stream_chunk_tokens).
+    //   stream_left_context_tokens Reserved (see note); not yet used.
     int stream_chunk_tokens        = 0;
     int stream_first_chunk_tokens  = 0;
     int stream_left_context_tokens = 0;
 
-    // Directory to scan for dynamically-loaded ggml backends.  Forwarded to
-    // ggml_backend_load_all_from_path() on first construction; empty falls
-    // back to ggml's default search path.  (No-op on the iteration-1 stub
-    // CPU path, but plumbed so the option surface is stable.)
+    // Reserved (GPU): directory to scan for dynamically-loaded ggml backends.
+    // Iteration 1 is CPU-only, so this is not consulted yet; plumbed so the
+    // option surface stays stable for the GPU follow-up.
     std::string backends_dir;
 };
 
@@ -160,11 +160,9 @@ struct SynthesisResult {
 // synthesize() calls reuse the resident model.
 class TTS_CPP_API Engine {
 public:
-    // Validates options and prepares the engine.  Throws std::runtime_error
-    // on a hard failure (e.g. model_dir set but missing).  In the
-    // iteration-1 scaffold the heavy GGUF weights are not required to exist:
-    // a warning is logged and synthesize() returns placeholder audio so the
-    // end-to-end SDK flow is exercisable before the converters land.
+    // Loads the model and prepares the resident engine.  Throws
+    // std::runtime_error on a hard failure (e.g. a required GGUF missing under
+    // model_dir).  Loading happens once here; synthesize() reuses it.
     explicit Engine(const EngineOptions & opts);
     ~Engine();
 
@@ -191,7 +189,7 @@ public:
     // Registered name of the resolved backend ("CPU", "Metal", ...).
     std::string backend_name() const;
 
-    // Resolved compute device.  CPU on the iteration-1 stub.
+    // Resolved compute device (CPU — iteration 1 is CPU-only).
     BackendDevice backend_device() const;
 
     // True when a GPU device was present but unusable (fell back to CPU).
