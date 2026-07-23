@@ -125,9 +125,7 @@ def resolve_instruction(args):
     if args.instruct_text:
         instruct = args.instruct_text
     elif args.emotion:
-        if args.emotion not in EMOTION_PRESETS:
-            sys.exit(f"unknown --emotion {args.emotion!r}; "
-                     f"choose from: {', '.join(EMOTION_PRESETS)}")
+        # argparse `choices` already guarantees a valid preset here.
         instruct = EMOTION_PRESETS[args.emotion]
     else:
         return ""
@@ -144,9 +142,9 @@ def main():
                     help="reference wav PATH (CosyVoice3 frontend re-loads it via "
                          "load_wav, so a path -- not a preloaded tensor -- is required)")
     ap.add_argument("--prompt-text", default="", help="transcript of --prompt-audio (zero-shot mode)")
-    ap.add_argument("--emotion", default="",
-                    help="canonical style preset: " + ", ".join(EMOTION_PRESETS) +
-                         ". Uses inference_instruct2. Prefer these over --instruct-text.")
+    ap.add_argument("--emotion", default=None, choices=sorted(EMOTION_PRESETS),
+                    help="canonical style preset (validated against EMOTION_PRESETS). "
+                         "Uses inference_instruct2. Prefer these over --instruct-text.")
     ap.add_argument("--instruct-text", default="",
                     help="raw instruction string (overrides --emotion). "
                          "<|endofprompt|> is appended automatically if absent.")
