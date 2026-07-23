@@ -229,13 +229,36 @@ ggml_tensor * build_qwen(ggml_context * c, const model_ctx & m, const qwen_hp & 
     return ggml_mul_mat(c, G(m, "lm/llm_decoder/weight"), x);
 }
 
-// Per-layer KV cache holding POST-rope K/V (rope is position-deterministic, so
-// caching after rope is correct — same as llama.cpp).  Layout per layer:
-// [HD, NKV, P] flat (ne0=HD fastest).
+// Per-layer KV cache holding POST-rope K / (unroped) V, resident in a backend
+// buffer sized once to the max sequence length (rope is position-deterministic,
+// so caching after rope is correct — same as llama.cpp).  Each step appends its
+// new Lq columns in-graph (ggml_cpy into a column-offset view) and reads the
+// past as a view of the first P columns, so a step moves O(Lq) data instead of
+// round-tripping the whole O(P) cache host<->backend every step (which was
+// O(L^2) over a full decode).  Layout per layer: [HD, NKV, max_P] (ne2=time).
 struct qwen_kvcache {
-    std::vector<std::vector<float>> k, v;
-    int P = 0;
-    void init(int depth) { k.assign(depth, {}); v.assign(depth, {}); P = 0; }
+    ggml_backend_t          backend = nullptr;
+    ggml_context *          ctx     = nullptr;
+    ggml_backend_buffer_t   buf     = nullptr;
+    std::vector<ggml_tensor*> k, v;   // per layer, resident [HD, NKV, max_P]
+    int P = 0, max_P = 0;
+    void init(model_ctx & m, const qwen_hp & hp, int max_tokens) {
+        backend = m.backend; max_P = max_tokens; P = 0;
+        const int HD = hp.head_dim, NKV = hp.n_kv, depth = hp.depth;
+        ggml_init_params p = { ggml_tensor_overhead() * (size_t)(2 * depth) + 64, nullptr, /*no_alloc=*/true };
+        ctx = ggml_init(p);
+        k.assign(depth, nullptr); v.assign(depth, nullptr);
+        for (int i = 0; i < depth; ++i) {
+            k[i] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, NKV, max_P);
+            v[i] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, NKV, max_P);
+        }
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    }
+    void free() {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+        buf = nullptr; ctx = nullptr; P = 0; k.clear(); v.clear();
+    }
 };
 
 // One prefill/decode step with a KV cache.  x_new: [D, Lq], Lq tokens starting
@@ -257,12 +280,8 @@ static std::vector<float> qwen_step_kv(model_ctx & m, const qwen_hp & hp,
     ggml_tensor * pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, Lq); ggml_set_name(pos,"pos"); ggml_set_input(pos);
     ggml_tensor * mask = ggml_new_tensor_2d(c, GGML_TYPE_F32, Lk, Lq); ggml_set_name(mask,"mask"); ggml_set_input(mask);
 
-    std::vector<ggml_tensor*> pk(hp.depth, nullptr), pv(hp.depth, nullptr);
-    if (P > 0) for (int i = 0; i < hp.depth; ++i) {
-        pk[i] = ggml_new_tensor_3d(c, GGML_TYPE_F32, HD, NKV, P); ggml_set_input(pk[i]);
-        pv[i] = ggml_new_tensor_3d(c, GGML_TYPE_F32, HD, NKV, P); ggml_set_input(pv[i]);
-    }
-    std::vector<ggml_tensor*> ok(hp.depth, nullptr), ov(hp.depth, nullptr);
+    // In-graph appends of this step's post-rope K/V into the resident cache.
+    std::vector<ggml_tensor*> cpy_k(hp.depth, nullptr), cpy_v(hp.depth, nullptr);
 
     ggml_tensor * xx = x;
     for (int i = 0; i < hp.depth; ++i) {
@@ -275,16 +294,23 @@ static std::vector<float> qwen_step_kv(model_ctx & m, const qwen_hp & hp,
         v = ggml_reshape_3d(c, v, HD, NKV, Lq);
         q = ggml_rope_ext(c, q, pos, nullptr, HD, GGML_ROPE_TYPE_NEOX, 0, hp.theta, 1.0f,0,1,0,0);
         k = ggml_rope_ext(c, k, pos, nullptr, HD, GGML_ROPE_TYPE_NEOX, 0, hp.theta, 1.0f,0,1,0,0);
-        ggml_tensor * kc = (P > 0) ? ggml_concat(c, pk[i], k, 2) : k;   // [HD,NKV,Lk]
-        ggml_tensor * vc = (P > 0) ? ggml_concat(c, pv[i], v, 2) : v;
-        // Materialise the cache outputs: for prefill vc=v is a reshape VIEW of
-        // the v_proj output, whose memory gallocr reuses as scratch once the
-        // attention path consumes it -> reading it back gives garbage.  cont()
-        // gives each a standalone contiguous buffer the output flag keeps alive.
-        ggml_tensor * k_store = ggml_cont(c, kc);
-        ggml_tensor * v_store = ggml_cont(c, vc);
-        ok[i] = k_store; ggml_set_output(k_store);
-        ov[i] = v_store; ggml_set_output(v_store);
+        // Past K/V come from the resident cache's first P columns (written by
+        // prior steps); attention runs over past ++ this step's new K/V.
+        ggml_tensor * past_k = (P > 0) ? ggml_view_3d(c, cache.k[i], HD, NKV, P,
+                                             cache.k[i]->nb[1], cache.k[i]->nb[2], 0) : nullptr;
+        ggml_tensor * past_v = (P > 0) ? ggml_view_3d(c, cache.v[i], HD, NKV, P,
+                                             cache.v[i]->nb[1], cache.v[i]->nb[2], 0) : nullptr;
+        ggml_tensor * kc = (P > 0) ? ggml_concat(c, past_k, k, 2) : k;   // [HD,NKV,Lk]
+        ggml_tensor * vc = (P > 0) ? ggml_concat(c, past_v, v, 2) : v;
+        // Append this step's new K/V into the resident cache at columns [P,Lk)
+        // for future steps.  Disjoint from past_k/past_v (which read [0,P)), so
+        // there is no read-after-write hazard within this graph.
+        ggml_tensor * dst_k = ggml_view_3d(c, cache.k[i], HD, NKV, Lq,
+                                  cache.k[i]->nb[1], cache.k[i]->nb[2], (size_t)P * cache.k[i]->nb[2]);
+        ggml_tensor * dst_v = ggml_view_3d(c, cache.v[i], HD, NKV, Lq,
+                                  cache.v[i]->nb[1], cache.v[i]->nb[2], (size_t)P * cache.v[i]->nb[2]);
+        cpy_k[i] = ggml_cpy(c, k, dst_k);
+        cpy_v[i] = ggml_cpy(c, v, dst_v);
         ggml_tensor * qh = ggml_reshape_4d(c, ggml_cont(c, ggml_permute(c, q, 0,2,1,3)), HD, Lq, G_, NKV);
         ggml_tensor * kh = ggml_reshape_4d(c, ggml_cont(c, ggml_permute(c, kc, 0,2,1,3)), HD, Lk, 1, NKV);
         ggml_tensor * vh = ggml_reshape_4d(c, ggml_cont(c, ggml_permute(c, vc, 0,2,1,3)), HD, Lk, 1, NKV);
@@ -306,7 +332,7 @@ static std::vector<float> qwen_step_kv(model_ctx & m, const qwen_hp & hp,
     ggml_tensor * logits = ggml_mul_mat(c, G(m, "lm/llm_decoder/weight"), xx); // [VS, Lq]
     ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
-    for (int i = 0; i < hp.depth; ++i) { ggml_build_forward_expand(gf, ok[i]); ggml_build_forward_expand(gf, ov[i]); }
+    for (int i = 0; i < hp.depth; ++i) { ggml_build_forward_expand(gf, cpy_k[i]); ggml_build_forward_expand(gf, cpy_v[i]); }
 
     ggml_gallocr_t al = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
     ggml_gallocr_reserve(al, gf); ggml_gallocr_alloc_graph(al, gf);
@@ -315,20 +341,10 @@ static std::vector<float> qwen_step_kv(model_ctx & m, const qwen_hp & hp,
     { std::vector<int32_t> pv_(Lq); for (int i = 0; i < Lq; ++i) pv_[i] = P + i; ggml_backend_tensor_set(pos, pv_.data(), 0, pv_.size() * 4); }
     { std::vector<float> mk((size_t)Lk * Lq); for (int j = 0; j < Lq; ++j) for (int kk = 0; kk < Lk; ++kk) mk[(size_t)j * Lk + kk] = (kk <= P + j) ? 0.f : -INFINITY;
       ggml_backend_tensor_set(mask, mk.data(), 0, mk.size() * 4); }
-    if (P > 0) for (int i = 0; i < hp.depth; ++i) {
-        ggml_backend_tensor_set(pk[i], cache.k[i].data(), 0, cache.k[i].size() * 4);
-        ggml_backend_tensor_set(pv[i], cache.v[i].data(), 0, cache.v[i].size() * 4);
-    }
-    ggml_backend_graph_compute(m.backend, gf);
+    ggml_backend_graph_compute(m.backend, gf);   // appends this step's K/V into the resident cache
 
     std::vector<float> out(VS);
     ggml_backend_tensor_get(logits, out.data(), (size_t)(Lq - 1) * VS * 4, (size_t)VS * 4);
-    for (int i = 0; i < hp.depth; ++i) {
-        cache.k[i].resize((size_t)HD * NKV * Lk);
-        cache.v[i].resize((size_t)HD * NKV * Lk);
-        ggml_backend_tensor_get(ok[i], cache.k[i].data(), 0, cache.k[i].size() * 4);
-        ggml_backend_tensor_get(ov[i], cache.v[i].data(), 0, cache.v[i].size() * 4);
-    }
     cache.P = Lk;
     ggml_gallocr_free(al); ggml_free(c);
     return out;
@@ -401,7 +417,8 @@ std::vector<int> cosyvoice_llm_generate(model_ctx & m, const qwen_hp & hp,
     std::vector<int> tokens;
     std::mt19937 rng(seed);
     std::vector<uint8_t> buf((size_t)1024 * 1024 * 1024);
-    qwen_kvcache cache; cache.init(hp.depth);
+    // Cache holds the L0 prefill positions plus up to max_steps decode positions.
+    qwen_kvcache cache; cache.init(m, hp, L0 + max_steps + 1);
 
     // Prefill the prompt (sos + text + task + prompt speech tokens) in one pass;
     // its last-position logits give the step-0 distribution.
@@ -416,6 +433,7 @@ std::vector<int> cosyvoice_llm_generate(model_ctx & m, const qwen_hp & hp,
         std::vector<float> x1(spk_emb + (size_t)tok * SE_D, spk_emb + (size_t)(tok + 1) * SE_D);
         logits = qwen_step_kv(m, hp, x1.data(), 1, D, VS, cache, buf);
     }
+    cache.free();
     return tokens;
 }
 
