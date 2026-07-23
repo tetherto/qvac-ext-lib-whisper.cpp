@@ -557,6 +557,16 @@ std::vector<float> cosyvoice_flow_run(model_ctx & m,
     std::vector<float> rn_host(ggml_nelements(rnt));
     ggml_backend_tensor_get(rnt, rn_host.data(), 0, rn_host.size() * 4);
     int RNW = (int)rnt->ne[0];
+    // The baked rand_noise is [RNW=15000, 80]; the gather below reads time index
+    // t in [0,TM). PyTorch caps the CFM at the same 15000 frames, so refuse
+    // (rather than over-read the buffer) when the requested mel length exceeds
+    // what the baked noise covers — ~5 min of speech at token_mel_ratio=2.
+    if (TM > RNW) {
+        throw std::runtime_error(
+            "cosyvoice_flow_run: requested mel length " + std::to_string(TM) +
+            " exceeds baked rand_noise frames " + std::to_string(RNW) +
+            " (input too long; max ~" + std::to_string(RNW / 2) + " tokens)");
+    }
     std::vector<float> x_host((size_t)MEL * TM);
     for (int ch = 0; ch < MEL; ++ch) for (int t = 0; t < TM; ++t) x_host[(size_t)ch + (size_t)t * MEL] = rn_host[(size_t)t + (size_t)ch * RNW];
 
