@@ -251,6 +251,11 @@ set(TTS_CPP_LIB_SOURCES
     src/supertonic_engine.cpp
     src/supertonic_voice_json.cpp
     src/supertonic_chunker.cpp
+    # CosyVoice3 (Fun-CosyVoice3-0.5B / 1.5B) — native CPU pipeline.
+    # cosyvoice_pipeline.cpp is the shared graph core (LM / DiT flow / HiFT),
+    # also used by the cosyvoice-{llm,flow,hift} parity CLIs below.
+    src/cosyvoice_pipeline.cpp
+    src/cosyvoice_engine.cpp
     src/mtl_tokenizer.cpp
     src/text_preprocess.cpp
     # LavaSR neural speech enhancement — CPU/GGML post-process.
@@ -445,6 +450,31 @@ if (TTS_CPP_BUILD_EXECUTABLES)
     target_include_directories(mel2wav PRIVATE ggml/include src)
     tts_cpp_apply_ccache(mel2wav)
 
+    # CosyVoice3 CausalHiFTGenerator vocoder (mel -> 24 kHz wav). Same
+    # HiFTGenerator lineage as Chatterbox's mel2wav with CosyVoice3's causal
+    # semantics + SineGen2. Validated at 0.989 log-mel corr vs the PyTorch
+    # reference (0.996 waveform corr after the source-excitation phase fix).
+    add_executable(cosyvoice-hift src/cosyvoice_hift.cpp src/cosyvoice_pipeline.cpp)
+    target_link_libraries(cosyvoice-hift PRIVATE ggml)
+    target_include_directories(cosyvoice-hift PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(cosyvoice-hift)
+
+    # CosyVoice3 flow (stage 4): 22-layer DiT + CFM Euler loop (speech tokens ->
+    # mel). Parity-gated against the PyTorch reference (flow_mel cosine
+    # 1.000000). Uses only standard ggml ops.
+    add_executable(cosyvoice-flow src/cosyvoice_flow.cpp src/cosyvoice_pipeline.cpp)
+    target_link_libraries(cosyvoice-flow PRIVATE ggml)
+    target_include_directories(cosyvoice-flow PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(cosyvoice-flow)
+
+    # CosyVoice3 LLM (stage 5): Qwen2.5-0.5B speech LM (text -> speech tokens),
+    # autoregressive decode + RAS sampling + Qwen2 BPE tokenizer (qwen_tokenizer.h).
+    # Prefill logits cosine 1.000000 vs the PyTorch reference.
+    add_executable(cosyvoice-llm src/cosyvoice_llm.cpp src/cosyvoice_pipeline.cpp)
+    target_link_libraries(cosyvoice-llm PRIVATE ggml)
+    target_include_directories(cosyvoice-llm PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(cosyvoice-llm)
+
     add_executable(supertonic-cli src/supertonic_cli.cpp)
     target_link_libraries(supertonic-cli PRIVATE tts-cpp)
     tts_cpp_apply_ccache(supertonic-cli)
@@ -463,6 +493,12 @@ if (TTS_CPP_BUILD_EXECUTABLES)
     target_link_libraries(lavasr-bench PRIVATE tts-cpp)
     target_include_directories(lavasr-bench PRIVATE include ggml/include src)
     tts_cpp_apply_ccache(lavasr-bench)
+
+    # CosyVoice3 end-to-end CLI: text -> 24 kHz WAV via the public Engine (the
+    # same API the JS addon / @qvac/sdk drive).  See src/cosyvoice_cli.cpp.
+    add_executable(cosyvoice-cli src/cosyvoice_cli.cpp)
+    target_link_libraries(cosyvoice-cli PRIVATE tts-cpp)
+    tts_cpp_apply_ccache(cosyvoice-cli)
 endif()
 
 if (TTS_CPP_BUILD_TESTS)
@@ -565,6 +601,57 @@ if (TTS_CPP_BUILD_TESTS)
     set(_tcb_parler_ref         "${TTS_CPP_TEST_REF_DIR}/parler-ref")
     set(_tcb_parler_indic_gguf  "${TTS_CPP_TEST_MODEL_DIR}/parler-indic-f32.gguf")
     set(_tcb_parler_indic_ref   "${TTS_CPP_TEST_REF_DIR}/parler-indic-ref")
+
+    # ---- CosyVoice3 per-stage parity tests --------------------------------
+    # Fixtures (f32 GGUFs + PyTorch reference .npy + HF tokenizer_ref.txt) are
+    # produced by scripts/dump-cosyvoice3-{reference,flow-reference,
+    # llm-reference,tokenizer-reference}.py; the tests auto-disable when a
+    # fixture is missing (fresh checkout stays green).
+    set(_tcb_cosy_llm_gguf   "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-f32.gguf")
+    set(_tcb_cosy_flow_gguf  "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-flow-f32.gguf")
+    set(_tcb_cosy_hift_gguf  "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-hift-f32.gguf")
+    set(_tcb_cosy_ref        "${TTS_CPP_TEST_REF_DIR}/cosyvoice3-ref")
+
+    add_executable(test-cosyvoice-flow test/test_cosyvoice_flow.cpp src/cosyvoice_pipeline.cpp)
+    target_link_libraries(test-cosyvoice-flow PRIVATE ggml)
+    target_include_directories(test-cosyvoice-flow PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-cosyvoice-flow)
+    tts_cpp_register_test(test-cosyvoice-flow
+        LABEL    "fixture"
+        ARGS     "--flow-gguf" "${_tcb_cosy_flow_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+        REQUIRES "${_tcb_cosy_flow_gguf}" "${_tcb_cosy_ref}/flow_mel.npy")
+
+    add_executable(test-cosyvoice-llm test/test_cosyvoice_llm.cpp src/cosyvoice_pipeline.cpp)
+    target_link_libraries(test-cosyvoice-llm PRIVATE ggml)
+    target_include_directories(test-cosyvoice-llm PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-cosyvoice-llm)
+    tts_cpp_register_test(test-cosyvoice-llm
+        LABEL    "fixture"
+        ARGS     "--llm-gguf" "${_tcb_cosy_llm_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+        REQUIRES "${_tcb_cosy_llm_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
+
+    add_executable(test-cosyvoice-hift test/test_cosyvoice_hift.cpp src/cosyvoice_pipeline.cpp)
+    target_link_libraries(test-cosyvoice-hift PRIVATE ggml)
+    target_include_directories(test-cosyvoice-hift PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-cosyvoice-hift)
+    tts_cpp_register_test(test-cosyvoice-hift
+        LABEL    "fixture"
+        ARGS     "--hift-gguf" "${_tcb_cosy_hift_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+        REQUIRES "${_tcb_cosy_hift_gguf}" "${_tcb_cosy_ref}/hift_wav.npy")
+
+    # Qwen2 BPE tokenizer parity (header-only; no GGUF weights, just the Qwen2
+    # vocab.json/merges.txt bundled with the model + HF-reference ids from
+    # scripts/dump-cosyvoice3-tokenizer-reference.py).
+    set(_tcb_cosy_vocab  "${TTS_CPP_TEST_MODEL_DIR}/vocab.json")
+    set(_tcb_cosy_merges "${TTS_CPP_TEST_MODEL_DIR}/merges.txt")
+    add_executable(test-cosyvoice-tokenizer test/test_cosyvoice_tokenizer.cpp)
+    target_include_directories(test-cosyvoice-tokenizer PRIVATE src)
+    tts_cpp_apply_ccache(test-cosyvoice-tokenizer)
+    tts_cpp_register_test(test-cosyvoice-tokenizer
+        LABEL    "fixture"
+        ARGS     "--vocab" "${_tcb_cosy_vocab}" "--merges" "${_tcb_cosy_merges}"
+                 "--ref" "${_tcb_cosy_ref}/tokenizer_ref.txt"
+        REQUIRES "${_tcb_cosy_vocab}" "${_tcb_cosy_merges}" "${_tcb_cosy_ref}/tokenizer_ref.txt")
 
     # ---- Parler-TTS tests (fixtures from scripts/parler/dump-reference.py) ----
     set(_tcb_parler_core_srcs
@@ -1147,15 +1234,15 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     --t3 "${_tcb_t3_mtl_gguf}" --s3gen "${_tcb_s3gen_mtl_gguf}" --cfm-steps 2
         REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}")
 
-    add_executable(test-streaming
+    add_executable(test-tts-streaming
         test/test_streaming.cpp
         src/chatterbox_tts.cpp
         src/sched_dispatch.cpp
         src/backend_selection.cpp)
-    target_link_libraries(test-streaming PRIVATE ggml tts-cpp-backend-defs)
-    target_include_directories(test-streaming PRIVATE ggml/include src include)
-    tts_cpp_apply_ccache(test-streaming)
-    tts_cpp_register_test(test-streaming
+    target_link_libraries(test-tts-streaming PRIVATE ggml tts-cpp-backend-defs)
+    target_include_directories(test-tts-streaming PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-tts-streaming)
+    tts_cpp_register_test(test-tts-streaming
         LABEL    "fixture"
         ARGS     "${_tcb_s3gen_gguf}" "${_tcb_streaming_ref}"
         REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_streaming_ref}")
@@ -1661,7 +1748,7 @@ if (TTS_CPP_BUILD_TESTS)
     # primitives.  No GGUF needed; register as "unit" label so a
     # fresh checkout's ctest exercises them.  Links against tts-cpp
     # (STATIC) so the detail-namespace symbols are reachable, same
-    # pattern as test-mtl-tokenizer / test-t3-mtl / test-streaming.
+    # pattern as test-mtl-tokenizer / test-t3-mtl / test-tts-streaming.
     add_executable(test-supertonic-backend-dispatch
         test/test_supertonic_backend_dispatch.cpp)
     target_link_libraries(test-supertonic-backend-dispatch PRIVATE tts-cpp)

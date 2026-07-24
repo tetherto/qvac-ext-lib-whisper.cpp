@@ -146,6 +146,42 @@ struct EngineOptions {
     // first-utterance latency is the user-perceived metric.
     bool  prewarm                = false;
     float prewarm_audio_seconds  = 1.0f;
+
+    // ── Long-form offline transcription (bounded-memory encoder) ──────────
+    //
+    // transcribe_samples() / transcribe_samples_stream() run the conformer
+    // encoder over the whole input in a single graph. Self-attention is
+    // O(T_enc^2) in encoder frames, so multi-hour inputs build tens-of-GB
+    // score tensors and OOM the process (a ~90 min file needs ~100 GB). When
+    // the input would exceed `long_form_window_frames` encoder frames, the
+    // encoder is instead slid over the audio in overlapping windows, the
+    // shared context is trimmed at the interior seams, and the per-window
+    // encoder outputs are concatenated into a single buffer the decoder
+    // consumes exactly as before. The mel-spectrogram is still computed once
+    // over the whole input, so per-feature CMVN statistics stay global; only the
+    // encoder's self-attention becomes window-local, so a windowed run's
+    // committed frames closely approximate -- but are not bit-identical to -- a
+    // full single-pass encode. Inputs that already fit in one window skip
+    // windowing entirely and keep the bit-identical single-pass path, so
+    // short/typical files are unaffected.
+    //
+    // long_form_window_frames -- requested encoder-frame ceiling per window.
+    // Whatever the source, the effective window is floored to a small minimum
+    // and never exceeds the encoder's trained positional range
+    // (pos_emb_max_len), which is a hard ceiling:
+    //     > 0  explicit request (still clamped to pos_emb_max_len).
+    //     = 0  auto: min(pos_emb_max_len, 3750), which keeps each window inside
+    //          the model's trained positional range and caps the attention
+    //          score tensor at a few hundred MB.
+    //     < 0  disabled: always single-pass (legacy behaviour; OOMs on long
+    //          inputs -- for A/B testing only).
+    //
+    // long_form_context_frames -- shared left/right context each window carries
+    // so its committed centre frames see enough neighbourhood to match the
+    // single-pass encoder. Trimmed off after the encoder runs, so it never
+    // appears twice in the output. 0 => auto (min(256, window/4) each side).
+    int long_form_window_frames  = 0;
+    int long_form_context_frames = 0;
 };
 
 // Resolved compute device the Engine is actually running on, after the
@@ -247,6 +283,17 @@ public:
     // when a GPU backend is active; literal "CPU" otherwise. Stable for
     // the lifetime of the Engine.
     std::string backend_name() const;
+
+    // Compute backend of the FastConformer encoder specifically. Returns
+    // "coreml" when the Apple Core ML (Neural Engine) sidecar is active;
+    // otherwise identical to backend_name(). The decoder (TDT/CTC) always
+    // runs on the ggml backend reported by backend_name().
+    std::string encoder_backend() const;
+
+    // True when the FastConformer encoder runs on the Apple Core ML (Neural
+    // Engine) sidecar rather than the ggml backend. Always false on non-Apple
+    // builds and whenever the sidecar is absent or failed to initialise.
+    bool encoder_on_coreml() const;
 
     // True when a GPU was detected but the engine fell back to CPU because it is
     // a known-bad backend (Mali). A CPU backend with this set is expected, not a
