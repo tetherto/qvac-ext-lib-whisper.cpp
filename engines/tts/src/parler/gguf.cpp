@@ -203,6 +203,12 @@ bool parler_load_gguf(const std::string & path, parler_model & model,
 
     ::tts_cpp::detail::ensure_backends_loaded();
     model.backend = ::tts_cpp::detail::init_gpu_backend(n_gpu_layers, /*verbose=*/false, "parler");
+    // Parler's GPU path (FA + fused weights + DAC phase-GEMM) is validated on Metal only;
+    // other GPU backends fall back to CPU until validated (PR #103).
+    if (model.backend && !::tts_cpp::detail::backend_is_metal(model.backend)) {
+        ggml_backend_free(model.backend);
+        model.backend = nullptr;
+    }
     if (!model.backend) model.backend = ::tts_cpp::detail::init_cpu_backend();
     if (!model.backend) return fail("failed to init backend");
 
@@ -376,36 +382,40 @@ bool parler_load_gguf(const std::string & path, parler_model & model,
             if (model.lm_heads[k]->type != model.lm_heads[0]->type ||
                 model.lm_heads[k]->ne[0] != d || model.lm_heads[k]->ne[1] != vocab) { fuse_heads = false; break; }
         }
-        ggml_init_params ip = { (size_t)(nl + 2) * ggml_tensor_overhead(), nullptr, /*no_alloc=*/ true };
-        model.ctx_fused = ggml_init(ip);
-        if (!model.ctx_fused) return fail("ggml_init(ctx_fused) failed");
-        std::vector<ggml_tensor *> qkv(nl, nullptr);
-        if (fuse_qkv) {
-            for (int i = 0; i < nl; ++i)
-                qkv[i] = ggml_new_tensor_2d(model.ctx_fused, model.dec_layers[i].q->type, d, 3 * d);
-        }
-        ggml_tensor * heads = fuse_heads
-            ? ggml_new_tensor_2d(model.ctx_fused, model.lm_heads[0]->type, d, vocab * nq) : nullptr;
-        model.buffer_fused = ggml_backend_alloc_ctx_tensors(model.ctx_fused, model.backend);
-        if (!model.buffer_fused) return fail("failed to allocate fused-weight buffer");
-        std::vector<uint8_t> tmp;
-        auto copy_into = [&](ggml_tensor * dst, size_t off, ggml_tensor * src) {
-            tmp.resize(ggml_nbytes(src));
-            ggml_backend_tensor_get(src, tmp.data(), 0, tmp.size());
-            ggml_backend_tensor_set(dst, tmp.data(), off, tmp.size());
-        };
-        if (fuse_qkv) {
-            for (int i = 0; i < nl; ++i) {
-                auto & l = model.dec_layers[i];
-                const size_t nb = ggml_nbytes(l.q);
-                copy_into(qkv[i], 0, l.q); copy_into(qkv[i], nb, l.k); copy_into(qkv[i], 2 * nb, l.v);
-                l.qkv = qkv[i];
+        // Skip the fused context entirely when nothing fuses: an empty ctx makes
+        // ggml_backend_alloc_ctx_tensors return NULL (0 buffers) and abort the load.
+        if (fuse_qkv || fuse_heads) {
+            ggml_init_params ip = { (size_t)(nl + 2) * ggml_tensor_overhead(), nullptr, /*no_alloc=*/ true };
+            model.ctx_fused = ggml_init(ip);
+            if (!model.ctx_fused) return fail("ggml_init(ctx_fused) failed");
+            std::vector<ggml_tensor *> qkv(nl, nullptr);
+            if (fuse_qkv) {
+                for (int i = 0; i < nl; ++i)
+                    qkv[i] = ggml_new_tensor_2d(model.ctx_fused, model.dec_layers[i].q->type, d, 3 * d);
             }
-        }
-        if (fuse_heads) {
-            const size_t nb = ggml_nbytes(model.lm_heads[0]);
-            for (int k = 0; k < nq; ++k) copy_into(heads, (size_t) k * nb, model.lm_heads[k]);
-            model.lm_head_stacked = heads;
+            ggml_tensor * heads = fuse_heads
+                ? ggml_new_tensor_2d(model.ctx_fused, model.lm_heads[0]->type, d, vocab * nq) : nullptr;
+            model.buffer_fused = ggml_backend_alloc_ctx_tensors(model.ctx_fused, model.backend);
+            if (!model.buffer_fused) return fail("failed to allocate fused-weight buffer");
+            std::vector<uint8_t> tmp;
+            auto copy_into = [&](ggml_tensor * dst, size_t off, ggml_tensor * src) {
+                tmp.resize(ggml_nbytes(src));
+                ggml_backend_tensor_get(src, tmp.data(), 0, tmp.size());
+                ggml_backend_tensor_set(dst, tmp.data(), off, tmp.size());
+            };
+            if (fuse_qkv) {
+                for (int i = 0; i < nl; ++i) {
+                    auto & l = model.dec_layers[i];
+                    const size_t nb = ggml_nbytes(l.q);
+                    copy_into(qkv[i], 0, l.q); copy_into(qkv[i], nb, l.k); copy_into(qkv[i], 2 * nb, l.v);
+                    l.qkv = qkv[i];
+                }
+            }
+            if (fuse_heads) {
+                const size_t nb = ggml_nbytes(model.lm_heads[0]);
+                for (int k = 0; k < nq; ++k) copy_into(heads, (size_t) k * nb, model.lm_heads[k]);
+                model.lm_head_stacked = heads;
+            }
         }
     }
 
