@@ -212,9 +212,15 @@ static ggml_tensor * lm_attn(ggml_context * ctx, ggml_cgraph * gf, const Qwen3Co
     ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, k, kv_rows));
     ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, v, kv_rows));
 
-    // Read padded window [0, n_kv_pad).
-    ggml_tensor * k_full = ggml_view_3d(ctx, cache_k, D, n_kv_pad, Nkv, cache_k->nb[1], cache_k->nb[2], 0);
-    ggml_tensor * v_full = ggml_view_3d(ctx, cache_v, D, n_kv_pad, Nkv, cache_v->nb[1], cache_v->nb[2], 0);
+    // Read padded window [0, n_kv_pad). These views are NON-contiguous: nb[2] is the
+    // full cache channel stride (max_seq), not n_kv_pad, so consecutive KV heads sit
+    // max_seq rows apart while we only read n_kv_pad of each. ggml_mul_mat on Vulkan
+    // mishandles a non-contiguous f16 src0 (it assumes packed channels) and returns
+    // wrong scores -> the LM degenerates on GPU (repeated/robotic codes) while CPU,
+    // which honours the strides, is correct. Packing the window with ggml_cont makes
+    // the KV read backend-agnostic. Verified bit-parity CPU vs Vulkan after cont.
+    ggml_tensor * k_full = ggml_cont(ctx, ggml_view_3d(ctx, cache_k, D, n_kv_pad, Nkv, cache_k->nb[1], cache_k->nb[2], 0));
+    ggml_tensor * v_full = ggml_cont(ctx, ggml_view_3d(ctx, cache_v, D, n_kv_pad, Nkv, cache_v->nb[1], cache_v->nb[2], 0));
 
     const float   scale = 1.0f / sqrtf((float) D);
     ggml_tensor * attn  = q3_attn_f32(ctx, q, k_full, v_full, mask, scale);  // [D, Nh, S]

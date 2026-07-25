@@ -209,19 +209,25 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     }
 
     // Backend layout when a GPU is active. Almost everything runs on the GPU, but
-    // the autoregressive LM is the exception: on iOS A-series Metal it produces
-    // empty/garbage logits -> the sampler yields zero audio codes ("LM produced
-    // no audio codes"), while the SAME weights decode correctly on CPU. This is a
-    // NUMERICAL issue, not memory (unified RAM doesn't help), confirmed by testing
-    // the full-GPU path on device. So the LM defaults to the CPU backend whenever
-    // a GPU is active; the one-shot text/cond encoders stay on the GPU with the
+    // the autoregressive LM is the exception on ONE backend: iOS/macOS A-series
+    // Metal produces empty/garbage logits -> the sampler yields zero audio codes
+    // ("LM produced no audio codes"), while the SAME weights decode correctly on
+    // CPU. This is a NUMERICAL issue, not memory (unified RAM doesn't help),
+    // confirmed by testing the full-GPU path on device. It is Metal-specific, so
+    // we only pin the LM to CPU when the active GPU backend is Metal; on
+    // Vulkan/CUDA the LM runs on the GPU by default (the whole reason to enable a
+    // GPU). The one-shot text/cond encoders always stay on the GPU with the
     // DiT + VAE. Env escape hatches (no rebuild needed):
-    //   ACESTEP_LM_GPU=1        -> force the LM back onto the GPU (desktop bench)
+    //   ACESTEP_LM_GPU=1        -> force the LM onto the GPU (even on Metal)
+    //   ACESTEP_LM_CPU=1        -> force the LM onto the CPU (any backend)
     //   ACESTEP_ENCODERS_CPU=1  -> move the encoders to the CPU (trim wired mem)
     ggml_backend_t enc_backend = m->backend;
     ggml_backend_t lm_backend  = m->backend;
     if (on_gpu) {
-        lm_backend = m->backend_cpu;  // A-series Metal LM is numerically broken
+        const char * be_name  = ggml_backend_name(m->backend);
+        const bool   is_metal = be_name && std::strstr(be_name, "Metal") != nullptr;
+        if (is_metal) lm_backend = m->backend_cpu;  // A-series Metal LM is numerically broken
+        if (std::getenv("ACESTEP_LM_CPU"))       lm_backend  = m->backend_cpu;
         if (std::getenv("ACESTEP_LM_GPU"))       lm_backend  = m->backend;
         if (std::getenv("ACESTEP_ENCODERS_CPU")) enc_backend = m->backend_cpu;
         if (v) fprintf(stderr, "[acestep-engine] backends: enc=%s lm=%s dit/vae=%s\n",
