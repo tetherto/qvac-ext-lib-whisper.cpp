@@ -299,9 +299,9 @@ Typical f16 stage rel vs NeMo (order of magnitude): mel ~1e-4 inner, blocks ~1e-
 | `cmake/` | Package templates (`qvac-parakeet-config.cmake.in`, `qvac-parakeet.pc.in`) |
 | `src/` | Engine, decoders, mel, CLI |
 | `include/parakeet/` | Public headers (`parakeet.h`, `engine.h`, `streaming.h`, …) |
-| `test/` | `test_*.cpp` CTest sources |
+| `test/` | `test_*.cpp` CTest sources; `consumer/` is the downstream fixture used by the package-consumption test |
 | `examples/` | `live-mic`, `live-mic-attributed`, vendored miniaudio |
-| `scripts/` | `setup-ggml.sh`, conversion, NeMo dumps, `download-all-models.sh`; optional tools in §4 |
+| `scripts/` | `setup-ggml.sh`, `test-package-consumption.sh` (installed-package contract: `find_package(qvac-parakeet)` + `qvac::parakeet`, pkg-config `--static`, no bare-`parakeet` artifacts), conversion, NeMo dumps, `download-all-models.sh`; optional tools in §4 |
 | `patches/` | ggml patches applied by `setup-ggml.sh` (filename-prefix loader, OpenCL relax, OpenCL kernel-binary cache) |
 | `ggml/` | Pinned upstream clone (or `-DPARAKEET_USE_SYSTEM_GGML=ON`) |
 | `models/`, `artifacts/`, `test/samples/` | Local fixtures (not tracked) |

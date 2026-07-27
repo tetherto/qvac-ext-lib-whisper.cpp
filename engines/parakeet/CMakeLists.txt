@@ -1166,16 +1166,137 @@ if (PARAKEET_INSTALL AND PARAKEET_BUILD_LIBRARY)
         DESTINATION ${PARAKEET_CONFIG_INSTALL_DIR}
     )
 
-    # ggml link names for the .pc: every QVAC ggml build renames its
+    # ---------------------------------------------------------------
+    # pkg-config linkage.
+    #
+    # ggml: derived from the actual ggml targets rather than from a
+    # hardcoded name list, because every QVAC ggml build renames its
     # libraries via GGML_LIB_OUTPUT_PREFIX (the ggml-speech vcpkg port
-    # uses `qvac-speech-`, the bundled build above sets `speech-`), so
-    # a hardcoded -lggml would never resolve against the install tree.
-    # The qvac-ext-ggml@speech ggml-config.cmake exports the prefix and
-    # the bundled subtree defines it as a cache option, so it is in
-    # scope here for both acquisition paths; a stock unprefixed ggml
-    # leaves it unset and the expansion degrades to plain -lggml.
-    set(PARAKEET_PC_GGML_LIBS
-        "-l${GGML_LIB_OUTPUT_PREFIX}ggml -l${GGML_LIB_OUTPUT_PREFIX}ggml-base")
+    # uses `qvac-speech-`, the bundled build above sets `speech-`) and
+    # a system ggml may live in a different prefix than ours. For an
+    # imported (system) ggml we read IMPORTED_LOCATION and emit both
+    # the containing -L and the real library stem; for the bundled
+    # in-tree build we read OUTPUT_NAME and rely on our own ${libdir}
+    # (the re-install rule above puts ggml there). Deliberately NOT
+    # `Requires: ggml`: the qvac-ext-ggml@speech ggml.pc advertises an
+    # unprefixed `-lggml` that no install actually produces and omits
+    # ggml-base entirely, so inheriting it would under-link. Revisit
+    # once that .pc is fixed upstream in the fork.
+    set(_pk_pc_ggml_libs "")
+    set(_pk_pc_ggml_libdirs "")
+    foreach (_pk_ggml_tgt ggml::ggml ggml::ggml-base ggml ggml-base)
+        if (NOT TARGET ${_pk_ggml_tgt})
+            continue()
+        endif()
+        get_target_property(_pk_ggml_imported ${_pk_ggml_tgt} IMPORTED)
+        set(_pk_ggml_libname "")
+        if (_pk_ggml_imported)
+            set(_pk_ggml_loc "")
+            get_target_property(_pk_ggml_loc ${_pk_ggml_tgt} IMPORTED_LOCATION)
+            if (NOT _pk_ggml_loc)
+                foreach (_pk_cfg RELEASE NOCONFIG DEBUG "")
+                    if (_pk_cfg)
+                        get_target_property(_pk_ggml_loc ${_pk_ggml_tgt} IMPORTED_LOCATION_${_pk_cfg})
+                    endif()
+                    if (_pk_ggml_loc)
+                        break()
+                    endif()
+                endforeach()
+            endif()
+            if (_pk_ggml_loc)
+                get_filename_component(_pk_ggml_dir  "${_pk_ggml_loc}" DIRECTORY)
+                get_filename_component(_pk_ggml_stem "${_pk_ggml_loc}" NAME_WE)
+                string(REGEX REPLACE "^lib" "" _pk_ggml_libname "${_pk_ggml_stem}")
+                if (NOT _pk_ggml_dir STREQUAL "${CMAKE_INSTALL_FULL_LIBDIR}")
+                    list(APPEND _pk_pc_ggml_libdirs "-L${_pk_ggml_dir}")
+                endif()
+            endif()
+        else()
+            get_target_property(_pk_ggml_libname ${_pk_ggml_tgt} OUTPUT_NAME)
+            if (NOT _pk_ggml_libname)
+                set(_pk_ggml_libname "${_pk_ggml_tgt}")
+            endif()
+        endif()
+        # Namespaced and plain spellings of the same target both appear in
+        # the loop (only one exists per acquisition path, but the bundled
+        # build aliases ggml::ggml -> ggml); de-duplicate on the resolved
+        # library name so the .pc never lists a library twice.
+        if (_pk_ggml_libname AND NOT "-l${_pk_ggml_libname}" IN_LIST _pk_pc_ggml_libs)
+            list(APPEND _pk_pc_ggml_libs "-l${_pk_ggml_libname}")
+        endif()
+    endforeach()
+    if (NOT _pk_pc_ggml_libs)
+        # Nothing resolvable (e.g. a hand-rolled ggml import with no
+        # location): fall back to the prefix-derived names so the .pc is
+        # still populated rather than silently empty.
+        set(_pk_pc_ggml_libs "-l${GGML_LIB_OUTPUT_PREFIX}ggml" "-l${GGML_LIB_OUTPUT_PREFIX}ggml-base")
+        message(WARNING "parakeet: could not resolve ggml library files for qvac-parakeet.pc; "
+                        "falling back to prefix-derived names (${_pk_pc_ggml_libs})")
+    endif()
+    list(REMOVE_DUPLICATES _pk_pc_ggml_libdirs)
+    string(JOIN " " PARAKEET_PC_GGML_LIBS ${_pk_pc_ggml_libdirs} ${_pk_pc_ggml_libs})
+
+    # ggml include dir, same reasoning as the -L above: the installed
+    # <parakeet/log.h> includes "ggml.h", so a pkg-config consumer needs
+    # ggml's headers on the search path. They are only co-located with
+    # ours in the bundled build; a system ggml lives in its own prefix.
+    set(_pk_pc_ggml_incs "")
+    foreach (_pk_ggml_tgt ggml::ggml ggml)
+        if (NOT TARGET ${_pk_ggml_tgt})
+            continue()
+        endif()
+        get_target_property(_pk_ggml_ifaces ${_pk_ggml_tgt} INTERFACE_INCLUDE_DIRECTORIES)
+        if (_pk_ggml_ifaces)
+            foreach (_pk_ggml_inc IN LISTS _pk_ggml_ifaces)
+                # Skip generator expressions ($<BUILD_INTERFACE:...> on the
+                # in-tree target) and our own includedir.
+                if (_pk_ggml_inc MATCHES "\\$<" OR NOT IS_DIRECTORY "${_pk_ggml_inc}")
+                    continue()
+                endif()
+                if (NOT _pk_ggml_inc STREQUAL "${CMAKE_INSTALL_FULL_INCLUDEDIR}")
+                    list(APPEND _pk_pc_ggml_incs "-I${_pk_ggml_inc}")
+                endif()
+            endforeach()
+        endif()
+        break()
+    endforeach()
+    list(REMOVE_DUPLICATES _pk_pc_ggml_incs)
+    string(JOIN " " PARAKEET_PC_GGML_CFLAGS ${_pk_pc_ggml_incs})
+
+    # Libs.private: deps that are PRIVATE/interface-only on the target and
+    # therefore NOT contained in the static archive. pkg-config consumers
+    # of a static libqvac-parakeet must pass these themselves or the link
+    # fails on unresolved OpenMP / Core ML symbols; `pkg-config --static`
+    # is what pulls them in. Harmless for shared consumption (the .so
+    # already carries its own dependencies).
+    set(_pk_pc_private "")
+    if (OpenMP_CXX_FOUND)
+        # OpenMP_CXX_FLAGS carries the compile/link driver flag (-fopenmp,
+        # or `-Xclang -fopenmp` on AppleClang, which needs the explicit
+        # runtime below). OpenMP_CXX_LIBRARIES holds absolute paths;
+        # pkg-config accepts those verbatim, so pass them through rather
+        # than guessing between -lgomp / -lomp / -liomp5.
+        if (OpenMP_CXX_FLAGS)
+            list(APPEND _pk_pc_private ${OpenMP_CXX_FLAGS})
+        endif()
+        foreach (_pk_omp_lib IN LISTS OpenMP_CXX_LIBRARIES)
+            if (IS_ABSOLUTE "${_pk_omp_lib}")
+                list(APPEND _pk_pc_private "${_pk_omp_lib}")
+            else()
+                list(APPEND _pk_pc_private "-l${_pk_omp_lib}")
+            endif()
+        endforeach()
+    endif()
+    if (PARAKEET_COREML)
+        list(APPEND _pk_pc_private "-framework CoreML" "-framework Foundation")
+    endif()
+    if (_pk_pc_private)
+        list(REMOVE_DUPLICATES _pk_pc_private)
+        string(JOIN " " _pk_pc_private_str ${_pk_pc_private})
+        set(PARAKEET_PC_LIBS_PRIVATE "Libs.private: ${_pk_pc_private_str}")
+    else()
+        set(PARAKEET_PC_LIBS_PRIVATE "")
+    endif()
 
     configure_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/qvac-parakeet.pc.in
