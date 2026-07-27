@@ -287,6 +287,21 @@ if (PARAKEET_BUILD_LIBRARY)
     )
     target_link_libraries(qvac-parakeet PUBLIC ggml)
 
+    # Export the language requirement so it reaches consumers through the
+    # installed target. The public headers use C++11 constructs (defaulted
+    # /deleted members, `noexcept`, alias templates in streaming.h), and
+    # the library itself is compiled at C++17 -- but CMAKE_CXX_STANDARD is
+    # a *build-local* variable and is NOT part of the export, so before
+    # this a `find_package(qvac-parakeet)` consumer that did not set its
+    # own standard compiled the headers at its compiler's default dialect
+    # and failed on those constructs. In-repo consumers (and the qvac
+    # addon, which sets CMAKE_CXX_STANDARD 20) masked the gap; the
+    # package-consumption test deliberately sets no standard so it stays
+    # caught. cxx_std_17 rather than cxx_std_11: 17 is what the library is
+    # built and tested at, so advertising 11 would claim a configuration
+    # nothing exercises.
+    target_compile_features(qvac-parakeet PUBLIC cxx_std_17)
+
     if (OpenMP_CXX_FOUND)
         target_link_libraries(qvac-parakeet PRIVATE OpenMP::OpenMP_CXX)
     endif()
