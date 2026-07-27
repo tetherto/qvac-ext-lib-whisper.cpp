@@ -93,7 +93,7 @@ endif()
 # (src/parakeet_ctc.cpp): OpenCL when an Adreno 700+ device is
 # present, Vulkan for every other GPU (non-Adreno, Adreno < 700,
 # Mali, Xclipse, ...). No static GPU backend entry points are linked
-# anywhere in libparakeet; the registry walk reaches the right
+# anywhere in libqvac-parakeet; the registry walk reaches the right
 # backend in both GGML_BACKEND_DL=ON (Android prebuild) and
 # GGML_BACKEND_DL=OFF (desktop dev) modes.
 #
@@ -226,8 +226,8 @@ if (PARAKEET_OPENMP)
 endif()
 
 # Legacy interface library kept for export-set compatibility (it is
-# still part of `install(EXPORT parakeet-cpp-targets)` below and
-# downstream `find_package(parakeet-cpp)` consumers list it as a link
+# still part of `install(EXPORT qvac-parakeet-targets)` below and
+# downstream `find_package(qvac-parakeet)` consumers list it as a link
 # dep). Body intentionally empty: parakeet routes every backend
 # decision through the ggml-backend registry
 # (`ggml_backend_load_all` + `ggml_backend_dev_*`, see
@@ -270,14 +270,14 @@ if (PARAKEET_BUILD_LIBRARY)
     # (BUILD_SHARED_LIBS-driven), so consumers that build other ggml-
     # based libraries shared see a consistent linkage selector.
     if (DEFINED BUILD_SHARED_LIBS)
-        add_library(parakeet ${PARAKEET_LIB_SOURCES})
+        add_library(qvac-parakeet ${PARAKEET_LIB_SOURCES})
     else()
-        add_library(parakeet STATIC ${PARAKEET_LIB_SOURCES})
+        add_library(qvac-parakeet STATIC ${PARAKEET_LIB_SOURCES})
     endif()
-    add_library(parakeet::parakeet ALIAS parakeet)
-    parakeet_apply_ccache(parakeet)
+    add_library(qvac::parakeet ALIAS qvac-parakeet)
+    parakeet_apply_ccache(qvac-parakeet)
 
-    target_include_directories(parakeet
+    target_include_directories(qvac-parakeet
         PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
@@ -285,20 +285,20 @@ if (PARAKEET_BUILD_LIBRARY)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
     )
-    target_link_libraries(parakeet PUBLIC ggml)
+    target_link_libraries(qvac-parakeet PUBLIC ggml)
 
     if (OpenMP_CXX_FOUND)
-        target_link_libraries(parakeet PRIVATE OpenMP::OpenMP_CXX)
+        target_link_libraries(qvac-parakeet PRIVATE OpenMP::OpenMP_CXX)
     endif()
 
-    target_link_libraries(parakeet PRIVATE parakeet-backend-defs)
+    target_link_libraries(qvac-parakeet PRIVATE parakeet-backend-defs)
 
     # Single source of truth for the version string the CLI prints
     # under `--version`. Kept PRIVATE because it only drives the in-
     # library `main.cpp` impl; consumers that need a runtime version
     # can read it via the public API surface or the CMake package
-    # version file (`parakeet-cppConfigVersion.cmake`).
-    target_compile_definitions(parakeet PRIVATE
+    # version file (`qvac-parakeet-config-version.cmake`).
+    target_compile_definitions(qvac-parakeet PRIVATE
         PARAKEET_VERSION="${PROJECT_VERSION}"
     )
 
@@ -336,7 +336,7 @@ if (PARAKEET_BUILD_LIBRARY)
     endif()
     option(PARAKEET_FLASH_ATTN "parakeet: enable fused flash-attn in MHA (default ON for Metal; OFF elsewhere pending per-backend A/B)" ${PARAKEET_FLASH_ATTN_DEFAULT})
     if (PARAKEET_FLASH_ATTN)
-        target_compile_definitions(parakeet PRIVATE PARAKEET_EXPERIMENTAL_FLASH_ATTN)
+        target_compile_definitions(qvac-parakeet PRIVATE PARAKEET_EXPERIMENTAL_FLASH_ATTN)
     endif()
 
     # -----------------------------------------------------------------------
@@ -353,11 +353,11 @@ if (PARAKEET_BUILD_LIBRARY)
     # src/coreml/parakeet-encoder.h.
     if (PARAKEET_COREML)
         # OBJCXX is enabled up front (see the top-level PARAKEET_COREML block);
-        # here we only bind the frameworks and fold the wrapper into libparakeet.
+        # here we only bind the frameworks and fold the wrapper into libqvac-parakeet.
         find_library(PARAKEET_FOUNDATION_FRAMEWORK Foundation REQUIRED)
         find_library(PARAKEET_COREML_FRAMEWORK     CoreML     REQUIRED)
 
-        # OBJECT library so the ARC-compiled Core ML objects fold into libparakeet
+        # OBJECT library so the ARC-compiled Core ML objects fold into libqvac-parakeet
         # (a single archive for the static vcpkg build; no extra install/export target).
         add_library(parakeet.coreml OBJECT src/coreml/parakeet-encoder.mm)
         parakeet_apply_ccache(parakeet.coreml)
@@ -371,23 +371,25 @@ if (PARAKEET_BUILD_LIBRARY)
             XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES
         )
 
-        target_sources(parakeet PRIVATE $<TARGET_OBJECTS:parakeet.coreml>)
-        target_compile_definitions(parakeet PRIVATE PARAKEET_USE_COREML)
-        target_link_libraries(parakeet PUBLIC
+        target_sources(qvac-parakeet PRIVATE $<TARGET_OBJECTS:parakeet.coreml>)
+        target_compile_definitions(qvac-parakeet PRIVATE PARAKEET_USE_COREML)
+        target_link_libraries(qvac-parakeet PUBLIC
             ${PARAKEET_FOUNDATION_FRAMEWORK}
             ${PARAKEET_COREML_FRAMEWORK}
         )
         message(STATUS "parakeet: Core ML encoder sidecar enabled (PARAKEET_USE_COREML)")
     endif()
 
-    set_target_properties(parakeet PROPERTIES
+    set_target_properties(qvac-parakeet PROPERTIES
         POSITION_INDEPENDENT_CODE ON
+        # EXPORT_NAME + the qvac:: install namespace below make the
+        # imported target `qvac::parakeet`, matching the in-tree ALIAS.
         EXPORT_NAME parakeet
         CXX_VISIBILITY_PRESET    hidden
         VISIBILITY_INLINES_HIDDEN ON
         # VERSION drives the full filename suffix on Linux/macOS shared
-        # libs (libparakeet.so.0.1.0); SOVERSION drives the symlink the
-        # dynamic loader actually opens (libparakeet.so.0). Pinning
+        # libs (libqvac-parakeet.so.0.1.0); SOVERSION drives the symlink
+        # the dynamic loader actually opens (libqvac-parakeet.so.0). Pinning
         # SOVERSION to 0 (rather than ${PROJECT_VERSION_MAJOR}) keeps
         # the ABI tag stable across pre-1.0 PROJECT_VERSION bumps so
         # downstream consumers do not need to re-link on every patch
@@ -402,14 +404,14 @@ if (PARAKEET_BUILD_LIBRARY)
     # TUs to flip Windows from `dllimport` to `dllexport`. Both no-ops
     # in static builds (the default), so static consumers see exactly
     # the same surface as before.
-    get_target_property(_parakeet_type parakeet TYPE)
+    get_target_property(_parakeet_type qvac-parakeet TYPE)
     if (_parakeet_type STREQUAL "SHARED_LIBRARY")
-        target_compile_definitions(parakeet PUBLIC  PARAKEET_SHARED)
-        target_compile_definitions(parakeet PRIVATE PARAKEET_BUILD)
+        target_compile_definitions(qvac-parakeet PUBLIC  PARAKEET_SHARED)
+        target_compile_definitions(qvac-parakeet PRIVATE PARAKEET_BUILD)
     endif()
 
     if (CMAKE_BUILD_TYPE STREQUAL "Release" OR NOT CMAKE_BUILD_TYPE)
-        target_compile_options(parakeet PRIVATE
+        target_compile_options(qvac-parakeet PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-O3>
             $<$<COMPILE_LANGUAGE:C>:-O3>
             $<$<COMPILE_LANGUAGE:CXX>:-ffast-math>
@@ -426,7 +428,7 @@ if (PARAKEET_BUILD_EXECUTABLES)
     endif()
 
     add_executable(parakeet-cli src/cli_main.cpp)
-    target_link_libraries(parakeet-cli PRIVATE parakeet)
+    target_link_libraries(parakeet-cli PRIVATE qvac-parakeet)
     set_target_properties(parakeet-cli PROPERTIES OUTPUT_NAME parakeet)
     parakeet_apply_ccache(parakeet-cli)
 endif()
@@ -593,7 +595,7 @@ if (PARAKEET_BUILD_TESTS)
         REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_ctc_ref}/logits.npy" "${_qvp_ctc_ref}/decoded.txt")
 
     add_executable(test-parakeet-streaming test/test_streaming.cpp)
-    target_link_libraries(test-parakeet-streaming PRIVATE parakeet)
+    target_link_libraries(test-parakeet-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-parakeet-streaming PRIVATE include src ggml/include)
     parakeet_apply_ccache(test-parakeet-streaming)
     parakeet_register_test(test-parakeet-streaming
@@ -602,7 +604,7 @@ if (PARAKEET_BUILD_TESTS)
         REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
 
     add_executable(test-eou-streaming test/test_eou_streaming.cpp)
-    target_link_libraries(test-eou-streaming PRIVATE parakeet)
+    target_link_libraries(test-eou-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-eou-streaming PRIVATE include src ggml/include)
     parakeet_apply_ccache(test-eou-streaming)
     parakeet_register_test(test-eou-streaming
@@ -611,7 +613,7 @@ if (PARAKEET_BUILD_TESTS)
         REQUIRES "${_qvp_eou_q8_gguf}" "${_qvp_jfk_wav}")
 
     add_executable(test-sortformer-streaming test/test_sortformer_streaming.cpp)
-    target_link_libraries(test-sortformer-streaming PRIVATE parakeet)
+    target_link_libraries(test-sortformer-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-sortformer-streaming PRIVATE include src ggml/include)
     parakeet_apply_ccache(test-sortformer-streaming)
     parakeet_register_test(test-sortformer-streaming
@@ -624,7 +626,7 @@ if (PARAKEET_BUILD_TESTS)
     # ceiling against the RTTM ground truth. One binary, two ctest
     # registrations (one per LIFO re-entry fixture).
     add_executable(test-sortformer-aosc-speakers test/test_sortformer_aosc_speakers.cpp)
-    target_link_libraries(test-sortformer-aosc-speakers PRIVATE parakeet)
+    target_link_libraries(test-sortformer-aosc-speakers PRIVATE qvac-parakeet)
     target_include_directories(test-sortformer-aosc-speakers PRIVATE include src ggml/include)
     parakeet_apply_ccache(test-sortformer-aosc-speakers)
     parakeet_register_test(test-sortformer-aosc-speakers-abcba
@@ -643,7 +645,7 @@ if (PARAKEET_BUILD_TESTS)
         REQUIRES "${_qvp_sfsv21_q8_gguf}" "${_qvp_abcdba_wav}" "${_qvp_abcdba_rttm}")
 
     add_executable(test-perf-regression test/test_perf_regression.cpp)
-    target_link_libraries(test-perf-regression PRIVATE parakeet)
+    target_link_libraries(test-perf-regression PRIVATE qvac-parakeet)
     target_include_directories(test-perf-regression PRIVATE include src ggml/include)
     parakeet_apply_ccache(test-perf-regression)
     parakeet_register_test(test-perf-regression
@@ -767,13 +769,13 @@ if (PARAKEET_BUILD_TESTS)
 
     # End-to-end transcription parity: full Engine::transcribe() with the Core ML
     # encoder vs the ggml encoder (forced via PARAKEET_COREML_DISABLE) must yield
-    # identical text. Links libparakeet for the public Engine API. Skips at runtime
+    # identical text. Links libqvac-parakeet for the public Engine API. Skips at runtime
     # when the Core ML sidecar is inactive, so it is a no-op on non-Apple /
     # no-sidecar CI and a real gate on Apple with a sidecar present.
-    if (TARGET parakeet)
+    if (TARGET qvac-parakeet)
         add_executable(test-transcribe-coreml-parity
             test/test_transcribe_coreml_parity.cpp)
-        target_link_libraries(test-transcribe-coreml-parity PRIVATE parakeet)
+        target_link_libraries(test-transcribe-coreml-parity PRIVATE qvac-parakeet)
         target_include_directories(test-transcribe-coreml-parity PRIVATE include)
         parakeet_apply_ccache(test-transcribe-coreml-parity)
         parakeet_register_test(test-transcribe-coreml-parity
@@ -937,7 +939,7 @@ if (PARAKEET_BUILD_TESTS)
     # see. Runs against any model type; switches to diarize() when the
     # GGUF declares Sortformer.
     add_executable(test-decoder-determinism test/test_decoder_determinism.cpp)
-    target_link_libraries(test-decoder-determinism PRIVATE parakeet)
+    target_link_libraries(test-decoder-determinism PRIVATE qvac-parakeet)
     target_include_directories(test-decoder-determinism PRIVATE include src ggml/include)
     parakeet_apply_ccache(test-decoder-determinism)
     parakeet_register_test(test-decoder-determinism
@@ -973,7 +975,7 @@ if (PARAKEET_BUILD_TESTS)
     parakeet_register_test(test-long-form-windows LABEL "unit")
 
     add_executable(test-long-form test/test_long_form.cpp)
-    target_link_libraries(test-long-form PRIVATE parakeet)
+    target_link_libraries(test-long-form PRIVATE qvac-parakeet)
     target_include_directories(test-long-form PRIVATE include src ggml/include)
     parakeet_apply_ccache(test-long-form)
     parakeet_register_test(test-long-form
@@ -1011,7 +1013,7 @@ if (PARAKEET_BUILD_EXAMPLES)
     add_executable(live-mic
         examples/live-mic.cpp
         examples/miniaudio_impl.cpp)
-    target_link_libraries(live-mic PRIVATE parakeet)
+    target_link_libraries(live-mic PRIVATE qvac-parakeet)
     target_include_directories(live-mic PRIVATE include examples)
     target_compile_options(live-mic PRIVATE -Wno-deprecated-declarations)
     parakeet_apply_ccache(live-mic)
@@ -1019,7 +1021,7 @@ if (PARAKEET_BUILD_EXAMPLES)
     add_executable(live-mic-attributed
         examples/live-mic-attributed.cpp
         examples/miniaudio_impl.cpp)
-    target_link_libraries(live-mic-attributed PRIVATE parakeet)
+    target_link_libraries(live-mic-attributed PRIVATE qvac-parakeet)
     target_include_directories(live-mic-attributed PRIVATE include examples)
     target_compile_options(live-mic-attributed PRIVATE -Wno-deprecated-declarations)
     parakeet_apply_ccache(live-mic-attributed)
@@ -1050,9 +1052,9 @@ endif()
 
 if (PARAKEET_INSTALL AND PARAKEET_BUILD_LIBRARY)
     # Re-install the bundled ggml targets into a `ggml-targets` export
-    # set so `install(EXPORT parakeet-cpp-targets)` can resolve the
-    # `parakeet PUBLIC ggml` link as the namespaced `ggml::ggml`.
-    # Without this, CMake refuses to generate parakeet-cpp-targets.cmake
+    # set so `install(EXPORT qvac-parakeet-targets)` can resolve the
+    # `qvac-parakeet PUBLIC ggml` link as the namespaced `ggml::ggml`.
+    # Without this, CMake refuses to generate qvac-parakeet-targets.cmake
     # because the in-tree `ggml` target is not part of any export set.
     # Replicates the standard
     # `install(TARGETS ggml ggml-base EXPORT ggml-targets)` pattern
@@ -1081,7 +1083,7 @@ if (PARAKEET_INSTALL AND PARAKEET_BUILD_LIBRARY)
         # PUBLIC_HEADER DESTINATION") about the gap, which is benign
         # here -- ggml's own rule still publishes the headers. Keep
         # the rule minimal: we only need EXPORT + library destinations
-        # so `parakeet-cpp-targets` can resolve the namespaced
+        # so `qvac-parakeet-targets` can resolve the namespaced
         # `ggml::ggml` link without rebuilding the headers install.
         install(TARGETS ${_parakeet_ggml_export_targets}
             EXPORT ggml-targets
@@ -1098,7 +1100,7 @@ if (PARAKEET_INSTALL AND PARAKEET_BUILD_LIBRARY)
     endif()
 
     # Export the parakeet target via an install(EXPORT ...) set so the
-    # generated parakeet-cpp-targets.cmake carries the correct shape
+    # generated qvac-parakeet-targets.cmake carries the correct shape
     # for whatever linkage the build produced (STATIC vs SHARED, with
     # IMPORTED_IMPLIB on Windows shared builds, etc.). Hand-writing
     # a STATIC IMPORTED stub here would silently mis-resolve the
@@ -1111,8 +1113,17 @@ if (PARAKEET_INSTALL AND PARAKEET_BUILD_LIBRARY)
     # carry transitive PRIVATE deps the way shared libs do), so the
     # exporter would otherwise refuse with
     # "requires target parakeet-backend-defs that is not in any export set".
-    install(TARGETS parakeet parakeet-backend-defs
-        EXPORT parakeet-cpp-targets
+    # Every installable artifact lives under the `qvac-parakeet` name:
+    # upstream whisper.cpp (v1.9.1+) builds and installs its own
+    # `parakeet` (lib/libparakeet.*, lib/cmake/parakeet/, parakeet.pc),
+    # so a vcpkg tree holding both the whisper-cpp port and this engine
+    # would otherwise fail with a file-ownership conflict on the shared
+    # filenames. Public headers stay at include/parakeet/ (a directory,
+    # no clash with upstream's single include/parakeet.h) and the C++
+    # `parakeet::` namespace is untouched — the collision is file
+    # ownership, not symbols.
+    install(TARGETS qvac-parakeet parakeet-backend-defs
+        EXPORT qvac-parakeet-targets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -1123,29 +1134,56 @@ if (PARAKEET_INSTALL AND PARAKEET_BUILD_LIBRARY)
         FILES_MATCHING PATTERN "*.h"
     )
 
-    set(PARAKEET_CONFIG_INSTALL_DIR ${CMAKE_INSTALL_DATADIR}/parakeet-cpp)
+    # lib/cmake/qvac-parakeet mirrors the whisper subtree's
+    # lib/cmake/whisper convention; the vcpkg port relocates it with
+    # vcpkg_cmake_config_fixup(PACKAGE_NAME qvac-parakeet
+    #                          CONFIG_PATH lib/cmake/qvac-parakeet)
+    # and must also call vcpkg_fixup_pkgconfig() for the .pc below
+    # (its prefix= bakes in the absolute packages dir otherwise).
+    set(PARAKEET_CONFIG_INSTALL_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/qvac-parakeet)
 
-    install(EXPORT parakeet-cpp-targets
-        FILE parakeet-cpp-targets.cmake
-        NAMESPACE parakeet::
+    install(EXPORT qvac-parakeet-targets
+        FILE qvac-parakeet-targets.cmake
+        NAMESPACE qvac::
         DESTINATION ${PARAKEET_CONFIG_INSTALL_DIR}
     )
 
     configure_package_config_file(
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/parakeet-cppConfig.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/parakeet-cppConfig.cmake
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/qvac-parakeet-config.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/qvac-parakeet-config.cmake
         INSTALL_DESTINATION ${PARAKEET_CONFIG_INSTALL_DIR}
     )
 
     write_basic_package_version_file(
-        ${CMAKE_CURRENT_BINARY_DIR}/parakeet-cppConfigVersion.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/qvac-parakeet-config-version.cmake
         VERSION ${PROJECT_VERSION}
         COMPATIBILITY SameMajorVersion
     )
 
     install(FILES
-        ${CMAKE_CURRENT_BINARY_DIR}/parakeet-cppConfig.cmake
-        ${CMAKE_CURRENT_BINARY_DIR}/parakeet-cppConfigVersion.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/qvac-parakeet-config.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/qvac-parakeet-config-version.cmake
         DESTINATION ${PARAKEET_CONFIG_INSTALL_DIR}
+    )
+
+    # ggml link names for the .pc: every QVAC ggml build renames its
+    # libraries via GGML_LIB_OUTPUT_PREFIX (the ggml-speech vcpkg port
+    # uses `qvac-speech-`, the bundled build above sets `speech-`), so
+    # a hardcoded -lggml would never resolve against the install tree.
+    # The qvac-ext-ggml@speech ggml-config.cmake exports the prefix and
+    # the bundled subtree defines it as a cache option, so it is in
+    # scope here for both acquisition paths; a stock unprefixed ggml
+    # leaves it unset and the expansion degrades to plain -lggml.
+    set(PARAKEET_PC_GGML_LIBS
+        "-l${GGML_LIB_OUTPUT_PREFIX}ggml -l${GGML_LIB_OUTPUT_PREFIX}ggml-base")
+
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/qvac-parakeet.pc.in
+        ${CMAKE_CURRENT_BINARY_DIR}/qvac-parakeet.pc
+        @ONLY
+    )
+
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/qvac-parakeet.pc
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
     )
 endif()
