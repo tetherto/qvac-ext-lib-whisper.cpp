@@ -71,8 +71,18 @@ PREFIX="${WORK_DIR}/install"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "  ok: $*"; }
 
+# Extra -D flags for the engine configure, whitespace-separated. Exists so
+# a developer on a host where CMake does not auto-find OpenMP (e.g. macOS
+# + brew libomp) can reproduce the Linux CI configuration, where OpenMP is
+# found and therefore appears in the exported link interface and in
+# Libs.private:
+#   PARAKEET_PKGTEST_CMAKE_ARGS="-DPARAKEET_OPENMP=ON \
+#     -DPARAKEET_OPENMP_USER_OVERRIDE=ON -DOpenMP_ROOT=/opt/homebrew/opt/libomp"
+read -r -a _pk_extra_args <<< "${PARAKEET_PKGTEST_CMAKE_ARGS:-}"
+
 echo "==> configuring + installing the engine (static, system ggml, COREML=${COREML})"
 cmake -S "${ENGINE_DIR}" -B "${BUILD_DIR}" \
+    ${_pk_extra_args[@]+"${_pk_extra_args[@]}"} \
     -DCMAKE_BUILD_TYPE=Release \
     -DPARAKEET_USE_SYSTEM_GGML=ON \
     -DPARAKEET_BUILD_LIBRARY=ON \
@@ -133,7 +143,15 @@ ok "no bare-parakeet artifacts (no collision with upstream whisper.cpp)"
 # ----------------------------------------------------------------------
 echo "==> 2/3 CMake consumer: find_package(qvac-parakeet) + qvac::parakeet"
 CM_BUILD="${WORK_DIR}/consumer-cmake"
+# The extra args are forwarded to the consumer too: when the engine build
+# links OpenMP, the installed package config does find_dependency(OpenMP)
+# (the PRIVATE link is exported as $<LINK_ONLY:OpenMP::OpenMP_CXX> for a
+# static build), so any toolchain hint needed to locate OpenMP -- e.g.
+# -DOpenMP_ROOT on macOS + brew libomp -- has to reach the consumer's
+# configure as well. Engine-only -DPARAKEET_* flags are simply unused
+# there, which CMake reports as a non-fatal warning.
 cmake -S "${ENGINE_DIR}/test/consumer" -B "${CM_BUILD}" \
+    ${_pk_extra_args[@]+"${_pk_extra_args[@]}"} \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH="${PREFIX};${GGML_PREFIX}" \
     > "${WORK_DIR}/consumer-cmake-configure.log" 2>&1 \

@@ -1163,6 +1163,17 @@ if (PARAKEET_INSTALL AND PARAKEET_BUILD_LIBRARY)
         DESTINATION ${PARAKEET_CONFIG_INSTALL_DIR}
     )
 
+    # Whether this build linked OpenMP, baked into the package config so a
+    # consumer re-resolves the same dependency set. See the comment in
+    # cmake/qvac-parakeet-config.cmake.in: the PRIVATE OpenMP link is
+    # exported as $<LINK_ONLY:OpenMP::OpenMP_CXX> for the STATIC build, so
+    # the imported target must exist in the consumer's scope.
+    if (OpenMP_CXX_FOUND)
+        set(QVAC_PARAKEET_WITH_OPENMP TRUE)
+    else()
+        set(QVAC_PARAKEET_WITH_OPENMP FALSE)
+    endif()
+
     configure_package_config_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/qvac-parakeet-config.cmake.in
         ${CMAKE_CURRENT_BINARY_DIR}/qvac-parakeet-config.cmake
