@@ -465,10 +465,50 @@ bool lm_generate_codes(LMModel *              m,
         return sample_top_k_p(lc.data(), V, params.temperature, params.top_p, params.top_k, rng);
     };
 
+    if (std::getenv("ACESTEP_LM_DEBUG")) {
+        int  mn = INT32_MAX, mx = INT32_MIN, bad = 0;
+        for (int t : tokens) {
+            if (t < mn) mn = t;
+            if (t > mx) mx = t;
+            if (t < 0 || t >= V) bad++;
+        }
+        fprintf(stderr, "[lm-dbg] cond prompt: n=%zu min=%d max=%d V=%d out_of_range=%d\n",
+                tokens.size(), mn, mx, V, bad);
+    }
+
+    const char *       dump_layers_path = std::getenv("ACESTEP_LM_DUMP_LAYERS");
+    std::vector<float> layer_states;
+
     lm_reset(m, 0);
-    if (!lm_model_forward(m, tokens.data(), (int) tokens.size(), lc, 0)) {
+    if (!lm_model_forward(m, tokens.data(), (int) tokens.size(), lc, 0,
+                          dump_layers_path ? &layer_states : nullptr)) {
         fprintf(stderr, "[lm-pipeline] cond prefill failed\n");
         return false;
+    }
+    if (dump_layers_path && !layer_states.empty()) {
+        const int32_t n_layers  = lm_model_config(m).n_layers;
+        const int32_t per_layer = (int32_t) (layer_states.size() / (size_t) n_layers);
+        const int32_t hdr[3]    = { 2, n_layers, per_layer };
+        if (FILE * f = fopen(dump_layers_path, "wb")) {
+            fwrite(hdr, sizeof(hdr), 1, f);
+            fwrite(layer_states.data(), sizeof(float), layer_states.size(), f);
+            fclose(f);
+            fprintf(stderr, "[lm-dbg] wrote layer states -> %s (%zu floats)\n", dump_layers_path,
+                    layer_states.size());
+        }
+    }
+    if (std::getenv("ACESTEP_LM_DEBUG")) {
+        size_t nan = 0, pinf = 0, ninf = 0, fin = 0;
+        float  fmax = 0.0f;
+        for (size_t i = 0; i < lc.size(); i++) {
+            const float x = lc[i];
+            if (std::isnan(x))      nan++;
+            else if (std::isinf(x)) (x > 0 ? pinf : ninf)++;
+            else { if (fin == 0 || x > fmax) fmax = x; fin++; }
+        }
+        fprintf(stderr, "[lm-dbg] cond prefill: n=%zu nan=%zu +inf=%zu -inf=%zu finite=%zu finite_max=%g\n",
+                lc.size(), nan, pinf, ninf, fin, fin ? fmax : 0.0f);
+        fprintf(stderr, "[lm-dbg]   lc[0..5] = %g %g %g %g %g\n", lc[0], lc[1], lc[2], lc[3], lc[4]);
     }
     if (use_cfg) {
         lm_reset(m, 1);
