@@ -10,6 +10,7 @@
 //   music-cli --dit dit.gguf --lm lm.gguf --text emb.gguf --vae vae.gguf ...
 //   optional: --caption "..." --lyrics "..." --steps 8 --shift 3.0
 //             --bpm 128 --key "C major" --tsig 4/4 --lang en
+//             --gpu --threads N --dump-stages <existing dir>
 
 #include "audiogen-cpp/acestep/engine.h"
 
@@ -112,6 +113,10 @@ int main(int argc, char ** argv) {
     // (Metal/CUDA/Vulkan) when available; the custom snake / col2im_1d ops now
     // have Metal kernels, so the VAE decode runs on GPU too. Detok stays on CPU.
     if (arg_flag(argc, argv, "--gpu"))   o.n_gpu_layers = 99;
+    if (arg_val(argc, argv, "--threads")) o.n_threads = atoi(arg_val(argc, argv, "--threads"));
+    // Parity aid: write one .bin per stage so a CPU/GPU divergence can be traced
+    // to the stage that introduces it rather than inferred from the final WAV.
+    if (arg_val(argc, argv, "--dump-stages")) o.dump_stages_dir = arg_val(argc, argv, "--dump-stages");
 
     if (o.models_dir.empty() && o.dit_model_path.empty()) {
         fprintf(stderr, "usage: music-cli --models <dir> [--out song.wav] [--dur 8] [--seed 42]\n");
