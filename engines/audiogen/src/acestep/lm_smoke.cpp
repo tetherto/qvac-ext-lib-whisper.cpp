@@ -6,12 +6,14 @@
 // With --gpu it runs the same deterministic prompt on a GPU backend instead of
 // the CPU, which makes it a backend-parity harness: the prompt is derived from
 // --seed alone, so two runs that differ only in --gpu isolate the backend as the
-// single variable. --dump writes every step's logits so the two runs can be
-// compared numerically (see scripts/compare-dumps.py).
+// single variable. --dump writes every step's logits using the same header layout as
+// the engine's stage dumps, so dropping each run's file into its own directory lets
+// scripts/stage_cos.py report the cosine between the two.
 //
 // Usage:
 //   lm-smoke --model ace-lm.gguf [--prefill 8] [--decode 8] [--seed 1234]
-//            [--gpu] [--threads N] [--dump logits.bin] [--dump-layers layers.bin]
+//            [--gpu] [--threads N] [--kv-sets 1]
+//            [--dump logits.bin] [--dump-layers layers.bin]
 
 #include "acestep/lm_ggml.h"
 

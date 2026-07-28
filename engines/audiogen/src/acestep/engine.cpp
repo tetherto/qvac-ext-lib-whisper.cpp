@@ -95,8 +95,6 @@ struct Engine::Impl {
     ggml_backend_t backend_cpu   = nullptr;  // CPU backend for the stages pinned off the GPU; == backend when primary is CPU
     ggml_backend_t backend_lm    = nullptr;  // backend the LM loads on (see create)
     ggml_backend_t backend_enc   = nullptr;  // backend for textenc + cond (see create)
-    ggml_backend_t backend_detok = nullptr;  // backend the FSQ detokenizer loads on (see create)
-
     TextEncModel * textenc = nullptr;
     LMModel *      lm      = nullptr;
     CondModel *    cond    = nullptr;
@@ -210,53 +208,52 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
         m->backend_cpu = m->backend;  // single CPU backend serves every stage
     }
 
-    // Backend layout when a GPU is active. Almost everything runs on the GPU, but
-    // the autoregressive LM is the exception on ONE backend: iOS/macOS A-series
-    // Metal produces empty/garbage logits -> the sampler yields zero audio codes
-    // ("LM produced no audio codes"), while the SAME weights decode correctly on
-    // CPU. This is a NUMERICAL issue, not memory (unified RAM doesn't help),
-    // confirmed by testing the full-GPU path on device. It is Metal-specific, so
-    // we only pin the LM to CPU when the active GPU backend is Metal; on
-    // Vulkan/CUDA the LM runs on the GPU by default (the whole reason to enable a
-    // GPU). The one-shot text/cond encoders always stay on the GPU with the
-    // DiT + VAE.
+    // Stage placement when a GPU is active. The DiT, the VAE and the one-shot
+    // text/cond encoders always run on it. The autoregressive LM and the FSQ
+    // detokenizer are allowlisted per backend instead, because each has a backend
+    // where it is known-wrong or simply unmeasured:
     //
-    // The FSQ detokenizer is pinned to CPU on Metal for the same "verified only
-    // there" reason, but its history is different: it was pinned because Metal had
-    // no kernel for the CPY variant its graph emits — `detokenizer.special_tokens`
-    // is stored quantized, so q3_as_f32 becomes ggml_cast(Q8_0 -> F32). Both
-    // backends have that kernel now (ggml-metal-device.m and ggml-vulkan.cpp both
-    // accept quantized src -> F32 dst for CPY), and it is verified working on
-    // Vulkan, so only Metal keeps the pin — untested there, not known-broken.
+    //   * LM: iOS/macOS A-series Metal produces empty/garbage logits, so the
+    //     sampler yields zero audio codes ("LM produced no audio codes") while the
+    //     SAME weights decode correctly on CPU. Numerical, not memory (unified RAM
+    //     does not help), confirmed against the full-GPU path on device.
+    //   * detokenizer: `detokenizer.special_tokens` ships quantized, so q3_as_f32
+    //     becomes ggml_cast(Q8_0 -> F32) and Metal had no kernel for that CPY
+    //     variant. It has one now (ggml-metal-device.m), but the stage has not been
+    //     run there since, so it stays off the Metal GPU.
     //
-    // Env escape hatches (no rebuild needed):
-    //   ACESTEP_LM_GPU=1        -> force the LM onto the GPU (even on Metal)
-    //   ACESTEP_LM_CPU=1        -> force the LM onto the CPU (any backend)
-    //   ACESTEP_DETOK_GPU=1     -> force the detokenizer onto the GPU (even on Metal)
-    //   ACESTEP_DETOK_CPU=1     -> force the detokenizer onto the CPU (any backend)
+    // Allowlist rather than denylist: Vulkan is the only GPU backend either stage has
+    // actually been measured on (LM logits against an F32 reference, detokenizer
+    // latents against CPU). Every other backend therefore keeps the CPU placement
+    // that ships today, so adding one cannot silently regress generated audio.
+    // Widen the allowlist per backend once it is measured — ACESTEP_LM_GPU /
+    // ACESTEP_DETOK_GPU are how you take that measurement without a rebuild.
+    //
+    // Env escape hatches (applied after the allowlist; CPU wins if both are set):
+    //   ACESTEP_LM_GPU=1        -> LM on the GPU, whatever the backend
+    //   ACESTEP_LM_CPU=1        -> LM on the CPU, whatever the backend
+    //   ACESTEP_DETOK_GPU=1     -> detokenizer on the GPU, whatever the backend
+    //   ACESTEP_DETOK_CPU=1     -> detokenizer on the CPU, whatever the backend
     //   ACESTEP_ENCODERS_CPU=1  -> move the encoders to the CPU (trim wired mem)
     ggml_backend_t enc_backend   = m->backend;
     ggml_backend_t lm_backend    = m->backend;
     ggml_backend_t detok_backend = m->backend;
     if (on_gpu) {
-        const char * be_name  = ggml_backend_name(m->backend);
-        const bool   is_metal = be_name && std::strstr(be_name, "Metal") != nullptr;
-        if (is_metal) {
-            lm_backend    = m->backend_cpu;  // A-series Metal LM is numerically broken
-            detok_backend = m->backend_cpu;  // unverified on Metal (see above)
+        if (!backend_is_vulkan(m->backend)) {
+            lm_backend    = m->backend_cpu;
+            detok_backend = m->backend_cpu;
         }
-        if (std::getenv("ACESTEP_LM_CPU"))       lm_backend    = m->backend_cpu;
         if (std::getenv("ACESTEP_LM_GPU"))       lm_backend    = m->backend;
-        if (std::getenv("ACESTEP_DETOK_CPU"))    detok_backend = m->backend_cpu;
+        if (std::getenv("ACESTEP_LM_CPU"))       lm_backend    = m->backend_cpu;
         if (std::getenv("ACESTEP_DETOK_GPU"))    detok_backend = m->backend;
+        if (std::getenv("ACESTEP_DETOK_CPU"))    detok_backend = m->backend_cpu;
         if (std::getenv("ACESTEP_ENCODERS_CPU")) enc_backend   = m->backend_cpu;
         if (v) fprintf(stderr, "[acestep-engine] backends: enc=%s lm=%s detok=%s dit/vae=%s\n",
                        ggml_backend_name(enc_backend), ggml_backend_name(lm_backend),
                        ggml_backend_name(detok_backend), ggml_backend_name(m->backend));
     }
-    m->backend_enc   = enc_backend;
-    m->backend_lm    = lm_backend;
-    m->backend_detok = detok_backend;
+    m->backend_enc = enc_backend;
+    m->backend_lm  = lm_backend;
 
     m->textenc = textenc_model_load(opts.text_enc_model_path, enc_backend, v);
     if (!m->textenc) throw std::runtime_error("acestep engine: text-encoder load failed");

@@ -216,18 +216,21 @@ static ggml_tensor * lm_attn(ggml_context * ctx, ggml_cgraph * gf, const Qwen3Co
     ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, k, kv_rows));
     ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, v, kv_rows));
 
-    // Read padded window [0, n_kv_pad). These views are NON-contiguous: nb[2] is the
-    // full cache channel stride (max_seq), not n_kv_pad, so consecutive KV heads sit
-    // max_seq rows apart while we only read n_kv_pad of each. ggml_mul_mat on Vulkan
-    // mishandles a non-contiguous f16 src0 (it assumes packed channels) and returns
-    // wrong scores -> the LM degenerates on GPU (repeated/robotic codes) while CPU,
-    // which honours the strides, is correct. Packing the window with ggml_cont makes
-    // the KV read backend-agnostic. Verified bit-parity CPU vs Vulkan after cont.
-    ggml_tensor * k_full = ggml_cont(ctx, ggml_view_3d(ctx, cache_k, D, n_kv_pad, Nkv, cache_k->nb[1], cache_k->nb[2], 0));
-    ggml_tensor * v_full = ggml_cont(ctx, ggml_view_3d(ctx, cache_v, D, n_kv_pad, Nkv, cache_v->nb[1], cache_v->nb[2], 0));
+    // Read the padded window [0, n_kv_pad). Both views are strided in dim 2: nb[2] is the
+    // full cache channel stride (max_seq rows), so consecutive KV heads sit max_seq rows
+    // apart while only n_kv_pad rows of each are live. Passed to the backends as-is.
+    //
+    // This used to pack K through ggml_cont at prefill. The Vulkan tiled matmul was
+    // deriving its channel stride as ne00*ne01 rather than from nb[2], so every KV head
+    // past the first read the previous head's rows and the LM degenerated on GPU while
+    // CPU stayed correct. That was a backend bug, not a property of this graph, and it is
+    // fixed in ggml (ggml_vk_channel_stride_elements); packing here only hid it for one
+    // caller while leaving every other strided-src0 matmul broken.
+    ggml_tensor * k_full = ggml_view_3d(ctx, cache_k, D, n_kv_pad, Nkv, cache_k->nb[1], cache_k->nb[2], 0);
+    ggml_tensor * v_full = ggml_view_3d(ctx, cache_v, D, n_kv_pad, Nkv, cache_v->nb[1], cache_v->nb[2], 0);
 
     const float   scale = 1.0f / sqrtf((float) D);
-    ggml_tensor * attn  = q3_attn_f32(ctx, q, k_full, v_full, mask, scale, c.prec);  // [D, Nh, S]
+    ggml_tensor * attn  = q3_attn(ctx, q, k_full, v_full, mask, scale, c.prec);  // [D, Nh, S]
     attn                = ggml_reshape_2d(ctx, attn, (int64_t) Nh * D, S);
     return q3_linear(ctx, ly->o_proj, attn, c.prec);
 }
