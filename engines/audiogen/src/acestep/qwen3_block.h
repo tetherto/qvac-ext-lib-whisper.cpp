@@ -57,7 +57,11 @@ static inline float q3_bf16_to_f32(uint16_t v) {
     return ggml_bf16_to_fp32(b);
 }
 
-static inline ggml_tensor * q3_create_like(ggml_context * ctx, const DitGGUF & g, const std::string & name) {
+// map_buf non-null (CPU backend) maps the verbatim weight in-place onto the GGUF
+// mmap; its q3_load_raw then becomes a no-op. Null on the GPU path (allocate +
+// upload as before). See dit_gguf_cpu_map_buffer.
+static inline ggml_tensor * q3_create_like(ggml_context * ctx, const DitGGUF & g, const std::string & name,
+                                           ggml_backend_buffer_t map_buf = nullptr) {
     ggml_tensor * mt = dit_gmeta(g, name);
     if (!mt) {
         fprintf(stderr, "[qwen3] missing tensor: %s\n", name.c_str());
@@ -65,6 +69,7 @@ static inline ggml_tensor * q3_create_like(ggml_context * ctx, const DitGGUF & g
     }
     ggml_tensor * t = ggml_new_tensor(ctx, mt->type, ggml_n_dims(mt), mt->ne);
     ggml_set_name(t, name.c_str());
+    if (map_buf) dit_gguf_map_tensor(t, g, name, map_buf);
     return t;
 }
 
@@ -79,8 +84,11 @@ static inline ggml_tensor * q3_create_f32_like(ggml_context * ctx, const DitGGUF
     return t;
 }
 
-static inline void q3_load_raw(ggml_tensor * dst, const DitGGUF & g, const std::string & name) {
-    if (!dst) return;
+// `mapped`: the tensor is already backed by the mmap (create_like mapped it), so
+// there is nothing to copy.
+static inline void q3_load_raw(ggml_tensor * dst, const DitGGUF & g, const std::string & name,
+                               bool mapped = false) {
+    if (!dst || mapped) return;
     const void *  src = dit_gdata(g, name);
     ggml_tensor * mt  = dit_gmeta(g, name);
     if (!src || !mt) {
@@ -116,33 +124,36 @@ static inline void q3_load_f32(ggml_tensor * dst, const DitGGUF & g, const std::
 }
 
 // Create the 11 per-layer weight tensors under `prefix` (e.g. "layers.0").
+// map_buf (CPU) maps the 7 verbatim proj weights in-place; the 4 F32 norms are
+// always allocated + converted.
 static inline void q3_create_layer(ggml_context * ctx, const DitGGUF & g, const std::string & prefix,
-                                   Qwen3Layer & ly) {
+                                   Qwen3Layer & ly, ggml_backend_buffer_t map_buf = nullptr) {
     ly.input_norm = q3_create_f32_like(ctx, g, prefix + ".input_layernorm.weight");
     ly.post_norm  = q3_create_f32_like(ctx, g, prefix + ".post_attention_layernorm.weight");
-    ly.q_proj     = q3_create_like(ctx, g, prefix + ".self_attn.q_proj.weight");
-    ly.k_proj     = q3_create_like(ctx, g, prefix + ".self_attn.k_proj.weight");
-    ly.v_proj     = q3_create_like(ctx, g, prefix + ".self_attn.v_proj.weight");
-    ly.o_proj     = q3_create_like(ctx, g, prefix + ".self_attn.o_proj.weight");
+    ly.q_proj     = q3_create_like(ctx, g, prefix + ".self_attn.q_proj.weight", map_buf);
+    ly.k_proj     = q3_create_like(ctx, g, prefix + ".self_attn.k_proj.weight", map_buf);
+    ly.v_proj     = q3_create_like(ctx, g, prefix + ".self_attn.v_proj.weight", map_buf);
+    ly.o_proj     = q3_create_like(ctx, g, prefix + ".self_attn.o_proj.weight", map_buf);
     ly.q_norm     = q3_create_f32_like(ctx, g, prefix + ".self_attn.q_norm.weight");
     ly.k_norm     = q3_create_f32_like(ctx, g, prefix + ".self_attn.k_norm.weight");
-    ly.gate_proj  = q3_create_like(ctx, g, prefix + ".mlp.gate_proj.weight");
-    ly.up_proj    = q3_create_like(ctx, g, prefix + ".mlp.up_proj.weight");
-    ly.down_proj  = q3_create_like(ctx, g, prefix + ".mlp.down_proj.weight");
+    ly.gate_proj  = q3_create_like(ctx, g, prefix + ".mlp.gate_proj.weight", map_buf);
+    ly.up_proj    = q3_create_like(ctx, g, prefix + ".mlp.up_proj.weight", map_buf);
+    ly.down_proj  = q3_create_like(ctx, g, prefix + ".mlp.down_proj.weight", map_buf);
 }
 
-static inline void q3_load_layer(const DitGGUF & g, const std::string & prefix, Qwen3Layer & ly) {
+static inline void q3_load_layer(const DitGGUF & g, const std::string & prefix, Qwen3Layer & ly,
+                                 bool mapped = false) {
     q3_load_f32(ly.input_norm, g, prefix + ".input_layernorm.weight");
     q3_load_f32(ly.post_norm, g, prefix + ".post_attention_layernorm.weight");
-    q3_load_raw(ly.q_proj, g, prefix + ".self_attn.q_proj.weight");
-    q3_load_raw(ly.k_proj, g, prefix + ".self_attn.k_proj.weight");
-    q3_load_raw(ly.v_proj, g, prefix + ".self_attn.v_proj.weight");
-    q3_load_raw(ly.o_proj, g, prefix + ".self_attn.o_proj.weight");
+    q3_load_raw(ly.q_proj, g, prefix + ".self_attn.q_proj.weight", mapped);
+    q3_load_raw(ly.k_proj, g, prefix + ".self_attn.k_proj.weight", mapped);
+    q3_load_raw(ly.v_proj, g, prefix + ".self_attn.v_proj.weight", mapped);
+    q3_load_raw(ly.o_proj, g, prefix + ".self_attn.o_proj.weight", mapped);
     q3_load_f32(ly.q_norm, g, prefix + ".self_attn.q_norm.weight");
     q3_load_f32(ly.k_norm, g, prefix + ".self_attn.k_norm.weight");
-    q3_load_raw(ly.gate_proj, g, prefix + ".mlp.gate_proj.weight");
-    q3_load_raw(ly.up_proj, g, prefix + ".mlp.up_proj.weight");
-    q3_load_raw(ly.down_proj, g, prefix + ".mlp.down_proj.weight");
+    q3_load_raw(ly.gate_proj, g, prefix + ".mlp.gate_proj.weight", mapped);
+    q3_load_raw(ly.up_proj, g, prefix + ".mlp.up_proj.weight", mapped);
+    q3_load_raw(ly.down_proj, g, prefix + ".mlp.down_proj.weight", mapped);
 }
 
 // ------------------------------------------------------------------ graph ops

@@ -38,6 +38,31 @@ ggml_tensor * dit_gmeta(const DitGGUF & g, const std::string & name) {
     return ggml_get_tensor(g.meta, name.c_str());
 }
 
+ggml_backend_buffer_t dit_gguf_cpu_map_buffer(const DitGGUF & g) {
+    // One CPU buffer wrapping the whole mmap; every mapped tensor's data lives
+    // at an offset inside [g.file.data, g.file.data + g.file.size). The buffer
+    // is read-only in practice (weights are never written); freeing it does not
+    // munmap (that is dit_gguf_close's job at model teardown).
+    return ggml_backend_cpu_buffer_from_ptr((void *) g.file.data, g.file.size);
+}
+
+bool dit_gguf_map_tensor(ggml_tensor * dst, const DitGGUF & g, const std::string & name,
+                         ggml_backend_buffer_t map_buf) {
+    if (!dst) return false;
+    const void * src = dit_gdata(g, name);
+    if (!src) {
+        fprintf(stderr, "[acestep] cannot map tensor (absent): %s\n", name.c_str());
+        return false;
+    }
+    // Point the tensor at the mmap and attach the shared CPU buffer. With ->data
+    // set, ggml_backend_alloc_ctx_tensors skips this tensor (no dirty RAM), and
+    // the direct single-backend graph_compute reads the weight straight from the
+    // mapped page.
+    dst->data   = (void *) src;
+    dst->buffer = map_buf;
+    return true;
+}
+
 bool dit_gguf_has(const DitGGUF & g, const std::string & name) {
     return gguf_find_tensor(g.ctx, name.c_str()) >= 0;
 }

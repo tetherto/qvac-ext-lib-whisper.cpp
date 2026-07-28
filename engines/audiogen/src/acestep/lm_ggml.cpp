@@ -22,6 +22,12 @@ struct LMModel {
     ggml_context *        weight_ctx = nullptr;
     ggml_backend_buffer_t weight_buf = nullptr;
 
+    // CPU map-in-place: verbatim weights backed by `gguf`'s mmap via `map_buf`
+    // (see dit_gguf_cpu_map_buffer). `gguf` is kept open for the model's lifetime.
+    DitGGUF               gguf;
+    ggml_backend_buffer_t map_buf = nullptr;
+    bool                  mapped  = false;
+
     LMConfig    cfg;
     Qwen3Config q3;
 
@@ -99,32 +105,37 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
         return nullptr;
     }
 
+    // CPU backend: map the quantised weights straight off the mmap (no dirty RAM).
+    const bool            mapped  = ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backend));
+    ggml_backend_buffer_t map_buf = mapped ? dit_gguf_cpu_map_buffer(g) : nullptr;
+
     // Allocate + load weights.
     const size_t n_tensors = (size_t) 2 + (size_t) c.n_layers * 11 + 8;
     ggml_init_params ip{ ggml_tensor_overhead() * n_tensors, nullptr, /*no_alloc=*/true };
     m->weight_ctx = ggml_init(ip);
     ggml_context * ctx = m->weight_ctx;
 
-    m->embed_tokens = q3_create_like(ctx, g, "model.embed_tokens.weight");
+    m->embed_tokens = q3_create_like(ctx, g, "model.embed_tokens.weight", map_buf);
     m->final_norm   = q3_create_f32_like(ctx, g, "model.norm.weight");
     m->layers.resize(c.n_layers);
     for (int i = 0; i < c.n_layers; i++) {
-        q3_create_layer(ctx, g, "model.layers." + std::to_string(i), m->layers[i]);
+        q3_create_layer(ctx, g, "model.layers." + std::to_string(i), m->layers[i], map_buf);
     }
 
     m->weight_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!m->weight_buf) {
         fprintf(stderr, "[acestep-lm] failed to allocate weight buffer\n");
+        if (map_buf) ggml_backend_buffer_free(map_buf);
         ggml_free(ctx);
         dit_gguf_close(g);
         delete m;
         return nullptr;
     }
 
-    q3_load_raw(m->embed_tokens, g, "model.embed_tokens.weight");
+    q3_load_raw(m->embed_tokens, g, "model.embed_tokens.weight", mapped);
     q3_load_f32(m->final_norm, g, "model.norm.weight");
     for (int i = 0; i < c.n_layers; i++) {
-        q3_load_layer(g, "model.layers." + std::to_string(i), m->layers[i]);
+        q3_load_layer(g, "model.layers." + std::to_string(i), m->layers[i], mapped);
     }
 
     // KV cache: n_sets * n_layers tensors.
@@ -145,6 +156,7 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
     m->kv_buf = ggml_backend_alloc_ctx_tensors(m->kv_ctx, backend);
     if (!m->kv_buf) {
         fprintf(stderr, "[acestep-lm] failed to allocate KV cache\n");
+        if (map_buf) ggml_backend_buffer_free(map_buf);
         ggml_free(ctx);
         ggml_free(m->kv_ctx);
         dit_gguf_close(g);
@@ -162,7 +174,13 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
                 c.n_kv_heads, c.head_dim, kv_bytes / 1048576.0, NS);
     }
 
-    dit_gguf_close(g);
+    if (mapped) {
+        m->mapped  = true;
+        m->map_buf = map_buf;
+        m->gguf    = g;  // keep the mmap alive; mapped weights point into it
+    } else {
+        dit_gguf_close(g);
+    }
     return m;
 }
 
@@ -172,6 +190,8 @@ void lm_model_free(LMModel * m) {
     if (m->kv_ctx) ggml_free(m->kv_ctx);
     if (m->weight_buf) ggml_backend_buffer_free(m->weight_buf);
     if (m->weight_ctx) ggml_free(m->weight_ctx);
+    if (m->map_buf) ggml_backend_buffer_free(m->map_buf);
+    if (m->mapped) dit_gguf_close(m->gguf);
     delete m;
 }
 
