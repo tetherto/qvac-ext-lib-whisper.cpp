@@ -84,11 +84,12 @@ static inline ggml_tensor * q3_create_f32_like(ggml_context * ctx, const DitGGUF
     return t;
 }
 
-// `mapped`: the tensor is already backed by the mmap (create_like mapped it), so
-// there is nothing to copy.
-static inline void q3_load_raw(ggml_tensor * dst, const DitGGUF & g, const std::string & name,
-                               bool mapped = false) {
-    if (!dst || mapped) return;
+// A tensor already backed by g's mmap (create_like mapped it) needs no copy;
+// only allocated tensors do. Derived per-tensor via dit_gguf_is_mapped so there
+// is no separate `mapped` flag to drift out of sync and memcpy into a PROT_READ
+// page (SIGSEGV) or leave an allocated tensor unuploaded (silent garbage).
+static inline void q3_load_raw(ggml_tensor * dst, const DitGGUF & g, const std::string & name) {
+    if (!dst || dit_gguf_is_mapped(dst, g)) return;
     const void *  src = dit_gdata(g, name);
     ggml_tensor * mt  = dit_gmeta(g, name);
     if (!src || !mt) {
@@ -141,19 +142,18 @@ static inline void q3_create_layer(ggml_context * ctx, const DitGGUF & g, const 
     ly.down_proj  = q3_create_like(ctx, g, prefix + ".mlp.down_proj.weight", map_buf);
 }
 
-static inline void q3_load_layer(const DitGGUF & g, const std::string & prefix, Qwen3Layer & ly,
-                                 bool mapped = false) {
+static inline void q3_load_layer(const DitGGUF & g, const std::string & prefix, Qwen3Layer & ly) {
     q3_load_f32(ly.input_norm, g, prefix + ".input_layernorm.weight");
     q3_load_f32(ly.post_norm, g, prefix + ".post_attention_layernorm.weight");
-    q3_load_raw(ly.q_proj, g, prefix + ".self_attn.q_proj.weight", mapped);
-    q3_load_raw(ly.k_proj, g, prefix + ".self_attn.k_proj.weight", mapped);
-    q3_load_raw(ly.v_proj, g, prefix + ".self_attn.v_proj.weight", mapped);
-    q3_load_raw(ly.o_proj, g, prefix + ".self_attn.o_proj.weight", mapped);
+    q3_load_raw(ly.q_proj, g, prefix + ".self_attn.q_proj.weight");
+    q3_load_raw(ly.k_proj, g, prefix + ".self_attn.k_proj.weight");
+    q3_load_raw(ly.v_proj, g, prefix + ".self_attn.v_proj.weight");
+    q3_load_raw(ly.o_proj, g, prefix + ".self_attn.o_proj.weight");
     q3_load_f32(ly.q_norm, g, prefix + ".self_attn.q_norm.weight");
     q3_load_f32(ly.k_norm, g, prefix + ".self_attn.k_norm.weight");
-    q3_load_raw(ly.gate_proj, g, prefix + ".mlp.gate_proj.weight", mapped);
-    q3_load_raw(ly.up_proj, g, prefix + ".mlp.up_proj.weight", mapped);
-    q3_load_raw(ly.down_proj, g, prefix + ".mlp.down_proj.weight", mapped);
+    q3_load_raw(ly.gate_proj, g, prefix + ".mlp.gate_proj.weight");
+    q3_load_raw(ly.up_proj, g, prefix + ".mlp.up_proj.weight");
+    q3_load_raw(ly.down_proj, g, prefix + ".mlp.down_proj.weight");
 }
 
 // ------------------------------------------------------------------ graph ops

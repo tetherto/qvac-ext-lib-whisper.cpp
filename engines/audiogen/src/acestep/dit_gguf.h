@@ -2,12 +2,12 @@
 
 // ACE-Step DiT — GGUF weight IO.
 //
-// mmaps the DiT GGUF (acestep.cpp convert.py) and uploads weights into
-// pre-allocated backend tensors. Unlike the VAE (weight_norm fusion), the DiT
-// loader:
+// mmaps the DiT GGUF (acestep.cpp convert.py). On host-memory backends the
+// verbatim weights are backed directly by the mmap (see the CPU map-in-place
+// helpers below); otherwise they are uploaded into backend tensors. Unlike the
+// VAE (weight_norm fusion), the DiT loader:
 //   - reads config from GGUF metadata (acestep-dit.* / acestep.*),
-//   - optionally fuses Q/K/V (self+cross attn) and gate/up (MLP) into single
-//     tensors when the source quant types match (matmul throughput),
+//   - keeps Q/K/V and gate/up as separate tensors (no fusion),
 //   - pre-permutes proj_in ([H,in_ch,P] -> [in_ch*P, H]) and proj_out
 //     ([H,out_ch,P] -> [H, out_ch*P]) at load time to drop runtime permutes.
 //
@@ -61,9 +61,35 @@ ggml_backend_buffer_t dit_gguf_cpu_map_buffer(const DitGGUF & g);
 // Point `dst` at its bytes inside the mmap and attach `map_buf`. `dst` must have
 // been created with the SAME type + shape as the GGUF tensor (create_like), so
 // the mapped bytes are a byte-for-byte match for what a copy would have set.
-// Returns false (and leaves `dst` untouched) if the tensor is absent.
+// Returns false (and leaves `dst->data` NULL) if the tensor is absent, or if its
+// bytes would fall outside the mapping / are under-aligned for the CPU quant
+// kernels (a truncated / corrupt GGUF) — in which case the caller allocates and
+// copies instead (which then fails loudly at load rather than SIGBUS'ing later).
 bool dit_gguf_map_tensor(ggml_tensor * dst, const DitGGUF & g, const std::string & name,
                          ggml_backend_buffer_t map_buf);
+
+// True iff `t`'s data points inside `g`'s mmap — i.e. it was mapped in-place
+// (rather than allocated in a backend buffer). This is derived purely from the
+// tensor + mmap, so the "is this weight mapped?" decision is unbreakable: load
+// paths never carry a separate `mapped` flag that could drift out of sync with
+// the create-time mapping and memcpy into a PROT_READ page.
+inline bool dit_gguf_is_mapped(const ggml_tensor * t, const DitGGUF & g) {
+    if (!t || !t->data || !g.file.data) return false;
+    const uintptr_t p = (uintptr_t) t->data;
+    const uintptr_t b = (uintptr_t) g.file.data;
+    return p >= b && p < b + g.file.size;
+}
+
+// Sum of ggml_nbytes over the tensors in `ctx` that were mapped in-place from
+// `g`. Exact (excludes the allocated/converted tensors and GGUF metadata), so
+// callers can report the mmapped weight footprint without double-counting.
+inline size_t dit_gguf_mapped_bytes(ggml_context * ctx, const DitGGUF & g) {
+    size_t total = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        if (dit_gguf_is_mapped(t, g)) total += ggml_nbytes(t);
+    }
+    return total;
+}
 
 // Metadata accessors (throw std::runtime_error on missing key).
 uint32_t dit_gguf_u32(const DitGGUF & g, const std::string & key);

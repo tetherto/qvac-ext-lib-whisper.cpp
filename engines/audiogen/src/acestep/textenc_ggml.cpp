@@ -33,6 +33,7 @@ struct TextEncModel {
     DitGGUF               gguf;
     ggml_backend_buffer_t map_buf = nullptr;
     bool                  mapped  = false;
+    size_t                mapped_bytes = 0;  // sum of mmapped weight nbytes
 };
 
 static Qwen3Config to_q3(const TextEncConfig & c) {
@@ -87,11 +88,12 @@ TextEncModel * textenc_model_load(const std::string & path, ggml_backend_t backe
         return nullptr;
     }
 
-    q3_load_raw(m->embed_tokens, g, "embed_tokens.weight", mapped);
+    q3_load_raw(m->embed_tokens, g, "embed_tokens.weight");
     q3_load_f32(m->final_norm, g, "norm.weight");
     for (int i = 0; i < c.n_layers; i++) {
-        q3_load_layer(g, "layers." + std::to_string(i), m->layers[i], mapped);
+        q3_load_layer(g, "layers." + std::to_string(i), m->layers[i]);
     }
+    m->mapped_bytes = mapped ? dit_gguf_mapped_bytes(ctx, g) : 0;
 
     if (verbose) {
         fprintf(stderr, "[acestep-txt] loaded %s: %.1f MB, %d layers H=%d Nh=%d/%d D=%d\n", path.c_str(),
@@ -121,7 +123,9 @@ void textenc_model_free(TextEncModel * m) {
 const TextEncConfig & textenc_model_config(const TextEncModel * m) { return m->cfg; }
 
 size_t textenc_model_weight_bytes(const TextEncModel * m) {
-    return m->weight_buf ? ggml_backend_buffer_get_size(m->weight_buf) : 0;
+    if (!m) return 0;
+    const size_t alloc = m->weight_buf ? ggml_backend_buffer_get_size(m->weight_buf) : 0;
+    return alloc + m->mapped_bytes;  // allocated (F32) + mmapped weights
 }
 
 bool textenc_model_forward(TextEncModel * m, const int32_t * token_ids, int S, std::vector<float> & hidden_out) {

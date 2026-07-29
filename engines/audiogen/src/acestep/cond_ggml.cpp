@@ -62,6 +62,7 @@ struct CondModel {
     DitGGUF               gguf;
     ggml_backend_buffer_t map_buf = nullptr;
     bool                  mapped  = false;
+    size_t                mapped_bytes = 0;  // sum of mmapped weight nbytes
 };
 
 static void dequant_to_f32(const DitGGUF & g, const std::string & name, std::vector<float> & out) {
@@ -150,20 +151,21 @@ CondModel * cond_model_load(const std::string & path, ggml_backend_t backend, bo
     }
 
     // upload
-    q3_load_raw(m->lyric_embed_w, g, "encoder.lyric_encoder.embed_tokens.weight", mapped);
+    q3_load_raw(m->lyric_embed_w, g, "encoder.lyric_encoder.embed_tokens.weight");
     q3_load_f32(m->lyric_embed_b, g, "encoder.lyric_encoder.embed_tokens.bias");
     q3_load_f32(m->lyric_norm, g, "encoder.lyric_encoder.norm.weight");
     for (int i = 0; i < m->lyric_cfg.n_layers; i++) {
-        q3_load_layer(g, "encoder.lyric_encoder.layers." + std::to_string(i), m->lyric_layers[i], mapped);
+        q3_load_layer(g, "encoder.lyric_encoder.layers." + std::to_string(i), m->lyric_layers[i]);
     }
-    q3_load_raw(m->timbre_embed_w, g, "encoder.timbre_encoder.embed_tokens.weight", mapped);
+    q3_load_raw(m->timbre_embed_w, g, "encoder.timbre_encoder.embed_tokens.weight");
     q3_load_f32(m->timbre_embed_b, g, "encoder.timbre_encoder.embed_tokens.bias");
     q3_load_f32(m->timbre_norm, g, "encoder.timbre_encoder.norm.weight");
     for (int i = 0; i < m->timbre_cfg.n_layers; i++) {
-        q3_load_layer(g, "encoder.timbre_encoder.layers." + std::to_string(i), m->timbre_layers[i], mapped);
+        q3_load_layer(g, "encoder.timbre_encoder.layers." + std::to_string(i), m->timbre_layers[i]);
     }
     if (m->use_timbre_cls) q3_load_f32(m->timbre_cls, g, "encoder.timbre_encoder.special_token");
-    q3_load_raw(m->text_proj_w, g, "encoder.text_projector.weight", mapped);
+    q3_load_raw(m->text_proj_w, g, "encoder.text_projector.weight");
+    m->mapped_bytes = mapped ? dit_gguf_mapped_bytes(ctx, g) : 0;
 
     dequant_to_f32(g, "null_condition_emb", m->null_emb);
 
@@ -207,7 +209,9 @@ void cond_model_free(CondModel * m) {
 }
 
 size_t cond_model_weight_bytes(const CondModel * m) {
-    return m->weight_buf ? ggml_backend_buffer_get_size(m->weight_buf) : 0;
+    if (!m) return 0;
+    const size_t alloc = m->weight_buf ? ggml_backend_buffer_get_size(m->weight_buf) : 0;
+    return alloc + m->mapped_bytes;  // allocated (F32) + mmapped weights
 }
 
 const std::vector<float> & cond_model_null_emb(const CondModel * m) { return m->null_emb; }

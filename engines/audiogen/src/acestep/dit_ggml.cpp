@@ -74,6 +74,7 @@ struct DitModel {
     DitGGUF               gguf;
     ggml_backend_buffer_t map_buf = nullptr;
     bool                  mapped  = false;
+    size_t                mapped_bytes = 0;  // sum of mmapped weight nbytes
 
     DitConfig cfg;
 
@@ -135,10 +136,11 @@ static ggml_tensor * create_f32_like(ggml_context * ctx, const DitGGUF & g, cons
 }
 
 // Upload raw bytes verbatim (dst type == GGUF type). Used for mul_mat operands
-// (kept in their native quant/precision type). When `mapped` is true the tensor
-// was already backed by the mmap in create_like, so there is nothing to copy.
-static void load_raw(ggml_tensor * dst, const DitGGUF & g, const std::string & name, bool mapped = false) {
-    if (!dst || mapped) return;
+// (kept in their native quant/precision type). A tensor already backed by the
+// mmap (create_like mapped it) needs no copy — derived per-tensor via
+// dit_gguf_is_mapped so no caller flag can drift and memcpy into a PROT_READ page.
+static void load_raw(ggml_tensor * dst, const DitGGUF & g, const std::string & name) {
+    if (!dst || dit_gguf_is_mapped(dst, g)) return;
     const void * src = dit_gdata(g, name);
     ggml_tensor * mt = dit_gmeta(g, name);
     if (!src || !mt) {
@@ -251,12 +253,12 @@ static void temb_create(DitTemb & w, ggml_context * ctx, const DitGGUF & g, cons
     w.time_proj_b = create_f32_like(ctx, g, pfx + ".time_proj.bias");
 }
 
-static void temb_load(DitTemb & w, const DitGGUF & g, const std::string & pfx, bool mapped = false) {
-    load_raw(w.linear_1_w, g, pfx + ".linear_1.weight", mapped);
+static void temb_load(DitTemb & w, const DitGGUF & g, const std::string & pfx) {
+    load_raw(w.linear_1_w, g, pfx + ".linear_1.weight");
     load_f32(w.linear_1_b, g, pfx + ".linear_1.bias");
-    load_raw(w.linear_2_w, g, pfx + ".linear_2.weight", mapped);
+    load_raw(w.linear_2_w, g, pfx + ".linear_2.weight");
     load_f32(w.linear_2_b, g, pfx + ".linear_2.bias");
-    load_raw(w.time_proj_w, g, pfx + ".time_proj.weight", mapped);
+    load_raw(w.time_proj_w, g, pfx + ".time_proj.weight");
     load_f32(w.time_proj_b, g, pfx + ".time_proj.bias");
 }
 
@@ -500,36 +502,36 @@ DitModel * dit_model_load(const std::string & path, ggml_backend_t backend, bool
         return nullptr;
     }
 
-    // upload — mapped weights are already backed by the mmap, so load_raw is a
-    // no-op for them; the F32-converted / permuted tensors are always uploaded.
-    temb_load(m->time_embed, g, "decoder.time_embed", mapped);
-    temb_load(m->time_embed_r, g, "decoder.time_embed_r", mapped);
+    // upload — load_raw is a per-tensor no-op for mapped weights (already backed
+    // by the mmap); the F32-converted / permuted tensors are always uploaded.
+    temb_load(m->time_embed, g, "decoder.time_embed");
+    temb_load(m->time_embed_r, g, "decoder.time_embed_r");
     load_proj_in(m->proj_in_w, g, "decoder.proj_in.1.weight", H, c.in_channels, c.patch_size);
     load_f32(m->proj_in_b, g, "decoder.proj_in.1.bias");
-    load_raw(m->cond_emb_w, g, "decoder.condition_embedder.weight", mapped);
+    load_raw(m->cond_emb_w, g, "decoder.condition_embedder.weight");
     load_f32(m->cond_emb_b, g, "decoder.condition_embedder.bias");
 
     for (int i = 0; i < c.n_layers; i++) {
         DitLayer &  ly = m->layers[i];
         std::string p  = "decoder.layers." + std::to_string(i);
         load_f32(ly.self_attn_norm, g, p + ".self_attn_norm.weight");
-        load_raw(ly.sa_q_proj, g, p + ".self_attn.q_proj.weight", mapped);
-        load_raw(ly.sa_k_proj, g, p + ".self_attn.k_proj.weight", mapped);
-        load_raw(ly.sa_v_proj, g, p + ".self_attn.v_proj.weight", mapped);
+        load_raw(ly.sa_q_proj, g, p + ".self_attn.q_proj.weight");
+        load_raw(ly.sa_k_proj, g, p + ".self_attn.k_proj.weight");
+        load_raw(ly.sa_v_proj, g, p + ".self_attn.v_proj.weight");
         load_f32(ly.sa_q_norm, g, p + ".self_attn.q_norm.weight");
         load_f32(ly.sa_k_norm, g, p + ".self_attn.k_norm.weight");
-        load_raw(ly.sa_o_proj, g, p + ".self_attn.o_proj.weight", mapped);
+        load_raw(ly.sa_o_proj, g, p + ".self_attn.o_proj.weight");
         load_f32(ly.cross_attn_norm, g, p + ".cross_attn_norm.weight");
-        load_raw(ly.ca_q_proj, g, p + ".cross_attn.q_proj.weight", mapped);
-        load_raw(ly.ca_k_proj, g, p + ".cross_attn.k_proj.weight", mapped);
-        load_raw(ly.ca_v_proj, g, p + ".cross_attn.v_proj.weight", mapped);
+        load_raw(ly.ca_q_proj, g, p + ".cross_attn.q_proj.weight");
+        load_raw(ly.ca_k_proj, g, p + ".cross_attn.k_proj.weight");
+        load_raw(ly.ca_v_proj, g, p + ".cross_attn.v_proj.weight");
         load_f32(ly.ca_q_norm, g, p + ".cross_attn.q_norm.weight");
         load_f32(ly.ca_k_norm, g, p + ".cross_attn.k_norm.weight");
-        load_raw(ly.ca_o_proj, g, p + ".cross_attn.o_proj.weight", mapped);
+        load_raw(ly.ca_o_proj, g, p + ".cross_attn.o_proj.weight");
         load_f32(ly.mlp_norm, g, p + ".mlp_norm.weight");
-        load_raw(ly.gate_proj, g, p + ".mlp.gate_proj.weight", mapped);
-        load_raw(ly.up_proj, g, p + ".mlp.up_proj.weight", mapped);
-        load_raw(ly.down_proj, g, p + ".mlp.down_proj.weight", mapped);
+        load_raw(ly.gate_proj, g, p + ".mlp.gate_proj.weight");
+        load_raw(ly.up_proj, g, p + ".mlp.up_proj.weight");
+        load_raw(ly.down_proj, g, p + ".mlp.down_proj.weight");
         load_f32(ly.scale_shift_table, g, p + ".scale_shift_table");
     }
 
@@ -539,6 +541,10 @@ DitModel * dit_model_load(const std::string & path, ggml_backend_t backend, bool
     load_f32(m->proj_out_b, g, "decoder.proj_out.1.bias");
     const float one = 1.0f;
     ggml_backend_tensor_set(m->scalar_one, &one, 0, sizeof(float));
+
+    // Exact mmapped weight footprint (sum of mapped tensor nbytes — excludes the
+    // allocated F32/permuted tensors and GGUF metadata, so it does not double-count).
+    m->mapped_bytes = mapped ? dit_gguf_mapped_bytes(ctx, g) : 0;
 
     if (mapped) {
         // Keep the mmap (and its backing buffer) alive for the model's lifetime;
@@ -551,11 +557,10 @@ DitModel * dit_model_load(const std::string & path, ggml_backend_t backend, bool
     }
 
     if (verbose) {
-        const size_t owned  = ggml_backend_buffer_get_size(m->weight_buf);
-        const size_t mapsz  = mapped ? m->gguf.file.size : 0;
-        fprintf(stderr, "[acestep-dit] loaded %s: %.1f MB (%.1f MB mmapped + %.1f MB alloc), %d layers H=%d Nh=%d/%d D=%d\n",
-                path.c_str(), (float) (owned + mapsz) / (1024 * 1024), (float) mapsz / (1024 * 1024),
-                (float) owned / (1024 * 1024), c.n_layers, H, c.n_heads, c.n_kv_heads, c.head_dim);
+        const float owned = (float) ggml_backend_buffer_get_size(m->weight_buf) / (1024 * 1024);
+        const float mapsz = (float) m->mapped_bytes / (1024 * 1024);
+        fprintf(stderr, "[acestep-dit] loaded %s: %.1f MB alloc + %.1f MB mmapped, %d layers H=%d Nh=%d/%d D=%d\n",
+                path.c_str(), owned, mapsz, c.n_layers, H, c.n_heads, c.n_kv_heads, c.head_dim);
     }
     return m;
 }
@@ -573,7 +578,9 @@ void dit_model_free(DitModel * m) {
 const DitConfig & dit_model_config(const DitModel * m) { return m->cfg; }
 
 size_t dit_model_weight_bytes(const DitModel * m) {
-    return (m && m->weight_buf) ? ggml_backend_buffer_get_size(m->weight_buf) : 0;
+    if (!m) return 0;
+    const size_t alloc = m->weight_buf ? ggml_backend_buffer_get_size(m->weight_buf) : 0;
+    return alloc + m->mapped_bytes;  // allocated (F32/permuted) + mmapped weights
 }
 
 bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<float> & velocity_out) {
