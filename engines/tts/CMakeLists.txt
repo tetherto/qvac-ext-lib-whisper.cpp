@@ -720,6 +720,17 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_parler_gguf}" "${_tcb_parler_ref}"
         REQUIRES "${_tcb_parler_gguf}" "${_tcb_parler_ref}/dacrand_wav.npy")
 
+    # Same binary on the GPU transposed-conv path (conv_transpose_1d_matmul), which
+    # the CPU run never reaches.  Skipped on GPU-less fleets via `ctest -LE gpu`.
+    if (GGML_METAL OR GGML_VULKAN OR GGML_CUDA)
+        tts_cpp_register_test(test-parler-dac-gpu
+            EXE      test-parler-dac
+            LABEL    "gpu"
+            ARGS     "${_tcb_parler_gguf}" "${_tcb_parler_ref}"
+            REQUIRES "${_tcb_parler_gguf}" "${_tcb_parler_ref}/dacrand_wav.npy")
+        set_property(TEST test-parler-dac-gpu APPEND PROPERTY ENVIRONMENT "PARLER_TEST_GPU=1")
+    endif()
+
     add_executable(test-parler-e2e test/parler/test_e2e.cpp
         src/parler/t5.cpp src/parler/decoder.cpp src/parler/delay.cpp
         src/parler/dac.cpp src/parler/sampler.cpp src/parler/tokenizer.cpp
@@ -795,6 +806,15 @@ if (TTS_CPP_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "${_tcb_parler_indic_gguf}" "${_tcb_parler_indic_ref}"
         REQUIRES "${_tcb_parler_indic_gguf}" "${_tcb_parler_indic_ref}/dacrand_wav.npy")
+
+    if (GGML_METAL OR GGML_VULKAN OR GGML_CUDA)
+        tts_cpp_register_test(test-parler-dac-indic-gpu
+            EXE      test-parler-dac
+            LABEL    "gpu"
+            ARGS     "${_tcb_parler_indic_gguf}" "${_tcb_parler_indic_ref}"
+            REQUIRES "${_tcb_parler_indic_gguf}" "${_tcb_parler_indic_ref}/dacrand_wav.npy")
+        set_property(TEST test-parler-dac-indic-gpu APPEND PROPERTY ENVIRONMENT "PARLER_TEST_GPU=1")
+    endif()
 
     tts_cpp_register_test(test-parler-e2e-indic
         EXE      test-parler-e2e
