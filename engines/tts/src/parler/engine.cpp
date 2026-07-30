@@ -10,6 +10,7 @@
 #include "backend_util.h"
 
 #include <atomic>
+#include <cstdio>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -25,6 +26,9 @@ struct Engine::Impl {
     parler_tokenizer     tokenizer;         // descriptions (and prompts when shared)
     parler_bpe_tokenizer prompt_tokenizer;  // prompts, iff the GGUF ships one
     ggml_gallocr_t       allocr = nullptr;
+    // Resolved once at construction (see Engine::Engine) -- opts stays as the
+    // caller wrote it so options() keeps reporting the request, not the repair.
+    parler_sampling_params sampling;
     std::string        cached_description;
     bool               has_cached_description = false;
     std::atomic<bool>  cancel_requested{false};
@@ -102,11 +106,7 @@ struct Engine::Impl {
                                                        : hp.gen_min_new_tokens;
         delay_state st(dcfg);
 
-        parler_sampling_params sp;
-        sp.greedy      = opts.greedy || !hp.gen_do_sample;
-        sp.temperature = opts.temperature > 0.0f ? opts.temperature : hp.gen_temperature;
-        sp.top_k       = opts.top_k > 0 ? opts.top_k : hp.gen_top_k;
-        sp.top_p       = opts.top_p;
+        const parler_sampling_params & sp = sampling;
         std::mt19937 rng((uint32_t) opts.seed);
 
         std::vector<float> logits;
@@ -214,6 +214,28 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(new Impl()) {
         ggml_backend_get_default_buffer_type(pimpl_->model.backend));
     if (!pimpl_->allocr) {
         throw std::runtime_error("parler: graph allocator creation failed");
+    }
+
+    const parler_hparams & hp = pimpl_->model.hparams;
+    parler_gen_defaults def;
+    def.do_sample   = hp.gen_do_sample;
+    def.temperature = hp.gen_temperature;
+    def.top_k       = hp.gen_top_k;
+    parler_sampling_request req;
+    req.greedy      = opts.greedy;
+    req.temperature = opts.temperature;
+    req.top_k       = opts.top_k;
+    req.top_p       = opts.top_p;
+
+    std::string repaired;
+    pimpl_->sampling = parler_resolve_sampling(req, def, &repaired);
+    if (!repaired.empty()) {
+        fprintf(stderr,
+            "parler: warning: %s selects argmax decoding, which this model family "
+            "cannot terminate (EOS is gated on codebook 0's argmax and the decoder "
+            "collapses to silence); falling back to sampling (temperature %.2f, "
+            "top-k %d). Use seed for reproducible output.\n",
+            repaired.c_str(), pimpl_->sampling.temperature, pimpl_->sampling.top_k);
     }
 }
 

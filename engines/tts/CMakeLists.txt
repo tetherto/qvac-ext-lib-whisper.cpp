@@ -668,6 +668,11 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_parler_ref}"
         REQUIRES "${_tcb_parler_ref}/delay_mask_len24.npy")
 
+    add_executable(test-parler-sampler test/parler/test_sampler.cpp src/parler/sampler.cpp)
+    target_include_directories(test-parler-sampler PRIVATE src)
+    tts_cpp_apply_ccache(test-parler-sampler)
+    tts_cpp_register_test(test-parler-sampler)
+
     add_executable(test-parler-text-norm test/parler/test_text_norm.cpp
         src/parler/text_norm.cpp)
     target_include_directories(test-parler-text-norm PRIVATE src)
