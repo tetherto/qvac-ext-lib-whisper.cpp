@@ -3,6 +3,7 @@
 #include "ggml-alloc.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -14,6 +15,10 @@ namespace {
 
 // F32 conv1d via im2col + mul_mat (ggml_conv_1d's F16 im2col loses too much
 // precision over the 26-conv DAC stack).  kernel ne=[K, IC, OC].
+//
+// Keeping im2col in F32 only helps if the matmul that consumes it stays in F32 too, so
+// the contraction asks for it explicitly: backends are free to multiply f32 operands in
+// fp16 for GGML_PREC_DEFAULT, and over 26 convolutions that dominates the output error.
 ggml_tensor * conv1d_f32(ggml_context * ctx, ggml_tensor * kernel, ggml_tensor * input,
                          int stride, int padding, int dilation) {
     ggml_tensor * im2col = ggml_im2col(ctx, kernel, input, stride, 0, padding, 0, dilation, 0,
@@ -21,6 +26,7 @@ ggml_tensor * conv1d_f32(ggml_context * ctx, ggml_tensor * kernel, ggml_tensor *
     ggml_tensor * result = ggml_mul_mat(ctx,
         ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
         ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]));
+    ggml_mul_mat_set_prec(result, GGML_PREC_F32);
     return ggml_reshape_3d(ctx, result, im2col->ne[1], kernel->ne[2], im2col->ne[2]);
 }
 
@@ -34,6 +40,46 @@ ggml_tensor * conv_transpose_1d_trim(ggml_context * ctx, ggml_tensor * kernel,
     ggml_tensor * v = ggml_view_3d(ctx, out, l_new, out->ne[1], out->ne[2],
                                    out->nb[1], out->nb[2], (size_t) padding * out->nb[0]);
     return ggml_cont(ctx, v);
+}
+
+// Transposed conv1d (K=2*stride) as two phase-GEMMs + shifted overlap-add on the
+// fast matmul path. kernel ne=[K,OC,IC]; input ne=[IL,IC,1]; returns [IL*stride,OC,1].
+ggml_tensor * conv_transpose_1d_matmul(ggml_context * ctx, ggml_tensor * kernel,
+                                       ggml_tensor * input, int stride) {
+    const int64_t K  = kernel->ne[0];
+    const int64_t OC = kernel->ne[1];
+    const int64_t IC = kernel->ne[2];
+    const int64_t IL = input->ne[0];
+    const int64_t s  = stride;
+    GGML_ASSERT(K == 2 * s);
+    GGML_ASSERT(s % 2 == 0); // s/2 trim + IL*s length assume even stride (DAC rates 8,8,4,2)
+
+    ggml_tensor * x2 = ggml_cont(ctx, ggml_transpose(ctx,
+        ggml_reshape_2d(ctx, input, IL, IC)));                          // [IC, IL]
+
+    auto phase = [&](int64_t k0) -> ggml_tensor * {
+        ggml_tensor * Wv = ggml_view_3d(ctx, kernel, s, OC, IC,
+            kernel->nb[1], kernel->nb[2], (size_t) k0 * kernel->nb[0]); // [s, OC, IC]
+        ggml_tensor * Wr = ggml_reshape_2d(ctx,
+            ggml_cont(ctx, ggml_permute(ctx, Wv, 1, 2, 0, 3)), IC, s * OC); // [IC, s*OC]
+        ggml_tensor * M  = ggml_mul_mat(ctx, Wr, x2);                   // [s*OC, IL]
+        ggml_mul_mat_set_prec(M, GGML_PREC_F32); // deep-IC contraction; DAC is precision-sensitive
+        ggml_tensor * Mi = ggml_cont(ctx, ggml_permute(ctx,
+            ggml_reshape_3d(ctx, M, s, OC, IL), 0, 2, 1, 3));           // [s, IL, OC]
+        return ggml_reshape_2d(ctx, Mi, IL * s, OC);                    // [IL*s, OC] ol=i*s+p
+    };
+    ggml_tensor * A = phase(0);                                         // ol = i*s + p
+    ggml_tensor * B = phase(s);                                         // ol = i*s + p + s
+
+    // A occupies [0, IL*s); B is shifted +s to [s, IL*s+s). Pad both to the full
+    // length and overlap-add.
+    ggml_tensor * A_full = ggml_pad_ext(ctx, A, 0, (int) s, 0, 0, 0, 0, 0, 0); // [IL*s+s, OC]
+    ggml_tensor * B_full = ggml_pad_ext(ctx, B, (int) s, 0, 0, 0, 0, 0, 0, 0); // [IL*s+s, OC]
+    ggml_tensor * out    = ggml_add(ctx, A_full, B_full);                     // [IL*s+s, OC]
+
+    ggml_tensor * trimmed = ggml_cont(ctx, ggml_view_2d(ctx, out,
+        IL * s, OC, out->nb[1], (size_t) (s / 2) * out->nb[0]));       // [IL*s, OC]
+    return ggml_reshape_3d(ctx, trimmed, IL * s, OC, 1);
 }
 
 // bias ne=[C] broadcast-added over the length dim of x ne=[L, C, 1]
@@ -54,6 +100,9 @@ bool parler_dac_decode(const parler_model & model, const int32_t * codes, int n_
                        std::vector<float> * latent_out) {
     const parler_hparams & hp = model.hparams;
     const int n_q = hp.dac_n_q;
+    // GPU: transposed-conv via phase-matmuls (fast GEMM). Env flag lets the CPU
+    // reference-parity test exercise the same path for validation.
+    const bool convt_mm = model.on_gpu || std::getenv("PARLER_DAC_CONVT_MATMUL") != nullptr;
 
     if (n_frames <= 0) {
         fprintf(stderr, "%s: invalid n_frames=%d\n", __func__, n_frames);
@@ -93,7 +142,9 @@ bool parler_dac_decode(const parler_model & model, const int32_t * codes, int n_
         ggml_tensor * z   = ggml_get_rows(ctx, q.codebook, ids);                   // [8, T]
         ggml_tensor * w2  = ggml_reshape_2d(ctx, q.out_proj_w,
                                             q.out_proj_w->ne[1], q.out_proj_w->ne[2]);
-        ggml_tensor * p   = ggml_add(ctx, ggml_mul_mat(ctx, w2, z), q.out_proj_b); // [1024, T]
+        ggml_tensor * proj = ggml_mul_mat(ctx, w2, z);
+        ggml_mul_mat_set_prec(proj, GGML_PREC_F32); // latent feeds the precision-sensitive conv stack
+        ggml_tensor * p   = ggml_add(ctx, proj, q.out_proj_b);                     // [1024, T]
         latent = latent ? ggml_add(ctx, latent, p) : p;
     }
     ggml_set_name(latent, "latent");
@@ -110,7 +161,8 @@ bool parler_dac_decode(const parler_model & model, const int32_t * codes, int n_
         const int s = blk.stride;
         x = snake(ctx, x, blk.snake_alpha, eps);
         const int64_t t_in = x->ne[0];
-        x = conv_transpose_1d_trim(ctx, blk.convt_w, x, s, s / 2);
+        x = convt_mm ? conv_transpose_1d_matmul(ctx, blk.convt_w, x, s)
+                     : conv_transpose_1d_trim(ctx, blk.convt_w, x, s, s / 2);
         GGML_ASSERT(x->ne[0] == t_in * s);
         x = add_bias(ctx, x, blk.convt_b);
         for (int j = 0; j < 3; ++j) {

@@ -34,6 +34,19 @@ struct Qwen3Config {
     float rope_theta        = 1000000.0f;
     float rms_norm_eps      = 1e-6f;
     bool  is_causal         = false;
+    // Matmul accumulation/arithmetic precision, applied to every matmul the block
+    // builds: the four projections, the MLP, and both attention matmuls.
+    //
+    // GGML_PREC_F32 is required for models whose activations leave fp16 range, otherwise
+    // fp16-based GPU matmul paths clamp them at 65504. The ACE-Step LM reaches ~1.9e6 and
+    // produces repetitive, robotic audio without it.
+    // Only the LM asks for it. The text encoder, cond encoder and detokenizer stay at
+    // GGML_PREC_DEFAULT deliberately: their activations remain well inside fp16 range,
+    // and the default keeps them on the fast coopmat path, bit-identical to before the
+    // LM fix. Raising it for those stages would cost throughput to buy accuracy they do
+    // not currently need -- worth revisiting only with measurements of their activation
+    // ranges, not on the strength of the LM's result.
+    ggml_prec prec = GGML_PREC_DEFAULT;
 };
 
 struct Qwen3Layer {
@@ -57,7 +70,11 @@ static inline float q3_bf16_to_f32(uint16_t v) {
     return ggml_bf16_to_fp32(b);
 }
 
-static inline ggml_tensor * q3_create_like(ggml_context * ctx, const DitGGUF & g, const std::string & name) {
+// map_buf non-null (CPU backend) maps the verbatim weight in-place onto the GGUF
+// mmap; its q3_load_raw then becomes a no-op. Null on the GPU path (allocate +
+// upload as before). See dit_gguf_cpu_map_buffer.
+static inline ggml_tensor * q3_create_like(ggml_context * ctx, const DitGGUF & g, const std::string & name,
+                                           ggml_backend_buffer_t map_buf = nullptr) {
     ggml_tensor * mt = dit_gmeta(g, name);
     if (!mt) {
         fprintf(stderr, "[qwen3] missing tensor: %s\n", name.c_str());
@@ -65,6 +82,7 @@ static inline ggml_tensor * q3_create_like(ggml_context * ctx, const DitGGUF & g
     }
     ggml_tensor * t = ggml_new_tensor(ctx, mt->type, ggml_n_dims(mt), mt->ne);
     ggml_set_name(t, name.c_str());
+    if (map_buf) dit_gguf_map_tensor(t, g, name, map_buf);
     return t;
 }
 
@@ -79,8 +97,12 @@ static inline ggml_tensor * q3_create_f32_like(ggml_context * ctx, const DitGGUF
     return t;
 }
 
+// A tensor already backed by g's mmap (create_like mapped it) needs no copy;
+// only allocated tensors do. Derived per-tensor via dit_gguf_is_mapped so there
+// is no separate `mapped` flag to drift out of sync and memcpy into a PROT_READ
+// page (SIGSEGV) or leave an allocated tensor unuploaded (silent garbage).
 static inline void q3_load_raw(ggml_tensor * dst, const DitGGUF & g, const std::string & name) {
-    if (!dst) return;
+    if (!dst || dit_gguf_is_mapped(dst, g)) return;
     const void *  src = dit_gdata(g, name);
     ggml_tensor * mt  = dit_gmeta(g, name);
     if (!src || !mt) {
@@ -116,19 +138,21 @@ static inline void q3_load_f32(ggml_tensor * dst, const DitGGUF & g, const std::
 }
 
 // Create the 11 per-layer weight tensors under `prefix` (e.g. "layers.0").
+// map_buf (CPU) maps the 7 verbatim proj weights in-place; the 4 F32 norms are
+// always allocated + converted.
 static inline void q3_create_layer(ggml_context * ctx, const DitGGUF & g, const std::string & prefix,
-                                   Qwen3Layer & ly) {
+                                   Qwen3Layer & ly, ggml_backend_buffer_t map_buf = nullptr) {
     ly.input_norm = q3_create_f32_like(ctx, g, prefix + ".input_layernorm.weight");
     ly.post_norm  = q3_create_f32_like(ctx, g, prefix + ".post_attention_layernorm.weight");
-    ly.q_proj     = q3_create_like(ctx, g, prefix + ".self_attn.q_proj.weight");
-    ly.k_proj     = q3_create_like(ctx, g, prefix + ".self_attn.k_proj.weight");
-    ly.v_proj     = q3_create_like(ctx, g, prefix + ".self_attn.v_proj.weight");
-    ly.o_proj     = q3_create_like(ctx, g, prefix + ".self_attn.o_proj.weight");
+    ly.q_proj     = q3_create_like(ctx, g, prefix + ".self_attn.q_proj.weight", map_buf);
+    ly.k_proj     = q3_create_like(ctx, g, prefix + ".self_attn.k_proj.weight", map_buf);
+    ly.v_proj     = q3_create_like(ctx, g, prefix + ".self_attn.v_proj.weight", map_buf);
+    ly.o_proj     = q3_create_like(ctx, g, prefix + ".self_attn.o_proj.weight", map_buf);
     ly.q_norm     = q3_create_f32_like(ctx, g, prefix + ".self_attn.q_norm.weight");
     ly.k_norm     = q3_create_f32_like(ctx, g, prefix + ".self_attn.k_norm.weight");
-    ly.gate_proj  = q3_create_like(ctx, g, prefix + ".mlp.gate_proj.weight");
-    ly.up_proj    = q3_create_like(ctx, g, prefix + ".mlp.up_proj.weight");
-    ly.down_proj  = q3_create_like(ctx, g, prefix + ".mlp.down_proj.weight");
+    ly.gate_proj  = q3_create_like(ctx, g, prefix + ".mlp.gate_proj.weight", map_buf);
+    ly.up_proj    = q3_create_like(ctx, g, prefix + ".mlp.up_proj.weight", map_buf);
+    ly.down_proj  = q3_create_like(ctx, g, prefix + ".mlp.down_proj.weight", map_buf);
 }
 
 static inline void q3_load_layer(const DitGGUF & g, const std::string & prefix, Qwen3Layer & ly) {
@@ -154,21 +178,31 @@ static inline ggml_tensor * q3_rms_norm_w(ggml_context * ctx, ggml_tensor * x, g
     return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), q3_as_f32(ctx, w));
 }
 
-static inline ggml_tensor * q3_linear(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x) {
-    return ggml_mul_mat(ctx, w, x);
+static inline ggml_tensor * q3_linear(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x,
+                                      ggml_prec prec = GGML_PREC_DEFAULT) {
+    ggml_tensor * t = ggml_mul_mat(ctx, w, x);
+    ggml_mul_mat_set_prec(t, prec);
+    return t;
 }
 
-static inline ggml_tensor * q3_linear_bias(ggml_context * ctx, ggml_tensor * w, ggml_tensor * b, ggml_tensor * x) {
-    return ggml_add(ctx, ggml_mul_mat(ctx, w, x), q3_as_f32(ctx, b));
+static inline ggml_tensor * q3_linear_bias(ggml_context * ctx, ggml_tensor * w, ggml_tensor * b, ggml_tensor * x,
+                                           ggml_prec prec = GGML_PREC_DEFAULT) {
+    return ggml_add(ctx, q3_linear(ctx, w, x, prec), q3_as_f32(ctx, b));
 }
 
-// F32 attention. q[D,S,Nh], k[D,S,Nkv], v[D,S,Nkv] -> [D, Nh, S].
-static inline ggml_tensor * q3_attn_f32(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
-                                        ggml_tensor * mask, float scale) {
+// Attention. q[D,S,Nh], k[D,S,Nkv], v[D,S,Nkv] -> [D, Nh, S].
+//
+// Both matmuls run at `prec`, which the caller supplies; softmax exponentiates whatever
+// error the scores carry, so this is not a knob to set casually. It is nonetheless a
+// caller decision rather than a fixed F32: see Qwen3Config::prec for who asks for what.
+static inline ggml_tensor * q3_attn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+                                    ggml_tensor * mask, float scale, ggml_prec prec = GGML_PREC_DEFAULT) {
     ggml_tensor * scores = ggml_mul_mat(ctx, k, q);
+    ggml_mul_mat_set_prec(scores, prec);
     scores               = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f);
     ggml_tensor * vt     = ggml_cont(ctx, ggml_transpose(ctx, v));
     ggml_tensor * out    = ggml_mul_mat(ctx, vt, scores);
+    ggml_mul_mat_set_prec(out, prec);
     return ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
 }
 
@@ -178,9 +212,9 @@ static inline ggml_tensor * q3_build_self_attn(ggml_context * ctx, const Qwen3Co
     const int Nh  = c.n_heads;
     const int Nkv = c.n_kv_heads;
 
-    ggml_tensor * q = q3_linear(ctx, ly->q_proj, x);
-    ggml_tensor * k = q3_linear(ctx, ly->k_proj, x);
-    ggml_tensor * v = q3_linear(ctx, ly->v_proj, x);
+    ggml_tensor * q = q3_linear(ctx, ly->q_proj, x, c.prec);
+    ggml_tensor * k = q3_linear(ctx, ly->k_proj, x, c.prec);
+    ggml_tensor * v = q3_linear(ctx, ly->v_proj, x, c.prec);
 
     q = ggml_reshape_3d(ctx, q, D, Nh, S);
     k = ggml_reshape_3d(ctx, k, D, Nkv, S);
@@ -197,16 +231,17 @@ static inline ggml_tensor * q3_build_self_attn(ggml_context * ctx, const Qwen3Co
     v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
 
     const float   scale = 1.0f / sqrtf((float) D);
-    ggml_tensor * attn  = q3_attn_f32(ctx, q, k, v, mask, scale);
+    ggml_tensor * attn  = q3_attn(ctx, q, k, v, mask, scale, c.prec);
     attn                = ggml_reshape_2d(ctx, attn, (int64_t) Nh * D, S);
-    return q3_linear(ctx, ly->o_proj, attn);
+    return q3_linear(ctx, ly->o_proj, attn, c.prec);
 }
 
-static inline ggml_tensor * q3_build_mlp(ggml_context * ctx, Qwen3Layer * ly, ggml_tensor * x) {
-    ggml_tensor * gate = q3_linear(ctx, ly->gate_proj, x);
-    ggml_tensor * up   = q3_linear(ctx, ly->up_proj, x);
+static inline ggml_tensor * q3_build_mlp(ggml_context * ctx, Qwen3Layer * ly, ggml_tensor * x,
+                                         ggml_prec prec = GGML_PREC_DEFAULT) {
+    ggml_tensor * gate = q3_linear(ctx, ly->gate_proj, x, prec);
+    ggml_tensor * up   = q3_linear(ctx, ly->up_proj, x, prec);
     ggml_tensor * ff   = ggml_swiglu_split(ctx, gate, up);
-    return q3_linear(ctx, ly->down_proj, ff);
+    return q3_linear(ctx, ly->down_proj, ff, prec);
 }
 
 // One layer: hidden [H, S] -> [H, S]. mask nullptr = full attention.
@@ -217,7 +252,7 @@ static inline ggml_tensor * q3_build_layer(ggml_context * ctx, const Qwen3Config
     hidden             = ggml_add(ctx, hidden, attn);
 
     norm              = q3_rms_norm_w(ctx, hidden, ly->post_norm, c.rms_norm_eps);
-    ggml_tensor * mlp = q3_build_mlp(ctx, ly, norm);
+    ggml_tensor * mlp = q3_build_mlp(ctx, ly, norm, c.prec);
     hidden            = ggml_add(ctx, hidden, mlp);
     return hidden;
 }

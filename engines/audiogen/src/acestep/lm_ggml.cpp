@@ -22,6 +22,13 @@ struct LMModel {
     ggml_context *        weight_ctx = nullptr;
     ggml_backend_buffer_t weight_buf = nullptr;
 
+    // CPU map-in-place: verbatim weights backed by `gguf`'s mmap via `map_buf`
+    // (see dit_gguf_cpu_map_buffer). `gguf` is kept open for the model's lifetime.
+    DitGGUF               gguf;
+    ggml_backend_buffer_t map_buf = nullptr;
+    bool                  mapped  = false;
+    size_t                mapped_bytes = 0;  // sum of mmapped weight nbytes
+
     LMConfig    cfg;
     Qwen3Config q3;
 
@@ -50,6 +57,10 @@ static Qwen3Config to_q3(const LMConfig & c) {
     q.rope_theta   = c.rope_theta;
     q.rms_norm_eps = c.rms_norm_eps;
     q.is_causal    = true;
+    // The ACE-Step LM carries massive activations (~1.9e6 by layer 2, measured),
+    // which is far outside fp16 range. Without F32 precision the fp16-based GPU
+    // matmul paths clamp them at 65504 and generation degenerates.
+    q.prec         = GGML_PREC_F32;
     return q;
 }
 
@@ -99,22 +110,31 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
         return nullptr;
     }
 
+    // CPU backend: map the quantised weights straight off the mmap (no dirty RAM).
+    const bool            mapped  = ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backend));
+    ggml_backend_buffer_t map_buf = mapped ? dit_gguf_cpu_map_buffer(g) : nullptr;
+
     // Allocate + load weights.
     const size_t n_tensors = (size_t) 2 + (size_t) c.n_layers * 11 + 8;
     ggml_init_params ip{ ggml_tensor_overhead() * n_tensors, nullptr, /*no_alloc=*/true };
     m->weight_ctx = ggml_init(ip);
     ggml_context * ctx = m->weight_ctx;
 
-    m->embed_tokens = q3_create_like(ctx, g, "model.embed_tokens.weight");
+    m->embed_tokens = q3_create_like(ctx, g, "model.embed_tokens.weight", map_buf);
     m->final_norm   = q3_create_f32_like(ctx, g, "model.norm.weight");
     m->layers.resize(c.n_layers);
     for (int i = 0; i < c.n_layers; i++) {
-        q3_create_layer(ctx, g, "model.layers." + std::to_string(i), m->layers[i]);
+        q3_create_layer(ctx, g, "model.layers." + std::to_string(i), m->layers[i], map_buf);
     }
 
+    // NB: ggml_backend_alloc_ctx_tensors returns NULL if EVERY tensor is already
+    // allocated (i.e. all mapped). Safe to treat as failure here because each
+    // stage always has F32 norms that need real allocation; revisit this guard if
+    // an all-quantised stage is ever added.
     m->weight_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!m->weight_buf) {
         fprintf(stderr, "[acestep-lm] failed to allocate weight buffer\n");
+        if (map_buf) ggml_backend_buffer_free(map_buf);
         ggml_free(ctx);
         dit_gguf_close(g);
         delete m;
@@ -126,6 +146,9 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
     for (int i = 0; i < c.n_layers; i++) {
         q3_load_layer(g, "model.layers." + std::to_string(i), m->layers[i]);
     }
+    // Exact mmapped weight footprint (see dit_gguf_mapped_bytes); reported by
+    // lm_model_weight_bytes below so mapped loads don't look like a few-MB stub.
+    m->mapped_bytes = mapped ? dit_gguf_mapped_bytes(ctx, g) : 0;
 
     // KV cache: n_sets * n_layers tensors.
     const int D = c.head_dim, Nkv = c.n_kv_heads, S = c.max_seq_len, Lc = c.n_layers, NS = m->n_sets;
@@ -145,6 +168,8 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
     m->kv_buf = ggml_backend_alloc_ctx_tensors(m->kv_ctx, backend);
     if (!m->kv_buf) {
         fprintf(stderr, "[acestep-lm] failed to allocate KV cache\n");
+        if (map_buf) ggml_backend_buffer_free(map_buf);
+        if (m->weight_buf) ggml_backend_buffer_free(m->weight_buf);  // ggml_free(ctx) drops descriptors, not the buffer
         ggml_free(ctx);
         ggml_free(m->kv_ctx);
         dit_gguf_close(g);
@@ -162,7 +187,13 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
                 c.n_kv_heads, c.head_dim, kv_bytes / 1048576.0, NS);
     }
 
-    dit_gguf_close(g);
+    if (mapped) {
+        m->mapped  = true;
+        m->map_buf = map_buf;
+        m->gguf    = g;  // keep the mmap alive; mapped weights point into it
+    } else {
+        dit_gguf_close(g);
+    }
     return m;
 }
 
@@ -172,12 +203,16 @@ void lm_model_free(LMModel * m) {
     if (m->kv_ctx) ggml_free(m->kv_ctx);
     if (m->weight_buf) ggml_backend_buffer_free(m->weight_buf);
     if (m->weight_ctx) ggml_free(m->weight_ctx);
+    if (m->map_buf) ggml_backend_buffer_free(m->map_buf);
+    if (m->mapped) dit_gguf_close(m->gguf);
     delete m;
 }
 
 const LMConfig & lm_model_config(const LMModel * m) { return m->cfg; }
 size_t           lm_model_weight_bytes(const LMModel * m) {
-    return m->weight_buf ? ggml_backend_buffer_get_size(m->weight_buf) : 0;
+    if (!m) return 0;
+    const size_t alloc = m->weight_buf ? ggml_backend_buffer_get_size(m->weight_buf) : 0;
+    return alloc + m->mapped_bytes;  // allocated (F32) + mmapped weights
 }
 int  lm_num_kv_sets(const LMModel * m) { return m->n_sets; }
 void lm_reset(LMModel * m, int set) { if (set >= 0 && set < m->n_sets) m->kv_pos[set] = 0; }
@@ -190,9 +225,9 @@ static ggml_tensor * lm_attn(ggml_context * ctx, ggml_cgraph * gf, const Qwen3Co
                              ggml_tensor * cache_k, ggml_tensor * cache_v, int n_kv_pad, int S) {
     const int D = c.head_dim, Nh = c.n_heads, Nkv = c.n_kv_heads;
 
-    ggml_tensor * q = q3_linear(ctx, ly->q_proj, x);
-    ggml_tensor * k = q3_linear(ctx, ly->k_proj, x);
-    ggml_tensor * v = q3_linear(ctx, ly->v_proj, x);
+    ggml_tensor * q = q3_linear(ctx, ly->q_proj, x, c.prec);
+    ggml_tensor * k = q3_linear(ctx, ly->k_proj, x, c.prec);
+    ggml_tensor * v = q3_linear(ctx, ly->v_proj, x, c.prec);
 
     q = ggml_reshape_3d(ctx, q, D, Nh, S);
     k = ggml_reshape_3d(ctx, k, D, Nkv, S);
@@ -212,17 +247,27 @@ static ggml_tensor * lm_attn(ggml_context * ctx, ggml_cgraph * gf, const Qwen3Co
     ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, k, kv_rows));
     ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, v, kv_rows));
 
-    // Read padded window [0, n_kv_pad).
+    // Read the padded window [0, n_kv_pad). Both views are strided in dim 2: nb[2] is the
+    // full cache channel stride (max_seq rows), so consecutive KV heads sit max_seq rows
+    // apart while only n_kv_pad rows of each are live. Passed to the backends as-is.
+    //
+    // This used to pack K through ggml_cont at prefill. The Vulkan tiled matmul was
+    // deriving its channel stride as ne00*ne01 rather than from nb[2], so every KV head
+    // past the first read the previous head's rows and the LM degenerated on GPU while
+    // CPU stayed correct. That was a backend bug, not a property of this graph, and it is
+    // fixed in ggml (ggml_vk_channel_stride_elements); packing here only hid it for one
+    // caller while leaving every other strided-src0 matmul broken.
     ggml_tensor * k_full = ggml_view_3d(ctx, cache_k, D, n_kv_pad, Nkv, cache_k->nb[1], cache_k->nb[2], 0);
     ggml_tensor * v_full = ggml_view_3d(ctx, cache_v, D, n_kv_pad, Nkv, cache_v->nb[1], cache_v->nb[2], 0);
 
     const float   scale = 1.0f / sqrtf((float) D);
-    ggml_tensor * attn  = q3_attn_f32(ctx, q, k_full, v_full, mask, scale);  // [D, Nh, S]
+    ggml_tensor * attn  = q3_attn(ctx, q, k_full, v_full, mask, scale, c.prec);  // [D, Nh, S]
     attn                = ggml_reshape_2d(ctx, attn, (int64_t) Nh * D, S);
-    return q3_linear(ctx, ly->o_proj, attn);
+    return q3_linear(ctx, ly->o_proj, attn, c.prec);
 }
 
-bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std::vector<float> & logits_out, int set) {
+bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std::vector<float> & logits_out, int set,
+                      std::vector<float> * layer_states_out) {
     const Qwen3Config & c   = m->q3;
     const LMConfig &    lc  = m->cfg;
     const int           H   = c.hidden_size;
@@ -256,6 +301,7 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
 
     ggml_cgraph * gf     = ggml_new_graph_custom(ctx, nodes, false);
     ggml_tensor * hidden = ggml_get_rows(ctx, m->embed_tokens, t_ids);  // [H, S]
+    std::vector<ggml_tensor *> layer_states;
     for (int l = 0; l < c.n_layers; l++) {
         Qwen3Layer *  ly   = &m->layers[l];
         ggml_tensor * norm = q3_rms_norm_w(ctx, hidden, ly->input_norm, c.rms_norm_eps);
@@ -264,14 +310,19 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
                                      n_kv_pad, S);
         hidden             = ggml_add(ctx, hidden, attn);
         norm               = q3_rms_norm_w(ctx, hidden, ly->post_norm, c.rms_norm_eps);
-        ggml_tensor * mlp  = q3_build_mlp(ctx, ly, norm);
+        ggml_tensor * mlp  = q3_build_mlp(ctx, ly, norm, c.prec);
         hidden             = ggml_add(ctx, hidden, mlp);
+        if (layer_states_out) {
+            ggml_set_output(hidden);
+            ggml_build_forward_expand(gf, hidden);
+            layer_states.push_back(hidden);
+        }
     }
     hidden = q3_rms_norm_w(ctx, hidden, m->final_norm, c.rms_norm_eps);
     if (S > 1) {
         hidden = ggml_view_1d(ctx, hidden, H, (int64_t) (S - 1) * H * sizeof(float));  // last token
     }
-    ggml_tensor * lgt = ggml_mul_mat(ctx, m->embed_tokens, hidden);  // [V, 1]
+    ggml_tensor * lgt = q3_linear(ctx, m->embed_tokens, hidden, c.prec);  // [V, 1]
     ggml_set_output(lgt);
     ggml_build_forward_expand(gf, lgt);
 
@@ -306,6 +357,15 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
 
     logits_out.resize((size_t) lc.vocab_size);
     ggml_backend_tensor_get(lgt, logits_out.data(), 0, (size_t) lc.vocab_size * sizeof(float));
+
+    if (layer_states_out) {
+        const size_t per_layer = (size_t) H * S;
+        layer_states_out->resize(per_layer * layer_states.size());
+        for (size_t i = 0; i < layer_states.size(); i++) {
+            ggml_backend_tensor_get(layer_states[i], layer_states_out->data() + i * per_layer, 0,
+                                    per_layer * sizeof(float));
+        }
+    }
 
     ggml_gallocr_free(ga);
     ggml_free(ctx);
