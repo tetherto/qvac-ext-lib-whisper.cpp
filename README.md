@@ -11,14 +11,13 @@ On-device speech and audio AI in pure C++ on [ggml](https://github.com/tetherto/
 | Desktop | Linux, macOS, Windows |
 | Mobile | Android (arm64-v8a), iOS (arm64) |
 | Backends | CPU, Metal, Vulkan, OpenCL (Adreno), CUDA, Apple Core ML (encoder sidecar) |
-| Quantization | `f32`, `f16`, `bf16`, `q8_0`, `q6_k`, `q5_0`, `q5_1`, `q4_0`, `q4_k_m` (per model, see tables) |
+| Quantization | `f32`, `f16`, `bf16`, `q8_0`, `q6_k`, `q5_0`, `q5_1`, `q4_0` (per model, see tables) |
 | Shared ggml | one `ggml-speech` vcpkg port, built from [qvac-ext-ggml@speech](https://github.com/tetherto/qvac-ext-ggml/tree/speech) |
 | Language | C++17 |
 
 ## Architecture
 
 ```
-                              engines
 +-----------------------------+  +-----------------------------+
 | third_party/whisper.cpp     |  | engines/parakeet            |
 | speech-to-text              |  | ASR + diarization + EOU     |
@@ -67,7 +66,7 @@ docs/UPSTREAM-SYNC.md       how to sync the whisper subtree
 
 ## Supported models
 
-One row per model. `Backends` lists the validated paths; anything not listed falls back to CPU.
+One row per model. `Backends` lists what the owning engine documents as working; backends not listed are untested for that model, even where ggml would compile them.
 
 ### Speech-to-text and translation
 
@@ -84,19 +83,19 @@ One row per model. `Backends` lists the validated paths; anything not listed fal
 | `whisper-large-v3-turbo` | whisper | 99 + translation | 809 M | `f16`, `q5_0`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | fastest large-class decode |
 | `silero-v5.1.2` | whisper | language agnostic | 2 M | `f16` | CPU | voice activity detection |
 | `silero-v6.2.0` | whisper | language agnostic | 2 M | `f16` | CPU | voice activity detection |
-| `nvidia/parakeet-ctc-0.6b` | parakeet | English | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | offline + streaming + long-form |
-| `nvidia/parakeet-ctc-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | offline + streaming + long-form |
-| `nvidia/parakeet-tdt-0.6b-v3` | parakeet | ~25 + punctuation and capitalization | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | fused LSTM + joint decoder |
-| `nvidia/parakeet-tdt-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | lowest WER, no punctuation |
+| `nvidia/parakeet-ctc-0.6b` | parakeet | English | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, Core ML | offline + streaming + long-form |
+| `nvidia/parakeet-ctc-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, Core ML | offline + streaming + long-form |
+| `nvidia/parakeet-tdt-0.6b-v3` | parakeet | ~25 + punctuation and capitalization | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, Core ML | fused LSTM + joint decoder |
+| `nvidia/parakeet-tdt-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, Core ML | lowest WER, no punctuation |
 
 ### End-of-utterance and diarization
 
 | Model | Engine | Task | Params | Quantization | Backends | Notes |
 |---|---|---|---|---|---|---|
-| `nvidia/parakeet_realtime_eou_120m-v1` | parakeet | low-latency ASR + end-of-turn | 120 M | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA (encoder); CPU (LSTM decoder) | segments expose `is_eou_boundary` |
-| `nvidia/diar_sortformer_4spk-v1` | parakeet | diarization, up to 4 speakers | 123 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA | offline + sliding-history live |
-| `nvidia/diar_streaming_sortformer_4spk-v2` | parakeet | diarization, up to 4 speakers | 117 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA | streaming-trained encoder |
-| `nvidia/diar_streaming_sortformer_4spk-v2.1` | parakeet | diarization, up to 4 speakers | 117 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA | Audio-Online Speaker Cache, stable slots across gaps |
+| `nvidia/parakeet_realtime_eou_120m-v1` | parakeet | low-latency ASR + end-of-turn | 120 M | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL (encoder); CPU (LSTM decoder) | segments expose `is_eou_boundary` |
+| `nvidia/diar_sortformer_4spk-v1` | parakeet | diarization, up to 4 speakers | 123 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL | offline + sliding-history live |
+| `nvidia/diar_streaming_sortformer_4spk-v2` | parakeet | diarization, up to 4 speakers | 117 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL | streaming-trained encoder |
+| `nvidia/diar_streaming_sortformer_4spk-v2.1` | parakeet | diarization, up to 4 speakers | 117 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL | Audio-Online Speaker Cache, stable slots across gaps |
 
 Pair any ASR GGUF with a Sortformer GGUF via `--diarization-model` for an attributed "who said what" transcript.
 
@@ -108,7 +107,7 @@ Pair any ASR GGUF with a Sortformer GGUF via `--diarization-model` for an attrib
 | Chatterbox Multilingual | tts | 23 | 24 kHz | `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, CUDA | zero-shot voice cloning, CFG, `--cfm-steps` knob, streaming |
 | Supertonic v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming |
 | Supertonic v2 | tts | 5 (`en`, `ko`, `es`, `pt`, `fr`) | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming |
-| Supertonic v3 | tts | 31 | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming |
+| Supertonic v3 | tts | 31 + `na` | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming, `na` for unknown source language |
 | Parler-TTS mini-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | description-conditioned voice, no cloning |
 | Parler-TTS large-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | description-conditioned voice |
 | Indic Parler-TTS | tts | 21 Indic | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | Indic prompt BPE tokenizer |
@@ -133,7 +132,8 @@ Pair any ASR GGUF with a Sortformer GGUF via `--diarization-model` for an attrib
 Prerequisites: CMake >= 3.20, a C++17 compiler, git.
 
 ```sh
-# 1) system ggml (the same source the ggml-speech vcpkg port ships)
+# 1) system ggml (the branch the ggml-speech vcpkg port is cut from; the port
+#    pins one commit, so check its portfile REF to match a port build exactly)
 git clone --depth 1 --branch speech https://github.com/tetherto/qvac-ext-ggml ggml-src
 cmake -S ggml-src -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
       -DCMAKE_INSTALL_PREFIX=$PWD/ggml-install
@@ -156,7 +156,7 @@ cmake --build build -j
 | `SPEECH_BUILD_TESTS` | `OFF` | build the engine test harnesses |
 | `SPEECH_BUILD_WHISPER_TESTS` | `OFF` | also build whisper's tests (transcription tests need downloaded models) |
 
-GPU backends come from the ggml build: `-DGGML_VULKAN=ON`, `-DGGML_OPENCL=ON`, `-DGGML_CUDA=ON`; Metal is on by default on Apple. Run the non-GPU suite with `ctest --test-dir build -LE 'gpu|perf'`.
+GPU backends come from the ggml build: `-DGGML_VULKAN=ON`, `-DGGML_OPENCL=ON`, `-DGGML_CUDA=ON`; Metal is on by default on Apple. Core ML is gated per engine and defaults to off on both, so add `-DWHISPER_COREML=ON -DPARAKEET_COREML=ON` (Apple only) to the umbrella configure for the Neural Engine encoder paths. For tests, configure with `-DSPEECH_BUILD_TESTS=ON`, then run the non-GPU suite with `ctest --test-dir build -LE 'gpu|perf'`.
 
 Each engine also configures standalone (`cmake -S engines/parakeet`, and so on), which is what the per-engine vcpkg ports and CI lanes use.
 
@@ -166,7 +166,7 @@ Each engine also configures standalone (`cmake -S engines/parakeet`, and so on),
 |---|---|---|
 | `ggml-speech` | `ggml` | `ggml::ggml` |
 | `whisper-cpp` | `whisper` | `whisper::whisper` |
-| `qvac-parakeet` | `qvac-parakeet` | `qvac::parakeet` |
+| `parakeet-cpp` | `qvac-parakeet` | `qvac::parakeet` |
 | `tts-cpp` | `tts-cpp` | `tts-cpp::tts-cpp` |
 | `audiogen-cpp` | `audiogen-cpp` | `audiogen-cpp::audiogen-cpp` |
 
@@ -254,7 +254,7 @@ GGUF conversion steps are in [engines/tts/README.md](engines/tts/README.md).
 
 ## Performance
 
-`RTF = inference_time / audio_duration`, lower is better. Per-engine READMEs carry the full tables, methodology, and reproduction steps.
+`RTF = inference_time / audio_duration`, lower is better. The parakeet and tts READMEs carry the full tables, methodology, and reproduction steps; audiogen has no benchmark suite yet and reports per-stage wall clock on stderr.
 
 ### ASR, end-of-utterance, diarization
 
@@ -277,13 +277,13 @@ CI numbers, `q4_0` GGUFs, same host. Full table: [engines/tts/README.md](engines
 | Chatterbox Multilingual | 4.31 | 0.189 | 1097 ms | 73 |
 | Supertonic | 0.079 | n/a | n/a | n/a |
 
-The shipped Supertonic package runs CPU only, so it has no CI Vulkan row.
+That CI run has no Supertonic GPU lane, so its Vulkan columns are unrecorded rather than unsupported.
 
 ### Apple silicon
 
 | Model | Host | Backend | Quantization | RTF | vs real-time |
 |---|---|---|---|--:|--:|
-| Parakeet TDT 0.6b v3 | Mac Studio M3 Ultra | Metal | `q8_0` | 0.006 | 160x |
+| Parakeet TDT 0.6b v3 | Apple silicon, host not recorded | Metal | `q8_0` | 0.006 | 160x |
 | Chatterbox Turbo | Mac Studio M3 Ultra | Metal | `q4_0` | 0.16 | 6.4x |
 | Chatterbox Turbo | Mac Studio M3 Ultra | CPU (NEON) | `q4_0` | 1.05 | 0.96x |
 | Chatterbox Multilingual (`--cfm-steps 7`) | Mac Studio M3 Ultra | Metal | `q4_0` | 0.30 | 3.3x |
@@ -307,7 +307,7 @@ These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons
 
 | QVAC addon | Wraps | vcpkg ports consumed |
 |---|---|---|
-| `@qvac/asr-ggml` | speech-to-text, diarization, end-of-utterance | `whisper-cpp`, `qvac-parakeet` |
+| `@qvac/asr-ggml` | speech-to-text, diarization, end-of-utterance | `whisper-cpp`, `parakeet-cpp` |
 | `@qvac/tts-ggml` | text-to-speech, voice cloning, speech enhancement | `tts-cpp` |
 | `@qvac/audiogen-ggml` | music generation | `audiogen-cpp` |
 | `@qvac/bci-whispercpp` | brain-computer interface transcription | `whisper-cpp` |
@@ -319,7 +319,7 @@ These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons
 | `third_party/whisper.cpp` | MIT | MIT (OpenAI Whisper), Silero VAD models under their own terms |
 | `engines/parakeet` | Apache-2.0 | CC-BY-4.0, except `parakeet_realtime_eou_120m-v1` under the NVIDIA Open Model License |
 | `engines/tts` | MIT | Chatterbox MIT, CosyVoice3 Apache-2.0, Supertonic and LavaSR per their model cards |
-| `engines/audiogen` | MIT | ACE-Step per its model card |
+| `engines/audiogen` | MIT | ACE-Step 1.5 MIT, Qwen3-Embedding Apache-2.0 |
 
 Per-engine `NOTICE` files list every third-party dependency and its license.
 
@@ -333,5 +333,6 @@ Per-engine `NOTICE` files list every third-party dependency and its license.
 | Whisper subtree sync process | [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md) |
 | ASR, diarization, end-of-utterance | [engines/parakeet/README.md](engines/parakeet/README.md) |
 | Text-to-speech and enhancement | [engines/tts/README.md](engines/tts/README.md) |
+| Music generation | [engines/audiogen/README.md](engines/audiogen/README.md) |
 | TTS memory behaviour | [engines/tts/MEMORY.md](engines/tts/MEMORY.md) |
 | Development journals | [engines/parakeet/PROGRESS.md](engines/parakeet/PROGRESS.md), [engines/tts/PROGRESS.md](engines/tts/PROGRESS.md) |
