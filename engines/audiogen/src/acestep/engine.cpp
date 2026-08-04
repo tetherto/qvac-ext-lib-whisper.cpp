@@ -13,6 +13,7 @@
 #include "acestep/textenc_ggml.h"
 
 #include "acestep/backend_registry.h"
+#include "acestep/stage_placement.h"
 
 #include "ggml-backend.h"
 
@@ -275,6 +276,8 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     // detokenizer are allowlisted per backend, so a backend nobody has measured
     // keeps the CPU placement and cannot silently regress generated audio.
     // ACESTEP_LM_GPU / ACESTEP_DETOK_GPU take that measurement without a rebuild.
+    // The policy itself lives in stage_placement.h so it can be unit tested
+    // without a GPU (test/test_acestep_units.cpp); this only applies its answer.
     //
     // Env escape hatches (applied after the allowlist; CPU wins if both are set):
     //   ACESTEP_LM_GPU=1        -> LM on the GPU, whatever the backend
@@ -286,15 +289,11 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     ggml_backend_t lm_backend    = m->backend;
     ggml_backend_t detok_backend = m->backend;
     if (on_gpu) {
-        if (!backend_is_vulkan(m->backend) && !backend_is_metal(m->backend)) {
-            lm_backend    = m->backend_cpu;
-            detok_backend = m->backend_cpu;
-        }
-        if (std::getenv("ACESTEP_LM_GPU"))       lm_backend    = m->backend;
-        if (std::getenv("ACESTEP_LM_CPU"))       lm_backend    = m->backend_cpu;
-        if (std::getenv("ACESTEP_DETOK_GPU"))    detok_backend = m->backend;
-        if (std::getenv("ACESTEP_DETOK_CPU"))    detok_backend = m->backend_cpu;
-        if (std::getenv("ACESTEP_ENCODERS_CPU")) enc_backend   = m->backend_cpu;
+        const StagePlacement place =
+            resolve_stage_placement(backend_reg_name(m->backend), placement_overrides_from_env());
+        if (!place.enc_on_gpu)   enc_backend   = m->backend_cpu;
+        if (!place.lm_on_gpu)    lm_backend    = m->backend_cpu;
+        if (!place.detok_on_gpu) detok_backend = m->backend_cpu;
         if (v) fprintf(stderr, "[acestep-engine] backends: enc=%s lm=%s detok=%s dit/vae=%s\n",
                        ggml_backend_name(enc_backend), ggml_backend_name(lm_backend),
                        ggml_backend_name(detok_backend), ggml_backend_name(m->backend));
