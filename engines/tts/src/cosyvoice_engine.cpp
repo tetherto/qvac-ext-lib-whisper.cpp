@@ -252,20 +252,20 @@ struct Engine::Impl {
         const int max_steps = 50 * ((int)tts_ids.size() + 1); // generous cap
         const bool greedy   = opts.greedy;
 
-        // Stage 1 — LM: text ids -> speech tokens (freed at scope end).
+        // Stage 1 — LM: text ids -> speech tokens (freed at scope end). A pinned
+        // trajectory skips the LM entirely -- sampling is chaotic in the logits,
+        // so pinning is the only way two backends run the flow and vocoder over
+        // identical input -- so the LM is not even loaded on that path.
         std::vector<int> speech_tokens;
-        {
+        if (opts.force_speech_tokens.empty()) {
             model_ctx llm_m = cosyvoice_load_gguf(llm_path_, backend);
             ModelGuard llm_guard(llm_m);
             llm_m.n_threads = opts.n_threads;
             qwen_hp hp = cosyvoice_qwen_hp(llm_m);
-            // A pinned trajectory skips the LM entirely: sampling is chaotic in
-            // the logits, so pinning is the only way two backends run the flow
-            // and vocoder over identical input (and do provably equal work).
-            speech_tokens = opts.force_speech_tokens.empty()
-                ? cosyvoice_llm_generate(llm_m, hp, text_ids, lm_prompt_stok,
-                                         max_steps, greedy, opts.seed, min_len, tmg)
-                : opts.force_speech_tokens;
+            speech_tokens = cosyvoice_llm_generate(llm_m, hp, text_ids, lm_prompt_stok,
+                                                   max_steps, greedy, opts.seed, min_len, tmg);
+        } else {
+            speech_tokens = opts.force_speech_tokens;
         }
         if (speech_tokens.empty()) {
             throw std::runtime_error("cosyvoice: LM produced no speech tokens");
