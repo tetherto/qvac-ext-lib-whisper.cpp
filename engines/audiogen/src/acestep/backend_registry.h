@@ -77,4 +77,11 @@ inline bool backend_is_vulkan(ggml_backend_t backend) {
     return std::strcmp(backend_reg_name(backend), "Vulkan") == 0;
 }
 
+// ggml-metal registers as "MTL"; older ggml reported "Metal". Match both, or the
+// check is silently dead on one of them.
+inline bool backend_is_metal(ggml_backend_t backend) {
+    const char * n = backend_reg_name(backend);
+    return std::strcmp(n, "MTL") == 0 || std::strcmp(n, "Metal") == 0;
+}
+
 }  // namespace tts_cpp::acestep
