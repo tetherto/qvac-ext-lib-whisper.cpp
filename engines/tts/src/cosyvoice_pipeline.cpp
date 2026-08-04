@@ -10,6 +10,7 @@
 
 #include "backend_selection.h"
 #include "backend_util.h"
+#include "gguf_stream.h"
 #include "ggml-alloc.h"
 #include "gguf.h"
 
@@ -164,8 +165,9 @@ model_ctx cosyvoice_load_gguf(const std::string & path, ggml_backend_t backend) 
     const bool have_map = tts_cpp::cosyvoice::mapped_file_open(m.mapped, path, "cosyvoice");
 
     ggml_context * tmp_ctx = nullptr;
-    // no_alloc when mapped: weights come from the mapping, not tmp_ctx.
-    gguf_init_params gp = { /*.no_alloc=*/ have_map, /*.ctx=*/ &tmp_ctx };
+    // Shapes only; bytes come from the mapping or the bounds-checked stream
+    // reader below, never from tmp_ctx.
+    gguf_init_params gp = { /*.no_alloc=*/ true, /*.ctx=*/ &tmp_ctx };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) {
         tts_cpp::cosyvoice::mapped_file_close(m.mapped);
@@ -259,19 +261,25 @@ model_ctx cosyvoice_load_gguf(const std::string & path, ggml_backend_t backend) 
         m.buffer_h = ggml_backend_alloc_ctx_tensors_from_buft(m.ctx_h, ggml_backend_dev_buffer_type(cpu_dev));
     }
 
-    // Upload the unmapped tensors, from the mapping when present else tmp_ctx.
-    for (ggml_context * ctx : { m.ctx_w, m.ctx_h }) {
-        if (!ctx) continue;
-        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
-            if (mapping && cur->buffer == m.map_buf) continue;
-            const char * name = ggml_get_name(cur);
-            if (have_map) {
-                const int64_t gi = gguf_find_tensor(g, name);
-                const size_t off = data_off + (size_t) gguf_get_tensor_offset(g, gi);
-                ggml_backend_tensor_set(cur, m.mapped.data + off, 0, ggml_nbytes(cur));
-            } else {
-                ggml_tensor * src = ggml_get_tensor(tmp_ctx, name);
-                ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+    // Stream the unmapped tensors with the bounds-checked reader (a truncated
+    // GGUF fails cleanly here instead of reading past the mapping).
+    {
+        ::tts_cpp::detail::gguf_stream_reader rd(g, path);
+        if (!rd.ok()) {
+            gguf_free(g); ggml_free(tmp_ctx);
+            tts_cpp::cosyvoice::mapped_file_close(m.mapped);
+            throw std::runtime_error("cosyvoice: failed to reopen GGUF for streaming: " + path);
+        }
+        for (ggml_context * ctx : { m.ctx_w, m.ctx_h }) {
+            if (!ctx) continue;
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                if (mapping && cur->buffer == m.map_buf) continue;
+                if (!rd.to_backend(ggml_get_name(cur), cur)) {
+                    gguf_free(g); ggml_free(tmp_ctx);
+                    tts_cpp::cosyvoice::mapped_file_close(m.mapped);
+                    throw std::runtime_error(std::string("cosyvoice: failed to stream tensor ") +
+                                             ggml_get_name(cur));
+                }
             }
         }
     }
