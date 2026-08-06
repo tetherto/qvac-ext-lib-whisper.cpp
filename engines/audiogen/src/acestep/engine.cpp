@@ -13,6 +13,7 @@
 #include "acestep/textenc_ggml.h"
 
 #include "acestep/backend_registry.h"
+#include "acestep/stage_placement.h"
 
 #include "ggml-backend.h"
 
@@ -249,11 +250,12 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     // only standard ggml ops, so a GPU backend (Metal on Apple, CUDA/Vulkan
     // elsewhere) can run them; opts.n_gpu_layers > 0 opts in. The VAE gets its
     // own dedicated backend (see Vae::load) and also follows n_gpu_layers now
-    // that its snake / col2im_1d ops have Metal kernels in the ggml-speech fork.
+    // that its snake / col2im_1d ops have Metal and Vulkan kernels in the
+    // ggml-speech fork.
     // Falls back to CPU when no GPU backend is registered/available.
     bool on_gpu = false;
     if (opts.n_gpu_layers > 0) {
-        m->backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+        m->backend = backend_gpu_init();
         on_gpu     = (m->backend != nullptr);
         if (!on_gpu && v) fprintf(stderr, "[acestep-engine] GPU requested but no GPU backend available; using CPU\n");
     }
@@ -272,24 +274,11 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
 
     // Stage placement when a GPU is active. The DiT, the VAE and the one-shot
     // text/cond encoders always run on it. The autoregressive LM and the FSQ
-    // detokenizer are allowlisted per backend instead, because each has a backend
-    // where it is known-wrong or simply unmeasured:
-    //
-    //   * LM: iOS/macOS A-series Metal produces empty/garbage logits, so the
-    //     sampler yields zero audio codes ("LM produced no audio codes") while the
-    //     SAME weights decode correctly on CPU. Numerical, not memory (unified RAM
-    //     does not help), confirmed against the full-GPU path on device.
-    //   * detokenizer: `detokenizer.special_tokens` ships quantized, so q3_as_f32
-    //     becomes ggml_cast(Q8_0 -> F32) and Metal had no kernel for that CPY
-    //     variant. It has one now (ggml-metal-device.m), but the stage has not been
-    //     run there since, so it stays off the Metal GPU.
-    //
-    // Allowlist rather than denylist: Vulkan is the only GPU backend either stage has
-    // actually been measured on (LM logits against an F32 reference, detokenizer
-    // latents against CPU). Every other backend therefore keeps the CPU placement
-    // that ships today, so adding one cannot silently regress generated audio.
-    // Widen the allowlist per backend once it is measured — ACESTEP_LM_GPU /
-    // ACESTEP_DETOK_GPU are how you take that measurement without a rebuild.
+    // detokenizer are allowlisted per backend, so a backend nobody has measured
+    // keeps the CPU placement and cannot silently regress generated audio.
+    // ACESTEP_LM_GPU / ACESTEP_DETOK_GPU take that measurement without a rebuild.
+    // The policy itself lives in stage_placement.h so it can be unit tested
+    // without a GPU (test/test_acestep_units.cpp); this only applies its answer.
     //
     // Env escape hatches (applied after the allowlist; CPU wins if both are set):
     //   ACESTEP_LM_GPU=1        -> LM on the GPU, whatever the backend
@@ -301,22 +290,18 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     ggml_backend_t lm_backend    = m->backend;
     ggml_backend_t detok_backend = m->backend;
     if (on_gpu) {
-        if (!backend_is_vulkan(m->backend)) {
-            lm_backend    = m->backend_cpu;
-            detok_backend = m->backend_cpu;
-        }
-        if (std::getenv("ACESTEP_LM_GPU"))       lm_backend    = m->backend;
-        if (std::getenv("ACESTEP_LM_CPU"))       lm_backend    = m->backend_cpu;
-        if (std::getenv("ACESTEP_DETOK_GPU"))    detok_backend = m->backend;
-        if (std::getenv("ACESTEP_DETOK_CPU"))    detok_backend = m->backend_cpu;
-        if (std::getenv("ACESTEP_ENCODERS_CPU")) enc_backend   = m->backend_cpu;
+        const StagePlacement place =
+            resolve_stage_placement(backend_reg_name(m->backend), placement_overrides_from_env());
+        if (!place.enc_on_gpu)   enc_backend   = m->backend_cpu;
+        if (!place.lm_on_gpu)    lm_backend    = m->backend_cpu;
+        if (!place.detok_on_gpu) detok_backend = m->backend_cpu;
         if (v) fprintf(stderr, "[acestep-engine] backends: enc=%s lm=%s detok=%s dit/vae=%s\n",
                        ggml_backend_name(enc_backend), ggml_backend_name(lm_backend),
                        ggml_backend_name(detok_backend), ggml_backend_name(m->backend));
     }
     m->backend_enc   = enc_backend;
     m->backend_lm    = lm_backend;
-    m->backend_detok = detok_backend;  // Vulkan-aware (QVAC-22613): GPU on Vulkan, CPU otherwise
+    m->backend_detok = detok_backend;  // GPU on the allowlisted backends, CPU otherwise
     m->nth           = nth;
 
     // ACE-Step loads six weight sets (text-enc, LM, cond, detok, DiT, VAE). Held
@@ -339,7 +324,7 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     vo.verbose      = v;
     vo.with_encoder = false;
     vo.n_threads    = nth;
-    vo.n_gpu_layers = opts.n_gpu_layers;  // snake / col2im_1d now have Metal kernels
+    vo.n_gpu_layers = opts.n_gpu_layers;  // snake / col2im_1d have Metal + Vulkan kernels
     if (const char * e = std::getenv("ACESTEP_VAE_GPU")) {
         vo.n_gpu_layers = (e[0] == '1') ? 99 : 0;
     }
@@ -498,12 +483,13 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
 
     // Sequential loading (default): each stage is loaded via m->ensure_*() right
     // before its step and freed via m->free_*() right after, so the peak resident
-    // set is a single stage rather than all six at once — small enough for a
-    // non-entitled iOS app not to be jetsam-killed (QVAC-22955). With
-    // ACESTEP_KEEP_STAGES=1 every stage is already resident (create() eager-loaded
-    // it), ensure_*() is a no-op, and the free_*() calls are skipped so nothing is
-    // released between generate() calls. Each stage's lazy-load cost is attributed
-    // to its own timing.mark() below — there is no separate up-front reload phase.
+    // set is one stage, or the cond + text encoders where those two overlap,
+    // rather than all six at once — small enough for a non-entitled iOS app not
+    // to be jetsam-killed. With ACESTEP_KEEP_STAGES=1 every stage is already
+    // resident (create() eager-loaded it), ensure_*() is a no-op, and the free_*()
+    // calls are skipped so nothing is released between generate() calls. Each
+    // stage's lazy-load cost is attributed to its own timing.mark() below — there
+    // is no separate up-front reload phase.
     const bool low_mem = !m->keep_stages;
 
     long long seed = params.seed;
