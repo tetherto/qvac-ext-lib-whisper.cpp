@@ -1,0 +1,1671 @@
+# tts-cpp
+
+> **In-tree subtree of [`chatterbox.cpp`](https://github.com/gianni-cor/chatterbox.cpp)
+> integrated into `qvac-ext-lib-whisper.cpp`.** The standalone development
+> repo carries `scripts/setup-ggml.sh` + `patches/` and supports
+> bundled-ggml dev builds; this in-tree subtree drops both and consumes
+> ggml exclusively through the QVAC speech-stack `ggml-speech` vcpkg
+> port (the [`qvac-ext-ggml/speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech)
+> branch, which ships the patches pre-applied).  See [§1 below](#1-build-from-the-qvac-speech-stack)
+> for the build flow.
+
+**Chatterbox** (Resemble AI, MIT-licensed zero-shot text-to-speech) ported
+to [`ggml`](https://github.com/ggml-org/ggml).  Pure C++/ggml inference on
+CPU / Metal / CUDA / Vulkan, no runtime dependency on Python or PyTorch.
+Ships both variants out of one binary, autodetected from GGUF metadata:
+
+- **Turbo** — English, GPT-2 Medium T3, meanflow 2-step CFM.  Optimised for
+  lowest-latency CLI use.
+- **Multilingual** — 23 languages, Llama-520M T3 + perceiver resampler +
+  classifier-free guidance, standard 10-step CFM with CFG inside.  The native
+  tokenizer supports `en, es, fr, de, it, pt, nl, pl, tr, sv, da, fi, no, el,
+  ms, sw, ar, ko` plus the external-preprocessor languages `ja, he, ru, zh,
+  hi`; `ja` requires MeCab/IPAdic and `zh` requires a Cangjie5 TSV.
+
+End-to-end inference on a short sentence with voice cloning from an 11 s
+reference wav (T3 + S3Gen + HiFT, warm runs, excludes model load):
+
+**Turbo:**
+
+| Backend                              | Wall      | `RTF`  | vs real-time |
+|--------------------------------------|----------:|-------:|-------------:|
+| Vulkan (CI · Linux x86-64, Q4_0)     |   419 ms  | 0.090  | **11.1×**    |
+| Metal (Mac Studio M3 Ultra, Q4_0)    |   985 ms  | 0.16   | 6.4×         |
+| CPU (CI · Linux x86-64, Q4_0)        | 4 577 ms  | 1.25   | 0.80×        |
+| CPU (Mac Studio M3 Ultra, NEON)      | 7 568 ms  | 1.05   | 0.96×        |
+
+> Rows are independent warm runs on different machines/backends, so **`RTF`** —
+> not wall time — is the comparable metric; wall time tracks each run's own
+> generated audio length. The Linux x86-64 rows are CI numbers (see the
+> [Performance](#performance) section for the full CI table + provenance).
+
+**Multilingual** (same Spanish prompt, seed 42, built-in voice):
+
+| Backend                              | Wall      | `RTF` | vs real-time |
+|--------------------------------------|----------:|------:|-------------:|
+| **Metal (M3 Ultra, Q4_0, `--cfm-steps 7`)** | **1.05 s**| **0.30** | **3.3×**     |
+| Metal (M3 Ultra, Q4_0)               |  **1.22 s** | 0.35  | 2.9×        |
+| Metal (M3 Ultra, F16, `--cfm-steps 7`)| 1.16 s   |  0.32  | 3.2×        |
+| Metal (M3 Ultra, F16)                |  1.41 s   |  0.38  | 2.6×        |
+| **Metal (M4, Q4_0)**                 |  **3.0 s**| 1.37  | 0.73×        |
+| Metal (M4, F16)                      |   4.0 s   | 1.65  | 0.61×        |
+| CPU (M4, 4t NEON, Q4_0)              |  10.7 s²  | 4.32² | 0.23×        |
+| CPU (M4, 4t NEON, F16)               |  17.1 s²  | 6.70² | 0.15×        |
+
+The M3 Ultra rows reflect the §3.21 optimisation pass — CFG cond+uncond
+batched into one Metal forward (B=2) on T3, the new `--cfm-steps N` knob
+on the standard 10-step CFM (N=7 is the recommended quality knee, log-mel
+cosine vs N=10 = **0.995**), and `ggml_swiglu_split` on the Llama MLP.
+The M4 rows are kept for continuity with §3.19/§3.20.
+
+² **CPU multilingual rows re-measured after restoring CFG on the
+non-Metal CFM path.**  The previous numbers in this row (`6.0 s / 2.69`
+and `7.8 s / 3.24`) were captured between Apr 23–May 4 while the
+non-`use_b2` branch in the CFM step loop was silently running only the
+conditional pass — i.e. half the CFM compute, no classifier-free
+guidance steering on CPU/Vulkan/CUDA.  Fixed in commit `6d9b42b`; the
+two rows above are now end-to-end re-measurements on the same M4 host
+with CFG correctly applied (12 CFM steps × 2 forward calls).
+S3Gen wall-time roughly doubled, RTF went up ~2×.  Metal rows are
+unaffected (the `use_b2` branched path always carried the CFG combine).
+
+See the [full benchmark](#performance) section below for the CI benchmark
+table, or [`PROGRESS.md`](PROGRESS.md) for the full chronological
+development journal — every numerical-parity stage and optimization pass
+(T3 Flash Attention, KV-cache layout rework, Metal kernel patches,
+CAMPPlus + VoiceEncoder + S3TokenizerV2 ported to ggml graphs, mel
+extraction via STFT matmul, T3 Q4/Q5/Q8 quantization, the multilingual
+Llama-520M port + CFG dual-cache (§3.19), and the shared S3Gen weight-
+quantisation pass that ships in this repo (§3.20)).
+
+---
+
+## API overview
+
+The two high-level entry points exported through the `TTS_CPP_API`
+public surface (defined in
+[`include/tts-cpp/export.h`](include/tts-cpp/export.h)):
+
+| Surface | Role |
+|---------|------|
+| `tts_cpp::chatterbox::Engine::synthesize` | One-shot text → 24 kHz PCM for the Chatterbox pipeline (T3 + S3Gen + HiFT). Loads the T3 + S3Gen GGUFs once at construction, optionally bakes a voice-cloning profile from a reference wav, and reuses everything across calls. Header: [`<tts-cpp/chatterbox/engine.h>`](include/tts-cpp/chatterbox/engine.h). Variant (Turbo / Multilingual) is autodetected from `chatterbox.variant` GGUF metadata. |
+| `tts_cpp::supertonic::synthesize` | One-shot text → 44.1 kHz PCM for the Supertonic TTS family, on CPU or GPU (`n_gpu_layers`). Header: [`<tts-cpp/supertonic/engine.h>`](include/tts-cpp/supertonic/engine.h). |
+
+Lower-level helpers also exposed via `TTS_CPP_API`, useful when
+embedding into a host that already manages model lifetime:
+**`s3gen_synthesize_to_wav`** (file-output S3Gen path,
+[`<tts-cpp/chatterbox/s3gen_pipeline.h>`](include/tts-cpp/chatterbox/s3gen_pipeline.h)),
+**`s3gen_preload`** / **`s3gen_unload`** (host-side weight pre-staging
++ explicit teardown — required for long-running processes that cycle
+through models or that need deterministic teardown before destroying
+their own ggml backend), and **`tts_cpp_cli_main`** (the same
+entry point used by the `tts-cli` binary — useful for embedding the
+end-to-end CLI into a downstream binary without forking
+[`src/cli_main.cpp`](src/cli_main.cpp)).  Anything outside the
+`TTS_CPP_API`-annotated surface (in particular the
+`tts_cpp::supertonic::detail::*` and `tts_cpp::chatterbox::*_internal`
+helpers reachable from the supertonic / chatterbox test harnesses) is
+**not** part of the public API and is hidden from `SHARED` builds.
+
+### Consumer integration
+
+Downstream projects in the QVAC speech stack consume `tts-cpp` via
+the matching `tts-cpp` vcpkg port (this in-tree subtree).  ggml comes
+from the [`ggml-speech`](https://github.com/tetherto/qvac-registry-vcpkg)
+sister port, which vendors the
+[`qvac-ext-ggml/speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech)
+branch with all Metal / OpenCL / Vulkan patches pre-applied.  Once
+both ports are installed, integration on the consumer side is one
+`find_package` call:
+
+```cmake
+find_package(tts-cpp CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE tts-cpp::tts-cpp)
+```
+
+```cpp
+#include <tts-cpp/chatterbox/engine.h>
+
+tts_cpp::chatterbox::EngineOptions opts;
+opts.t3_gguf_path    = "models/chatterbox-t3-turbo.gguf";
+opts.s3gen_gguf_path = "models/chatterbox-s3gen.gguf";
+opts.n_gpu_layers    = 99;
+tts_cpp::chatterbox::Engine engine(opts);
+auto result = engine.synthesize("Hello, world.");
+// result.pcm is 24 kHz mono float32 PCM ready to be written as wav.
+```
+
+The supertonic test/bench harnesses link against `tts-cpp` directly
+and use detail-namespaced symbols outside the `TTS_CPP_API` public
+surface, so the integrated port keeps the default
+`TTS_CPP_BUILD_SHARED=OFF` and `TTS_CPP_BUILD_TESTS=OFF`.  See
+[**Useful CMake options**](#useful-cmake-options) below for the full
+flag table.
+
+## Pipeline at a glance
+
+```
+      text                                                 24 kHz wav
+       │                                                        ▲
+       ▼                                                        │
+  ┌────────────────────────────────────────────────────────────────┐
+  │                       tts-cli (libtts-cpp)                     │
+  │                                                                │
+  │      T3      ──►   S3Gen encoder   ──►        CFM              │
+  │  text → toks       toks → h                   h → mel          │
+  │                                                                │
+  │                         HiFT vocoder  ──►  24 kHz wav          │
+  └────────────────────────────────────────────────────────────────┘
+       ▲                                              ▲
+   text tokenizer                              reference voice
+   (embedded in T3 GGUF metadata)              (embedded in S3Gen GGUF)
+```
+
+`tts-cli` (and the back-compat `chatterbox` binary, same code) handles
+both Chatterbox variants via `chatterbox.variant` GGUF metadata.  Supertonic
+GGUFs are also autodetected from `supertonic.arch` and routed to the
+Supertonic engine.
+
+| Stage         | Turbo                                      | Multilingual                                        |
+|---------------|--------------------------------------------|-----------------------------------------------------|
+| Tokenizer     | GPT-2 byte-level BPE (English)             | HuggingFace `tokenizers.json` (23 langs, NFKD pre)  |
+| T3 backbone   | GPT-2 Medium, 24 layers, single forward    | Llama-520M, 30 layers, CFG cond+uncond per token    |
+| CFM solver    | Meanflow, 2 Euler steps                    | Standard, 10 Euler steps with `cfg_rate=0.7`        |
+| HiFT vocoder  | shared (same checkpoint format)            | shared (same checkpoint format)                     |
+
+One binary, one invocation, end to end — `scripts/synthesize.sh` is a
+thin convenience wrapper that fills in the two GGUF paths.
+
+## Parler-TTS
+
+Description-conditioned TTS: the transcript (`--text`) is spoken in a voice
+controlled by a natural-language description (`--description`).  Supports
+`parler-tts/parler-tts-mini-v1`, `parler-tts/parler-tts-large-v1` and
+`ai4bharat/indic-parler-tts` (21 languages incl. Hindi/Gujarati);
+model differences are pure GGUF metadata (`parler.*` keys), no code
+branching.  Pipeline: Flan-T5 encoder (description → cross-attention K/V,
+precomputed once and cached per description) → delay-pattern decoder LM
+(9 DAC codebooks, MusicGen-style stagger, HF-faithful EOS gating) → DAC
+codec decode → 44.1 kHz mono PCM.  Validated backends are CPU, Metal,
+Vulkan, and OpenCL (Adreno): the GPU path (F16 flash attention, fused QKV +
+stacked LM heads, DAC upsampling as phase matmuls) is gated on that
+allowlist in `src/parler/gguf.cpp`, and any other GPU backend is released at
+load and replaced by CPU rather than run unvalidated.  The graph dispatch
+uses the shared `sched_dispatch` dual path like the other engines.
+
+Indic-class checkpoints ship a second, SentencePiece-BPE **prompt**
+tokenizer (90k vocab covering the Indic scripts, byte fallback) alongside
+the Flan-T5 description tokenizer; the converter embeds both
+(`parler.prompt_tokenizer.*` keys) and the engine routes prompts through
+the BPE tokenizer when present.  mini/large GGUFs are unaffected (one
+shared tokenizer, byte-identical output).  The language is auto-detected
+from the prompt script; descriptions stay English (name a recommended
+voice — e.g. Rohit for Hindi, Yash for Gujarati — for stable speakers).
+
+```sh
+# convert (single GGUF: T5 + decoder + DAC + tokenizer; ~3.4 GB f32)
+python3 tts-cpp/scripts/parler/convert-to-gguf.py \
+    --model-id parler-tts/parler-tts-mini-v1 --dtype f32 \
+    --out tts-cpp/models/parler-mini-v1-f32.gguf
+
+# synthesize (also autodetected by tts-cli via parler.arch + --description)
+./build/parler-cli --model tts-cpp/models/parler-mini-v1-f32.gguf \
+    --text "Hey, how are you doing today?" \
+    --description "A female speaker with a calm, clear voice, close up." \
+    --out out.wav
+```
+
+The indic checkpoint is gated on HF (`gated: auto` — any account gets
+instant access); pass a downloaded snapshot directory as `--model-id`
+with `--reference-repo ai4bharat/indic-parler-tts` for provenance.
+
+Instead of writing a full `--description`, the voice can be configured
+through template flags (`build_description()` in
+`<tts-cpp/parler/description.h>` — the same renderer the downstream addon
+uses).  The rendered text follows the models' training-caption phrasing,
+and every flag has a working default — with no flags at all the engine
+uses the models' recommended fallback caption ("The speaker speaks
+naturally. The recording is very high quality with no background noise."):
+
+| flag | values (default first) | rendered as |
+|---|---|---|
+| `--voice` | free name, e.g. Rohit, Laura | sentence subject |
+| `--emotion` | one of the 12 below | tone clause + "The intended style is …" |
+| `--pitch` | unset, low, moderate, high | "with a low pitch" |
+| `--pace` | unset, slow, moderate, fast | "speaks slowly" / "at a fast pace" |
+| `--expressivity` | unset, monotone, slightly expressive, expressive | "in an expressive manner" |
+| `--noise` | clear, noisy | "with no/noticeable background noise" |
+| `--reverb` | close, distant | "distant-sounding" (close is implied) |
+| `--quality` | very high, high, basic | "The recording is … quality" |
+
+Emotions (case-insensitive, validated): command, anger, narration,
+conversation, disgust, fear, happy, neutral, proper noun, news, sad,
+surprise — the 12 speaking styles in the indic training set.  Each renders
+an in-distribution clause ("with an angry tone", "delivering the news",
+"perfect for narration") plus the trailing style anchor sentence the
+training captions used.  The indic card lists 10 officially emotion-tested
+languages (Assamese, Bengali, Bodo, Dogri, Kannada, Malayalam, Marathi,
+Sanskrit, Nepali, Tamil); elsewhere — including Hindi/Gujarati and the
+mini/large English checkpoints — emotion conditioning exists but is
+best-effort: validate by ear.  `--description` and the template flags are
+mutually exclusive (the CLI errors out rather than silently preferring
+one).
+
+`--dtype f16` (~2.5 GB) casts only the decoder matmul weights and
+embeddings; the T5 encoder stays f32 (Flan-T5 activations overflow the
+f16 range — the well-known T5 fp16 trap), as do norms, biases, snake
+alphas, the positional table and all DAC tensors.
+
+Quantized recipes (mini sizes; argmax agreement vs the f32 fixtures over a
+200-step teacher-forced trace, f16 scoring 99.6%):
+
+| `--dtype` | size | agree | bulk / tables / heads / T5 |
+|---|---|---|---|
+| `q8_0` | ~1.16 GB | 98.1% | q8_0 / f16 / f16 / q8_0 |
+| `q6_k` | ~0.98 GB | 94.9% | q6_K / q6_K / f16 / q8_0 |
+
+Sub-q6 tiers measured well below this quality floor (q5_0 90.4%, q4_k_m
+83.1% on mini; 70.0% / 65.9% on large) and are deliberately not shipped —
+reproduce them via `--recipe` if ever needed.  The recipes transfer to
+the indic checkpoint unchanged (its own 200-step fixtures: f16 99.6%,
+q8_0 98.3%; f32 scores 100%).  All recipes keep the f32
+set above untouched and the T5 matmuls at q8_0 (quantized dot products
+re-quantize activations per block, so the f16 trap does not apply — T5
+must never go f16).  The 9 LM heads never drop below q8_0 (6-bit heads
+derail sampled decoding); both tiers lift heads (q8_0 also tables) to
+f16 — the dominant quality lever found by grid search
+(`scripts/parler/quant-grid.py`; per-tier override via `--recipe`, optional
+activation-weighted quantization via `scripts/parler/compute-imatrix.py` +
+`--imatrix`).  Non-trivial encodes go through the built ggml library
+(`ggml_quantize_chunk` via ctypes; auto-located, or pass `--ggml-lib`), so
+build tts-cpp first.  Quantized output diverges from the f32 parity
+fixtures by construction — validate by ear;
+`PARLER_TEST_REPORT_ONLY=1 test-parler-{t5,decoder}` prints the stage
+metrics without enforcing the f32 tolerance bars.
+
+Digits in the prompt are expanded to English words before tokenization
+("12" → "twelve"): parler-v1 ships no text front-end and voices raw digits
+badly, so this deliberately diverges from stock HF.  English cardinals
+(incl. thousands separators), decimals and ordinals are covered; times,
+currency and units are not.  Opt out with `--no-normalize-numbers`
+(`EngineOptions::normalize_numbers = false`); the description is never
+rewritten.  On indic-class models, ASCII digit runs whose nearest letter
+context is an Indic script are instead transliterated to that script's
+native digits ("कमरा 12" → "कमरा १२"; all 13 digit-bearing scripts of the
+21 languages covered); Latin-context runs still become English words, and
+native numerals always pass through untouched.  Best effort by design:
+the model only voices native numerals for scripts whose numerals were
+frequent in its training text (Devanagari yes; e.g. Gujarati no —
+verified by ear); full per-language number-words belong upstream where
+the prompt language is known.
+
+Verification: `ctest -R test-parler` runs tokenizer/T5/decoder/delay/DAC/
+e2e parity against `.npy` fixtures produced by
+`scripts/parler/dump-reference.py` (HF PyTorch reference, greedy).  The
+greedy token trace matches HF exactly; the DAC waveform matches at
+>120 dB SNR.  Default decoding is sampled (temperature 1.0, top-k 50, from
+`generation_config.json`); `--greedy` gives the deterministic parity path.
+Streaming synthesis is not offered yet (frames complete 8 steps late under
+the delay pattern and DAC decode is whole-sequence).
+
+## Supertonic GGUF
+
+The tree also contains a Supertonic path.  It is
+model-specific: the official Supertone ONNX files and assets are converted
+into one GGUF, then a ggml C++ runtime runs the known Supertonic stages on
+CPU or, with `--n-gpu-layers > 0`, on Metal (Apple), Vulkan, OpenCL (Adreno),
+or CUDA when that backend is compiled in.  Metal is the fastest backend
+measured so far: `91.4 ms` total, `RTF 0.029`, ~35x realtime on an M2 with the
+`q8_0` GGUF, ahead of ggml CPU, ONNX CPU, and ONNX CoreML on every stage that
+matters (see [`PROGRESS_SUPERTONIC.md`](PROGRESS_SUPERTONIC.md)).
+
+There are two related upstream bundles:
+
+- `Supertone/supertonic` is the stable English bundle.  It should be used for
+  English and does **not** wrap text in language tags.
+- `Supertone/supertonic-2` is the multilingual bundle.  It should use the
+  open/close language-tag path (`<lang>...</lang>`).  The older prefix-only
+  form (`<lang>... `) can make English prompts stutter.
+
+Current status:
+
+- `scripts/dump-supertonic-reference.py` dumps ONNX Runtime reference tensors.
+- `scripts/setup-supertonic2.sh` downloads the official Hugging Face bundle
+  through `huggingface_hub` and writes the local GGUF.
+- `scripts/convert-supertonic2-to-gguf.py` writes `models/supertonic.gguf`
+  (English) or `models/supertonic2.gguf` (multilingual), depending on flags.
+  When `--onnx-dir` is omitted, it downloads the selected repo just like the
+  Chatterbox converters.
+- `build/tts-cli` autodetects Supertonic GGUFs from `supertonic.arch` and can
+  synthesize a 44.1 kHz wav on CPU or GPU (`--n-gpu-layers`, with
+  `--vulkan-device` to pick an adapter).  `build/supertonic-cli` remains as a
+  focused compatibility/debug wrapper.
+- All five stages pass numerical parity against the ONNX reference
+  (preprocess, duration, text encoder, vector estimator, vocoder), and the
+  full pipeline (`test-supertonic-pipeline`) reproduces the ONNX reference
+  waveform when fed the same initial noise tensor.
+- The production path is GGML-backed for duration, text encoder, vector
+  estimator, and vocoder.  Text relative-position self-attention and FFN blocks
+  are expressed with stock GGML ops, and the speech-prompted text attention /
+  vector attention blocks use `ggml_flash_attn_ext` where the math allows it.
+- Vector attention uses strided Q/K/V GGML views where the time-channel layout
+  permits it.  The vector runtime also keeps persistent graph/allocr caches for
+  attention, ConvNeXt group, and tail islands, plus fused ConvNeXt boundary /
+  tail update graphs and portable custom CPU kernels for pointwise Conv1D,
+  depthwise Conv1D, row-wise layer norm, dense time matmul, and fused
+  bias/GELU/residual elementwise work.
+- The vocoder keeps a persistent GGML graph cache and uses portable
+  BLAS/Accelerate-backed causal Conv1D custom ops for the hot projection paths.
+  BLAS worker threads are capped by default to avoid nested oversubscription
+  under GGML task-level threading.
+- `SUPERTONIC_VECTOR_PROFILE=1` and `SUPERTONIC_TEXT_PROFILE=1` print
+  per-island timings for tuning graph boundaries.  Current text profiling shows
+  stock-op relpos is ~0.7-0.8 ms/layer on the quick prompt, so a fused relpos
+  op is deferred until backend profiling proves it necessary.
+- CPU thread count is controlled by `--threads`; the default caps at 4 threads
+  because the current small-graph Supertonic path regresses when oversubscribed.
+- Current CPU benchmark artifacts live in
+  `artifacts/supertonic-thread-matrix/`.  The final matched matrix on this
+  machine uses F1, 5 denoise steps, speed `1.05`, `runs=3`, `warmup=1`, and
+  ONNX Runtime `CPUExecutionProvider` only.  GGML wins 10 of 12 matched
+  thread/prompt comparisons.  The only end-to-end losses are quick English at
+  4 threads (`157.7 ms` vs `148.8 ms`) and long English at 4 threads
+  (`361.2 ms` vs `351.5 ms`).
+- The current quick prompt 4-thread medians are `13.5 ms` text encoder,
+  `96.3 ms` vector estimator, `43.6 ms` vocoder, and `157.7 ms` total
+  (`RTF 0.050`).  Portuguese 4-thread now wins end to end (`234.3 ms` GGML vs
+  `250.8 ms` ONNX), with GGML vocoder at `68.9 ms` vs ONNX `95.6 ms`.
+
+Latest matched CPU matrix, median total milliseconds:
+
+| Prompt | GGML 1t | GGML 2t | GGML 3t | GGML 4t | ONNX 1t | ONNX 2t | ONNX 3t | ONNX 4t |
+|--------|--------:|--------:|--------:|--------:|--------:|--------:|--------:|--------:|
+| quick English | 298.0 | 189.4 | 157.7 | 157.7 | 373.8 | 218.5 | 168.3 | 148.8 |
+| longer English | 757.5 | 491.2 | 390.3 | 361.2 | 1103.0 | 580.6 | 555.7 | 351.5 |
+| Portuguese smoke | 457.2 | 292.9 | 251.0 | 234.3 | 610.6 | 344.6 | 268.3 | 250.8 |
+
+Example:
+
+```bash
+# Stable English bundle: no language wrapping.
+bash scripts/setup-supertonic2.sh --arch supertonic
+
+cmake --build build --target tts-cli
+./build/tts-cli \
+  --model models/supertonic.gguf \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --voice F1 --language en --steps 5 --speed 1.05 \
+  --out /tmp/supertonic.wav
+
+# Multilingual bundle: uses the <lang>...</lang> wrapping path.
+bash scripts/setup-supertonic2.sh
+
+cmake --build build --target tts-cli
+./build/tts-cli \
+  --model models/supertonic2.gguf \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --voice M1 --language en --steps 5 --speed 1.05 \
+  --out /tmp/supertonic.wav
+
+# Bit-exact reproduction of the ONNX reference run (pass the same noise tensor)
+./build/tts-cli --model models/supertonic2.gguf \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --voice M1 --language en --steps 5 --speed 1.05 \
+  --noise-npy artifacts/supertonic-ref-quick/noise.npy \
+  --out /tmp/supertonic.wav
+
+# Matched GGML benchmark with machine-readable metrics.
+./build/supertonic-bench \
+  --model models/supertonic2.gguf \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --voice F1 --language en --steps 5 --speed 1.05 \
+  --threads 4 --runs 5 --warmup 1 \
+  --json-out artifacts/supertonic-bench.json
+
+# Matched ONNX Runtime benchmark.  Use open_close wrapping for Supertonic 2.
+python scripts/bench-supertonic-onnx.py \
+  --onnx-dir /path/to/supertonic-pytorch/onnx_models/onnx \
+  --assets-dir /path/to/supertonic-pytorch/assets \
+  --voice-style /path/to/supertonic-pytorch/assets/voice_styles/F1.json \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --lang en --language-wrap-mode open_close \
+  --steps 5 --speed 1.05 --threads 1 --runs 5 --warmup 1 \
+  --json-out artifacts/supertonic-onnx-bench.json
+```
+
+## Audio8
+
+[Audio8](https://github.com/Audio8-AI/Audio8_TTS) is a DualAR zero-shot TTS
+model: a 24-layer Qwen2.5-0.6B-shaped **slow AR** emits one semantic token per
+codec frame, a 4-layer **fast AR** expands each of those into the frame's
+remaining 9 codebooks, and a DAC-style residual-vector-quantised **codec**
+turns the 10-codebook frames into 44.1 kHz audio at 2048 samples (21.5 Hz) per
+frame.  Cloning needs no speaker encoder: the codec *encoder* turns a reference
+wav into codes, and those codes plus the reference transcript are prepended to
+the prompt.
+
+**Status — CPU engine, validated against the reference.**  Text-to-speech and
+voice cloning both run in-process; the backend plumbing mirrors the other
+engines so a GPU path can be added without touching the graphs.
+
+### Convert
+
+Three GGUFs, because the halves have different lifetimes: the LM and the codec
+decoder are needed for every synthesis, the codec encoder only to enrol a voice
+from a wav.  Both codec halves carry the codebooks, so each file stands alone.
+
+```bash
+python3 scripts/convert-audio8-lm-to-gguf.py \
+    --model-dir models/Audio8-TTS-Preview-0.6b \
+    --outfile models/audio8-lm-q8_0.gguf --dtype q8_0
+
+for part in encoder decoder; do
+  python3 scripts/convert-audio8-codec-to-gguf.py \
+      --model-dir models/Audio8-TTS-Preview-0.6b --part $part \
+      --outfile models/audio8-codec-$part-q8_0.gguf --dtype q8_0
+done
+```
+
+| `--dtype` | LM | codec decoder | codec encoder |
+|---|---:|---:|---:|
+| `f32` | 2.3 GB | 499 MB | 793 MB |
+| `f16` | 1.2 GB | 251 MB | 398 MB |
+| `q8_0` | 801 MB | 201 MB | 252 MB |
+| `q4_0` | 602 MB | — | — |
+
+**The f16 LM is free.**  The LM checkpoint ships in bfloat16, whose 8 mantissa
+bits fit inside f16's 10, so half precision stores it without loss — f32 and
+f16 builds agree to 3e-8, which is below the f32 rounding of the conversion
+itself.  Prefer f16 over f32 unless you are debugging.  The codec ships in f32
+and its f16 build is genuinely lossy (worst tensor deviation 1.6e-3).
+
+`--dtype` sets a ceiling, not a blanket cast.  Each tensor is classified by
+what it is used for, in `role_of()` in either converter: body matmuls take the
+block format, bulk weights that must stay element-addressable (embedding
+tables, convolution kernels) stop at f16, and tensors that decide a greedy
+choice stay f32 in every build — the RoPE tables, the sampling heads, the
+codebooks (the encoder picks codes by nearest neighbour, so rounding them moves
+the argmin) and every 1-D parameter, the snake alphas among them.  A q4_0 codec
+is not offered: over half the decoder is convolution kernels that block formats
+cannot address, so the tier would buy little and cost audible quality.
+
+Two things the converters do that are worth knowing before reading them:
+
+- **RoPE tables are baked, not recomputed.**  The reference builds them in
+  bfloat16 even under float32 inference, and that ~2e-3 rounding is not
+  cosmetic — recomputing in float32 changes the greedy fast-AR codebook choices
+  on the very first frame and the trajectories separate from there.
+  `--rope-precision f32` is available to reproduce that measurement.  The
+  tables are emitted as separate `_cos` and `_sin` planes, the shape
+  `apply_rope_in_graph` consumes.
+- **Q and K rows are reordered.**  The reference rotates each head's adjacent
+  pair `(2j, 2j+1)`; ggml and the rest of this tree rotate `(j, head_dim/2+j)`.
+  Reordering the projection rows at conversion time avoids a strided gather in
+  every attention block, and attention cannot tell the difference because the
+  same permutation lands on Q and K and their dot product does not depend on
+  the order of the terms.  `verify-audio8-conversion.py` checks this by
+  comparing attention scores, not tensors.
+- **The text head is replaced by a semantic head.**  The head is tied to the
+  155776-row input embedding, but the sampler masks every logit outside
+  `[semantic_begin, semantic_end]` plus EOS, so the converter emits just those
+  4097 rows as `lm/sem_head`.  Masked-out logits contribute nothing to the
+  top-k/top-p renormalisation, so this is exact, and it turns a 155776-row
+  projection per step into a 4097-row one.
+
+### Verify
+
+`verify-audio8-conversion.py` reloads the checkpoint through its own remote
+code and compares every converted tensor against it, at a tolerance derived
+from what the tensor's storage can actually represent — exact for f32, one
+reconstruction step for the block formats.  It recomputes the RoPE tables
+independently rather than trusting the converter's copy.
+
+Each GGUF is also checked for completeness on its own, against the half of the
+checkpoint the converter's own split says it carries, so a tensor written to
+the wrong half fails here rather than at load time.  It takes any subset of the
+three files, but at least one.
+
+```bash
+python3 scripts/verify-audio8-conversion.py \
+    --model-dir models/Audio8-TTS-Preview-0.6b \
+    --lm-gguf models/audio8-lm-q8_0.gguf \
+    --codec-encoder-gguf models/audio8-codec-encoder-q8_0.gguf \
+    --codec-decoder-gguf models/audio8-codec-decoder-q8_0.gguf
+```
+
+### Reference fixtures
+
+Three dumpers write the `.npy` fixtures the C++ stages will be checked against.
+They capture stage boundaries, not just endpoints, so a failing stage can be
+located without bisecting the network.
+
+```bash
+python3 scripts/dump-audio8-tokenizer-reference.py \
+    --model-dir models/Audio8-TTS-Preview-0.6b --out-dir artifacts/audio8-ref
+
+# reference-free generation: prompt, embeddings, per-step hidden states,
+# semantic logits before and after filtering, fast-AR logits, emitted codes.
+# --dump-wav also decodes those codes, which test-audio8-engine compares against
+python3 scripts/dump-audio8-lm-reference.py \
+    --model-dir models/Audio8-TTS-Preview-0.6b \
+    --out-dir artifacts/audio8-ref --max-new-tokens 32 --dump-wav
+
+# codec both ways: decode the codes above, encode a reference wav.  This is the
+# recording the cloning fixtures below are enrolled from, so the tests expect it
+python3 scripts/dump-audio8-codec-reference.py \
+    --model-dir models/Audio8-TTS-Preview-0.6b \
+    --codes artifacts/audio8-ref/codes.npy \
+    --audio test/reference-audio/audio8-reference-en.wav \
+    --out-dir artifacts/audio8-ref
+
+# the cloning path end to end: reference codes + transcript -> prompt -> codes
+python3 scripts/dump-audio8-lm-reference.py \
+    --model-dir models/Audio8-TTS-Preview-0.6b \
+    --text "Tear in eye, your dress you'll tear." \
+    --reference-codes artifacts/audio8-ref/codec_enc_codes.npy \
+    --reference-text "What these pictures? An elephant with uh so many legs." \
+    --out-dir artifacts/audio8-ref-clone --max-new-tokens 24 --dump-wav
+```
+
+The dumps are taken with `do_sample=False`.  The shipped sampler draws Gumbel
+noise and applies repetition-aware resampling, neither of which reproduces
+across runtimes; greedy decoding makes the trajectory comparable, and the
+filtered score vectors are dumped alongside the tokens so everything feeding
+the draw can be checked even where the draw itself cannot.  `--dump-wav` runs
+the generated codes back through the codec so the engine test has an
+end-to-end waveform to compare against, not just codes.
+
+CTest looks for the results in fixed places, and a fixture it cannot find turns
+its test into a "Not Run (Disabled)" rather than a failure, so the recipe above
+writes where the tests read: the dumps into `artifacts/audio8-ref` and
+`artifacts/audio8-ref-clone`, the GGUFs into `models/`.  `cmake` prints a
+`disabled (missing fixture(s): ...)` line at configure time for whatever is
+still absent, which is the quickest way to see that a run is thinner than it
+looks.
+
+### Run
+
+```bash
+# text only: the LM and the codec's synthesis half
+audio8-cli --lm models/audio8-lm-q8_0.gguf \
+           --codec-decoder models/audio8-codec-decoder-q8_0.gguf \
+           --text "Hello from a fully on-device C++ pipeline." \
+           --out out.wav --threads 8
+
+# cloning: add the analysis half, a reference wav and what it says
+audio8-cli --lm models/audio8-lm-q8_0.gguf \
+           --codec-decoder models/audio8-codec-decoder-q8_0.gguf \
+           --codec-encoder models/audio8-codec-encoder-q8_0.gguf \
+           --ref-audio voice.wav --ref-text "What the recording says." \
+           --text "Now say this instead." --out out.wav --threads 8
+```
+
+`--greedy` reproduces the fixtures; otherwise `--seed`, `--temperature`,
+`--top-k` and `--top-p` drive the sampler.  `--max-frames` caps the output at
+2048 samples each (~46 ms), `--output-sample-rate` resamples away from the
+codec's native 44.1 kHz, and `--backends-dir` points a `GGML_BACKEND_DL` build
+at its backend libraries.  The reference wav is resampled and downmixed on the
+way in, so any format `dr_wav` reads will do.
+
+The same thing through the library, from `tts-cpp/audio8/engine.h`:
+
+```cpp
+tts_cpp::audio8::EngineOptions opts;
+opts.lm_gguf_path            = "models/audio8-lm-q8_0.gguf";
+opts.codec_decoder_gguf_path = "models/audio8-codec-decoder-q8_0.gguf";
+opts.codec_encoder_gguf_path = "models/audio8-codec-encoder-q8_0.gguf";  // cloning only
+
+tts_cpp::audio8::Engine engine(opts);
+auto plain = engine.synthesize("Hello.");
+
+auto voice = tts_cpp::audio8::load_voice_prompt("voice.wav",
+                                                "What the recording says.");
+auto cloned = engine.synthesize("Now say this instead.", voice);
+```
+
+`VoicePrompt` is mono float32 plus a transcript, so a caller that already has
+samples can fill it directly; `load_voice_prompt` is there for the common case
+of a file on disk.
+
+The engine holds the models resident across calls and caches the codes for the
+most recent voice prompt, so re-using a reference skips the codec encoder.
+`cancel()` stops an in-flight `synthesize()` at the next language model step or
+codec block, whichever comes first; the call throws rather than returning a
+partial waveform.
+
+The three GGUFs have to come from one checkpoint, and the engine checks that
+they do — codebook counts and widths, the codec's two halves against each other
+and both against the language model — from their headers, before it reads a
+byte of weights.
+
+### Engine notes
+
+Roughly a second of audio per second of CPU on eight cores of a desktop x86-64,
+q8_0 weights: 16 s of speech in 19 s wall, 5.5 s of cloned speech in 10 s
+including enrolment.
+
+**The codec is chunked, in both directions.**  Its convolution stacks, not the
+LM, are what made memory grow with utterance length — a 24 s decode used to
+need a 1.5 GB arena.  Each direction is now split into a whole-sequence graph
+and a block graph that walks the utterance, and each block is re-fed the exact
+receptive field its stack needs (`span_through_*` in `codec_ops.cpp` walks the
+strides and dilations to compute it) and drops the samples that context
+produced.  The result is bit-identical to running in one pass whatever the
+block size, which `test-audio8-codec` asserts by re-running both directions at
+a deliberately tiny block and comparing.  Decode now holds ~130 MB flat, encode
+~140 MB for a 10 s reference.  End to end that is 1.25 GB resident for
+text-only and 1.67 GB for cloning, of which 1.25 GB is the q8_0 weights
+themselves.
+
+The one part that still grows with input length is the encoder's analysis
+transformer: `ggml_soft_max_ext` materialises the full score matrix, so a
+reference much beyond 30 s gets expensive.  References of a few seconds are
+what the model expects anyway.
+
+**Sampling follows the reference's order, which is unusual.**  top-k and top-p
+run on the raw logits and the temperature is applied to what survives, so
+temperature does not affect which candidates are in the running.  Semantic
+tokens additionally go through repetition-aware resampling: drawing a token
+that already appears in a short trailing window triggers one re-draw at a
+narrower nucleus and a higher temperature.  The window holds tokens the model
+actually drew and nothing else, so an utterance opens with no history at all;
+the opening token stays out of it, as it does in the reference.  `--greedy`
+bypasses all of it.
+
+### Test
+
+The C++ stages are checked against the fixtures above, one CTest target per
+stage boundary:
+
+```bash
+ctest -R audio8 --output-on-failure
+```
+
+| target | checks |
+|---|---|
+| `test-audio8-tokenizer` | BPE ids and the ChatML prompt, both cloning and not |
+| `test-audio8-lm` | prompt embeddings, per-step hidden states, semantic and fast-AR logits, emitted codes |
+| `test-audio8-codec` | encode and decode at every stage boundary, block-size independence, and that a cancel stops the block loop |
+| `test-audio8-sampler` | filtered score vectors, which is the part of the draw that is reproducible |
+| `test-audio8-ras` | the repetition-aware window: which draws enter it, eligibility, eviction, and the retry's nucleus |
+| `test-audio8-engine` | both public paths end to end against the decoded waveforms, and the refusal of GGUFs that disagree |
+
+Every target above except `test-audio8-ras` needs the dumps, so `test-audio8-ras`
+is the only one that runs on a checkout with no models.
+
+The engine test hands the cloning path a wav rather than pre-computed codes, so
+it exercises the codec encoder the way a caller would.
+
+## Prerequisites
+
+- C++17 compiler (clang or gcc)
+- cmake ≥ 3.14
+- Python 3.10+ with `torch`, `numpy`, `onnx`, `gguf`, `huggingface_hub`,
+  `safetensors`, `scipy`, `librosa`, `resampy` — needed **once**, at setup time only, to run the
+  weight converters (which bake the precomputed mel filterbanks into the
+  GGUFs) and the optional reference-dump scripts. Once the GGUFs exist,
+  the C++ binary has zero runtime dependency on Python.
+
+The easiest way to get the Python side is:
+
+```bash
+git clone https://github.com/resemble-ai/chatterbox.git chatterbox-ref
+cd chatterbox-ref
+python -m venv .venv && . .venv/bin/activate
+pip install -e .
+pip install onnx gguf huggingface_hub safetensors scipy librosa resampy
+cd -
+```
+
+## 1. Build from the qvac speech stack
+
+This in-tree subtree is built against the [`ggml-speech`](https://github.com/tetherto/qvac-registry-vcpkg)
+vcpkg port (which vendors the [`qvac-ext-ggml/speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech)
+branch with all patches pre-applied).  `tts-cpp` itself is consumed
+through the matching `tts-cpp` port; downstream applications in the
+QVAC speech stack add both to their `vcpkg.json` and call
+`find_package(tts-cpp CONFIG REQUIRED)`:
+
+```cmake
+find_package(tts-cpp CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE tts-cpp::tts-cpp)
+```
+
+For development out of this in-tree subtree (running the parity
+harnesses, prototyping API changes, etc.) the canonical build is the
+**bundled-ggml dev flow**:
+
+```bash
+bash tts-cpp/scripts/setup-ggml.sh    # clones qvac-ext-ggml@speech into tts-cpp/ggml/
+cmake -S tts-cpp -B tts-cpp/build -DCMAKE_BUILD_TYPE=Release \
+  -DTTS_CPP_USE_SYSTEM_GGML=OFF
+cmake --build tts-cpp/build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+```
+
+`setup-ggml.sh` checks out the pinned tetherto/qvac-ext-ggml@speech
+commit (which already carries every QVAC infrastructure patch + the
+Supertonic 2 fused custom op family — no `patches/` overlay needed).
+CMakeLists's `add_subdirectory(ggml)` path then consumes it directly
+with `GGML_NATIVE=ON` for native ARM/SIMD codegen — typically ~10%
+faster on M-series than the vcpkg-port flavor's portable build.
+
+Downstream production builds use the system-installed `ggml` instead:
+
+```bash
+cmake -S tts-cpp -B tts-cpp/build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=<vcpkg_root>/scripts/buildsystems/vcpkg.cmake
+cmake --build tts-cpp/build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+```
+
+`TTS_CPP_USE_SYSTEM_GGML` defaults to `ON` for this flow, finding
+the `ggml-speech` port from qvac-registry-vcpkg (which pulls
+qvac-ext-ggml@speech with patches as commits).  GPU acceleration is
+selected at the ggml-port level — the port already carries the
+Metal / Vulkan / OpenCL backend support its consumers ask for; pass
+`--n-gpu-layers 99` at runtime to actually use the compiled GPU
+backend.
+
+### Useful CMake options
+
+Project-namespaced flags (all default to a sensible standalone build;
+override with `-D<flag>=...` at configure time):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `TTS_CPP_BUILD_LIBRARY` | `ON` | Build the `tts-cpp` library target itself (linkage controlled by `TTS_CPP_BUILD_SHARED`, not `BUILD_SHARED_LIBS` — see below) |
+| `TTS_CPP_BUILD_SHARED` | `OFF` | Build `tts-cpp` as `SHARED` instead of `STATIC`. Decoupled from `BUILD_SHARED_LIBS` because ggml's own CMake declares its own `option(BUILD_SHARED_LIBS)` defaulting to `ON` on Windows non-MinGW; using a project-namespaced option keeps the two independent. The supertonic test/bench harnesses link against `tts-cpp` directly and use detail-namespaced symbols outside the `TTS_CPP_API` public surface, so `SHARED` builds hide them and disable those targets — leave OFF for development, flip ON only for downstream packaging where the test harnesses aren't built |
+| `TTS_CPP_BUILD_EXECUTABLES` | `ON` standalone / `OFF` subdir | `tts-cli`, `mel2wav`, `supertonic-cli`, `supertonic-bench` |
+| `TTS_CPP_BUILD_TESTS` | `ON` standalone / `OFF` subdir | `test-*` parity / unit harnesses, registered with CTest (label-filterable via `ctest -L unit` / `ctest -L fixture` / `ctest -L gpu`) |
+| `TTS_CPP_INSTALL` | `ON` | Generate `install` rules + the `tts-cpp` CMake package config so consumers can `find_package(tts-cpp CONFIG REQUIRED)` |
+| `TTS_CPP_USE_SYSTEM_GGML` | `ON` (this in-tree subtree) | `find_package(ggml CONFIG REQUIRED)` against the QVAC speech-stack `ggml-speech` vcpkg port (the [`qvac-ext-ggml/speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech) branch). Flipping `OFF` is rejected at configure time here because the standalone `patches/` directory is intentionally absent. The standalone `chatterbox.cpp` repo defaults this to `OFF` for its bundled-ggml dev flow |
+| ~~`TTS_CPP_GGML_LIB_PREFIX`~~ | n/a in this subtree | The standalone `chatterbox.cpp` repo exposes this option to rename bundled `libggml-*` to `libspeech-ggml-*`.  This in-tree subtree consumes ggml exclusively from the `ggml-speech` vcpkg port, which already emits the `libspeech-ggml-*` filenames at its own build time, so the option / helper / loop are dropped here and the file-prefix surface is whatever vcpkg installs |
+| `TTS_CPP_CCACHE` | `ON` | Use ccache as compiler launcher for `tts-cpp`'s own targets when `find_program(ccache)` succeeds. Scoped per target; ggml's independent `GGML_CCACHE` option handles the ggml subdirectory |
+
+When tests are enabled, the build also exposes three cache-overridable
+fixture roots that the registered ctest entries resolve against:
+
+| CACHE PATH | Default | Used by |
+|------------|---------|---------|
+| `TTS_CPP_TEST_MODEL_DIR` | `${CMAKE_CURRENT_SOURCE_DIR}/models`               | GGUF checkpoints (produced by `scripts/convert-*-to-gguf.py` or `bash scripts/setup-supertonic2.sh`) |
+| `TTS_CPP_TEST_AUDIO_DIR` | `${CMAKE_CURRENT_SOURCE_DIR}/test/reference-audio` | Reference WAV fixtures (e.g. `test/reference-audio/jfk.wav`) |
+| `TTS_CPP_TEST_REF_DIR`   | `${CMAKE_CURRENT_SOURCE_DIR}/artifacts`            | `.npy` reference dumps from `scripts/dump-{s3gen,supertonic,t3-mtl}-reference.py` |
+
+Tests whose required fixtures don't exist at configure time are
+auto-marked `DISABLED` (they still appear in `ctest -N` output but
+return `Not Run` instead of failing), so a fresh checkout still gives
+a green `ctest` run on the harnesses whose fixtures it does have.
+
+This produces the end-to-end binary plus a set of per-stage validation
+harnesses:
+
+| Binary | What it does |
+|--------|--------------|
+| `build/tts-cli`            | End-to-end Chatterbox text → speech tokens (T3) → wav (S3Gen + HiFT), plus Supertonic text → wav. Handles Chatterbox voice cloning via `--reference-audio`, autodetects Chatterbox Turbo/Multilingual from `chatterbox.variant`, and autodetects Supertonic from `supertonic.arch`. |
+| `build/mel2wav`               | HiFT only: mel.npy → wav (demo) |
+| `build/supertonic-cli`        | Supertonic-only end-to-end CLI (text → wav) — the same engine `tts-cli` invokes when it sees a Supertonic GGUF, exposed standalone for scripting and parity work |
+| `build/supertonic-bench`      | Per-stage Supertonic benchmark harness (`--text` / `--out` / `--runs`); machine-readable RTF + per-stage timings |
+| `build/test-s3gen`            | Staged numerical validation of S3Gen encoder + CFM vs Python dumps |
+| `build/test-resample`         | Round-trip SNR of the C++ Kaiser-windowed sinc resampler + output-frequency helpers (validate / passthrough / ratio) |
+| `build/test-output-sample-rate` | `--output-sample-rate` on `chatterbox::Engine`: native/16 kHz batch, out-of-range rejection, streaming `pcm == concat(chunks)` invariant (needs the MTL GGUFs) |
+| `build/test-voice-features`   | 24 kHz 80-ch mel parity (prompt_feat) |
+| `build/test-fbank`            | 16 kHz 80-ch Kaldi fbank parity |
+| `build/test-voice-encoder`    | VoiceEncoder 256-d speaker embedding parity |
+| `build/test-campplus`         | CAMPPlus 192-d embedding parity |
+| `build/test-voice-embedding`  | wav → fbank → CAMPPlus end-to-end parity |
+| `build/test-s3tokenizer`      | S3TokenizerV2 log-mel + speech-token parity |
+| `build/test-tts-streaming`        | Per-chunk CFM + HiFT parity for the streaming pipeline (B1) |
+| `build/test-mtl-tokenizer`    | Multilingual grapheme tokenizer parity vs the HF reference |
+| `build/test-t3-mtl`           | End-to-end MTL T3 (Llama-520M) forward-pass parity |
+| `build/test-t3-mtl-stages`    | Staged MTL T3 parity (cond/text/inputs/layers/head) |
+| `build/test-cpu-caches`       | CPU-side persistent-cache validation (time_mlp / time_emb / cfm_estimator / weight_mirror caches that amortise per-synth overhead on the multilingual CPU path); no-arg invocation runs the bit-cast cache-key + initial-state checks, GGUF arg runs the warm-cache + bit-exact pipeline check |
+| `build/test-t3-caches`        | T3 step-graph cache validation (no-arg = initial-state, GGUF arg = warm-cache + bit-exact end-to-end check) |
+| `build/test-supertonic-*`     | Per-stage Supertonic parity harnesses (`preprocess`, `vocoder` ± `trace` / `pointwise`, `duration` ± `trace`, `text-encoder` ± `trace`, `vector` ± `trace`, `pipeline`); each takes `MODEL.gguf REF_DIR` |
+| `build/test-metal-ops`        | Metal-only: parity check for `diag_mask_inf`, `pad_ext`, and fast `conv_transpose_1d` (only useful when built with `-DGGML_METAL=ON`) |
+
+You'll normally only need `build/tts-cli`; the `test-*` binaries are
+there for the staged-verification methodology in `PROGRESS.md`, and
+register with CTest so you can run `ctest -C Release -L unit` /
+`ctest -C Release -L fixture` from the build directory after fixtures
+are in place.
+
+### How `TTS_CPP_USE_SYSTEM_GGML=ON` resolves ggml
+
+When the option is `ON` (the default in this in-tree subtree), the
+top-level `CMakeLists.txt` swaps `add_subdirectory(ggml)` for
+`find_package(ggml CONFIG REQUIRED)` and aliases the imported
+`ggml::ggml` target onto the plain `ggml` name that the rest of the
+build uses.  No local `./ggml/` clone is read.  The imported package
+ships the equivalent of the patches the standalone `chatterbox.cpp`
+repo applies via `patches/` - the `qvac-ext-ggml/speech` branch
+carries them pre-applied so consumers don't maintain a patch trail.
+This shape mirrors `stable-diffusion.cpp`'s `SD_USE_SYSTEM_GGML`.
+
+## 2. One-time: convert weights
+
+```bash
+# Activate the Python environment from the Prerequisites step
+. ../chatterbox-ref/.venv/bin/activate
+
+# --- Turbo (English, default) ---
+python scripts/convert-t3-turbo-to-gguf.py --out models/chatterbox-t3-turbo.gguf
+python scripts/convert-s3gen-to-gguf.py    --out models/chatterbox-s3gen.gguf
+
+# --- Multilingual (23 languages) ---
+python scripts/convert-t3-mtl-to-gguf.py            --out models/chatterbox-t3-mtl.gguf
+python scripts/convert-s3gen-to-gguf.py --variant mtl --out models/chatterbox-s3gen-mtl.gguf
+
+# --- Multilingual, quantised (recommended for speed) ---
+# Matches the RTF numbers in the benchmark table above.  --quant accepts
+# {f32,f16,q8_0,q5_0,q4_0} on convert-s3gen-to-gguf.py (default f16) and
+# {f16,q8_0,q5_0,q4_0} on convert-t3-mtl-to-gguf.py (default f16, since
+# the T3 storage baseline is already F16).  The flag controls the large
+# matmul weights only — biases, LayerNorm gammas/betas, embedding tables,
+# voice encoders, and built-in voice conditioning always stay at full
+# precision (see the deny-list in scripts/requantize-gguf.py for the
+# exact policy; the same policy is used by all three tools).
+python scripts/convert-t3-mtl-to-gguf.py --quant q4_0 \
+       --out models/chatterbox-t3-mtl-q4_0.gguf
+python scripts/convert-s3gen-to-gguf.py  --variant mtl --quant q4_0 \
+       --out models/chatterbox-s3gen-mtl-q4_0.gguf
+```
+
+The Turbo converter pulls `ResembleAI/chatterbox-turbo` (~1.5 GB), the MTL
+converter pulls `ResembleAI/chatterbox` (~3 GB).  The BPE tokenizer for
+Turbo (`vocab.json` + `merges.txt` + `added_tokens.json`) is **embedded
+directly into the T3 GGUF** as `tokenizer.ggml.*` metadata; for MTL we
+embed the full HuggingFace `tokenizers.json` blob (plus a Korean-Jamo /
+NFKD Unicode table for offline preprocessing), so in both cases you don't
+need to keep the source tokenizer files around on disk.
+
+The quantisation flag on `convert-s3gen-to-gguf.py` is new as of §3.20 —
+it's pure data-format work, so the binary needs no changes and every
+backend (CPU, Metal, Vulkan, CUDA) picks up the faster matmul kernels
+transparently.  The per-tensor decision lives in `should_quantize()`
+inside `scripts/requantize-gguf.py` (single source of truth shared
+with the offline rewriter): biases, norm scales, embedding tables,
+spectral filterbanks, voice-cloning preprocessors (CAMPPlus,
+VoiceEncoder, S3TokenizerV2) and any tensor whose reduction dim isn't
+block-aligned all stay at full precision.  See `PROGRESS.md §3.20` for
+the full deny-list and resulting size / speed numbers.
+
+You should now have (either pair is usable on its own):
+
+```
+models/
+  chatterbox-t3-turbo.gguf   (~742 MB) — T3 GPT-2 Medium + embedded GPT-2 BPE
+                               tokenizer + VoiceEncoder weights + built-in voice
+  chatterbox-s3gen.gguf      (~1.0 GB) — S3Gen encoder/CFM (meanflow 2-step)
+                               + HiFT vocoder + CAMPPlus + S3TokenizerV2
+                               + built-in voice (everything needed for voice
+                               cloning Turbo-side)
+
+  chatterbox-t3-mtl.gguf          (~1.1 GB) — T3 Llama-520M + perceiver resampler
+                                    + emotion adv + learned pos embs + embedded
+                                    MTL grapheme tokenizer JSON + VoiceEncoder
+                                    + built-in voice
+  chatterbox-s3gen-mtl.gguf       (~1.0 GB) — S3Gen encoder/CFM (standard 10-step
+                                    + CFG inside, cfg_rate=0.7) + HiFT vocoder
+                                    + CAMPPlus + S3TokenizerV2 + built-in voice
+
+  # Optional quantised multilingual variants — numerically very close to F16 but
+  # ~1.5-2x faster on every backend (CPU/Metal/Vulkan/CUDA) due to lower weight
+  # memory bandwidth.  Recommended for production use; see benchmark table above.
+  chatterbox-t3-mtl-q4_0.gguf     (~344 MB) — Q4_0 T3 Llama-520M
+  chatterbox-s3gen-mtl-q4_0.gguf  (~685 MB) — Q4_0 MTL S3Gen
+```
+
+For numerical validation against PyTorch (optional, step 4), also run:
+
+```bash
+python scripts/dump-s3gen-reference.py \
+  --text "Hello from ggml." --out artifacts/s3gen-ref \
+  --seed 42 --n-predict 64 --device cpu
+```
+
+### Optional: quantize the models (smaller + faster)
+
+Both GGUFs can be quantized to `Q8_0` (near-lossless), `Q5_0`, or
+`Q4_0` (different CFM sample but same subjective quality, smaller).
+The same machinery works on the multilingual GGUFs too — the
+benchmark numbers at the top of this README use the q4_0 variants
+shown there.  `llama-quantize` doesn't recognize the `chatterbox` /
+`chatterbox-s3gen` custom architectures, so we ship a small standalone
+rewriter that works on any of the four GGUFs:
+
+```bash
+# T3
+python scripts/requantize-gguf.py \
+  models/chatterbox-t3-turbo.gguf \
+  models/t3-q8_0.gguf q8_0
+
+# S3Gen
+python scripts/requantize-gguf.py \
+  models/chatterbox-s3gen.gguf \
+  models/chatterbox-s3gen-q8_0.gguf q8_0
+```
+
+Swap `q8_0` → `q4_0` (or `q5_0`) for a more aggressive variant.  T3's
+original converter also accepts `--quant` if you prefer to quantize at
+conversion time instead of after.
+
+Measured on a representative paragraph (M3 Ultra, Metal, streaming mode
+`--stream-chunk-tokens 25 --max-sentence-chars 100`):
+
+| T3 / S3Gen                | total size | first-audio | total wall | cos sim¹ |
+|---------------------------|-----------:|------------:|-----------:|--------:|
+| F16 / F32 (baseline)      |  1 757 MB  |  1 604 ms   |   28.6 s   |  1.000  |
+| Q8_0 / F32                |  1 476 MB  |  1 451 ms   |   27.2 s   |   —     |
+| F16 / Q8_0                |  1 532 MB  |  1 646 ms   |   28.2 s   |  0.991  |
+| **Q8_0 / Q8_0**           | **1 251 MB** | **1 399 ms** | **26.4 s** | 0.991 |
+| **Q4_0 / Q4_0**           | **1 071 MB** | **1 510 ms** | **26.7 s** | 0.66²  |
+
+¹ Cosine similarity of the final waveform vs the F16/F32 baseline.
+
+² Q4_0 quantization shifts the CFM diffusion ODE's trajectory enough
+  to land on a *different sample* from the same noise seed.  Subjective
+  quality is essentially the same (in-distribution speech, correct
+  phonemes, stable voice); it's just a different legitimate sample
+  rather than a lower-fidelity version of the baseline.
+
+Using both Q8_0 variants cuts **~500 MB off disk**, drops first-audio
+latency **~13 %**, speeds total wall-clock **~8 %**, and produces
+audibly-identical output (cos-sim > 0.99 vs F32 reference waveform).
+Q4_0 trims another ~180 MB on top for roughly the same speed — best
+choice on memory-constrained targets (mobile, low-end CPUs) when you
+don't need per-seed reproducibility against the F32 baseline.
+
+Note: the S3Gen requantize script only compresses the 385 big 2-D
+matmul weights (encoder attention/MLPs + CFM projections + flow FFs).
+The 1 664 other tensors — biases, norms, spectral filterbanks, the
+input-embedding table, the 3-D convolution weights — remain at their
+source dtype to keep numerics clean.  That's why Q4_0 ends up only
+~15 % smaller than Q8_0 rather than 2× smaller; the bulk not covered
+by block quantization dominates.
+
+Pass the quantized GGUFs to `tts-cli` exactly like the defaults:
+
+```bash
+./build/tts-cli \
+  --model      models/t3-q8_0.gguf \
+  --s3gen-gguf models/chatterbox-s3gen-q8_0.gguf \
+  --text "Hello from the quantized port." \
+  --n-gpu-layers 99 --out out.wav
+```
+
+## 3. Run — end-to-end text → wav
+
+The easiest way:
+
+```bash
+./scripts/synthesize.sh "Hello from native C plus plus." /tmp/out.wav
+```
+
+That's equivalent to running the binary directly:
+
+```bash
+./build/tts-cli \
+  --model       models/chatterbox-t3-turbo.gguf \
+  --s3gen-gguf  models/chatterbox-s3gen.gguf \
+  --text        "Hello from native C plus plus." \
+  --out         /tmp/out.wav
+```
+
+**Multilingual** takes the same flags plus a required `--language CODE`
+(one of the tier-1 codes listed at the top of the README) and runs all the
+CFG / perceiver / 10-step-CFM machinery automatically based on the GGUF's
+`chatterbox.variant` metadata:
+
+```bash
+./build/tts-cli \
+  --model       models/chatterbox-t3-mtl.gguf \
+  --s3gen-gguf  models/chatterbox-s3gen-mtl.gguf \
+  --text        "Hola, esto es una demostración multilingüe." \
+  --language    es \
+  --out         /tmp/mtl_es.wav
+```
+
+Extra MTL-only knobs: `--cfg-weight F` (default 0.5, must be ≥ 0),
+`--min-p F` (0.05, in [0, 1]), `--exaggeration F` (0.5 — emotion
+intensity, in [0, 1]).  `--reference-audio` works
+the same way on both variants.
+
+`--cfm-steps N` lowers the CFM Euler step count for non-streaming
+synthesis (default 10 for Multilingual's standard CFM).  N=7 saves ~22%
+of S3Gen wall time at log-mel cosine 0.995 vs the N=10 reference and is
+the recommended quality knee on M3 Ultra (see [`PROGRESS.md §3.21`](PROGRESS.md));
+N=6 is too aggressive (cosine 0.990 right at the threshold, PCM cosine
+drops to 0.88).  Streaming chunks ignore this flag and use
+`--stream-cfm-steps` instead.
+
+`--output-sample-rate HZ` selects the output frequency. The
+pipeline natively emits 24 kHz (Chatterbox) / the model's metadata rate
+(Supertonic); pass a positive rate in `8000..192000` to resample the final
+PCM with the in-tree Kaiser-windowed sinc resampler before it's written or
+streamed (e.g. `--output-sample-rate 16000` for a 16 kHz wav).  `0` (the
+default) keeps the native rate — zero behaviour change.  Works on the
+single-shot, auto-split, and streaming paths and on both engines (the
+`tts_cpp::*::EngineOptions::output_sample_rate` field exposes the same knob
+to library callers; `SynthesisResult::sample_rate` always reports the actual
+rate).
+
+Everything is self-contained in the two `.gguf` files:
+
+- `chatterbox-t3-turbo.gguf` embeds the BPE tokenizer (vocab + merges +
+  added tokens) as standard `tokenizer.ggml.*` metadata, which the C++
+  binary loads out of GGUF at startup.
+- `chatterbox-s3gen.gguf` embeds the built-in reference voice (embedding,
+  prompt token, prompt mel) under `s3gen/builtin/*`.
+
+Advanced modes:
+
+- **T3 only** — drop `--s3gen-gguf` + `--out`; write tokens with
+  `--output tokens.txt`. Useful for piping into other tools.
+- **S3Gen + HiFT only** — pass `--s3gen-gguf` + `--tokens-file FILE` with
+  already-generated speech tokens and no `--model`.
+- **Custom voice (voice cloning)** — point `--reference-audio` at a
+  reference `.wav` and the C++ binary does everything else natively
+  (no Python, no preprocessing step):
+
+  ```bash
+  ./build/tts-cli --model models/chatterbox-t3-turbo.gguf \
+                     --s3gen-gguf models/chatterbox-s3gen.gguf \
+                     --reference-audio me.wav \
+                     --text "Hello in my voice." \
+                     --out out.wav
+  ```
+
+  Requirements for the reference wav:
+  - **Strictly more than 5 s** of clean mono speech (the binary enforces
+    this and fails fast; 10–15 s gives the best similarity).
+  - Any sample rate, any PCM bit-depth (binary resamples + downmixes).
+
+  **Prep helper** — `scripts/extract-voice.py` automates the usual
+  chore of picking a good clip out of a messy recording (podcast,
+  WhatsApp voice note, `.mov` screen capture, etc.):
+
+  ```bash
+  # auto-detect codec, pick the best 10 s speech block, write voices/alice.wav:
+  ./scripts/extract-voice.py ~/Downloads/alice.m4a --name alice
+  # same, but also bake the .npy profile in one go:
+  ./scripts/extract-voice.py ~/Downloads/alice.m4a --name alice --bake
+  ```
+
+  It probes the file, runs `silencedetect` to find speech regions,
+  picks the longest clean 5–15 s block from the middle of the
+  recording (or concatenates the two best short blocks if no single
+  long block exists), then applies a codec-aware filter chain:
+
+  | source codec                         | chain applied                                                                 |
+  |--------------------------------------|-------------------------------------------------------------------------------|
+  | WAV / FLAC / ≥ 96 kbps AAC / ≥ 128 kbps MP3 | `highpass + alimiter` — minimal, trusts the source                      |
+  | Opus / Vorbis at any bitrate, low-bitrate AAC/MP3 | `highpass + afftdn + 3-band EQ + loudnorm + alimiter` — restores presence/air past the codec's brick-wall low-pass |
+
+  The lossy chain is what takes an 18 kbps Opus voice note from
+  "clone sounds wrong" to "clone sounds like the speaker".  See
+  `./scripts/extract-voice.py --help` for the full flag set.
+
+  Loudness is normalised to **-27 LUFS** (ITU-R BS.1770-4 / EBU R 128)
+  internally before preprocessing, so a quiet recording like a phone
+  memo works as well as a studio track.  All five voice-conditioning
+  tensors are produced in C++:
+
+  | tensor                         | source                           |
+  |--------------------------------|----------------------------------|
+  | `speaker_emb`                  | C++ VoiceEncoder  (T3 GGUF)      |
+  | `cond_prompt_speech_tokens`    | C++ S3TokenizerV2 (S3Gen GGUF)   |
+  | `prompt_token`                 | C++ S3TokenizerV2 (S3Gen GGUF)   |
+  | `embedding`                    | C++ CAMPPlus      (S3Gen GGUF)   |
+  | `prompt_feat`                  | C++ mel extraction               |
+
+- **Cache a voice for fast reuse (`--save-voice`)** — voice preprocessing
+  (VoiceEncoder + CAMPPlus + S3TokenizerV2 + mel) adds ≈ 2 minutes on a
+  Mac before every synthesis.  The five tensors don't depend on the
+  text, so bake them once:
+
+  ```bash
+  # Bake the profile (no --text needed; just preprocesses + saves).
+  ./build/tts-cli --model models/chatterbox-t3-turbo.gguf \
+                     --s3gen-gguf models/chatterbox-s3gen.gguf \
+                     --reference-audio me.wav \
+                     --save-voice voices/me/
+  # Writes voices/me/{speaker_emb, cond_prompt_speech_tokens,
+  # embedding, prompt_token, prompt_feat}.npy (~160 KB total).
+
+  # Reuse (≈ 17× faster; VoiceEncoder / CAMPPlus / S3TokenizerV2
+  # / mel extraction are all skipped).
+  ./build/tts-cli --model models/chatterbox-t3-turbo.gguf \
+                     --s3gen-gguf models/chatterbox-s3gen.gguf \
+                     --ref-dir voices/me/ \
+                     --text "Anything you want." \
+                     --out  out.wav
+  ```
+
+  You can mix the two: `--ref-dir D --reference-audio X.wav` will load
+  any `.npy` present in `D` and compute the rest from `X.wav`.  Useful
+  during development when you want to iterate on one tensor.
+
+Play the result:
+
+```bash
+afplay /tmp/out.wav         # macOS
+aplay  /tmp/out.wav         # Linux (alsa)
+ffplay /tmp/out.wav         # any OS with ffmpeg
+```
+
+### Live / streaming input
+
+When you want a long-running process that keeps the model loaded and
+synthesises whatever text arrives as it arrives — e.g. the output of
+a streaming LLM, a live transcription, or just a human typing —
+use `--input-file`.  The binary `tail -f`'s the file, splits on
+sentence terminators (or `\n` in `--input-by-line` mode), and pipes
+raw PCM (s16le, 24 kHz, mono) to stdout chunk-by-chunk.
+
+```bash
+# Two-process demo: background writer appends sentences, tts-cli
+# tail-follows, sox plays in real time.
+./build/tts-cli \
+    --model       models/t3-q8_0.gguf \
+    --s3gen-gguf  models/chatterbox-s3gen-q8_0.gguf \
+    --ref-dir     voices/alice \
+    --input-file  ./speech.txt \
+    --input-by-line \
+    --stream-chunk-tokens 25 --stream-cfm-steps 2 \
+    --n-gpu-layers 99 \
+    --out -                     \
+  | play -q -t raw -r 24000 -b 16 -e signed -c 1 -   # sox(1)
+
+# Another process (LLM, transcriber, shell, etc.) writes here:
+echo "First request." >> speech.txt
+echo "Second request with, internal, punctuation." >> speech.txt
+```
+
+**Interactive mode on a TTY** — pass `--input-file -` to read from
+stdin.  On a terminal you get a `> ` prompt; each Enter-terminated
+line is spoken immediately, Ctrl-D exits:
+
+```bash
+./build/tts-cli \
+    --model       models/t3-q8_0.gguf \
+    --s3gen-gguf  models/chatterbox-s3gen-q8_0.gguf \
+    --ref-dir     voices/alice \
+    --input-file  - --input-by-line \
+    --stream-chunk-tokens 25 --stream-cfm-steps 2 \
+    --n-gpu-layers 99 \
+    --out -                     \
+  | play -q -t raw -r 24000 -b 16 -e signed -c 1 -
+```
+
+Relevant flags:
+
+| flag                          | effect                                                                                                               |
+|-------------------------------|----------------------------------------------------------------------------------------------------------------------|
+| `--input-file PATH`           | Tail-follow `PATH`; `-` means read stdin (interactive on a TTY).                                                     |
+| `--input-by-line`             | One Enter-terminated line = one request.  `. ! ?` inside a line stay part of the same utterance (no mid-line restart). |
+| `--input-eof-marker STR`      | Exit cleanly after seeing `STR` anywhere in the input (useful for scripted pipelines).                                |
+| `--stream-chunk-tokens N`     | Speech-token chunk granularity for the S3Gen streaming loop.  25 is a good default.                                   |
+| `--stream-cfm-steps N`        | CFM Euler steps per chunk.  2 is the minimum the model was designed for; 4–5 gives crisper word endings on cloned voices. |
+| `--stream-first-chunk-tokens N` | Override the first chunk's size to minimise first-audio-out latency.                                                |
+
+The process keeps the T3 + S3Gen models warm across requests, so
+after the initial load (~150 ms), each request only pays T3 + S3Gen
+inference cost (well under real-time on any GPU backend).
+
+### Useful flags
+
+- `--seed N` — change the RNG seed for the CFM initial noise and the SineGen
+  excitation (same text, different voice "take").
+- `--threads N` — override the default `std::thread::hardware_concurrency()`.
+  The sweet spot on a 10-core CPU is 10.
+- `--n-gpu-layers N` — move layers to the GPU backend when built with
+  `-DGGML_METAL=ON` / `-DGGML_CUDA=ON` / `-DGGML_VULKAN=ON`.  Pass `99`
+  (or any large number) to move everything.
+- `--reference-audio PATH` — voice cloning input (see the Custom voice
+  section above).
+- `--save-voice DIR` — cache the five voice-conditioning tensors for
+  reuse via `--ref-dir DIR`.
+- `--ref-dir DIR` — load previously-baked voice tensors (or a subset)
+  from `DIR/*.npy`.
+- `--input-file PATH` — long-running mode; tail-follow `PATH` and
+  synthesise text as it arrives.  Pass `-` to read from stdin (see the
+  Live / streaming input section above).
+- `--input-by-line` — treat one newline as one complete request; `. ! ?`
+  inside a line stay part of the same utterance.
+- `--debug` (requires `--ref-dir`) — substitute Python-dumped reference
+  values for the random bits so every stage can be bit-exactly compared
+  to PyTorch.
+
+<a id="performance"></a>
+## Performance
+
+End-to-end speed; `RTF = generation_time / audio_duration` (lower is faster).
+The authoritative Linux x86-64 numbers come from CI (table below); the
+Apple-silicon figures are maintainer measurements (no CI Metal runner). Shared
+setup for the Apple rows:
+
+- Text: *"Hello from native C plus plus. This audio was generated end
+  to end on CPU using ggml."*
+- Reference voice: `test/reference-audio/jfk.wav` (11 s mono 16 kHz)
+- Seed: 42, warm 3-run average, inference only (excludes model load)
+
+### CI benchmarks (latest `ggml-speech`, Linux x86-64)
+
+End-to-end RTF measured in CI on the `tetherto/qvac` self-hosted runners, using
+the q4 GGUFs from the QVAC model registry, 1 warmup + 5 timed runs.
+`RTF = generation_time / audio_duration` (lower is faster; RTF is the
+backend-comparable metric, wall time is workload-specific).
+
+| Engine                  | CPU RTF | Vulkan RTF | Vulkan wall | Vulkan tok/s |
+|-------------------------|--------:|-----------:|------------:|-------------:|
+| Chatterbox (Turbo)      |    1.34 |      0.090 |      368 ms |          186 |
+| Chatterbox Multilingual |    4.31 |      0.189 |     1097 ms |           73 |
+| Supertonic              |   0.079 |      n/a¹  |       n/a¹  |         n/a¹ |
+
+_Source: workflow run [#27415600049](https://github.com/tetherto/qvac/actions/runs/27415600049)
+(2026-06-12), runner `qvac-ubuntu2204-x64-gpu`, GPU **NVIDIA RTX 4000 SFF Ada
+Generation** (`backend=vulkan`). Chatterbox built against `tts-cpp` `1c75d6e9`
+on a benchmark branch; at the time of the run the shipped `tts-ggml` pin was the Android-safe
+`2026-06-03` revision. ¹ That run has no Supertonic Vulkan lane, so the Vulkan
+columns are unrecorded, not unsupported: Supertonic runs on Metal, Vulkan,
+OpenCL (Adreno), and CUDA, and the shipped `tts-ggml` addon has honoured
+`useGPU` / `nGpuLayers` for it since `0.3.0`._
+
+### Mac Studio M3 Ultra (96 GB unified memory)
+
+| Implementation                        | Backend         | T3 gen             | S3Gen+HiFT gen | Total inference | RTF   | vs real-time |
+|---------------------------------------|-----------------|-------------------:|---------------:|----------------:|------:|-------------:|
+| **`tts-cpp` Q4_0**                    | **Metal**       |  573 ms / 155 tok  |    412 ms      |   **985 ms**    | 0.16  | **6.4×**     |
+| `tts-cpp` Q4_0                        | CPU (NEON+Accel)| 2 045 ms / 178 tok |  5 523 ms      |    7 568 ms     | 1.05  | 0.96×        |
+
+On Apple Silicon the Metal build runs end to end at **6.4× real time**; the
+CPU-only build stays just under real time.
+
+### Multilingual (Apple M4, F16 weights)
+
+Same prompt + seed run through both variants on the same M4, for apples-to-
+apples comparison.  MTL is 30 transformer layers vs Turbo's 24 plus CFG on
+both T3 and CFM (2 forward passes per step), and it samples standard CFM
+for 10 Euler steps instead of Turbo's meanflow 2.
+
+| Config                              | T3 infer            | S3Gen infer | Audio | **RTF** |
+|-------------------------------------|---------------------:|-------------:|------:|--------:|
+| Turbo, Metal                        |  788 ms /  73 tok   |    768 ms    | 3.04 s| 0.51    |
+| Turbo, CPU 4t                       | 1 721 ms /  73 tok  |  3 334 ms    | 3.04 s| 1.66    |
+| Multilingual, Metal *(batched CFM)* | 1 865 ms /  61 tok  |  2 247 ms    | 2.56 s| 1.61    |
+| Multilingual, CPU 4t *(2-call CFM)*³| 3 210 ms /  85 tok  | 25 660 ms    | 3.52 s| 8.20    |
+
+The MTL Metal path packs the CFG cond+uncond into a single batch=2
+decoder forward (`use_b2 = !ggml_backend_is_cpu(...)`), since kernel
+dispatch overhead amortises well across the bigger workload; on ggml-cpu
+the extra permute+cont ops that a batched attention block needs regress
+throughput, so CPU keeps the two-call path.  See
+[`PROGRESS.md §3.19`](PROGRESS.md) for the measurement and a discussion
+of where the MTL slowdown lives relative to Turbo.
+
+³ Re-measured on the same M4 host after commit `6d9b42b` restored the
+CFG combine on the non-`use_b2` (CPU) CFM path.  The previous row in
+this table (`2 711 ms / 71 tok`, `8 029 ms`, `RTF 3.63`) was captured
+while CPU was silently running only the conditional CFM pass — i.e.
+half the CFM compute and no classifier-free guidance steering.  S3Gen
+wall-time roughly doubled (one extra forward call per CFM step) and
+RTF went from 3.63 → 8.20.  The remeasurement here uses a different
+local reference wav (the original `jfk.wav` was not present on the
+host) — that accounts for the slightly larger token count (85 vs the
+original 71); the per-audio-second cost ratio is what shifted, ~2×,
+in line with restoring the missing pass.  Turbo and the Metal
+multilingual row are
+unaffected — they always carried the CFG combine.
+
+### Multilingual (Mac Studio M3 Ultra, after §3.21 optimisation pass)
+
+Same Spanish prompt (`"Hola, esto es una demostración multilingüe."`,
+`--language es`), `jfk.wav` voice, seed 42, greedy (`--temp 0 --top-k 1`),
+3 warm runs averaged.  T3 is now CFG-batched into a single Metal forward
+(B=2, mirrors S3Gen's `use_b2`); MLP uses `ggml_swiglu_split` so the 30
+SiLU+Mul element-wise pairs collapse into one fused Metal kernel per
+layer.  The new `--cfm-steps N` flag exposes the standard CFM step count
+(default 10); N=7 is the recommended quality knee (log-mel cosine vs N=10
+= **0.995**).
+
+| Config                              | T3 infer           | S3Gen infer | Audio | **RTF** |
+|-------------------------------------|-------------------:|------------:|------:|--------:|
+| MTL, Metal Q4_0, `--cfm-steps 7`    |  478 ms /  84 tok  |    576 ms   | 3.48 s|  0.30   |
+| MTL, Metal Q4_0 (default N=10)      |  482 ms /  84 tok  |    730 ms   | 3.48 s|  0.35   |
+| MTL, Metal F16, `--cfm-steps 7`     |  579 ms /  89 tok  |    586 ms   | 3.68 s|  0.32   |
+| MTL, Metal F16 (default N=10)       |  613 ms /  89 tok  |    752 ms   | 3.68 s|  0.37   |
+
+Compared to the M4 multilingual numbers above, the M3 Ultra hits
+**RTF 0.30** on Q4_0 — a 4.6× speedup.  The CFG-batching alone drops T3
+by 42–45% (see PROGRESS.md §3.21 for the full bench matrix and the
+NEGATIVE results for F16 KV cache and SwiGLU on F16).
+
+### Multilingual (M3 Ultra, post §3.24–§3.31 Metal kernel portfolio)
+
+Same prompt, voice, seed as §3.21 above.  Adds, on top of §3.21:
+
+- **§3.24** — HiFT conv-kernel F16 quantisation (64 tensors).
+- **§3.26** — `kernel_mul_mv_f32_f16{,_4,_short}` Metal kernel variants
+  to unblock 21 more HiFT `source_*` F16 tensors
+  (GGUF shrinks **754 → 747 MB**, WAV cos 1.000000 vs §3.24).
+- **§3.27** — `kernel_mul_mm` + `ADD(bias)` [+ `ADD(residual)`] fusion
+  for the CFM transformer Q4_0 mat-muls (1820 saved `ggml_add`
+  dispatches per synth).
+- **§3.28** — extends the fusion to absorb `GELU_ERF` (CFM FF ff0
+  activation path; 1120 additional saved dispatches).
+- **§3.30** — `test-metal-ops` fused-mul_mm parity harness + bias-only
+  direct-store variant.
+- **§3.31** — iOS-arm64 cross-build portability +
+  `scripts/bench-m4-validation.sh` for M4 hand-off.
+
+5-invocation averages (`default N=10` CFM — compare to the §3.21 N=10 row):
+
+| Config                              | T3 infer            | S3Gen infer | Audio | **RTF** |
+|-------------------------------------|--------------------:|------------:|------:|--------:|
+| MTL, Metal Q4_0 + HiFT F16 v2 (§3.28) |  433 ms / 84 tok  |    706 ms   | 3.48 s| **0.33** |
+| MTL, Metal Q4_0 baseline (§3.21 N=10) |  482 ms / 84 tok  |    730 ms   | 3.48 s|  0.35    |
+| **Δ §3.21 → §3.28**                   |  **−49 ms / −10.2 %** | **−24 ms / −3.3 %** | — | **−0.02** |
+
+WAV is byte-exact deterministic across runs (md5
+`d8a1b22375dbcb2259c686426a7d76c5` ×5).  Parity harness
+`test-metal-ops` passes 14 gates (3 base + 3 conv_transpose_1d + 8
+fused `mul_mm`).  The 1088-line ggml-metal patch backing these
+kernel changes is shipped pre-applied by the `ggml-speech` vcpkg
+port (qvac-ext-ggml/speech branch); the standalone chatterbox.cpp
+repo carries it under `patches/ggml-metal-chatterbox-ops.patch`
+against pinned ggml `58c38058`.  All §3.24–§3.30 kernel changes
+cross-compile cleanly for iOS-arm64 (portability verified; runtime
+measurement deferred until an M4 / iPhone / iPad run of
+[`scripts/bench-m4-validation.sh`](scripts/bench-m4-validation.sh)).
+
+M3 Ultra CFM time specifically drops from 541.9 ms → 534.0 ms
+(**−1.5 %**) — modest on this chip because per-dispatch overhead
+is very low; expected to be larger on bandwidth-limited silicon
+(M4 / A-series) where each saved `ggml_add` dispatch is worth more
+relative to compute.
+
+### Reproducing these numbers
+
+```bash
+# Build tts-cpp, then:
+./build/tts-cli \
+    --model       models/chatterbox-t3-turbo.gguf \
+    --s3gen-gguf  models/chatterbox-s3gen.gguf \
+    --reference-audio test/reference-audio/jfk.wav \
+    --text "Hello from native C plus plus. This audio was generated end to end on CPU using ggml." \
+    --out /tmp/bench.wav \
+    --seed 42 \
+    --n-gpu-layers 99   # 0 or omit for CPU
+```
+
+The binary prints both the per-stage timings and `BENCH:` lines that
+scripts can scrape.  Note: the binary also prints an inner
+`=== pipeline: … RTF=… ===` line — that RTF covers **only the
+S3Gen + HiFT phase** (the timer around `s3gen_synthesize_to_wav`, which
+runs after T3 is already done).  The tables above report the full
+end-to-end number (T3_INFER + S3GEN_INFER).
+
+`gen_RTF = (T3_INFER_MS + S3GEN_INFER_MS) / AUDIO_MS`
+
+Token counts vary slightly across backends because the CPU-side
+sampler reads logits that come out of different float-reduction orders
+per backend; per-token T3 cost is the directly-comparable figure.
+Full development history and older backend combinations (F16 vs
+Q4_0 / Q5_0 / Q8_0, plus other machines) are in
+[`PROGRESS.md §3.10 / §3.13`](PROGRESS.md).
+
+### Streaming mode — low-latency playback
+
+For interactive use cases, the binary can emit audio **chunk-by-chunk**
+as it's generated instead of waiting for the whole sentence to finish.
+Any non-zero `--stream-chunk-tokens N` turns streaming on.
+
+**Flags:**
+
+- `--stream-chunk-tokens N` — main knob; N speech tokens per chunk
+  (25 ≈ 1 s of audio, 50 ≈ 2 s).
+- `--stream-first-chunk-tokens N` — override the *first* chunk's size
+  so first-audio-out lands early while later chunks stay big and keep
+  overall RTF low.  Typical: 10.
+- `--stream-cfm-steps N` — CFM Euler step count.  Default 2 (matches
+  Python meanflow).  `1` halves CFM cost with a small quality penalty;
+  Turbo's meanflow training makes 1-step a valid sampling mode per the
+  paper.
+- `--out -` — emit raw `s16le` mono @ 24 kHz to stdout instead of
+  writing a wav file, so the output can be piped straight into a
+  player.
+
+**Recommended low-latency preset for interactive use:**
+
+```bash
+brew install sox      # one-time, for the `play` command
+
+./build/tts-cli \
+    --model      models/chatterbox-t3-turbo.gguf \
+    --s3gen-gguf models/chatterbox-s3gen.gguf \
+    --text       "Hello from streaming Chatterbox." \
+    --stream-first-chunk-tokens 10 \
+    --stream-chunk-tokens       25 \
+    --stream-cfm-steps          1 \
+    --n-gpu-layers              99 \
+    --out - \
+  | play -q -t raw -r 24000 -b 16 -e signed -c 1 -
+```
+
+`play` ships with `sox` and routes straight to CoreAudio.  If you
+prefer, the same stdout stream works with `ffplay -f s16le -ar 24000
+-ch_layout mono -nodisp -i -` or piped through a Python
+`sounddevice.play()` one-liner; on some macOS 26 builds ffplay's SDL
+output is silent for raw piped audio, so `sox play` is the safest
+default.
+
+You can also drop the `--out -` to get a regular wav:
+
+```bash
+./build/tts-cli … --stream-chunk-tokens 50 --out out.wav
+afplay out.wav
+```
+
+**Latency and throughput** on an Apple M4 with the Metal backend and
+the preset above, feeding the sentence *"Hello from streaming
+Chatterbox, I am John and I work in Google since 2010. I love to go
+out with my friends, eat some pizza and also drink some wine. I also
+love to travel around the world alone."* (produces 317 speech tokens,
+~12.7 s of audio):
+
+| metric | value |
+|---|---|
+| first-audio-out latency | **279 ms** |
+| chunk 1 (10-token bootstrap) | RTF 0.99 |
+| chunks 2–13 (steady-state, 25 tokens each) | **RTF 0.30 – 0.63** |
+| chunk 14 (tail finalise) | RTF 1.42 |
+| total wall time | 11.5 s for 12.7 s of audio |
+| overall RTF | **0.90** |
+
+The steady-state RTFs stay comfortably below 1.0, so the streamer
+sustainably pushes audio faster than real-time playback consumes it.
+Chunk 1 is small by design so first audio lands in ~280 ms; the final
+chunk is short and relatively slow (fixed encoder/CFM overhead
+amortised over only 0.4 s of audio).
+
+For the full journal of how streaming got there — bit-exact CFM parity,
+`cache_source` + `trim_fade` port, `--out -` stdout wiring, per-chunk
+tuning — see [`PROGRESS.md §B1`](PROGRESS.md).
+
+## 4. Optional: validate against PyTorch
+
+Every stage of the pipeline has a numerical regression test against
+Python-dumped reference tensors:
+
+```bash
+./build/test-s3gen models/chatterbox-s3gen.gguf artifacts/s3gen-ref ALL
+```
+
+Expected output (rel error per stage):
+
+```
+Stage A  speaker_emb_affine    rel ≈ 1e-7
+Stage B  input_embedded        rel = 0
+Stage C  encoder_embed         rel ≈ 4e-7
+Stage D  pre_lookahead         rel ≈ 3e-7
+Stage E  enc_block0_out        rel ≈ 1e-7
+Stage F  encoder_proj (mu)     rel ≈ 5e-7
+Stage G1 time_mixer            rel ≈ 7e-7
+Stage G2 cfm_resnet_out        rel ≈ 3e-7
+Stage G3 tfm_out               rel ≈ 2e-7
+Stage G4 cfm_step0_dxdt        rel ≈ 1e-6
+Stage H1 f0                    rel ≈ 4e-6
+Stage H3 conv_post             rel ≈ 6e-7
+Stage H4 stft                  rel ≈ 8e-3 (boundary-bound)
+Stage H5 waveform              rel ≈ 1e-4
+```
+
+For T3 bit-exact validation against the Python reference:
+
+```bash
+python scripts/reference-t3-turbo.py \
+  --text "Hello from ggml." \
+  --out-dir artifacts \
+  --cpp-bin ./build/tts-cli \
+  --cpp-model models/chatterbox-t3-turbo.gguf
+```
+
+## Repository layout
+
+```
+tts-cpp/                         in-tree subtree of github.com/gianni-cor/chatterbox.cpp
+  include/tts-cpp/               installed public headers (Engine API)
+    tts-cpp.h                    library entry; declares tts_cpp_cli_main()
+    chatterbox/engine.h          Engine + EngineOptions (text → wav)
+    chatterbox/s3gen_pipeline.h  low-level S3Gen + HiFT pipeline entries
+    audio8/engine.h              Audio8 Engine + EngineOptions + VoicePrompt
+  src/
+    main.cpp                     T3 turbo runtime + shared helpers (libtts-cpp)
+    t3_mtl.{h,cpp}               T3 multilingual (Llama-520M) runtime + stage builders
+    chatterbox_t3_internal.h     internal T3 declarations shared by main/engine/CLI
+    chatterbox_engine.cpp        public Engine API impl (libtts-cpp)
+    chatterbox_cli.cpp           CLI entry (`tts-cli` binary)
+    cli_main.cpp                 thin int-main forwarder; calls tts_cpp_cli_main()
+    chatterbox_tts.cpp           S3Gen + HiFT pipeline        (libtts-cpp)
+    mel2wav.cpp                  HiFT-only demo              (mel2wav)
+    gpt2_bpe.{h,cpp}             self-contained GPT-2 BPE tokenizer (Turbo)
+    mtl_tokenizer.{h,cpp}        multilingual grapheme tokenizer
+                                   (HF tokenizers.json + NFKD lowercasing)
+    mtl_unicode_tables.inc       embedded NFKD + Korean Jamo lookup tables
+
+    voice_features.{h,cpp}       WAV I/O, sinc resampler, LUFS meter,
+                                   24 kHz & 16 kHz log-mel extraction,
+                                   Kaldi-style 80-ch fbank
+    mel_extract_stft.cpp         STFT-based mel extraction shared by C++ pipelines
+    voice_encoder.{h,cpp}        3-layer LSTM → 256-d speaker_emb
+                                   (matches Resemble VoiceEncoder)
+    campplus.{h,cpp}             FunASR x-vector port (FCM + 3× CAMDense
+                                   TDNN) → 192-d embedding
+    s3tokenizer.{h,cpp}          6-layer FSMN-attn transformer + FSQ →
+                                   25-Hz speech tokens
+    dr_wav.h                     vendored single-header WAV reader
+    npy.h                        minimal .npy load / save + compare
+
+    audio8_cli.cpp               Audio8 CLI entry (`audio8-cli` binary)
+    audio8/engine.cpp            public Engine API impl: prompt → codes → wav
+    audio8/{tokenizer,unicode}.{h,cpp}  Qwen2.5 byte-level BPE + ChatML builder
+    audio8/unicode_tables.inc    embedded NFC + character-category tables
+    audio8/gguf.cpp              hparams, tensors, backend buffers
+    audio8/{graph.h,graph.cpp}   shared ggml blocks (RoPE, attention, norms)
+    audio8/lm.cpp                slow AR with KV cache + fast AR head
+    audio8/codec_ops.{h,cpp}     causal convs, Snake, ConvNeXt, receptive spans
+    audio8/codec_{decode,encode}.cpp  chunked synthesis / analysis stacks
+    audio8/sampling.{h,cpp}      top-k/top-p, Gumbel draw, repetition-aware resample
+    audio8/internal.h            model containers shared by the above
+
+    test_*.cpp                   per-stage numerical-parity harnesses
+                                   (S3Gen / HiFT / streaming / MTL T3 /
+                                    MTL tokenizer / voice features / Metal ops)
+  scripts/
+    synthesize.sh                text → wav wrapper around tts-cli
+    convert-t3-turbo-to-gguf.py  Turbo T3 weights + GPT-2 BPE + VE + builtin
+                                   voice → T3 GGUF (--quant)
+    convert-t3-mtl-to-gguf.py    MTL T3 (Llama-520M) + perceiver + emotion-adv
+                                   + tokenizers.json + builtin voice → T3 GGUF (--quant)
+    convert-s3gen-to-gguf.py     S3Gen encoder + CFM + HiFT + CAMPPlus +
+                                   S3TokenizerV2 + mel filterbanks → S3Gen GGUF
+                                   (--variant {turbo,mtl}, --quant)
+    requantize-gguf.py           in-place block-quantise of an existing
+                                   T3/S3Gen GGUF (canonical deny-list lives here)
+    extract-voice.py             one-shot voice-clone prep (silencedetect +
+                                   codec-aware EQ + optional `--save-voice` bake)
+    gen-nfkd-table.py            generates src/mtl_unicode_tables.inc
+    dump-*-reference.py          PyTorch → .npy intermediates for the
+                                   per-stage harnesses (S3Gen, CAMPPlus,
+                                   S3TokenizerV2, streaming, MTL T3, Audio8)
+    audio8_reference.py          shared Audio8 helpers: config + checkpoint
+                                   loading, tensor renaming, RoPE tables,
+                                   GGUF storage policy
+    convert-audio8-lm-to-gguf.py Audio8 slow + fast AR + Qwen2.5 BPE → LM GGUF
+    convert-audio8-codec-to-gguf.py Audio8 codec → encoder / decoder GGUF
+                                   (weight norm folded, --part)
+    verify-audio8-conversion.py  compares Audio8 GGUFs tensor by tensor
+                                   against the checkpoint
+    gen-audio8-unicode-tables.py generates src/audio8/unicode_tables.inc
+    reference-t3-turbo.py        PyTorch T3 bit-exact compare vs C++
+    compare-tokenizer.py         10-case BPE tokenizer compare vs HF
+  (no patches/ in this in-tree subtree - the standalone chatterbox.cpp
+   repo ships ggml patches under patches/; here ggml comes pre-patched
+   from the ggml-speech vcpkg port and tts-cpp doesn't carry them.)
+  voices/                        baked voice profiles (not tracked; populated
+                                   by --save-voice)
+  models/                        generated GGUFs (not tracked)
+  artifacts/                     .npy dumps for validation (not tracked)
+  CMakeLists.txt                 top-level build
+  README.md                      this file
+  PROGRESS.md                    chronological development journal
+```
+
+## Troubleshooting
+
+**`error: this GGUF has no embedded tokenizer`** — you're running against
+a legacy T3 GGUF built before the tokenizer was embedded. Re-run the
+converter to produce a fresh GGUF:
+
+```bash
+python scripts/convert-t3-turbo-to-gguf.py --out models/chatterbox-t3-turbo.gguf
+```
+
+**`warning: s3gen GGUF lacks variant keys`** — you're running against a
+legacy S3Gen GGUF produced before the variant metadata was added in
+§3.19/§3.20. The defaults (`meanflow=true, n_timesteps=2, cfg_rate=0`)
+match the historical Turbo behaviour, so legacy Turbo GGUFs continue
+to work.  For a Multilingual S3Gen GGUF, however, those defaults are
+wrong and the output will be garbage — re-run the converter:
+
+```bash
+python scripts/convert-s3gen-to-gguf.py --variant mtl --out models/chatterbox-s3gen-mtl.gguf
+```
+
+**`error: --min-p must be in [0, 1]`** / `--cfg-weight must be >= 0` /
+`--exaggeration must be in [0, 1]` — the MTL sampling knobs reject
+out-of-range values up front instead of producing wrong-but-not-crashing
+output.  Pass values inside the documented ranges (see "Run" above).
+
+**`--debug requires --ref-dir`** — debug mode substitutes Python-dumped
+random bits to make every intermediate tensor bit-exactly comparable.
+Run `python scripts/dump-s3gen-reference.py --out artifacts/s3gen-ref …`
+first, then pass `--ref-dir artifacts/s3gen-ref`.
+
+**Output is much louder than the Python reference** — expected: the Python
+reference dump uses a very short utterance (mostly silence). Generate a
+longer sentence and compare RMS. Differences up to ~2.5 % in spectrogram
+magnitude are from the stochastic SineGen excitation (non-bit-exact RNG
+between `std::mt19937` and `torch.rand`).
+
+**Slower than real-time** — make sure you built `-DCMAKE_BUILD_TYPE=Release`
+and that `--threads` picks up all your cores. The binary defaults to
+`std::thread::hardware_concurrency()`.
+
+## License
+
+Released under the [MIT License](LICENSE) — Copyright (c) 2026 Gianfranco
+Cordella. The bundled `ggml/` is also MIT-licensed
+([ggml/LICENSE](ggml/LICENSE)). The upstream Python implementation
+([Chatterbox](https://github.com/resemble-ai/chatterbox), Copyright (c) 2025
+Resemble AI) is likewise MIT-licensed; see `LICENSE` for the third-party
+attribution block.

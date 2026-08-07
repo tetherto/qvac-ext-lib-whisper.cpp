@@ -1,902 +1,338 @@
-# whisper.cpp
+# qvac-ext-lib-whisper.cpp
 
-![whisper.cpp](https://user-images.githubusercontent.com/1991296/235238348-05d0f6a4-da44-4900-a1de-d0707e75b763.jpeg)
+On-device speech and audio AI in pure C++ on [ggml](https://github.com/tetherto/qvac-ext-ggml): speech-to-text, speaker diarization, end-of-utterance detection, text-to-speech, voice cloning, speech enhancement, and music generation.
 
-[![Actions Status](https://github.com/ggml-org/whisper.cpp/workflows/CI/badge.svg)](https://github.com/ggml-org/whisper.cpp/actions)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Conan Center](https://shields.io/conan/v/whisper-cpp)](https://conan.io/center/whisper-cpp)
-[![npm](https://img.shields.io/npm/v/whisper.cpp.svg)](https://www.npmjs.com/package/whisper.cpp/)
+| Property | Value |
+|---|---|
+| CMake project | `qvac-speech` (feature-gated superbuild over `third_party/` + `engines/`) |
+| Runtime dependencies | ggml only. No Python, PyTorch, or ONNX Runtime at inference time |
+| Engines | `third_party/whisper.cpp`, `engines/parakeet`, `engines/tts`, `engines/audiogen` |
+| Models | every model loads from GGUF (see [Supported models](#supported-models)) |
+| Desktop | Linux, macOS, Windows |
+| Mobile | Android (arm64-v8a), iOS (arm64) |
+| Backends | CPU, Metal, Vulkan, OpenCL (Adreno), CUDA, Apple Core ML (encoder sidecar) |
+| Quantization | `f32`, `f16`, `bf16`, `q8_0`, `q6_k`, `q5_0`, `q5_1`, `q4_0` (per model, see tables) |
+| Shared ggml | one `ggml-speech` vcpkg port, built from [qvac-ext-ggml@speech](https://github.com/tetherto/qvac-ext-ggml/tree/speech) |
+| Language | C++17 |
 
-Stable: [v1.8.1](https://github.com/ggml-org/whisper.cpp/releases/tag/v1.8.1) / [Roadmap](https://github.com/orgs/ggml-org/projects/4/)
-
-High-performance inference of [OpenAI's Whisper](https://github.com/openai/whisper) automatic speech recognition (ASR) model:
-
-- Plain C/C++ implementation without dependencies
-- Apple Silicon first-class citizen - optimized via ARM NEON, Accelerate framework, Metal and [Core ML](#core-ml-support)
-- AVX intrinsics support for x86 architectures
-- [VSX intrinsics support for POWER architectures](#power-vsx-intrinsics)
-- Mixed F16 / F32 precision
-- [Integer quantization support](#quantization)
-- Zero memory allocations at runtime
-- [Vulkan support](#vulkan-gpu-support)
-- Support for CPU-only inference
-- [Efficient GPU support for NVIDIA](#nvidia-gpu-support)
-- [AMD ROCm GPU support](#amd-rocm-gpu-support)
-- [OpenVINO Support](#openvino-support)
-- [Ascend NPU Support](#ascend-npu-support)
-- [Moore Threads GPU Support](#moore-threads-gpu-support)
-- [C-style API](https://github.com/ggml-org/whisper.cpp/blob/master/include/whisper.h)
-- [Voice Activity Detection (VAD)](#voice-activity-detection-vad)
-
-Supported platforms:
-
-- [x] Mac OS (Intel and Arm)
-- [x] [iOS](examples/whisper.objc)
-- [x] [Android](examples/whisper.android)
-- [x] [Java](bindings/java/README.md)
-- [x] Linux / [FreeBSD](https://github.com/ggml-org/whisper.cpp/issues/56#issuecomment-1350920264)
-- [x] [WebAssembly](examples/whisper.wasm)
-- [x] Windows ([MSVC](https://github.com/ggml-org/whisper.cpp/blob/master/.github/workflows/build.yml#L117-L144) and [MinGW](https://github.com/ggml-org/whisper.cpp/issues/168))
-- [x] [Raspberry Pi](https://github.com/ggml-org/whisper.cpp/discussions/166)
-- [x] [Docker](https://github.com/ggml-org/whisper.cpp/pkgs/container/whisper.cpp)
-
-The entire high-level implementation of the model is contained in [whisper.h](include/whisper.h) and [whisper.cpp](src/whisper.cpp).
-The rest of the code is part of the [`ggml`](https://github.com/ggml-org/ggml) machine learning library.
-
-Having such a lightweight implementation of the model allows to easily integrate it in different platforms and applications.
-As an example, here is a video of running the model on an iPhone 13 device - fully offline, on-device: [whisper.objc](examples/whisper.objc)
-
-https://user-images.githubusercontent.com/1991296/197385372-962a6dea-bca1-4d50-bf96-1d8c27b98c81.mp4
-
-You can also easily make your own offline voice assistant application: [command](examples/command)
-
-https://user-images.githubusercontent.com/1991296/204038393-2f846eae-c255-4099-a76d-5735c25c49da.mp4
-
-On Apple Silicon, the inference runs fully on the GPU via Metal:
-
-https://github.com/ggml-org/whisper.cpp/assets/1991296/c82e8f86-60dc-49f2-b048-d2fdbd6b5225
-
-## QVAC speech-stack ports
-
-This fork carries two in-tree subtrees alongside the upstream whisper.cpp
-sources:
-
-- [`tts-cpp/`](tts-cpp/) — text-to-speech via Resemble Chatterbox (Turbo +
-  Multilingual) and Supertonic. In-tree subtree of
-  [github.com/gianni-cor/chatterbox.cpp](https://github.com/gianni-cor/chatterbox.cpp);
-  consumes ggml from the [`qvac-ext-ggml/speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech)
-  branch via the `ggml-speech` vcpkg port.
-- [`parakeet-cpp/`](parakeet-cpp/) — automatic speech recognition (NVIDIA
-  Parakeet FastConformer family — CTC, TDT, EOU, Sortformer) and
-  speaker diarization. In-tree subtree of the standalone parakeet.cpp
-  repo; same `ggml-speech` consumption pattern.
-
-Each subtree has its own README / build flow / public C++ API.  The
-upstream whisper.cpp build below is unaffected by either.
-
-## Quick start
-
-First clone the repository:
-
-```bash
-git clone https://github.com/ggml-org/whisper.cpp.git
-```
-
-Navigate into the directory:
+## Architecture
 
 ```
-cd whisper.cpp
++-----------------------------+  +-----------------------------+
+| third_party/whisper.cpp     |  | engines/parakeet            |
+| speech-to-text              |  | ASR + diarization + EOU     |
++-----------------------------+  +-----------------------------+
++-----------------------------+  +-----------------------------+
+| engines/tts                 |  | engines/audiogen            |
+| TTS + cloning + enhancement |  | text-to-music               |
++-----------------------------+  +-----------------------------+
+                    |                     :
+                    v                     : optional encoder sidecar
+   ggml-speech (qvac-ext-ggml@speech)     v
+                    |                Apple Core ML
+   +--------+-------+-------+---------+
+   v        v       v       v         v
+  CPU     Metal  Vulkan  OpenCL     CUDA
+                        (Adreno)
 ```
 
-Then, download one of the Whisper [models](models/README.md) converted in [`ggml` format](#ggml-format). For example:
+Every component consumes one system ggml, so the whole stack shares a single ggml pin and file set. The `ggml/` tree vendored inside the whisper subtree is never compiled.
 
-```bash
-sh ./models/download-ggml-model.sh base.en
-```
-
-Now build the [whisper-cli](examples/cli) example and transcribe an audio file like this:
-
-```bash
-# build the project
-cmake -B build
-cmake --build build -j --config Release
-
-# transcribe an audio file
-./build/bin/whisper-cli -f samples/jfk.wav
-```
-
----
-
-For a quick demo, simply run `make base.en`.
-
-The command downloads the `base.en` model converted to custom `ggml` format and runs the inference on all `.wav` samples in the folder `samples`.
-
-For detailed usage instructions, run: `./build/bin/whisper-cli -h`
-
-Note that the [whisper-cli](examples/cli) example currently runs only with 16-bit WAV files, so make sure to convert your input before running the tool.
-For example, you can use `ffmpeg` like this:
-
-```bash
-ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le output.wav
-```
-
-## More audio samples
-
-If you want some extra audio samples to play with, simply run:
+## Pipelines
 
 ```
-make -j samples
+whisper   wav  -> log-mel -> encoder -> decoder -> text            (+ Silero VAD, + Core ML encoder)
+parakeet  wav  -> log-mel -> FastConformer encoder -> CTC | TDT | EOU | Sortformer
+                                                   -> text | speaker segments | turn boundary
+tts       text -> LM (T3 / Llama / Qwen2.5) -> acoustic tokens -> CFM or flow -> vocoder -> wav
+                                                   (+ LavaSR denoise -> bandwidth extension)
+audiogen  caption + lyrics -> text encoder -> ACE-Step LM -> FSQ detokenizer
+                           -> DiT flow matching -> Oobleck VAE -> 48 kHz stereo
 ```
 
-This will download a few more audio files from Wikipedia and convert them to 16-bit WAV format via `ffmpeg`.
-
-You can download and run the other models as follows:
+## Repo layout
 
 ```
-make -j tiny.en
-make -j tiny
-make -j base.en
-make -j base
-make -j small.en
-make -j small
-make -j medium.en
-make -j medium
-make -j large-v1
-make -j large-v2
-make -j large-v3
-make -j large-v3-turbo
+CMakeLists.txt              feature-gated umbrella superbuild
+third_party/whisper.cpp/    upstream whisper.cpp, vendored as a git subtree,
+                            pinned @ v1.9.1 (f049fff9); every QVAC delta is
+                            declared in PATCHES.md and enforced by CI
+engines/
+  parakeet/                 ASR + diarization + end-of-utterance (NVIDIA Parakeet family)
+  tts/                      text-to-speech, voice cloning, speech enhancement
+  audiogen/                 music generation (ACE-Step)
+docs/UPSTREAM-SYNC.md       how to sync the whisper subtree
 ```
 
-## Memory usage
+## Supported models
 
-| Model  | Disk    | Mem     |
-| ------ | ------- | ------- |
-| tiny   | 75 MiB  | ~273 MB |
-| base   | 142 MiB | ~388 MB |
-| small  | 466 MiB | ~852 MB |
-| medium | 1.5 GiB | ~2.1 GB |
-| large  | 2.9 GiB | ~3.9 GB |
+One row per model. `Backends` lists what the owning engine documents as working; backends not listed are untested for that model, even where ggml would compile them.
 
-## POWER VSX Intrinsics
+### Speech-to-text and translation
 
-`whisper.cpp` supports POWER architectures and includes code which
-significantly speeds operation on Linux running on POWER9/10, making it
-capable of faster-than-realtime transcription on underclocked Raptor
-Talos II. Ensure you have a BLAS package installed, and replace the
-standard cmake setup with:
+| Model | Engine | Languages | Params | Quantization | Backends | Notes |
+|---|---|---|---|---|---|---|
+| `whisper-tiny` / `tiny.en` | whisper | 99 + translation | 39 M | `f16`, `q5_1`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | |
+| `whisper-base` / `base.en` | whisper | 99 + translation | 74 M | `f16`, `q5_1`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | |
+| `whisper-small` / `small.en` | whisper | 99 + translation | 244 M | `f16`, `q5_1`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | |
+| `whisper-small.en-tdrz` | whisper | English | 244 M | `f16` | CPU, Metal, Vulkan, OpenCL, CUDA | tinydiarize speaker turns |
+| `whisper-medium` / `medium.en` | whisper | 99 + translation | 769 M | `f16`, `q5_0`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | |
+| `whisper-large-v1` | whisper | 99 + translation | 1.55 B | `f16` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | |
+| `whisper-large-v2` | whisper | 99 + translation | 1.55 B | `f16`, `q5_0`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | |
+| `whisper-large-v3` | whisper | 99 + translation | 1.55 B | `f16`, `q5_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | |
+| `whisper-large-v3-turbo` | whisper | 99 + translation | 809 M | `f16`, `q5_0`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | fastest large-class decode |
+| `silero-v5.1.2` | whisper | language agnostic | 2 M | `f16` | CPU | voice activity detection |
+| `silero-v6.2.0` | whisper | language agnostic | 2 M | `f16` | CPU | voice activity detection |
+| `nvidia/parakeet-ctc-0.6b` | parakeet | English | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, Core ML | offline + streaming + long-form |
+| `nvidia/parakeet-ctc-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, Core ML | offline + streaming + long-form |
+| `nvidia/parakeet-tdt-0.6b-v3` | parakeet | ~25 + punctuation and capitalization | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, Core ML | fused LSTM + joint decoder |
+| `nvidia/parakeet-tdt-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, Core ML | lowest WER, no punctuation |
 
-```bash
-# build with GGML_BLAS defined
-cmake -B build -DGGML_BLAS=1
-cmake --build build -j --config Release
-./build/bin/whisper-cli [ .. etc .. ]
+### End-of-utterance and diarization
+
+| Model | Engine | Task | Params | Quantization | Backends | Notes |
+|---|---|---|---|---|---|---|
+| `nvidia/parakeet_realtime_eou_120m-v1` | parakeet | low-latency ASR + end-of-turn | 120 M | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL (encoder); CPU (LSTM decoder) | segments expose `is_eou_boundary` |
+| `nvidia/diar_sortformer_4spk-v1` | parakeet | diarization, up to 4 speakers | 123 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL | offline + sliding-history live |
+| `nvidia/diar_streaming_sortformer_4spk-v2` | parakeet | diarization, up to 4 speakers | 117 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL | streaming-trained encoder |
+| `nvidia/diar_streaming_sortformer_4spk-v2.1` | parakeet | diarization, up to 4 speakers | 117 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL | Audio-Online Speaker Cache, stable slots across gaps |
+
+Pair any ASR GGUF with a Sortformer GGUF via `--diarization-model` for an attributed "who said what" transcript.
+
+### Text-to-speech and voice cloning
+
+| Model | Engine | Languages | Sample rate | Quantization | Backends | Notes |
+|---|---|---|---|---|---|---|
+| Chatterbox Turbo | tts | English | 24 kHz | `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, CUDA | zero-shot voice cloning, 2-step meanflow CFM, streaming |
+| Chatterbox Multilingual | tts | 23 | 24 kHz | `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, CUDA | zero-shot voice cloning, CFG, `--cfm-steps` knob, streaming |
+| Supertonic v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming |
+| Supertonic v2 | tts | 5 (`en`, `ko`, `es`, `pt`, `fr`) | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming |
+| Supertonic v3 | tts | 31 + `na` | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming, `na` for unknown source language |
+| Parler-TTS mini-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | description-conditioned voice, no cloning |
+| Parler-TTS large-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | description-conditioned voice |
+| Indic Parler-TTS | tts | 21 Indic | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | Indic prompt BPE tokenizer |
+| Fun-CosyVoice3-0.5B | tts | Chinese and English text | 24 kHz | `f32` | CPU | Qwen2.5 LM + DiT flow + CausalHiFT, instruct mode for dialect and emotion |
+
+### Speech enhancement
+
+| Model | Engine | Task | Rate | Quantization | Backends | Notes |
+|---|---|---|---|---|---|---|
+| LavaSR denoiser (UL-UNAS) | tts | speech denoising | rate preserving, 16 kHz internal STFT | `f32`, `f16` | CPU, OpenCL | applied after synthesis or on captured audio |
+| LavaSR enhancer (Vocos BWE) | tts | bandwidth extension | native in, 48 kHz out | `f32`, `f16` | CPU, Metal, Vulkan, OpenCL, CUDA | ConvNeXt + ISTFT head |
+
+### Music generation
+
+| Model | Engine | Task | Rate | Quantization | Backends | Notes |
+|---|---|---|---|---|---|---|
+| ACE-Step v15 turbo | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal | 8 diffusion steps by default |
+| ACE-Step v15 base / sft | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal | 50 diffusion steps by default |
+
+## Build
+
+Prerequisites: CMake >= 3.20, a C++17 compiler, git.
+
+```sh
+# 1) system ggml (the branch the ggml-speech vcpkg port is cut from; the port
+#    pins one commit, so check its portfile REF to match a port build exactly)
+git clone --depth 1 --branch speech https://github.com/tetherto/qvac-ext-ggml ggml-src
+cmake -S ggml-src -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+      -DCMAKE_INSTALL_PREFIX=$PWD/ggml-install
+cmake --build ggml-src/build -j && cmake --install ggml-src/build
+
+# 2) the speech stack (whisper + parakeet + tts + audiogen, one shared ggml)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$PWD/ggml-install
+cmake --build build -j
 ```
 
-## Quantization
+### CMake options
 
-`whisper.cpp` supports integer quantization of the Whisper `ggml` models.
-Quantized models require less memory and disk space and depending on the hardware can be processed more efficiently.
+| Option | Default | Effect |
+|---|---|---|
+| `SPEECH_BUILD_WHISPER` | `ON` | build `third_party/whisper.cpp` |
+| `SPEECH_BUILD_PARAKEET` | `ON` | build `engines/parakeet` |
+| `SPEECH_BUILD_TTS` | `ON` | build `engines/tts` |
+| `SPEECH_BUILD_AUDIOGEN` | `ON` | build `engines/audiogen` |
+| `SPEECH_BUILD_EXECUTABLES` | `ON` | build the CLIs; set `OFF` for library-only builds |
+| `SPEECH_BUILD_TESTS` | `OFF` | build the engine test harnesses |
+| `SPEECH_BUILD_WHISPER_TESTS` | `OFF` | also build whisper's tests (transcription tests need downloaded models) |
 
-Here are the steps for creating and using a quantized model:
+GPU backends come from the ggml build: `-DGGML_VULKAN=ON`, `-DGGML_OPENCL=ON`, `-DGGML_CUDA=ON`; Metal is on by default on Apple. Core ML is gated per engine and defaults to off on both, so add `-DWHISPER_COREML=ON -DPARAKEET_COREML=ON` (Apple only) to the umbrella configure for the Neural Engine encoder paths. For tests, configure with `-DSPEECH_BUILD_TESTS=ON`, then run the non-GPU suite with `ctest --test-dir build -LE 'gpu|perf'`.
 
-```bash
-# quantize a model with Q5_0 method
-cmake -B build
-cmake --build build -j --config Release
-./build/bin/quantize models/ggml-base.en.bin models/ggml-base.en-q5_0.bin q5_0
+Each engine also configures standalone (`cmake -S engines/parakeet`, and so on), which is what the per-engine vcpkg ports and CI lanes use.
 
-# run the examples as usual, specifying the quantized model file
-./build/bin/whisper-cli -m models/ggml-base.en-q5_0.bin ./samples/gb0.wav
+### Consumable packages
+
+| vcpkg port | `find_package` | Imported target |
+|---|---|---|
+| `ggml-speech` | `ggml` | `ggml::ggml` |
+| `whisper-cpp` | `whisper` | `whisper::whisper` |
+| `parakeet-cpp` | `qvac-parakeet` | `qvac::parakeet` |
+| `tts-cpp` | `tts-cpp` | `tts-cpp::tts-cpp` |
+| `audiogen-cpp` | `audiogen-cpp` | `audiogen-cpp::audiogen-cpp` |
+
+## Command line tools
+
+| Binary | Engine | Purpose |
+|---|---|---|
+| `whisper-cli` | whisper | transcribe and translate, with optional Silero VAD |
+| `parakeet` | parakeet | transcribe, diarize, detect end-of-utterance, benchmark |
+| `tts-cli` | tts | Chatterbox, Supertonic, and Parler synthesis, autodetected from GGUF metadata |
+| `parler-cli` | tts | full Parler-TTS flag surface |
+| `supertonic-cli` | tts | standalone Supertonic synthesis |
+| `cosyvoice-cli` | tts | CosyVoice3 synthesis |
+| `music-cli` | audiogen | end-to-end text-to-music |
+| `acestep-cli` | audiogen | Oobleck VAE decode and roundtrip harness |
+| `lavasr-bench` | tts | denoiser and enhancer benchmark |
+| `mel2wav` | tts | HiFT mel to wav |
+
+### Whisper
+
+```sh
+./third_party/whisper.cpp/models/download-ggml-model.sh base.en
+./build/bin/whisper-cli -m third_party/whisper.cpp/models/ggml-base.en.bin \
+                        -f third_party/whisper.cpp/samples/jfk.wav
 ```
 
-## Core ML support
+### Parakeet
 
-On Apple Silicon devices, the Encoder inference can be executed on the Apple Neural Engine (ANE) via Core ML. This can result in significant
-speed-up - more than x3 faster compared with CPU-only execution. Here are the instructions for generating a Core ML model and using it with `whisper.cpp`:
+Models are converted from NeMo checkpoints with `download-all-models.sh` and `convert-nemo-to-gguf.py`; see [engines/parakeet/README.md](engines/parakeet/README.md).
 
-- Install Python dependencies needed for the creation of the Core ML model:
+```sh
+# transcribe (the GGUF metadata selects CTC / TDT / EOU)
+./build/engines/parakeet/parakeet --model models/parakeet-tdt-0.6b-v3.q8_0.gguf \
+                                  --wav engines/parakeet/test/samples/jfk.wav
 
-  ```bash
-  pip install ane_transformers
-  pip install openai-whisper
-  pip install coremltools
-  ```
+# transcribe with speaker attribution
+./build/engines/parakeet/parakeet --model models/parakeet-tdt-0.6b-v3.q8_0.gguf \
+                                  --diarization-model models/diar_sortformer_4spk-v1.f16.gguf \
+                                  --wav engines/parakeet/test/samples/diarization-sample-16k.wav
 
-  - To ensure `coremltools` operates correctly, please confirm that [Xcode](https://developer.apple.com/xcode/) is installed and execute `xcode-select --install` to install the command-line tools.
-  - Python 3.11 is recommended.
-  - MacOS Sonoma (version 14) or newer is recommended, as older versions of MacOS might experience issues with transcription hallucination.
-  - [OPTIONAL] It is recommended to utilize a Python version management system, such as [Miniconda](https://docs.conda.io/en/latest/miniconda.html) for this step:
-    - To create an environment, use: `conda create -n py311-whisper python=3.11 -y`
-    - To activate the environment, use: `conda activate py311-whisper`
-
-- Generate a Core ML model. For example, to generate a `base.en` model, use:
-
-  ```bash
-  ./models/generate-coreml-model.sh base.en
-  ```
-
-  This will generate the folder `models/ggml-base.en-encoder.mlmodelc`
-
-- Build `whisper.cpp` with Core ML support:
-
-  ```bash
-  # using CMake
-  cmake -B build -DWHISPER_COREML=1
-  cmake --build build -j --config Release
-  ```
-
-- Run the examples as usual. For example:
-
-  ```text
-  $ ./build/bin/whisper-cli -m models/ggml-base.en.bin -f samples/jfk.wav
-
-  ...
-
-  whisper_init_state: loading Core ML model from 'models/ggml-base.en-encoder.mlmodelc'
-  whisper_init_state: first run on a device may take a while ...
-  whisper_init_state: Core ML model loaded
-
-  system_info: n_threads = 4 / 10 | AVX = 0 | AVX2 = 0 | AVX512 = 0 | FMA = 0 | NEON = 1 | ARM_FMA = 1 | F16C = 0 | FP16_VA = 1 | WASM_SIMD = 0 | BLAS = 1 | SSE3 = 0 | VSX = 0 | COREML = 1 |
-
-  ...
-  ```
-
-  The first run on a device is slow, since the ANE service compiles the Core ML model to some device-specific format.
-  Next runs are faster.
-
-For more information about the Core ML implementation please refer to PR [#566](https://github.com/ggml-org/whisper.cpp/pull/566).
-
-## OpenVINO support
-
-On platforms that support [OpenVINO](https://github.com/openvinotoolkit/openvino), the Encoder inference can be executed
-on OpenVINO-supported devices including x86 CPUs and Intel GPUs (integrated & discrete).
-
-This can result in significant speedup in encoder performance. Here are the instructions for generating the OpenVINO model and using it with `whisper.cpp`:
-
-- First, setup python virtual env. and install python dependencies. Python 3.10 is recommended.
-
-  Windows:
-
-  ```powershell
-  cd models
-  python -m venv openvino_conv_env
-  openvino_conv_env\Scripts\activate
-  python -m pip install --upgrade pip
-  pip install -r requirements-openvino.txt
-  ```
-
-  Linux and macOS:
-
-  ```bash
-  cd models
-  python3 -m venv openvino_conv_env
-  source openvino_conv_env/bin/activate
-  python -m pip install --upgrade pip
-  pip install -r requirements-openvino.txt
-  ```
-
-- Generate an OpenVINO encoder model. For example, to generate a `base.en` model, use:
-
-  ```
-  python convert-whisper-to-openvino.py --model base.en
-  ```
-
-  This will produce ggml-base.en-encoder-openvino.xml/.bin IR model files. It's recommended to relocate these to the same folder as `ggml` models, as that
-  is the default location that the OpenVINO extension will search at runtime.
-
-- Build `whisper.cpp` with OpenVINO support:
-
-  Download OpenVINO package from [release page](https://github.com/openvinotoolkit/openvino/releases). The recommended version to use is [2024.6.0](https://github.com/openvinotoolkit/openvino/releases/tag/2024.6.0). Ready to use Binaries of the required libraries can be found in the [OpenVino Archives](https://storage.openvinotoolkit.org/repositories/openvino/packages/2024.6/)
-
-  After downloading & extracting package onto your development system, set up required environment by sourcing setupvars script. For example:
-
-  Linux:
-
-  ```bash
-  source /path/to/l_openvino_toolkit_ubuntu22_2023.0.0.10926.b4452d56304_x86_64/setupvars.sh
-  ```
-
-  Windows (cmd):
-
-  ```powershell
-  C:\Path\To\w_openvino_toolkit_windows_2023.0.0.10926.b4452d56304_x86_64\setupvars.bat
-  ```
-
-  And then build the project using cmake:
-
-  ```bash
-  cmake -B build -DWHISPER_OPENVINO=1
-  cmake --build build -j --config Release
-  ```
-
-- Run the examples as usual. For example:
-
-  ```text
-  $ ./build/bin/whisper-cli -m models/ggml-base.en.bin -f samples/jfk.wav
-
-  ...
-
-  whisper_ctx_init_openvino_encoder: loading OpenVINO model from 'models/ggml-base.en-encoder-openvino.xml'
-  whisper_ctx_init_openvino_encoder: first run on a device may take a while ...
-  whisper_openvino_init: path_model = models/ggml-base.en-encoder-openvino.xml, device = GPU, cache_dir = models/ggml-base.en-encoder-openvino-cache
-  whisper_ctx_init_openvino_encoder: OpenVINO model loaded
-
-  system_info: n_threads = 4 / 8 | AVX = 1 | AVX2 = 1 | AVX512 = 0 | FMA = 1 | NEON = 0 | ARM_FMA = 0 | F16C = 1 | FP16_VA = 0 | WASM_SIMD = 0 | BLAS = 0 | SSE3 = 1 | VSX = 0 | COREML = 0 | OPENVINO = 1 |
-
-  ...
-  ```
-
-  The first time run on an OpenVINO device is slow, since the OpenVINO framework will compile the IR (Intermediate Representation) model to a device-specific 'blob'. This device-specific blob will get
-  cached for the next run.
-
-For more information about the OpenVINO implementation please refer to PR [#1037](https://github.com/ggml-org/whisper.cpp/pull/1037).
-
-## NVIDIA GPU support
-
-With NVIDIA cards the processing of the models is done efficiently on the GPU via cuBLAS and custom CUDA kernels.
-First, make sure you have installed `cuda`: https://developer.nvidia.com/cuda-downloads
-
-Now build `whisper.cpp` with CUDA support:
-
-```
-cmake -B build -DGGML_CUDA=1
-cmake --build build -j --config Release
+# streaming end-of-utterance, JSONL events
+./build/engines/parakeet/parakeet --model models/parakeet_realtime_eou_120m-v1.q8_0.gguf \
+                                  --wav engines/parakeet/test/samples/jfk.wav \
+                                  --stream --stream-chunk-ms 1500 --emit jsonl
 ```
 
-or for newer NVIDIA GPU's (RTX 5000 series):
-```
-cmake -B build -DGGML_CUDA=1 -DCMAKE_CUDA_ARCHITECTURES="86"
-cmake --build build -j --config Release
-```
+### Text-to-speech
 
-## Vulkan GPU support
-Cross-vendor solution which allows you to accelerate workload on your GPU.
-First, make sure your graphics card driver provides support for Vulkan API.
+GGUF conversion steps are in [engines/tts/README.md](engines/tts/README.md).
 
-Now build `whisper.cpp` with Vulkan support:
-```
-cmake -B build -DGGML_VULKAN=1
-cmake --build build -j --config Release
-```
+```sh
+# Chatterbox Turbo, with voice cloning from a reference wav
+./build/engines/tts/tts-cli --model      models/chatterbox-t3-turbo.gguf \
+                            --s3gen-gguf models/chatterbox-s3gen.gguf \
+                            --reference-audio me.wav \
+                            --text "Hello from native C plus plus." --out out.wav
 
-## AMD ROCm GPU support
+# Chatterbox Multilingual
+./build/engines/tts/tts-cli --model      models/chatterbox-t3-mtl-q4_0.gguf \
+                            --s3gen-gguf models/chatterbox-s3gen-mtl-q4_0.gguf \
+                            --text "Hola, esto es una demostracion multilingue." \
+                            --language es --cfm-steps 7 --out out.wav
 
-With AMD GPUs the processing can be accelerated via HIP/ROCm.
-First, make sure you have installed [ROCm](https://rocm.docs.amd.com/en/latest/).
+# Supertonic, preset voice
+./build/engines/tts/tts-cli --model models/supertonic2.gguf --voice M1 --language en \
+                            --text "The quick brown fox jumps over the lazy dog." --out out.wav
 
-Now build `whisper.cpp` with HIP support:
+# Parler-TTS, description-conditioned
+./build/engines/tts/parler-cli --model models/parler-mini-v1-q8_0.gguf \
+                               --description "A female speaker with a calm, clear voice, close up." \
+                               --text "Hey, how are you doing today?" --out out.wav
 
-```
-cmake -B build -DGGML_HIP=1 -DAMDGPU_TARGETS="gfx1201"
-cmake --build build -j --config Release
-```
-
-Replace `gfx1201` with your GPU architecture. You can find it with:
-
-```
-rocminfo | grep "gfx"
+# CosyVoice3
+./build/engines/tts/cosyvoice-cli --model-dir models/cosyvoice3-0.5b \
+                                  --text "Hello from a fully on-device pipeline." --out out.wav
 ```
 
-Common architectures: `gfx1100` (RX 7900 XTX), `gfx1101` (RX 7800 XT), `gfx1201` (RX 9070 XT).
-For multiple GPUs with different architectures: `-DAMDGPU_TARGETS="gfx1100;gfx1201"`.
+### Music generation
 
-## BLAS CPU support via OpenBLAS
-
-Encoder processing can be accelerated on the CPU via OpenBLAS.
-First, make sure you have installed `openblas`: https://www.openblas.net/
-
-Now build `whisper.cpp` with OpenBLAS support:
-
-```
-cmake -B build -DGGML_BLAS=1
-cmake --build build -j --config Release
+```sh
+./build/engines/audiogen/music-cli --models models/acestep \
+                                   --caption "driving synth pop, bright analog leads, 120 bpm" \
+                                   --lyrics "[Instrumental]" --dur 8 --gpu --out song.wav
 ```
 
-## Ascend NPU support
+## Performance
 
-Ascend NPU provides inference acceleration via [`CANN`](https://www.hiascend.com/en/software/cann) and AI cores.
+`RTF = inference_time / audio_duration`, lower is better. The parakeet and tts READMEs carry the full tables, methodology, and reproduction steps; audiogen has no benchmark suite yet and reports per-stage wall clock on stderr.
 
-First, check if your Ascend NPU device is supported:
+### ASR, end-of-utterance, diarization
 
-**Verified devices**
-| Ascend NPU                    | Status  |
-|:-----------------------------:|:-------:|
-| Atlas 300T A2                 | Support |
-| Atlas 300I Duo                | Support |
+CI numbers, `q8_0` GGUFs, 1 warmup plus 5 timed runs, host `qvac-ubuntu2204-x64-gpu` (CPU: Intel Core i5-13500, GPU: NVIDIA RTX 4000 SFF Ada, Vulkan). Full table: [engines/parakeet/README.md](engines/parakeet/README.md#ci-benchmarks-latest-ggml-speech-linux-x86-64).
 
-Then, make sure you have installed [`CANN toolkit`](https://www.hiascend.com/en/software/cann/community) . The lasted version of CANN is recommanded.
+| Model | CPU RTF | CPU wall | Vulkan RTF | Vulkan wall |
+|---|--:|--:|--:|--:|
+| Parakeet CTC | 0.078 | 1572 ms | 0.0023 | 47 ms |
+| Parakeet TDT | 0.083 | 1670 ms | 0.0035 | 71 ms |
+| Parakeet EOU | 0.030 | 607 ms | 0.0052 | 105 ms |
+| Sortformer | 0.025 | 508 ms | 0.0020 | 40 ms |
 
-Now build `whisper.cpp` with CANN support:
+### Text-to-speech
 
-```
-cmake -B build -DGGML_CANN=1
-cmake --build build -j --config Release
-```
+CI numbers, `q4_0` GGUFs, same host. Full table: [engines/tts/README.md](engines/tts/README.md#performance).
 
-Run the inference examples as usual, for example:
+| Model | CPU RTF | Vulkan RTF | Vulkan wall | Vulkan tok/s |
+|---|--:|--:|--:|--:|
+| Chatterbox Turbo | 1.34 | 0.090 | 368 ms | 186 |
+| Chatterbox Multilingual | 4.31 | 0.189 | 1097 ms | 73 |
+| Supertonic | 0.079 | n/a | n/a | n/a |
 
-```
-./build/bin/whisper-cli -f samples/jfk.wav -m models/ggml-base.en.bin -t 8
-```
+That CI run has no Supertonic GPU lane, so its Vulkan columns are unrecorded rather than unsupported.
 
-*Notes:*
+### Apple silicon
 
-- If you have trouble with Ascend NPU device, please create a issue with **[CANN]** prefix/tag.
-- If you run successfully with your Ascend NPU device, please help update the table `Verified devices`.
+| Model | Host | Backend | Quantization | RTF | vs real-time |
+|---|---|---|---|--:|--:|
+| Parakeet TDT 0.6b v3 | Apple silicon, host not recorded | Metal | `q8_0` | 0.006 | 160x |
+| Chatterbox Turbo | Mac Studio M3 Ultra | Metal | `q4_0` | 0.16 | 6.4x |
+| Chatterbox Turbo | Mac Studio M3 Ultra | CPU (NEON) | `q4_0` | 1.05 | 0.96x |
+| Chatterbox Multilingual (`--cfm-steps 7`) | Mac Studio M3 Ultra | Metal | `q4_0` | 0.30 | 3.3x |
+| Chatterbox Multilingual | Apple M4 | Metal | `q4_0` | 1.37 | 0.73x |
 
-## Moore Threads GPU support
+### Streaming latency
 
-With Moore Threads cards the processing of the models is done efficiently on the GPU via muBLAS and custom MUSA kernels.
-First, make sure you have installed `MUSA SDK rc4.2.0`: https://developer.mthreads.com/sdk/download/musa?equipment=&os=&driverVersion=&version=4.2.0
+Chatterbox on Apple M4 Metal, 317 speech tokens (12.7 s of audio), `--stream-first-chunk-tokens 10 --stream-chunk-tokens 25 --stream-cfm-steps 1`. Full table: [engines/tts/README.md](engines/tts/README.md#streaming-mode--low-latency-playback).
 
-Now build `whisper.cpp` with MUSA support:
+| Metric | Value |
+|---|--:|
+| first audio out | 279 ms |
+| steady-state chunk RTF | 0.30 to 0.63 |
+| overall RTF | 0.90 |
 
-```
-cmake -B build -DGGML_MUSA=1
-cmake --build build -j --config Release
-```
+On-device Android and iOS performance is tracked by the benchmark lanes in [QVAC](https://github.com/tetherto/qvac).
 
-or specify the architecture for your Moore Threads GPU. For example, if you have a MTT S80 GPU, you can specify the architecture as follows:
+## Use in QVAC
 
-```
-cmake -B build -DGGML_MUSA=1 -DMUSA_ARCHITECTURES="21"
-cmake --build build -j --config Release
-```
+These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons, which consume the vcpkg ports built from this repo. The CLIs here are development and validation entry points: for anything beyond them, such as the JavaScript and TypeScript APIs on the Bare runtime, model download and registry, and desktop plus mobile app integration, see QVAC.
 
-## FFmpeg support (Linux only)
+| QVAC addon | Wraps | vcpkg ports consumed |
+|---|---|---|
+| `@qvac/asr-ggml` | speech-to-text, diarization, end-of-utterance | `whisper-cpp`, `parakeet-cpp` |
+| `@qvac/tts-ggml` | text-to-speech, voice cloning, speech enhancement | `tts-cpp` |
+| `@qvac/audiogen-ggml` | music generation | `audiogen-cpp` |
+| `@qvac/bci-whispercpp` | brain-computer interface transcription | `whisper-cpp` |
 
-If you want to support more audio formats (such as Opus and AAC), you can turn on the `WHISPER_FFMPEG` build flag to enable FFmpeg integration.
+## Licenses
 
-First, you need to install required libraries:
+| Component | Code license | Model weights |
+|---|---|---|
+| `third_party/whisper.cpp` | MIT | MIT (OpenAI Whisper), Silero VAD models under their own terms |
+| `engines/parakeet` | Apache-2.0 | CC-BY-4.0, except `parakeet_realtime_eou_120m-v1` under the NVIDIA Open Model License |
+| `engines/tts` | MIT | Chatterbox MIT, CosyVoice3 Apache-2.0, Supertonic and LavaSR per their model cards |
+| `engines/audiogen` | MIT | ACE-Step 1.5 MIT, Qwen3-Embedding Apache-2.0 |
 
-```bash
-# Debian/Ubuntu
-sudo apt install libavcodec-dev libavformat-dev libavutil-dev
+Per-engine `NOTICE` files list every third-party dependency and its license.
 
-# RHEL/Fedora
-sudo dnf install libavcodec-free-devel libavformat-free-devel libavutil-free-devel
-```
+## Documentation
 
-Then you can build the project as follows:
-
-```bash
-cmake -B build -D WHISPER_FFMPEG=yes
-cmake --build build
-```
-
-Run the following example to confirm it's working:
-
-```bash
-# Convert an audio file to Opus format
-ffmpeg -i samples/jfk.wav jfk.opus
-
-# Transcribe the audio file
-./build/bin/whisper-cli --model models/ggml-base.en.bin --file jfk.opus
-```
-
-## Docker
-
-### Prerequisites
-
-- Docker must be installed and running on your system.
-- Create a folder to store big models & intermediate files (ex. /whisper/models)
-
-### Images
-
-We have multiple Docker images available for this project:
-
-1. `ghcr.io/ggml-org/whisper.cpp:main`: This image includes the main executable file as well as `curl` and `ffmpeg`. (platforms: `linux/amd64`, `linux/arm64`)
-2. `ghcr.io/ggml-org/whisper.cpp:main-cuda`: Same as `main` but compiled with CUDA support. (platforms: `linux/amd64`)
-3. `ghcr.io/ggml-org/whisper.cpp:main-musa`: Same as `main` but compiled with MUSA support. (platforms: `linux/amd64`)
-4. `ghcr.io/ggml-org/whisper.cpp:main-vulkan`: Same as `main` but compiled with Vulkan support. (platforms: `linux/amd64`)
-
-### Usage
-
-```shell
-# download model and persist it in a local folder
-docker run -it --rm \
-  -v path/to/models:/models \
-  whisper.cpp:main "./models/download-ggml-model.sh base /models"
-
-# transcribe an audio file
-docker run -it --rm \
-  -v path/to/models:/models \
-  -v path/to/audios:/audios \
-  whisper.cpp:main "whisper-cli -m /models/ggml-base.bin -f /audios/jfk.wav"
-
-# transcribe an audio file in samples folder
-docker run -it --rm \
-  -v path/to/models:/models \
-  whisper.cpp:main "whisper-cli -m /models/ggml-base.bin -f ./samples/jfk.wav"
-
-# run the web server
-docker run -it --rm -p "8080:8080" \
-  -v path/to/models:/models \
-  whisper.cpp:main "whisper-server --host 127.0.0.1 -m /models/ggml-base.bin"
-  
-# run the bench too on the small.en model using 4 threads
-docker run -it --rm \
-  -v path/to/models:/models \
-  whisper.cpp:main "whisper-bench -m /models/ggml-small.en.bin -t 4"
-```
-
-## Installing with Conan
-
-You can install pre-built binaries for whisper.cpp or build it from source using [Conan](https://conan.io/). Use the following command:
-
-```
-conan install --requires="whisper-cpp/[*]" --build=missing
-```
-
-For detailed instructions on how to use Conan, please refer to the [Conan documentation](https://docs.conan.io/2/).
-
-## Limitations
-
-- Inference only
-
-## Real-time audio input example
-
-This is a naive example of performing real-time inference on audio from your microphone.
-The [stream](examples/stream) tool samples the audio every half a second and runs the transcription continuously.
-More info is available in [issue #10](https://github.com/ggml-org/whisper.cpp/issues/10).
-You will need to have [sdl2](https://wiki.libsdl.org/SDL2/Installation) installed for it to work properly.
-
-```bash
-cmake -B build -DWHISPER_SDL2=ON
-cmake --build build -j --config Release
-./build/bin/whisper-stream -m ./models/ggml-base.en.bin -t 8 --step 500 --length 5000
-```
-
-https://user-images.githubusercontent.com/1991296/194935793-76afede7-cfa8-48d8-a80f-28ba83be7d09.mp4
-
-## Confidence color-coding
-
-Adding the `--print-colors` argument will print the transcribed text using an experimental color coding strategy
-to highlight words with high or low confidence:
-
-```bash
-./build/bin/whisper-cli -m models/ggml-base.en.bin -f samples/gb0.wav --print-colors
-```
-
-<img width="965" alt="image" src="https://user-images.githubusercontent.com/1991296/197356445-311c8643-9397-4e5e-b46e-0b4b4daa2530.png">
-
-## Controlling the length of the generated text segments (experimental)
-
-For example, to limit the line length to a maximum of 16 characters, simply add `-ml 16`:
-
-```text
-$ ./build/bin/whisper-cli -m ./models/ggml-base.en.bin -f ./samples/jfk.wav -ml 16
-
-whisper_model_load: loading model from './models/ggml-base.en.bin'
-...
-system_info: n_threads = 4 / 10 | AVX2 = 0 | AVX512 = 0 | NEON = 1 | FP16_VA = 1 | WASM_SIMD = 0 | BLAS = 1 |
-
-main: processing './samples/jfk.wav' (176000 samples, 11.0 sec), 4 threads, 1 processors, lang = en, task = transcribe, timestamps = 1 ...
-
-[00:00:00.000 --> 00:00:00.850]   And so my
-[00:00:00.850 --> 00:00:01.590]   fellow
-[00:00:01.590 --> 00:00:04.140]   Americans, ask
-[00:00:04.140 --> 00:00:05.660]   not what your
-[00:00:05.660 --> 00:00:06.840]   country can do
-[00:00:06.840 --> 00:00:08.430]   for you, ask
-[00:00:08.430 --> 00:00:09.440]   what you can do
-[00:00:09.440 --> 00:00:10.020]   for your
-[00:00:10.020 --> 00:00:11.000]   country.
-```
-
-## Word-level timestamp (experimental)
-
-The `--max-len` argument can be used to obtain word-level timestamps. Simply use `-ml 1`:
-
-```text
-$ ./build/bin/whisper-cli -m ./models/ggml-base.en.bin -f ./samples/jfk.wav -ml 1
-
-whisper_model_load: loading model from './models/ggml-base.en.bin'
-...
-system_info: n_threads = 4 / 10 | AVX2 = 0 | AVX512 = 0 | NEON = 1 | FP16_VA = 1 | WASM_SIMD = 0 | BLAS = 1 |
-
-main: processing './samples/jfk.wav' (176000 samples, 11.0 sec), 4 threads, 1 processors, lang = en, task = transcribe, timestamps = 1 ...
-
-[00:00:00.000 --> 00:00:00.320]
-[00:00:00.320 --> 00:00:00.370]   And
-[00:00:00.370 --> 00:00:00.690]   so
-[00:00:00.690 --> 00:00:00.850]   my
-[00:00:00.850 --> 00:00:01.590]   fellow
-[00:00:01.590 --> 00:00:02.850]   Americans
-[00:00:02.850 --> 00:00:03.300]  ,
-[00:00:03.300 --> 00:00:04.140]   ask
-[00:00:04.140 --> 00:00:04.990]   not
-[00:00:04.990 --> 00:00:05.410]   what
-[00:00:05.410 --> 00:00:05.660]   your
-[00:00:05.660 --> 00:00:06.260]   country
-[00:00:06.260 --> 00:00:06.600]   can
-[00:00:06.600 --> 00:00:06.840]   do
-[00:00:06.840 --> 00:00:07.010]   for
-[00:00:07.010 --> 00:00:08.170]   you
-[00:00:08.170 --> 00:00:08.190]  ,
-[00:00:08.190 --> 00:00:08.430]   ask
-[00:00:08.430 --> 00:00:08.910]   what
-[00:00:08.910 --> 00:00:09.040]   you
-[00:00:09.040 --> 00:00:09.320]   can
-[00:00:09.320 --> 00:00:09.440]   do
-[00:00:09.440 --> 00:00:09.760]   for
-[00:00:09.760 --> 00:00:10.020]   your
-[00:00:10.020 --> 00:00:10.510]   country
-[00:00:10.510 --> 00:00:11.000]  .
-```
-
-## Speaker segmentation via tinydiarize (experimental)
-
-More information about this approach is available here: https://github.com/ggml-org/whisper.cpp/pull/1058
-
-Sample usage:
-
-```py
-# download a tinydiarize compatible model
-./models/download-ggml-model.sh small.en-tdrz
-
-# run as usual, adding the "-tdrz" command-line argument
-./build/bin/whisper-cli -f ./samples/a13.wav -m ./models/ggml-small.en-tdrz.bin -tdrz
-...
-main: processing './samples/a13.wav' (480000 samples, 30.0 sec), 4 threads, 1 processors, lang = en, task = transcribe, tdrz = 1, timestamps = 1 ...
-...
-[00:00:00.000 --> 00:00:03.800]   Okay Houston, we've had a problem here. [SPEAKER_TURN]
-[00:00:03.800 --> 00:00:06.200]   This is Houston. Say again please. [SPEAKER_TURN]
-[00:00:06.200 --> 00:00:08.260]   Uh Houston we've had a problem.
-[00:00:08.260 --> 00:00:11.320]   We've had a main beam up on a volt. [SPEAKER_TURN]
-[00:00:11.320 --> 00:00:13.820]   Roger main beam interval. [SPEAKER_TURN]
-[00:00:13.820 --> 00:00:15.100]   Uh uh [SPEAKER_TURN]
-[00:00:15.100 --> 00:00:18.020]   So okay stand, by thirteen we're looking at it. [SPEAKER_TURN]
-[00:00:18.020 --> 00:00:25.740]   Okay uh right now uh Houston the uh voltage is uh is looking good um.
-[00:00:27.620 --> 00:00:29.940]   And we had a a pretty large bank or so.
-```
-
-## Karaoke-style movie generation (experimental)
-
-The [whisper-cli](examples/cli) example provides support for output of karaoke-style movies, where the
-currently pronounced word is highlighted. Use the `-owts` argument and run the generated bash script.
-This requires to have `ffmpeg` installed.
-
-Here are a few _"typical"_ examples:
-
-```bash
-./build/bin/whisper-cli -m ./models/ggml-base.en.bin -f ./samples/jfk.wav -owts
-source ./samples/jfk.wav.wts
-ffplay ./samples/jfk.wav.mp4
-```
-
-https://user-images.githubusercontent.com/1991296/199337465-dbee4b5e-9aeb-48a3-b1c6-323ac4db5b2c.mp4
-
----
-
-```bash
-./build/bin/whisper-cli -m ./models/ggml-base.en.bin -f ./samples/mm0.wav -owts
-source ./samples/mm0.wav.wts
-ffplay ./samples/mm0.wav.mp4
-```
-
-https://user-images.githubusercontent.com/1991296/199337504-cc8fd233-0cb7-4920-95f9-4227de3570aa.mp4
-
----
-
-```bash
-./build/bin/whisper-cli -m ./models/ggml-base.en.bin -f ./samples/gb0.wav -owts
-source ./samples/gb0.wav.wts
-ffplay ./samples/gb0.wav.mp4
-```
-
-https://user-images.githubusercontent.com/1991296/199337538-b7b0c7a3-2753-4a88-a0cd-f28a317987ba.mp4
-
----
-
-## Video comparison of different models
-
-Use the [scripts/bench-wts.sh](https://github.com/ggml-org/whisper.cpp/blob/master/scripts/bench-wts.sh) script to generate a video in the following format:
-
-```bash
-./scripts/bench-wts.sh samples/jfk.wav
-ffplay ./samples/jfk.wav.all.mp4
-```
-
-https://user-images.githubusercontent.com/1991296/223206245-2d36d903-cf8e-4f09-8c3b-eb9f9c39d6fc.mp4
-
----
-
-## Benchmarks
-
-In order to have an objective comparison of the performance of the inference across different system configurations,
-use the [whisper-bench](examples/bench) tool. The tool simply runs the Encoder part of the model and prints how much time it
-took to execute it. The results are summarized in the following Github issue:
-
-[Benchmark results](https://github.com/ggml-org/whisper.cpp/issues/89)
-
-Additionally a script to run whisper.cpp with different models and audio files is provided [bench.py](scripts/bench.py).
-
-You can run it with the following command, by default it will run against any standard model in the models folder.
-
-```bash
-python3 scripts/bench.py -f samples/jfk.wav -t 2,4,8 -p 1,2
-```
-
-It is written in python with the intention of being easy to modify and extend for your benchmarking use case.
-
-It outputs a csv file with the results of the benchmarking.
-
-## `ggml` format
-
-The original models are converted to a custom binary format. This allows to pack everything needed into a single file:
-
-- model parameters
-- mel filters
-- vocabulary
-- weights
-
-You can download the converted models using the [models/download-ggml-model.sh](models/download-ggml-model.sh) script
-or manually from here:
-
-- https://huggingface.co/ggerganov/whisper.cpp
-
-For more details, see the conversion script [models/convert-pt-to-ggml.py](models/convert-pt-to-ggml.py) or [models/README.md](models/README.md).
-
-## [Bindings](https://github.com/ggml-org/whisper.cpp/discussions/categories/bindings)
-
-- [x] Rust: [tazz4843/whisper-rs](https://github.com/tazz4843/whisper-rs) | [#310](https://github.com/ggml-org/whisper.cpp/discussions/310)
-- [x] JavaScript: [bindings/javascript](bindings/javascript) | [#309](https://github.com/ggml-org/whisper.cpp/discussions/309)
-  - React Native (iOS / Android): [whisper.rn](https://github.com/mybigday/whisper.rn)
-- [x] Go: [bindings/go](bindings/go) | [#312](https://github.com/ggml-org/whisper.cpp/discussions/312)
-- [x] Java:
-  - [GiviMAD/whisper-jni](https://github.com/GiviMAD/whisper-jni)
-- [x] Ruby: [bindings/ruby](bindings/ruby) | [#507](https://github.com/ggml-org/whisper.cpp/discussions/507)
-- [x] Objective-C / Swift: [ggml-org/whisper.spm](https://github.com/ggml-org/whisper.spm) | [#313](https://github.com/ggml-org/whisper.cpp/discussions/313)
-  - [exPHAT/SwiftWhisper](https://github.com/exPHAT/SwiftWhisper)
-- [x] .NET: | [#422](https://github.com/ggml-org/whisper.cpp/discussions/422)
-  - [sandrohanea/whisper.net](https://github.com/sandrohanea/whisper.net)
-  - [NickDarvey/whisper](https://github.com/NickDarvey/whisper)
-- [x] Python: | [#9](https://github.com/ggml-org/whisper.cpp/issues/9)
-  - [stlukey/whispercpp.py](https://github.com/stlukey/whispercpp.py) (Cython)
-  - [AIWintermuteAI/whispercpp](https://github.com/AIWintermuteAI/whispercpp) (Updated fork of aarnphm/whispercpp)
-  - [aarnphm/whispercpp](https://github.com/aarnphm/whispercpp) (Pybind11)
-  - [abdeladim-s/pywhispercpp](https://github.com/abdeladim-s/pywhispercpp) (Pybind11)
-- [x] R: [bnosac/audio.whisper](https://github.com/bnosac/audio.whisper)
-- [x] Unity: [macoron/whisper.unity](https://github.com/Macoron/whisper.unity)
-
-## XCFramework
-The XCFramework is a precompiled version of the library for iOS, visionOS, tvOS,
-and macOS. It can be used in Swift projects without the need to compile the
-library from source. For example, the v1.7.5 version of the XCFramework can be
-used as follows:
-
-```swift
-// swift-tools-version: 5.10
-// The swift-tools-version declares the minimum version of Swift required to build this package.
-
-import PackageDescription
-
-let package = Package(
-    name: "Whisper",
-    targets: [
-        .executableTarget(
-            name: "Whisper",
-            dependencies: [
-                "WhisperFramework"
-            ]),
-        .binaryTarget(
-            name: "WhisperFramework",
-            url: "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.5/whisper-v1.7.5-xcframework.zip",
-            checksum: "c7faeb328620d6012e130f3d705c51a6ea6c995605f2df50f6e1ad68c59c6c4a"
-        )
-    ]
-)
-```
-
-## Voice Activity Detection (VAD)
-Support for Voice Activity Detection (VAD) can be enabled using the `--vad`
-argument to `whisper-cli`. In addition to this option a VAD model is also
-required.
-
-The way this works is that first the audio samples are passed through
-the VAD model which will detect speech segments. Using this information,
-only the speech segments that are detected are extracted from the original audio
-input and passed to whisper for processing. This reduces the amount of audio
-data that needs to be processed by whisper and can significantly speed up the
-transcription process.
-
-The following VAD models are currently supported:
-
-### Silero-VAD
-[Silero-vad](https://github.com/snakers4/silero-vad) is a lightweight VAD model
-written in Python that is fast and accurate.
-
-Models can be downloaded by running the following command on Linux or MacOS:
-```console
-$ ./models/download-vad-model.sh silero-v6.2.0
-Downloading ggml model silero-v6.2.0 from 'https://huggingface.co/ggml-org/whisper-vad' ...
-ggml-silero-v6.2.0.bin        100%[==============================================>] 864.35K  --.-KB/s    in 0.04s
-Done! Model 'silero-v6.2.0' saved in '/path/models/ggml-silero-v6.2.0.bin'
-You can now use it like this:
-
-  $ ./build/bin/whisper-cli -vm /path/models/ggml-silero-v6.2.0.bin --vad -f samples/jfk.wav -m models/ggml-base.en.bin
-
-```
-And the following command on Windows:
-```console
-> .\models\download-vad-model.cmd silero-v6.2.0
-Downloading vad model silero-v6.2.0...
-Done! Model silero-v6.2.0 saved in C:\Users\danie\work\ai\whisper.cpp\ggml-silero-v6.2.0.bin
-You can now use it like this:
-
-C:\path\build\bin\Release\whisper-cli.exe -vm C:\path\ggml-silero-v6.2.0.bin --vad -m models/ggml-base.en.bin -f samples\jfk.wav
-
-```
-
-To see a list of all available models, run the above commands without any
-arguments.
-
-This model can be also be converted manually to ggml using the following command:
-```console
-$ python3 -m venv venv && source venv/bin/activate
-$ (venv) pip install silero-vad
-$ (venv) $ python models/convert-silero-vad-to-ggml.py --output models/silero.bin
-Saving GGML Silero-VAD model to models/silero-v6.2.0-ggml.bin
-```
-And it can then be used with whisper as follows:
-```console
-$ ./build/bin/whisper-cli \
-   --file ./samples/jfk.wav \
-   --model ./models/ggml-base.en.bin \
-   --vad \
-   --vad-model ./models/silero-v6.2.0-ggml.bin
-```
-
-### VAD Options
-
-* --vad-threshold: Threshold probability for speech detection. A probability
-for a speech segment/frame above this threshold will be considered as speech.
-
-* --vad-min-speech-duration-ms: Minimum speech duration in milliseconds. Speech
-segments shorter than this value will be discarded to filter out brief noise or
-false positives.
-
-* --vad-min-silence-duration-ms: Minimum silence duration in milliseconds. Silence
-periods must be at least this long to end a speech segment. Shorter silence
-periods will be ignored and included as part of the speech.
-
-* --vad-max-speech-duration-s: Maximum speech duration in seconds. Speech segments
-longer than this will be automatically split into multiple segments at silence
-points exceeding 98ms to prevent excessively long segments.
-
-* --vad-speech-pad-ms: Speech padding in milliseconds. Adds this amount of padding
-before and after each detected speech segment to avoid cutting off speech edges.
-
-* --vad-samples-overlap: Amount of audio to extend from each speech segment into
-the next one, in seconds (e.g., 0.10 = 100ms overlap). This ensures speech isn't
-cut off abruptly between segments when they're concatenated together.
-
-## Examples
-
-There are various examples of using the library for different projects in the [examples](examples) folder.
-Some of the examples are even ported to run in the browser using WebAssembly. Check them out!
-
-| Example                                             | Web                                   | Description                                                                                                                     |
-| --------------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| [whisper-cli](examples/cli)                         | [whisper.wasm](examples/whisper.wasm) | Tool for translating and transcribing audio using Whisper                                                                       |
-| [whisper-bench](examples/bench)                     | [bench.wasm](examples/bench.wasm)     | Benchmark the performance of Whisper on your machine                                                                            |
-| [whisper-stream](examples/stream)                   | [stream.wasm](examples/stream.wasm)   | Real-time transcription of raw microphone capture                                                                               |
-| [whisper-command](examples/command)                 | [command.wasm](examples/command.wasm) | Basic voice assistant example for receiving voice commands from the mic                                                         |
-| [whisper-server](examples/server)                   |                                       | HTTP transcription server with OAI-like API                                                                                     |
-| [whisper-talk-llama](examples/talk-llama)           |                                       | Talk with a LLaMA bot                                                                                                           |
-| [whisper.objc](examples/whisper.objc)               |                                       | iOS mobile application using whisper.cpp                                                                                        |
-| [whisper.swiftui](examples/whisper.swiftui)         |                                       | SwiftUI iOS / macOS application using whisper.cpp                                                                               |
-| [whisper.android](examples/whisper.android)         |                                       | Android mobile application using whisper.cpp                                                                                    |
-| [whisper.nvim](examples/whisper.nvim)               |                                       | Speech-to-text plugin for Neovim                                                                                                |
-| [generate-karaoke.sh](examples/generate-karaoke.sh) |                                       | Helper script to easily [generate a karaoke video](https://youtu.be/uj7hVta4blM) of raw audio capture                           |
-| [livestream.sh](examples/livestream.sh)             |                                       | [Livestream audio transcription](https://github.com/ggml-org/whisper.cpp/issues/185)                                            |
-| [yt-wsp.sh](examples/yt-wsp.sh)                     |                                       | Download + transcribe and/or translate any VOD [(original)](https://gist.github.com/DaniruKun/96f763ec1a037cc92fe1a059b643b818) |
-| [wchess](examples/wchess)                           | [wchess.wasm](examples/wchess)        | Voice-controlled chess                                                                                                          |
-
-## [Discussions](https://github.com/ggml-org/whisper.cpp/discussions)
-
-If you have any kind of feedback about this project feel free to use the Discussions section and open a new topic.
-You can use the [Show and tell](https://github.com/ggml-org/whisper.cpp/discussions/categories/show-and-tell) category
-to share your own projects that use `whisper.cpp`. If you have a question, make sure to check the
-[Frequently asked questions (#126)](https://github.com/ggml-org/whisper.cpp/discussions/126) discussion.
+| Topic | Where |
+|---|---|
+| Product using these engines | [QVAC](https://github.com/tetherto/qvac) |
+| Speech-to-text engine | [third_party/whisper.cpp/README.md](third_party/whisper.cpp/README.md) |
+| Whisper subtree deltas | [third_party/whisper.cpp/PATCHES.md](third_party/whisper.cpp/PATCHES.md) |
+| Whisper subtree sync process | [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md) |
+| ASR, diarization, end-of-utterance | [engines/parakeet/README.md](engines/parakeet/README.md) |
+| Text-to-speech and enhancement | [engines/tts/README.md](engines/tts/README.md) |
+| Music generation | [engines/audiogen/README.md](engines/audiogen/README.md) |
+| TTS memory behaviour | [engines/tts/MEMORY.md](engines/tts/MEMORY.md) |
+| Development journals | [engines/parakeet/PROGRESS.md](engines/parakeet/PROGRESS.md), [engines/tts/PROGRESS.md](engines/tts/PROGRESS.md) |
