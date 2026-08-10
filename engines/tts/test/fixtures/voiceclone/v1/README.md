@@ -5,7 +5,7 @@ Golden fixtures for the voice-clone metrics self-tests
 model-free** so the `unit` ctest tier reproduces known metric scores with no
 downloads.
 
-Regenerate with:
+The implemented, model-free generator is:
 
 ```bash
 python3 scripts/dump-voiceclone-fixtures.py synthetic --out test/fixtures/voiceclone/v1
@@ -13,6 +13,10 @@ python3 scripts/dump-voiceclone-fixtures.py synthetic --out test/fixtures/voicec
 
 `synthetic` mode is pure-Python (no numpy required) and writes `.npy` v1.0
 little-endian float32 arrays compatible with `src/npy.h`.
+
+The separate `reference` command is not a generator yet. It is an explicit
+stub that exits with an explanation of the required off-device models and
+corpus; do not document or automate it as fixture setup.
 
 ## Files
 
@@ -43,9 +47,9 @@ their pinned fixtures.
 
 ## Not committed here (heavy / off-device)
 
-The real speaker-similarity and gradient references the cloning tasks depend on
-are produced off-device and live out-of-tree (point the build at them with
-`-DTTS_CPP_TEST_REF_DIR`):
+The intended heavy speaker-similarity and gradient references will live
+out-of-tree (point the build at them with `-DTTS_CPP_TEST_REF_DIR`) once the
+unimplemented `reference` mode is completed:
 
 - CAMPPlus (on-device) + WavLM-base-plus-sv / ECAPA-TDNN / ResNet (off-device,
   SpeechBrain) target speaker embeddings,
@@ -55,6 +59,5 @@ are produced off-device and live out-of-tree (point the build at them with
 - expected per-stage gradients (PyTorch autograd through the onnx2torch
   Supertonic pipeline) for `gradcheck`.
 
-See the `reference` mode in `scripts/dump-voiceclone-fixtures.py` for the
-contract; it is wired up by a later cloning task alongside the C++ analytic
-gradients it validates.
+See the `reference` stub in `scripts/dump-voiceclone-fixtures.py` for the
+planned contract. At present it produces no files.

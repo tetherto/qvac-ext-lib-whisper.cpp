@@ -1,26 +1,90 @@
 # tts-cpp
 
-> **In-tree subtree of [`chatterbox.cpp`](https://github.com/gianni-cor/chatterbox.cpp)
-> integrated into `qvac-ext-lib-whisper.cpp`.** The standalone development
-> repo carries `scripts/setup-ggml.sh` + `patches/` and supports
-> bundled-ggml dev builds; this in-tree subtree drops both and consumes
-> ggml exclusively through the QVAC speech-stack `ggml-speech` vcpkg
-> port (the [`qvac-ext-ggml/speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech)
-> branch, which ships the patches pre-applied).  See [§1 below](#1-build-from-the-qvac-speech-stack)
-> for the build flow.
+Native C++17/ggml speech synthesis, voice cloning, and post-synthesis
+enhancement for the QVAC speech stack. There is no Python, PyTorch, or ONNX
+Runtime dependency after models have been converted to GGUF.
 
-**Chatterbox** (Resemble AI, MIT-licensed zero-shot text-to-speech) ported
-to [`ggml`](https://github.com/ggml-org/ggml).  Pure C++/ggml inference on
-CPU / Metal / CUDA / Vulkan, no runtime dependency on Python or PyTorch.
-Ships both variants out of one binary, autodetected from GGUF metadata:
+This package exposes five public synthesis engine APIs covering six synthesis
+families and eight model lines: Chatterbox Turbo, Chatterbox Multilingual,
+Supertonic 1, 2, and 3, Parler-TTS, CosyVoice3, and Audio8. LavaSR is a
+speech-enhancement pipeline, not a TTS synthesizer. The API count follows the
+installed public headers under `include/tts-cpp/`; the two Chatterbox families
+share one engine API, while the Supertonic generations share another.
 
-- **Turbo** — English, GPT-2 Medium T3, meanflow 2-step CFM.  Optimised for
-  lowest-latency CLI use.
-- **Multilingual** — 23 languages, Llama-520M T3 + perceiver resampler +
-  classifier-free guidance, standard 10-step CFM with CFG inside.  The native
-  tokenizer supports `en, es, fr, de, it, pt, nl, pl, tr, sv, da, fi, no, el,
-  ms, sw, ar, ko` plus the external-preprocessor languages `ja, he, ru, zh,
-  hi`; `ja` requires MeCab/IPAdic and `zh` requires a Cangjie5 TSV.
+This directory is the in-tree `engines/tts` package in
+[`qvac-ext-lib-whisper.cpp`](../../README.md). It consumes the system
+`ggml-speech` package built from
+[`qvac-ext-ggml@speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech).
+The checkout intentionally starts without a local `ggml/`, `patches/`, or
+`scripts/setup-ggml.sh`; a bundled build requires manually staging the speech
+fork under `engines/tts/ggml`. The standalone
+[`chatterbox.cpp`](https://github.com/gianni-cor/chatterbox.cpp) repository is
+the separate bundled-ggml development path.
+
+## Start here
+
+- [Capabilities](#capabilities)
+- [Public APIs](#public-apis)
+- [Pipelines](#pipelines)
+- [Build paths](#build-paths)
+- [Command-line tools](#command-line-tools)
+- [Fixtures and static validation](#fixtures-and-static-validation)
+- Engine details: [Chatterbox](#chatterbox), [Parler](#parler-tts),
+  [Supertonic](#supertonic-gguf), [CosyVoice3](#cosyvoice3), and
+  [Audio8](#audio8)
+- [LavaSR enhancement](#lavasr-enhancement)
+- [Troubleshooting](#troubleshooting)
+
+## Capabilities
+
+### Supported models and backends
+
+Backends below are the paths validated or explicitly implemented by each
+engine, not every backend ggml can compile.
+
+| Model line | Languages | Voice source | Native rate | CPU | Metal | Vulkan | OpenCL | CUDA |
+|---|---|---|---:|:---:|:---:|:---:|:---:|:---:|
+| Chatterbox Turbo | English | built-in or zero-shot reference WAV/profile | 24 kHz | yes | yes | yes | yes | yes |
+| Chatterbox Multilingual | 23 | built-in or zero-shot reference WAV/profile | 24 kHz | yes | yes | yes | yes | yes |
+| Supertonic 1 | English | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
+| Supertonic 2 | `en`, `ko`, `es`, `pt`, `fr` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
+| Supertonic 3 | 31 languages plus `na` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
+| Parler-TTS mini/large/Indic | English or 21 Indic languages | natural-language description | 44.1 kHz | yes | yes | yes | yes | no |
+| Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice; instruct controls | 24 kHz | yes | no | no | yes | no |
+| Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | no | no | no | no |
+| LavaSR denoiser | language agnostic | input PCM | rate preserving | yes | yes | yes | yes | yes |
+| LavaSR enhancer | language agnostic | input PCM | 48 kHz | yes | yes | yes | yes | yes |
+
+Chatterbox Multilingual's native tokenizer covers `en, es, fr, de, it, pt, nl,
+pl, tr, sv, da, fi, no, el, ms, sw, ar, ko`; `ja`, `he`, `ru`, `zh`, and `hi`
+use external preprocessing. Japanese requires MeCab/IPAdic and Chinese requires
+a Cangjie5 TSV.
+
+### API, streaming, and CLI matrix
+
+| Family | Installed header | Streaming API | CLI surface |
+|---|---|---|---|
+| Chatterbox | `<tts-cpp/chatterbox/engine.h>` | true incremental S3Gen/HiFT chunks | `tts-cli` batch and streaming |
+| Supertonic 1/2/3 | `<tts-cpp/supertonic/engine.h>` | text-chunk pipeline streaming | `supertonic-cli` batch/streaming; `tts-cli` batch only and rejects streaming flags |
+| Parler | `<tts-cpp/parler/engine.h>` | incremental callback via `stream_chunk_frames` | `parler-cli` and `tts-cli` batch only; neither exposes streaming |
+| CosyVoice3 | `<tts-cpp/cosyvoice/engine.h>` | callback is post-hoc chunking after full generation | `cosyvoice-cli` |
+| Audio8 | `<tts-cpp/audio8/engine.h>` | no | `audio8-cli` |
+| LavaSR | `<tts-cpp/lavasr/{denoiser,enhancer}.h>` | block-oriented enhancement APIs | `lavasr-bench` |
+
+`tts-cli` is intentionally a limited metadata dispatcher: it handles
+Chatterbox, batch Supertonic, and a reduced Parler surface. Use the dedicated
+CLIs for the complete Supertonic, Parler, CosyVoice3, and Audio8 options.
+
+### Defaults that differ by surface
+
+| Setting | `tts-cli` | Library engines and dedicated CLIs |
+|---|---|---|
+| Seed | `0` unless `--seed` is supplied | generally `42` |
+| Threads | capped at 4 by default | Chatterbox, Supertonic, Parler, and Audio8 cap automatic selection at 4; CosyVoice stage behavior is not generalized here |
+| Parler greedy | repaired to sampling with a warning because argmax does not terminate | same; use `seed` for reproducibility |
+| Chatterbox streaming CFM | Turbo accepts 1 or 2 steps | Multilingual standard CFM requests below the model timestep count are floored to 10 |
+
+## Chatterbox
 
 End-to-end inference on a short sentence with voice cloning from an 11 s
 reference wav (T3 + S3Gen + HiFT, warm runs, excludes model load):
@@ -80,32 +144,24 @@ quantisation pass that ships in this repo (§3.20)).
 
 ---
 
-## API overview
+## Public APIs
 
-The two high-level entry points exported through the `TTS_CPP_API`
-public surface (defined in
-[`include/tts-cpp/export.h`](include/tts-cpp/export.h)):
+The installed CMake target is `tts-cpp::tts-cpp`. Persistent engine classes
+load their model once and reuse it across synthesis calls:
 
-| Surface | Role |
-|---------|------|
-| `tts_cpp::chatterbox::Engine::synthesize` | One-shot text → 24 kHz PCM for the Chatterbox pipeline (T3 + S3Gen + HiFT). Loads the T3 + S3Gen GGUFs once at construction, optionally bakes a voice-cloning profile from a reference wav, and reuses everything across calls. Header: [`<tts-cpp/chatterbox/engine.h>`](include/tts-cpp/chatterbox/engine.h). Variant (Turbo / Multilingual) is autodetected from `chatterbox.variant` GGUF metadata. |
-| `tts_cpp::supertonic::synthesize` | One-shot text → 44.1 kHz PCM for the Supertonic TTS family, on CPU or GPU (`n_gpu_layers`). Header: [`<tts-cpp/supertonic/engine.h>`](include/tts-cpp/supertonic/engine.h). |
+| Namespace | Primary surface | Result |
+|---|---|---|
+| `tts_cpp::chatterbox` | `Engine::synthesize` | 24 kHz PCM by default; Turbo/Multilingual selected by GGUF metadata |
+| `tts_cpp::supertonic` | `Engine::synthesize` | model-rate PCM, usually 44.1 kHz |
+| `tts_cpp::parler` | `Engine::synthesize` | 44.1 kHz PCM conditioned by a description |
+| `tts_cpp::cosyvoice` | `Engine::synthesize` | 24 kHz PCM |
+| `tts_cpp::audio8` | `Engine::synthesize` | 44.1 kHz PCM, optionally cloned from `VoicePrompt` |
+| `tts_cpp::lavasr` | `Denoiser` / `Enhancer` | enhanced PCM |
 
-Lower-level helpers also exposed via `TTS_CPP_API`, useful when
-embedding into a host that already manages model lifetime:
-**`s3gen_synthesize_to_wav`** (file-output S3Gen path,
-[`<tts-cpp/chatterbox/s3gen_pipeline.h>`](include/tts-cpp/chatterbox/s3gen_pipeline.h)),
-**`s3gen_preload`** / **`s3gen_unload`** (host-side weight pre-staging
-+ explicit teardown — required for long-running processes that cycle
-through models or that need deterministic teardown before destroying
-their own ggml backend), and **`tts_cpp_cli_main`** (the same
-entry point used by the `tts-cli` binary — useful for embedding the
-end-to-end CLI into a downstream binary without forking
-[`src/cli_main.cpp`](src/cli_main.cpp)).  Anything outside the
-`TTS_CPP_API`-annotated surface (in particular the
-`tts_cpp::supertonic::detail::*` and `tts_cpp::chatterbox::*_internal`
-helpers reachable from the supertonic / chatterbox test harnesses) is
-**not** part of the public API and is hidden from `SHARED` builds.
+The public surface also includes Chatterbox's lower-level
+`s3gen_synthesize_to_wav`, `s3gen_preload`, and `s3gen_unload`, plus
+`tts_cpp_cli_main`. Symbols without `TTS_CPP_API`, including `detail`
+namespaces used by tests, are private and hidden from shared-library consumers.
 
 ### Consumer integration
 
@@ -142,7 +198,7 @@ surface, so the integrated port keeps the default
 [**Useful CMake options**](#useful-cmake-options) below for the full
 flag table.
 
-## Pipeline at a glance
+## Pipelines
 
 ```
       text                                                 24 kHz wav
@@ -161,10 +217,9 @@ flag table.
    (embedded in T3 GGUF metadata)              (embedded in S3Gen GGUF)
 ```
 
-`tts-cli` (and the back-compat `chatterbox` binary, same code) handles
-both Chatterbox variants via `chatterbox.variant` GGUF metadata.  Supertonic
-GGUFs are also autodetected from `supertonic.arch` and routed to the
-Supertonic engine.
+`tts-cli` handles both Chatterbox variants via `chatterbox.variant` metadata.
+There is no separate `chatterbox` executable target. Supertonic and Parler
+GGUFs are autodetected from their architecture metadata.
 
 | Stage         | Turbo                                      | Multilingual                                        |
 |---------------|--------------------------------------------|-----------------------------------------------------|
@@ -173,8 +228,15 @@ Supertonic engine.
 | CFM solver    | Meanflow, 2 Euler steps                    | Standard, 10 Euler steps with `cfg_rate=0.7`        |
 | HiFT vocoder  | shared (same checkpoint format)            | shared (same checkpoint format)                     |
 
-One binary, one invocation, end to end — `scripts/synthesize.sh` is a
-thin convenience wrapper that fills in the two GGUF paths.
+The other synthesis pipelines are:
+
+| Family | Pipeline |
+|---|---|
+| Supertonic | text preprocessing → duration → text encoder → vector estimator → vocoder |
+| Parler | Flan-T5 description encoder → delay-pattern decoder → DAC |
+| CosyVoice3 | Qwen2.5 LM → DiT flow → CausalHiFT |
+| Audio8 | DualAR semantic/fast LM → 10-codebook codec decoder |
+| LavaSR | optional UL-UNAS denoiser → Vocos bandwidth-extension enhancer |
 
 ## Voice conditioning (cross-engine)
 
@@ -247,12 +309,12 @@ voice — e.g. Rohit for Hindi, Yash for Gujarati — for stable speakers).
 
 ```sh
 # convert (single GGUF: T5 + decoder + DAC + tokenizer; ~3.4 GB f32)
-python3 tts-cpp/scripts/parler/convert-to-gguf.py \
+python3 scripts/parler/convert-to-gguf.py \
     --model-id parler-tts/parler-tts-mini-v1 --dtype f32 \
-    --out tts-cpp/models/parler-mini-v1-f32.gguf
+    --out models/parler-mini-v1-f32.gguf
 
 # synthesize (also autodetected by tts-cli via parler.arch + --description)
-./build/parler-cli --model tts-cpp/models/parler-mini-v1-f32.gguf \
+./build/parler-cli --model models/parler-mini-v1-f32.gguf \
     --text "Hey, how are you doing today?" \
     --description "A female speaker with a calm, clear voice, close up." \
     --out out.wav
@@ -322,8 +384,9 @@ activation-weighted quantization via `scripts/parler/compute-imatrix.py` +
 (`ggml_quantize_chunk` via ctypes; auto-located, or pass `--ggml-lib`), so
 build tts-cpp first.  Quantized output diverges from the f32 parity
 fixtures by construction — validate by ear;
-`PARLER_TEST_REPORT_ONLY=1 test-parler-{t5,decoder}` prints the stage
-metrics without enforcing the f32 tolerance bars.
+`PARLER_TEST_REPORT_ONLY=1 ./build/test-parler-t5 MODEL.gguf REF_DIR` and
+the corresponding `test-parler-decoder` invocation print stage metrics without
+enforcing the f32 tolerance bars.
 
 Digits in the prompt are expanded to English words before tokenization
 ("12" → "twelve"): parler-v1 ships no text front-end and voices raw digits
@@ -345,10 +408,15 @@ Verification: `ctest -R test-parler` runs tokenizer/T5/decoder/delay/DAC/
 e2e parity against `.npy` fixtures produced by
 `scripts/parler/dump-reference.py` (HF PyTorch reference, greedy).  The
 greedy token trace matches HF exactly; the DAC waveform matches at
->120 dB SNR.  Default decoding is sampled (temperature 1.0, top-k 50, from
-`generation_config.json`); `--greedy` gives the deterministic parity path.
-Streaming synthesis is not offered yet (frames complete 8 steps late under
-the delay pattern and DAC decode is whole-sequence).
+>120 dB SNR. Default decoding is sampled (temperature 1.0, top-k 50, from
+`generation_config.json`). End-user `--greedy` and `top_k=1` requests are
+repaired to sampling with a warning because argmax does not terminate for this
+architecture; use `--seed` for reproducibility. Greedy is retained only inside
+the bounded parity harness.
+
+Streaming is available through the `parler::Engine` callback API using
+`stream_chunk_frames` and `stream_first_chunk_frames`. Neither `parler-cli` nor
+the limited `tts-cli` Parler route exposes those controls.
 
 ## Supertonic GGUF
 
@@ -361,17 +429,21 @@ measured so far: `91.4 ms` total, `RTF 0.029`, ~35x realtime on an M2 with the
 `q8_0` GGUF, ahead of ggml CPU, ONNX CPU, and ONNX CoreML on every stage that
 matters (see [`PROGRESS_SUPERTONIC.md`](PROGRESS_SUPERTONIC.md)).
 
-There are two related upstream bundles:
+There are three related upstream bundles:
 
 - `Supertone/supertonic` is the stable English bundle.  It should be used for
   English and does **not** wrap text in language tags.
 - `Supertone/supertonic-2` is the multilingual bundle.  It should use the
   open/close language-tag path (`<lang>...</lang>`).  The older prefix-only
   form (`<lang>... `) can make English prompts stutter.
+- `Supertone/supertonic-3` advertises 31 languages plus `na` for unknown source
+  language and uses the open/close language-tag path.
 
 Current status:
 
-- `scripts/dump-supertonic-reference.py` dumps ONNX Runtime reference tensors.
+- `scripts/dump-supertonic-reference.py` dumps ONNX Runtime reference tensors;
+  see [Fixtures and static validation](#fixtures-and-static-validation) for
+  the exact v2/v3 artifact layout.
 - `scripts/setup-supertonic2.sh` downloads the official Hugging Face bundle
   through `huggingface_hub` and writes the local GGUF.
 - `scripts/convert-supertonic2-to-gguf.py` writes `models/supertonic.gguf`
@@ -380,8 +452,8 @@ Current status:
   Chatterbox converters.
 - `build/tts-cli` autodetects Supertonic GGUFs from `supertonic.arch` and can
   synthesize a 44.1 kHz wav on CPU or GPU (`--n-gpu-layers`, with
-  `--vulkan-device` to pick an adapter).  `build/supertonic-cli` remains as a
-  focused compatibility/debug wrapper.
+  `--vulkan-device` to pick an adapter), but rejects Supertonic streaming
+  flags. `build/supertonic-cli` is the full batch/streaming surface.
 - All five stages pass numerical parity against the ONNX reference
   (preprocess, duration, text encoder, vector estimator, vocoder), and the
   full pipeline (`test-supertonic-pipeline`) reproduces the ONNX reference
@@ -473,6 +545,24 @@ python scripts/bench-supertonic-onnx.py \
   --lang en --language-wrap-mode open_close \
   --steps 5 --speed 1.05 --threads 1 --runs 5 --warmup 1 \
   --json-out artifacts/supertonic-onnx-bench.json
+```
+
+## CosyVoice3
+
+CosyVoice3 runs a Qwen2.5 speech-token LM, DiT conditional-flow-matching
+network, and CausalHiFT vocoder through `tts_cpp::cosyvoice::Engine`. The
+validated backends are CPU and OpenCL; `n_gpu_layers > 0` selects the OpenCL
+path and other GPU backends are not supported.
+
+Use `cosyvoice-cli` for end-to-end synthesis. The `cosyvoice-hift`,
+`cosyvoice-flow`, and `cosyvoice-llm` executables isolate stages, and
+`cosyvoice-bench` reports per-stage timing. The streaming callback currently
+chunks PCM only after the full utterance has been generated, so it preserves
+the callback shape but does not reduce first-audio latency.
+
+```bash
+./build/cosyvoice-cli --model-dir models/cosyvoice3-0.5b \
+  --text "Hello from CosyVoice3." --out out.wav
 ```
 
 ## Audio8
@@ -649,7 +739,7 @@ codec's native 44.1 kHz, and `--backends-dir` points a `GGML_BACKEND_DL` build
 at its backend libraries.  The reference wav is resampled and downmixed on the
 way in, so any format `dr_wav` reads will do.
 
-The same thing through the library, from `tts-cpp/audio8/engine.h`:
+The same thing through the library, from `<tts-cpp/audio8/engine.h>`:
 
 ```cpp
 tts_cpp::audio8::EngineOptions opts;
@@ -738,10 +828,100 @@ is the only one that runs on a checkout with no models.
 The engine test hands the cloning path a wav rather than pre-computed codes, so
 it exercises the codec encoder the way a caller would.
 
-## Prerequisites
+## LavaSR enhancement
 
-- C++17 compiler (clang or gcc)
-- cmake ≥ 3.14
+LavaSR is post-processing for synthesized or captured speech, not another
+text-to-speech engine. The denoiser uses a 16 kHz internal STFT and preserves
+the requested output rate; the bandwidth-extension enhancer emits 48 kHz.
+Public APIs are installed under `<tts-cpp/lavasr/>`, and `lavasr-bench`
+exercises the denoiser, enhancer, or two-stage pipeline. Backend support differs
+between the two stages, so use the capability matrix rather than assuming every
+compiled ggml backend applies to both.
+
+## Build paths
+
+Prerequisites are CMake 3.20 or newer, a C++17 compiler, and either an installed
+`ggml` CMake package from the `ggml-speech` port or a manually staged
+`qvac-ext-ggml@speech` checkout for the bundled path.
+
+| Path | Configure entry | ggml source | Main artifacts |
+|---|---|---|---|
+| Umbrella speech build | repository root, `-DSPEECH_BUILD_TTS=ON` | system `ggml` | `build/engines/tts/tts-cli` and sibling tools; library under `build/engines/tts/` |
+| Direct in-tree package | `engines/tts` | system `ggml`; `TTS_CPP_USE_SYSTEM_GGML=ON` is required | `engines/tts/build/tts-cli` and `engines/tts/build/libtts-cpp.*` |
+| Bundled ggml | `engines/tts` with `TTS_CPP_USE_SYSTEM_GGML=OFF` | manually staged `engines/tts/ggml` checkout of `qvac-ext-ggml@speech` | `engines/tts/build-bundled/tts-cli` and `engines/tts/build-bundled/libtts-cpp.*` |
+| vcpkg consumer | `tts-cpp` port | `ggml-speech` dependency | `<vcpkg>/installed/<triplet>/lib/` (or `debug/lib/`), headers under `include/tts-cpp/`, config under `share/tts-cpp/` |
+
+The bundled path has no downloader in this tree and applies no patch overlay.
+Use a reviewed checkout of the speech branch at the required path. The separate
+`chatterbox.cpp` repository has its own pinned bundled-ggml setup flow and
+produces artifacts under its own `build/`.
+
+### Umbrella build
+
+From the repository root:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH=/path/to/ggml-speech/install \
+  -DSPEECH_BUILD_TTS=ON
+cmake --build build --target tts-cli
+```
+
+`SPEECH_BUILD_EXECUTABLES` controls all engine CLIs and defaults to `ON`;
+`SPEECH_BUILD_TESTS` controls TTS test harnesses and defaults to `OFF`.
+
+### Direct in-tree build
+
+From the repository root:
+
+```bash
+cmake -S engines/tts -B engines/tts/build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH=/path/to/ggml-speech/install
+cmake --build engines/tts/build --target tts-cli
+```
+
+The detailed commands below assume `cd engines/tts`, so direct-build
+executables are shown as `build/<name>`.
+
+### Bundled-ggml build
+
+After manually staging `qvac-ext-ggml@speech` as `engines/tts/ggml`:
+
+```bash
+cmake -S engines/tts -B engines/tts/build-bundled \
+  -DCMAKE_BUILD_TYPE=Release -DTTS_CPP_USE_SYSTEM_GGML=OFF
+cmake --build engines/tts/build-bundled --target tts-cli
+```
+
+### Windows and multi-config generators
+
+Use a Developer PowerShell or Developer Command Prompt and quote paths:
+
+```powershell
+cmake -S engines/tts -B engines/tts/build `
+  -DCMAKE_TOOLCHAIN_FILE=C:\src\vcpkg\scripts\buildsystems\vcpkg.cmake
+cmake --build engines/tts/build --config Release --target tts-cli
+engines\tts\build\Release\tts-cli.exe --help
+ctest --test-dir engines/tts/build -C Release -L unit --output-on-failure
+```
+
+Visual Studio and other multi-config generators place executables under
+`Release\` (or the selected configuration) and require `ctest -C Release`.
+Single-config Ninja/Make generators use the artifact paths in the table.
+
+### vcpkg consumer
+
+The port installs the library and public headers, not the development CLIs:
+
+```cmake
+find_package(tts-cpp CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE tts-cpp::tts-cpp)
+```
+
+### Conversion tooling
+
+- C++17 compiler (clang, gcc, or MSVC)
+- CMake 3.20 or newer
 - Python 3.10+ with `torch`, `numpy`, `onnx`, `gguf`, `huggingface_hub`,
   `safetensors`, `scipy`, `librosa`, `resampy` — needed **once**, at setup time only, to run the
   weight converters (which bake the precomputed mel filterbanks into the
@@ -759,7 +939,7 @@ pip install onnx gguf huggingface_hub safetensors scipy librosa resampy
 cd -
 ```
 
-## 1. Build from the qvac speech stack
+### In-tree system-ggml details
 
 This in-tree subtree is built against the [`ggml-speech`](https://github.com/tetherto/qvac-registry-vcpkg)
 vcpkg port (which vendors the [`qvac-ext-ggml/speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech)
@@ -773,30 +953,21 @@ find_package(tts-cpp CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE tts-cpp::tts-cpp)
 ```
 
-For development out of this in-tree subtree (running the parity
-harnesses, prototyping API changes, etc.) the canonical build is the
-**bundled-ggml dev flow**:
+For development in this tree (running parity harnesses, prototyping API
+changes, and inspecting CLIs), use the direct in-tree system-ggml flow:
 
 ```bash
-bash tts-cpp/scripts/setup-ggml.sh    # clones qvac-ext-ggml@speech into tts-cpp/ggml/
-cmake -S tts-cpp -B tts-cpp/build -DCMAKE_BUILD_TYPE=Release \
-  -DTTS_CPP_USE_SYSTEM_GGML=OFF
-cmake --build tts-cpp/build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH=/path/to/ggml-speech/install
+cmake --build build --target tts-cli
 ```
 
-`setup-ggml.sh` checks out the pinned tetherto/qvac-ext-ggml@speech
-commit (which already carries every QVAC infrastructure patch + the
-Supertonic 2 fused custom op family — no `patches/` overlay needed).
-CMakeLists's `add_subdirectory(ggml)` path then consumes it directly
-with `GGML_NATIVE=ON` for native ARM/SIMD codegen — typically ~10%
-faster on M-series than the vcpkg-port flavor's portable build.
-
-Downstream production builds use the system-installed `ggml` instead:
+Downstream production builds normally use the vcpkg toolchain:
 
 ```bash
-cmake -S tts-cpp -B tts-cpp/build -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE=<vcpkg_root>/scripts/buildsystems/vcpkg.cmake
-cmake --build tts-cpp/build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+cmake --build build --target tts-cpp
 ```
 
 `TTS_CPP_USE_SYSTEM_GGML` defaults to `ON` for this flow, finding
@@ -816,12 +987,13 @@ override with `-D<flag>=...` at configure time):
 |------|---------|---------|
 | `TTS_CPP_BUILD_LIBRARY` | `ON` | Build the `tts-cpp` library target itself (linkage controlled by `TTS_CPP_BUILD_SHARED`, not `BUILD_SHARED_LIBS` — see below) |
 | `TTS_CPP_BUILD_SHARED` | `OFF` | Build `tts-cpp` as `SHARED` instead of `STATIC`. Decoupled from `BUILD_SHARED_LIBS` because ggml's own CMake declares its own `option(BUILD_SHARED_LIBS)` defaulting to `ON` on Windows non-MinGW; using a project-namespaced option keeps the two independent. The supertonic test/bench harnesses link against `tts-cpp` directly and use detail-namespaced symbols outside the `TTS_CPP_API` public surface, so `SHARED` builds hide them and disable those targets — leave OFF for development, flip ON only for downstream packaging where the test harnesses aren't built |
-| `TTS_CPP_BUILD_EXECUTABLES` | `ON` standalone / `OFF` subdir | `tts-cli`, `mel2wav`, `supertonic-cli`, `supertonic-bench` |
+| `TTS_CPP_BUILD_EXECUTABLES` | `ON` standalone / `OFF` subdir | `tts-cli`, `mel2wav`, `cosyvoice-hift`, `cosyvoice-flow`, `cosyvoice-llm`, `cosyvoice-cli`, `cosyvoice-bench`, `supertonic-cli`, `parler-cli`, `parler-bench`, `lavasr-bench`, and `audio8-cli` |
 | `TTS_CPP_BUILD_TESTS` | `ON` standalone / `OFF` subdir | `test-*` parity / unit harnesses, registered with CTest (label-filterable via `ctest -L unit` / `ctest -L fixture` / `ctest -L gpu`) |
 | `TTS_CPP_INSTALL` | `ON` | Generate `install` rules + the `tts-cpp` CMake package config so consumers can `find_package(tts-cpp CONFIG REQUIRED)` |
-| `TTS_CPP_USE_SYSTEM_GGML` | `ON` (this in-tree subtree) | `find_package(ggml CONFIG REQUIRED)` against the QVAC speech-stack `ggml-speech` vcpkg port (the [`qvac-ext-ggml/speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech) branch). Flipping `OFF` is rejected at configure time here because the standalone `patches/` directory is intentionally absent. The standalone `chatterbox.cpp` repo defaults this to `OFF` for its bundled-ggml dev flow |
-| ~~`TTS_CPP_GGML_LIB_PREFIX`~~ | n/a in this subtree | The standalone `chatterbox.cpp` repo exposes this option to rename bundled `libggml-*` to `libspeech-ggml-*`.  This in-tree subtree consumes ggml exclusively from the `ggml-speech` vcpkg port, which already emits the `libspeech-ggml-*` filenames at its own build time, so the option / helper / loop are dropped here and the file-prefix surface is whatever vcpkg installs |
+| `TTS_CPP_USE_SYSTEM_GGML` | `ON` | Use `find_package(ggml CONFIG REQUIRED)` against `ggml-speech`. `OFF` uses `add_subdirectory(ggml)` and requires a manually staged `engines/tts/ggml` checkout of `qvac-ext-ggml@speech`; no setup script or patch overlay is present |
+| ~~`TTS_CPP_GGML_LIB_PREFIX`~~ | n/a in this subtree | The standalone `chatterbox.cpp` repo exposes this option to rename bundled `libggml-*` to `libspeech-ggml-*`. This in-tree package does not expose the option: system builds use the filenames installed by `ggml-speech`, while bundled builds use the filenames produced by the manually staged speech-branch checkout |
 | `TTS_CPP_CCACHE` | `ON` | Use ccache as compiler launcher for `tts-cpp`'s own targets when `find_program(ccache)` succeeds. Scoped per target; ggml's independent `GGML_CCACHE` option handles the ggml subdirectory |
+| `TTS_CPP_OPENMP` | `ON` | Link OpenMP when available. On Windows non-MinGW builds it is forced `OFF` to avoid clang-cl/MSVC and msys2 `libgomp` incompatibilities; advanced callers can explicitly set both `TTS_CPP_OPENMP_USER_OVERRIDE=ON` and `TTS_CPP_OPENMP=ON` |
 
 When tests are enabled, the build also exposes three cache-overridable
 fixture roots that the registered ctest entries resolve against:
@@ -837,15 +1009,28 @@ auto-marked `DISABLED` (they still appear in `ctest -N` output but
 return `Not Run` instead of failing), so a fresh checkout still gives
 a green `ctest` run on the harnesses whose fixtures it does have.
 
-This produces the end-to-end binary plus a set of per-stage validation
-harnesses:
+## Command-line tools
+
+`TTS_CPP_BUILD_EXECUTABLES` creates:
 
 | Binary | What it does |
 |--------|--------------|
-| `build/tts-cli`            | End-to-end Chatterbox text → speech tokens (T3) → wav (S3Gen + HiFT), plus Supertonic text → wav. Handles Chatterbox voice cloning via `--reference-audio`, autodetects Chatterbox Turbo/Multilingual from `chatterbox.variant`, and autodetects Supertonic from `supertonic.arch`. |
-| `build/mel2wav`               | HiFT only: mel.npy → wav (demo) |
-| `build/supertonic-cli`        | Supertonic-only end-to-end CLI (text → wav) — the same engine `tts-cli` invokes when it sees a Supertonic GGUF, exposed standalone for scripting and parity work |
-| `build/supertonic-bench`      | Per-stage Supertonic benchmark harness (`--text` / `--out` / `--runs`); machine-readable RTF + per-stage timings |
+| `build/tts-cli` | Chatterbox batch/streaming, Supertonic batch, and limited Parler batch dispatch |
+| `build/mel2wav` | Chatterbox HiFT-only mel-to-WAV demo |
+| `build/cosyvoice-hift` / `cosyvoice-flow` / `cosyvoice-llm` | CosyVoice3 stage tools |
+| `build/cosyvoice-cli` / `cosyvoice-bench` | CosyVoice3 end-to-end synthesis and benchmark |
+| `build/supertonic-cli` | full Supertonic batch and streaming CLI |
+| `build/parler-cli` / `parler-bench` | Parler end-to-end synthesis and benchmark |
+| `build/lavasr-bench` | LavaSR denoiser/enhancer benchmark and by-ear harness |
+| `build/audio8-cli` | Audio8 text-to-speech and zero-shot voice cloning |
+
+`supertonic-bench` is built only by `TTS_CPP_BUILD_TESTS`; it is not in the
+executable gate. The tests also produce the following representative
+validation harnesses:
+
+| Binary | What it does |
+|--------|--------------|
+| `build/supertonic-bench` | Per-stage Supertonic benchmark harness (`--text` / `--out` / `--runs`); machine-readable RTF + per-stage timings |
 | `build/test-s3gen`            | Staged numerical validation of S3Gen encoder + CFM vs Python dumps |
 | `build/test-resample`         | Round-trip SNR of the C++ Kaiser-windowed sinc resampler + output-frequency helpers (validate / passthrough / ratio) |
 | `build/test-output-sample-rate` | `--output-sample-rate` on `chatterbox::Engine`: native/16 kHz batch, out-of-range rejection, streaming `pcm == concat(chunks)` invariant (needs the MTL GGUFs) |
@@ -864,11 +1049,9 @@ harnesses:
 | `build/test-supertonic-*`     | Per-stage Supertonic parity harnesses (`preprocess`, `vocoder` ± `trace` / `pointwise`, `duration` ± `trace`, `text-encoder` ± `trace`, `vector` ± `trace`, `pipeline`); each takes `MODEL.gguf REF_DIR` |
 | `build/test-metal-ops`        | Metal-only: parity check for `diag_mask_inf`, `pad_ext`, and fast `conv_transpose_1d` (only useful when built with `-DGGML_METAL=ON`) |
 
-You'll normally only need `build/tts-cli`; the `test-*` binaries are
-there for the staged-verification methodology in `PROGRESS.md`, and
-register with CTest so you can run `ctest -C Release -L unit` /
-`ctest -C Release -L fixture` from the build directory after fixtures
-are in place.
+The test targets register with CTest. From a single-config build directory use
+`ctest -L unit` or `ctest -L fixture`; with Visual Studio or another
+multi-config generator add `-C Release`.
 
 ### How `TTS_CPP_USE_SYSTEM_GGML=ON` resolves ggml
 
@@ -882,11 +1065,11 @@ repo applies via `patches/` - the `qvac-ext-ggml/speech` branch
 carries them pre-applied so consumers don't maintain a patch trail.
 This shape mirrors `stable-diffusion.cpp`'s `SD_USE_SYSTEM_GGML`.
 
-## 2. One-time: convert weights
+## One-time: convert weights
 
 ```bash
-# Activate the Python environment from the Prerequisites step
-. ../chatterbox-ref/.venv/bin/activate
+# Activate the Python environment from the Conversion tooling step
+. chatterbox-ref/.venv/bin/activate
 
 # --- Turbo (English, default) ---
 python scripts/convert-t3-turbo-to-gguf.py --out models/chatterbox-t3-turbo.gguf
@@ -1034,7 +1217,7 @@ Pass the quantized GGUFs to `tts-cli` exactly like the defaults:
   --n-gpu-layers 99 --out out.wav
 ```
 
-## 3. Run — end-to-end text → wav
+## Run — end-to-end text → wav
 
 The easiest way:
 
@@ -1257,8 +1440,9 @@ inference cost (well under real-time on any GPU backend).
 
 - `--seed N` — change the RNG seed for the CFM initial noise and the SineGen
   excitation (same text, different voice "take").
-- `--threads N` — override the default `std::thread::hardware_concurrency()`.
-  The sweet spot on a 10-core CPU is 10.
+- `--threads N` — override the CLI default, which caps automatic selection at
+  4. Library Chatterbox, Parler, and Audio8 engines use the same cap; do not
+  infer CosyVoice stage threading from this flag.
 - `--n-gpu-layers N` — move layers to the GPU backend when built with
   `-DGGML_METAL=ON` / `-DGGML_CUDA=ON` / `-DGGML_VULKAN=ON`.  Pass `99`
   (or any large number) to move everything.
@@ -1468,10 +1652,10 @@ Any non-zero `--stream-chunk-tokens N` turns streaming on.
 - `--stream-first-chunk-tokens N` — override the *first* chunk's size
   so first-audio-out lands early while later chunks stay big and keep
   overall RTF low.  Typical: 10.
-- `--stream-cfm-steps N` — CFM Euler step count.  Default 2 (matches
-  Python meanflow).  `1` halves CFM cost with a small quality penalty;
-  Turbo's meanflow training makes 1-step a valid sampling mode per the
-  paper.
+- `--stream-cfm-steps N` — CFM Euler step count. Turbo defaults to 2 and
+  supports 1 or 2; one step trades some quality for lower cost.
+  Multilingual uses standard CFM, and streaming requests below its model
+  timestep count are floored to 10.
 - `--out -` — emit raw `s16le` mono @ 24 kHz to stdout instead of
   writing a wav file, so the output can be piped straight into a
   player.
@@ -1533,7 +1717,48 @@ For the full journal of how streaming got there — bit-exact CFM parity,
 `cache_source` + `trim_fade` port, `--out -` stdout wiring, per-chunk
 tuning — see [`PROGRESS.md §B1`](PROGRESS.md).
 
-## 4. Optional: validate against PyTorch
+## Fixtures and static validation
+
+The checkout includes the model-free voice-clone metric fixtures under
+`test/fixtures/voiceclone/v1` and the public-domain JFK voice reference under
+`test/reference-audio`. Model-dependent fixtures remain optional:
+
+```bash
+python scripts/dump-s3gen-reference.py --out artifacts/s3gen-ref
+python scripts/dump-supertonic-reference.py \
+  --onnx-dir /path/to/supertonic/onnx \
+  --assets-dir /path/to/supertonic/assets \
+  --voice-style /path/to/supertonic/assets/voice_styles/M1.json \
+  --lang en --out artifacts/supertonic-ref-quick
+```
+
+For Supertonic 3, use the same existing dumper interface once per language,
+pointing `--onnx-dir`, `--assets-dir`, and `--voice-style` at the v3 bundle:
+
+```bash
+python scripts/dump-supertonic-reference.py \
+  --onnx-dir /path/to/supertonic-3/onnx \
+  --assets-dir /path/to/supertonic-3/assets \
+  --voice-style /path/to/supertonic-3/assets/voice_styles/M1.json \
+  --lang en --out artifacts/supertonic3-ref-en
+```
+
+The current dumper accepts the legacy five-language `--lang` choices. Generate
+`en`, `ko`, `es`, `pt`, and `fr` for the registered Supertonic 3 parity suite;
+the model-free `test-supertonic-languages` target covers the complete v3
+language registry.
+
+For quantized Parler inspection, report-only mode is an environment variable
+on the individual harness executable:
+
+```bash
+PARLER_TEST_REPORT_ONLY=1 ./build/test-parler-t5 MODEL.gguf REF_DIR
+PARLER_TEST_REPORT_ONLY=1 ./build/test-parler-decoder MODEL.gguf REF_DIR
+```
+
+Do not treat `ctest -N` or disabled fixture registrations as executed tests.
+
+### Optional: validate against Python references
 
 Every stage of the pipeline has a numerical regression test against
 Python-dumped reference tensors:
@@ -1574,7 +1799,7 @@ python scripts/reference-t3-turbo.py \
 ## Repository layout
 
 ```
-tts-cpp/                         in-tree subtree of github.com/gianni-cor/chatterbox.cpp
+engines/tts/                     multi-engine TTS and enhancement package
   include/tts-cpp/               installed public headers (Engine API)
     tts-cpp.h                    library entry; declares tts_cpp_cli_main()
     chatterbox/engine.h          Engine + EngineOptions (text → wav)
@@ -1650,9 +1875,7 @@ tts-cpp/                         in-tree subtree of github.com/gianni-cor/chatte
     gen-audio8-unicode-tables.py generates src/audio8/unicode_tables.inc
     reference-t3-turbo.py        PyTorch T3 bit-exact compare vs C++
     compare-tokenizer.py         10-case BPE tokenizer compare vs HF
-  (no patches/ in this in-tree subtree - the standalone chatterbox.cpp
-   repo ships ggml patches under patches/; here ggml comes pre-patched
-   from the ggml-speech vcpkg port and tts-cpp doesn't carry them.)
+  (no local ggml/ or patches/; ggml comes from the system ggml-speech package)
   voices/                        baked voice profiles (not tracked; populated
                                    by --save-voice)
   models/                        generated GGUFs (not tracked)
@@ -1663,6 +1886,34 @@ tts-cpp/                         in-tree subtree of github.com/gianni-cor/chatte
 ```
 
 ## Troubleshooting
+
+**`TTS_CPP_USE_SYSTEM_GGML=OFF` reports a missing `engines/tts/ggml`** — this
+tree has no downloader. Manually stage a reviewed `qvac-ext-ggml@speech`
+checkout there, or install `ggml-speech`, set `CMAKE_PREFIX_PATH` or use the
+vcpkg toolchain, and leave the option enabled.
+
+**A CLI is not under `build/`** — umbrella builds place it under
+`build/engines/tts/`. Visual Studio builds add the selected configuration
+directory, for example `engines\tts\build\Release\audio8-cli.exe`.
+
+**CTest cannot find a Release executable on Windows** — pass `-C Release` to
+CTest when the generator is multi-config.
+
+**Supertonic streaming flags fail in `tts-cli`** — this is intentional. Use
+`supertonic-cli`; the umbrella dispatcher supports only batch Supertonic.
+
+**Parler `--greedy` warns and still samples** — argmax does not reach a
+terminating sequence for this architecture. Keep sampling and set `--seed` for
+reproducible runs.
+
+**CosyVoice3 callback chunks arrive only after generation** — the callback
+currently slices completed PCM. It does not provide incremental
+first-audio latency.
+
+**A fixture-backed test is disabled** — configure output names each missing
+GGUF, WAV, or reference directory. Set `TTS_CPP_TEST_MODEL_DIR`,
+`TTS_CPP_TEST_AUDIO_DIR`, and `TTS_CPP_TEST_REF_DIR` to populated roots, then
+reconfigure. `ctest -N` lists registrations but does not execute them.
 
 **`error: this GGUF has no embedded tokenizer`** — you're running against
 a legacy T3 GGUF built before the tokenizer was embedded. Re-run the
@@ -1699,15 +1950,15 @@ longer sentence and compare RMS. Differences up to ~2.5 % in spectrogram
 magnitude are from the stochastic SineGen excitation (non-bit-exact RNG
 between `std::mt19937` and `torch.rand`).
 
-**Slower than real-time** — make sure you built `-DCMAKE_BUILD_TYPE=Release`
-and that `--threads` picks up all your cores. The binary defaults to
-`std::thread::hardware_concurrency()`.
+**Slower than real-time** — make sure you built a Release configuration,
+requested an available backend, and selected an appropriate `--threads` value.
+Most TTS CLI and engine defaults cap automatic CPU threads at 4 because these
+graphs can regress under oversubscription; more threads are not automatically
+faster.
 
 ## License
 
-Released under the [MIT License](LICENSE) — Copyright (c) 2026 Gianfranco
-Cordella. The bundled `ggml/` is also MIT-licensed
-([ggml/LICENSE](ggml/LICENSE)). The upstream Python implementation
-([Chatterbox](https://github.com/resemble-ai/chatterbox), Copyright (c) 2025
-Resemble AI) is likewise MIT-licensed; see `LICENSE` for the third-party
-attribution block.
+The package code is released under the [MIT License](LICENSE). Models and
+conversion-time dependencies retain their own terms; see [NOTICE](NOTICE) for
+canonical upstream sources and license identities. This in-tree package does
+not bundle ggml.

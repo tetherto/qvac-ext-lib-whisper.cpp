@@ -2,11 +2,11 @@
 
 // Persistent CosyVoice3 engine (Fun-CosyVoice3-0.5B / 1.5B).
 //
-// Native C++/ggml, CPU implementation of the Fun-CosyVoice3 back-half, under the
-// same public API as the Chatterbox / Supertonic engines so the JS addon +
-// @qvac/sdk flow works end-to-end.  synthesize() returns real 24 kHz speech.
+// Native C++/ggml implementation of Fun-CosyVoice3 on CPU or the validated
+// OpenCL GPU path. It uses the same persistent Engine shape as the other
+// synthesis families and returns 24 kHz speech.
 //
-// Pipeline (CPU path):
+// Pipeline:
 //   text --(Qwen2 BPE tokenizer)--> Qwen2.5 LM --> speech tokens [0, 6561)
 //        --> DiT conditional-flow-matching (Euler ODE) --> mel
 //        --> CausalHiFT vocoder --> 24 kHz mono PCM
@@ -27,7 +27,7 @@
 //
 //     EngineOptions opts;
 //     opts.model_dir     = "models/cosyvoice3-0.5b";
-//     opts.n_gpu_layers  = 0;                 // 0 = CPU (iteration 1 is CPU-only)
+//     opts.n_gpu_layers  = 0;                 // 0 = CPU; >0 = OpenCL
 //
 //     Engine engine(opts);
 //     auto result = engine.synthesize("Hello world.");
@@ -279,7 +279,7 @@ public:
     // Registered name of the resolved backend ("CPU", "Metal", ...).
     std::string backend_name() const;
 
-    // Resolved compute device (CPU — iteration 1 is CPU-only).
+    // Resolved compute device (CPU or OpenCL).
     BackendDevice backend_device() const;
 
     // True when a GPU device was present but unusable (fell back to CPU).

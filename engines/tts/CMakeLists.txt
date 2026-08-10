@@ -15,20 +15,16 @@ endif()
 
 option(TTS_CPP_BUILD_LIBRARY     "tts-cpp: build the tts-cpp library"                        ON)
 option(TTS_CPP_BUILD_SHARED      "tts-cpp: build tts-cpp as a SHARED library (otherwise STATIC). Defaults to OFF; the test harnesses (test-mtl-tokenizer, test-supertonic-*) link against tts-cpp directly and use detail-namespaced symbols outside the TTS_CPP_API public surface, so SHARED hides them and disables those targets. Decoupled from BUILD_SHARED_LIBS because ggml's own CMake declares its own option(BUILD_SHARED_LIBS) which pollutes the cache with a platform-dependent default once any configure has run; using a project-namespaced option keeps the two independent and prevents a second configure from silently flipping linkage." OFF)
-option(TTS_CPP_BUILD_EXECUTABLES "tts-cpp: build the tts-cli executable + mel2wav demo"     ${TTS_CPP_STANDALONE_DEFAULT})
+option(TTS_CPP_BUILD_EXECUTABLES "tts-cpp: build tts-cli, mel2wav, CosyVoice, Supertonic, Parler, LavaSR, and Audio8 command-line tools" ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_BUILD_TESTS       "tts-cpp: build per-stage numerical validation harnesses"   ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_INSTALL           "tts-cpp: generate install rules"                           ON)
-option(TTS_CPP_USE_SYSTEM_GGML   "tts-cpp: use system-installed GGML library (find_package(ggml) instead of add_subdirectory(ggml)). Defaults to ON in this in-tree subtree of qvac-ext-lib-whisper.cpp because the standalone setup-ggml.sh + patches/ tooling has been dropped here; the QVAC speech-stack vcpkg port `ggml-speech` ships a pre-patched ggml from the qvac-ext-ggml/speech branch and is the canonical source-of-truth for builds out of this tree.  Flipping OFF in this tree is rejected at configure time (no patches/ to apply); use the standalone github.com/gianni-cor/chatterbox.cpp repo if you need a bundled-ggml dev build." ON)
+option(TTS_CPP_USE_SYSTEM_GGML   "tts-cpp: use find_package(ggml) instead of add_subdirectory(ggml). Defaults to ON for qvac-ext-lib-whisper.cpp and vcpkg builds. OFF requires a manually staged engines/tts/ggml checkout of qvac-ext-ggml@speech; this tree has no setup-ggml.sh or patches overlay." ON)
 # Note: the standalone chatterbox.cpp repo carries a TTS_CPP_GGML_LIB_PREFIX
 # option here that controls renaming of bundled libggml-*.so to
-# libspeech-ggml-*.so when add_subdirectory(ggml) builds it locally.  In
-# this in-tree subtree that path is rejected at configure time (the
-# patches/ folder is intentionally absent; see TTS_CPP_USE_SYSTEM_GGML
-# below), so the option, the helper function, and the foreach prefix
-# loop that used to live here would all be unreachable code.  Dropped
-# entirely; the `ggml-speech` vcpkg port emits the renamed filenames
-# itself, so consumers picking up tts-cpp through find_package never
-# see the standalone bundled-rename path.
+# libspeech-ggml-*.so when add_subdirectory(ggml) builds it locally. This
+# in-tree package can consume a manually staged speech-branch checkout but
+# does not expose the standalone filename-prefix option; the speech branch or
+# `ggml-speech` vcpkg port already emits the integrated filenames.
 option(TTS_CPP_CCACHE            "tts-cpp: use ccache as compiler launcher if available"     ON)
 
 # ccache shaves ~30 % off iterative rebuild time on developer machines.
@@ -170,15 +166,14 @@ if (NOT TARGET ggml)
         # fork carrying every infrastructure patch + the Supertonic 2
         # fused custom op family as commits (not as a patches/ overlay).
         #
-        # Run `bash tts-cpp/scripts/setup-ggml.sh` first to clone +
-        # check out the pinned commit.  No patches/ directory is
-        # consulted: the speech branch is already pre-patched at the
-        # commit level.
+        # Stage the checkout manually at `engines/tts/ggml/`. No patches/
+        # directory is consulted: the speech branch is already patched at
+        # the commit level.
         if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ggml/CMakeLists.txt")
             message(FATAL_ERROR
-                "tts-cpp: bundled-ggml build requires tts-cpp/ggml/ to be "
-                "a checkout of tetherto/qvac-ext-ggml@speech.  Run "
-                "`bash tts-cpp/scripts/setup-ggml.sh` first, or pass "
+                "tts-cpp: bundled-ggml build requires engines/tts/ggml/ to be "
+                "a manually staged checkout of tetherto/qvac-ext-ggml@speech. "
+                "Populate that directory, or pass "
                 "-DTTS_CPP_USE_SYSTEM_GGML=ON to consume the QVAC "
                 "speech-stack `ggml-speech` vcpkg port.")
         endif()
@@ -186,15 +181,12 @@ if (NOT TARGET ggml)
     endif()
 endif()
 
-# The bundled-ggml filename-prefix block (helper function +
-# tts_cpp_apply_ggml_prefix loop + GGML_BACKEND_DL_PROJECT_PREFIX
-# define) used to live here in the standalone chatterbox.cpp source.
-# Removed in this in-tree subtree: the bundled add_subdirectory(ggml)
-# path is rejected above when patches/ is absent, and find_package
-# (TTS_CPP_USE_SYSTEM_GGML=ON, the default here) consumes a ggml
-# whose filenames + macro are already set by the ggml-speech vcpkg
-# port at its build time.  See the standalone chatterbox.cpp repo if
-# you need the locally-rename flow.
+# The standalone chatterbox.cpp source carries a bundled-ggml filename-prefix
+# block (helper function, tts_cpp_apply_ggml_prefix loop, and
+# GGML_BACKEND_DL_PROJECT_PREFIX define). This in-tree package does not expose
+# that rename surface. System builds consume filenames and macros installed by
+# the ggml-speech port; bundled builds use the filenames produced by the
+# manually staged speech-branch checkout.
 
 option(TTS_CPP_OPENMP "tts-cpp: enable OpenMP for the tts-cpp target" ON)
 if (WIN32 AND NOT MINGW AND TTS_CPP_OPENMP AND NOT DEFINED CACHE{TTS_CPP_OPENMP_USER_OVERRIDE})
@@ -1845,10 +1837,10 @@ if (TTS_CPP_BUILD_TESTS)
     # The harnesses above are arch-agnostic: they take (MODEL.gguf REF_DIR)
     # and don't care which Supertonic generation produced them.  We re-use
     # those same binaries (via `EXE`) to also run them against a Supertonic
-    # 3 GGUF plus per-language ONNX-Runtime references.  Stage the data with
-    #     scripts/fetch-supertonic3-testdata.sh
-    # (or, once published, the QVAC S3 model registry) and point the build
-    # at it:
+    # 3 GGUF plus per-language ONNX-Runtime references. Generate each dump
+    # with scripts/dump-supertonic-reference.py using the Supertonic 3
+    # ONNX/assets/voice-style paths documented in README.md, stage the
+    # converted GGUF, and point the build at them:
     #     -DTTS_CPP_TEST_MODEL_DIR=<staging>/models
     #     -DTTS_CPP_TEST_REF_DIR=<staging>/artifacts
     # Each registration auto-DISABLEs when its GGUF / reference dump is

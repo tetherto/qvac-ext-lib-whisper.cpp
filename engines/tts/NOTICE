@@ -1,110 +1,134 @@
-chatterbox.cpp
+tts-cpp
 Copyright 2026 QVAC contributors
 
-This product includes third-party components under their respective
-licenses. chatterbox.cpp itself is licensed under MIT; bundled
-dependencies are governed by the licenses listed below. Python packages
-listed under Python Dependencies are optional and apply only to scripts/
-(conversion and offline reference tooling), not to C++ inference binaries.
+The tts-cpp package code is licensed under MIT. It is the multi-engine
+engines/tts component of qvac-ext-lib-whisper.cpp, not a bundled copy of one
+model project. Model checkpoints, upstream reference implementations, and
+optional conversion-time Python packages remain under their own licenses.
+No model weights are distributed in this source directory.
 
 =========================================================================
-Upstream model code
+Upstream model and reference implementations
 =========================================================================
 
---- mit (MIT License) ---
+MIT
 
-  Resemble Chatterbox (T3 + S3Gen + HiFT)
-    https://github.com/resemble-ai/chatterbox
-    The C++ port in src/chatterbox_*.cpp / src/t3_mtl.cpp /
-    src/voice_features.cpp / src/voice_encoder.cpp / src/campplus.cpp /
-    src/s3tokenizer.cpp re-implements the Resemble Chatterbox PyTorch
-    inference path on top of ggml.
+  Resemble Chatterbox Turbo and Multilingual
+    Code: https://github.com/resemble-ai/chatterbox
+    Models: https://huggingface.co/ResembleAI/chatterbox-turbo
+            https://huggingface.co/ResembleAI/chatterbox
+    The upstream repository and model cards identify the code and weights as
+    MIT-licensed. The native implementation covers T3, S3Gen, HiFT, voice
+    encoders, tokenizers, and voice-feature preprocessing.
 
---- mit (MIT License) ---
+MIT sample code; BigScience OpenRAIL-M model weights
 
-  Supertonic (text encoder + duration + vector estimator + vocoder)
+  Supertone Supertonic 1, 2, and 3
     https://huggingface.co/Supertone/supertonic
-    The C++ port in src/supertonic_*.cpp re-implements the Supertonic
-    ONNX inference path on top of ggml; the model weights themselves
-    ship under their own license (consult the HuggingFace repo).
+    https://huggingface.co/Supertone/supertonic-2
+    https://huggingface.co/Supertone/supertonic-3
+    The canonical model cards identify sample code as MIT and accompanying
+    model weights as OpenRAIL-M. The native implementation covers text
+    preprocessing, duration, text encoder, vector estimator, and vocoder.
 
---- apache-2.0 (Apache License 2.0) ---
+Apache License 2.0
 
-  CosyVoice / Fun-CosyVoice3 (FunAudioLLM, Alibaba)
+  Parler-TTS Mini/Large and Indic Parler-TTS
+    https://github.com/huggingface/parler-tts
+    https://huggingface.co/parler-tts/parler-tts-mini-v1
+    https://huggingface.co/parler-tts/parler-tts-large-v1
+    https://huggingface.co/ai4bharat/indic-parler-tts
+    The canonical model cards identify these model weights as Apache-2.0.
+
+  FunAudioLLM CosyVoice / Fun-CosyVoice3-0.5B-2512
     https://github.com/FunAudioLLM/CosyVoice
     https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512
-    The C++ port in src/cosyvoice_engine.cpp (and, as the pipeline lands,
-    the Qwen2.5 LM / DiT flow / CausalHiFT graphs) re-implements the
-    CosyVoice3 PyTorch inference path on top of ggml. Code and weights are
-    Apache-2.0, including the constituent Qwen2.5-0.5B LM and the CAM++
-    speaker encoder. Text normalization is planned to use the Apache-2.0
-    wetext / WeTextProcessing frontend (https://github.com/wenet-e2e/WeTextProcessing)
-    -- not yet integrated/linked (the `language` option is reserved); the
-    closed-source CosyVoice-ttsfrd frontend is deliberately NOT used.
+    The canonical repository and model card identify the code and weights as
+    Apache-2.0. The closed-source CosyVoice-ttsfrd frontend is not linked or
+    redistributed by this package.
+
+  Audio8 TTS Preview 0.6B
+    https://github.com/Audio8-AI/Audio8_TTS
+    https://huggingface.co/Audio8/Audio8-TTS-Preview-0.6b
+    The canonical model card identifies code and weights as Apache-2.0 and
+    points to the upstream NOTICE for additional attribution:
+    https://github.com/Audio8-AI/Audio8_TTS/blob/master/NOTICE
+
+  LavaSR
+    https://github.com/ysharma3501/LavaSR
+    https://huggingface.co/YatharthS/LavaSR
+    The canonical repository and model card identify code and weights as
+    Apache-2.0.
 
 =========================================================================
-C++ Dependencies
+C++ dependencies
 =========================================================================
 
---- mit (MIT License) ---
+MIT
 
-  ggml
-    https://github.com/ggml-org/ggml
-    Vendored under ggml/ at the pinned commit declared in
-    scripts/setup-ggml.sh; chatterbox.cpp ships its local fixes as
-    standalone patches under patches/ rather than maintaining a fork.
-
---- mit (MIT License) ---
+  ggml-speech
+    https://github.com/tetherto/qvac-ext-ggml/tree/speech
+    The default and vcpkg paths use find_package(ggml CONFIG REQUIRED).
+    Bundled development builds may manually stage the same speech branch under
+    engines/tts/ggml; no ggml source or patch overlay is tracked in this
+    package.
 
   JSON for Modern C++ (nlohmann/json)
     src/json.hpp
     https://github.com/nlohmann/json
-    Single-header build (v3.11.2) vendored for parsing external Supertonic
-    voice JSON in src/supertonic_voice_json.cpp.
 
---- dual-license (Unlicense or MIT-0; recipient may choose either; see file) ---
+Unlicense or MIT-0, at the recipient's option
 
-  dr_wav (dr_libs)
+  dr_wav
     src/dr_wav.h
     https://github.com/mackron/dr_libs
 
---- apache-2.0-with-llvm-exception ---
+Apache License 2.0 with LLVM exception, when linked by the toolchain
 
-  libc++ (LLVM C++ Standard Library), when linked (e.g. some Linux toolchains)
+  libc++
     https://github.com/llvm/llvm-project
 
 =========================================================================
-Python Dependencies
+Optional conversion and reference-script dependencies
 =========================================================================
 
---- apache-2.0 (Apache License 2.0) ---
+These packages are used by scripts only and are not runtime dependencies of
+the C++ inference library. The list reflects imports present in scripts/.
 
-  huggingface_hub
-    https://github.com/huggingface/huggingface_hub
-  onnx
-    https://github.com/onnx/onnx
-  resampy
-    https://github.com/bmcfee/resampy
-  safetensors
-    https://github.com/huggingface/safetensors
+Apache License 2.0
 
---- bsd-3-clause ---
+  huggingface_hub  https://github.com/huggingface/huggingface_hub
+  onnx             https://github.com/onnx/onnx
+  safetensors      https://github.com/huggingface/safetensors
+  transformers     https://github.com/huggingface/transformers
 
-  numpy
-    https://numpy.org/
-  scipy
-    https://scipy.org/
-  torch (PyTorch)
-    https://pytorch.org/
+BSD 3-Clause
 
---- isc ---
+  NumPy            https://numpy.org/
+  SciPy            https://scipy.org/
+  PyTorch          https://pytorch.org/
+  torchaudio       https://pytorch.org/audio/
+  SoundFile        https://github.com/bastibe/python-soundfile
 
-  librosa
-    https://librosa.org/
+MIT
 
---- mit (MIT License) ---
+  ONNX Runtime     https://github.com/microsoft/onnxruntime
+  gguf             https://github.com/ggml-org/llama.cpp/tree/master/gguf-py
+  einops           https://github.com/arogozhnikov/einops
 
-  gguf
-    https://pypi.org/project/gguf/
-  Resemble Chatterbox (Python reference, used at conversion time)
-    https://github.com/resemble-ai/chatterbox
+ISC
+
+  librosa          https://librosa.org/
+  resampy          https://github.com/bmcfee/resampy
+
+MIT or WTFPL wrapper code; IPADIC dictionary distribution terms
+
+  ipadic           https://github.com/polm/ipadic-py
+    The Python wrapper is offered under MIT or WTFPL. The bundled IPADIC
+    dictionary is copyright Nara Institute of Science and Technology and ICOT
+    and is distributed under the terms in:
+    https://github.com/polm/ipadic-py/blob/master/ipadic/dicdir/COPYING
+
+Some reference scripts import the corresponding upstream model packages or
+checkpoint-provided Python modules. Those modules retain the model-project
+licenses listed above and are not copied into the C++ inference binary.

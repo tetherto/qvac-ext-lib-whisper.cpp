@@ -112,13 +112,14 @@ Pair any ASR GGUF with a Sortformer GGUF via `--diarization-model` for an attrib
 | Parler-TTS mini-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | description-conditioned voice, no cloning |
 | Parler-TTS large-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | description-conditioned voice |
 | Indic Parler-TTS | tts | 21 Indic | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | Indic prompt BPE tokenizer |
-| Fun-CosyVoice3-0.5B | tts | Chinese and English text | 24 kHz | `f32` | CPU | Qwen2.5 LM + DiT flow + CausalHiFT, instruct mode for dialect and emotion |
+| Fun-CosyVoice3-0.5B | tts | model-advertised multilingual text | 24 kHz | `f32` | CPU, OpenCL | Qwen2.5 LM + DiT flow + CausalHiFT; OpenCL is the only validated GPU path |
+| Audio8-TTS-Preview-0.6B | tts | multilingual | 44.1 kHz | `f32`, `f16`, `q8_0`; LM also `q4_0` | CPU | DualAR + DAC codec, zero-shot cloning from reference audio and transcript |
 
 ### Speech enhancement
 
 | Model | Engine | Task | Rate | Quantization | Backends | Notes |
 |---|---|---|---|---|---|---|
-| LavaSR denoiser (UL-UNAS) | tts | speech denoising | rate preserving, 16 kHz internal STFT | `f32`, `f16` | CPU, OpenCL | applied after synthesis or on captured audio |
+| LavaSR denoiser (UL-UNAS) | tts | speech denoising | rate preserving, 16 kHz internal STFT | `f32`, `f16` | CPU, Metal, Vulkan, OpenCL, CUDA | applied after synthesis or on captured audio |
 | LavaSR enhancer (Vocos BWE) | tts | bandwidth extension | native in, 48 kHz out | `f32`, `f16` | CPU, Metal, Vulkan, OpenCL, CUDA | ConvNeXt + ISTFT head |
 
 ### Music generation
@@ -181,6 +182,7 @@ Each engine also configures standalone (`cmake -S engines/parakeet`, and so on),
 | `parler-cli` | tts | full Parler-TTS flag surface |
 | `supertonic-cli` | tts | standalone Supertonic synthesis |
 | `cosyvoice-cli` | tts | CosyVoice3 synthesis |
+| `audio8-cli` | tts | Audio8 synthesis and zero-shot voice cloning |
 | `music-cli` | audiogen | end-to-end text-to-music |
 | `acestep-cli` | audiogen | Oobleck VAE decode and roundtrip harness |
 | `lavasr-bench` | tts | denoiser and enhancer benchmark |
@@ -216,7 +218,9 @@ Models are converted from NeMo checkpoints with `download-all-models.sh` and `co
 
 ### Text-to-speech
 
-GGUF conversion steps are in [engines/tts/README.md](engines/tts/README.md).
+GGUF conversion steps and the umbrella/direct/vcpkg build-path matrix are in
+[engines/tts/README.md](engines/tts/README.md). The umbrella build enables this
+package with `SPEECH_BUILD_TTS=ON`.
 
 ```sh
 # Chatterbox Turbo, with voice cloning from a reference wav
@@ -243,6 +247,11 @@ GGUF conversion steps are in [engines/tts/README.md](engines/tts/README.md).
 # CosyVoice3
 ./build/engines/tts/cosyvoice-cli --model-dir models/cosyvoice3-0.5b \
                                   --text "Hello from a fully on-device pipeline." --out out.wav
+
+# Audio8
+./build/engines/tts/audio8-cli --lm models/audio8-lm-q8_0.gguf \
+                               --codec-decoder models/audio8-codec-decoder-q8_0.gguf \
+                               --text "Hello from Audio8." --out out.wav
 ```
 
 `--emotion` and `--pace` work the same way on every engine that supports them;
@@ -333,7 +342,7 @@ These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons
 |---|---|---|
 | `third_party/whisper.cpp` | MIT | MIT (OpenAI Whisper), Silero VAD models under their own terms |
 | `engines/parakeet` | Apache-2.0 | CC-BY-4.0, except `parakeet_realtime_eou_120m-v1` under the NVIDIA Open Model License |
-| `engines/tts` | MIT | Chatterbox MIT, CosyVoice3 Apache-2.0, Supertonic and LavaSR per their model cards |
+| `engines/tts` | MIT | Chatterbox MIT; Parler, CosyVoice3, Audio8, and LavaSR Apache-2.0; Supertonic OpenRAIL-M |
 | `engines/audiogen` | MIT | ACE-Step 1.5 MIT, Qwen3-Embedding Apache-2.0 |
 
 Per-engine `NOTICE` files list every third-party dependency and its license.
