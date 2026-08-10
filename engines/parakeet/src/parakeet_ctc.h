@@ -445,6 +445,12 @@ bool find_ctc_language_range(const ParakeetCtcModel & model,
                              int32_t                & out_start,
                              int32_t                & out_end);
 
+// Resolve EngineOptions::language / CLI --language into CTC decode options.
+// Empty language with masks present throws (required). Non-empty language with
+// no masks returns full-vocab options (ignored). Unknown id with masks throws.
+CtcDecodeOptions resolve_ctc_decode_options(const ParakeetCtcModel & model,
+                                            const std::string      & language);
+
 std::vector<int32_t> ctc_greedy_decode(const float * logits,
                                        int           n_frames,
                                        int           vocab_size,

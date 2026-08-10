@@ -197,36 +197,6 @@ int run_encoder_windowed(ParakeetCtcModel & model,
     return 0;
 }
 
-CtcDecodeOptions resolve_ctc_decode_options(const ParakeetCtcModel & model,
-                                            const std::string      & language) {
-    CtcDecodeOptions dopts;
-    if (language.empty()) {
-        if (!model.ctc_lang_ranges.empty()) {
-            throw std::runtime_error(
-                "parakeet: this CTC GGUF requires EngineOptions::language "
-                "(multilingual language masks present)");
-        }
-        return dopts;
-    }
-    int32_t start = 0;
-    int32_t end   = -1;
-    if (!find_ctc_language_range(model, language, start, end)) {
-        std::string available;
-        for (size_t i = 0; i < model.ctc_lang_ranges.size(); ++i) {
-            if (i) available += ",";
-            available += model.ctc_lang_ranges[i].id;
-        }
-        throw std::runtime_error(
-            "parakeet: unknown CTC language '" + language + "'" +
-            (available.empty()
-                 ? " (GGUF has no language masks)"
-                 : " (available: " + available + ")"));
-    }
-    dopts.token_start = start;
-    dopts.token_end   = end;
-    return dopts;
-}
-
 }
 
 struct Engine::Impl {

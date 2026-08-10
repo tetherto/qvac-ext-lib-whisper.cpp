@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -58,7 +59,7 @@ void print_usage(const char * argv0) {
         "  --language ID        CTC language id for multilingual aggregate vocabs\n"
         "                       (e.g. hi, ta, gu). Required for IndicConformer-style\n"
         "                       GGUFs that advertise parakeet.ctc.lang_* ranges;\n"
-        "                       ignored for monolingual CTC.\n"
+        "                       ignored (full-vocab decode) for monolingual CTC.\n"
         "  --n-gpu-layers N     when > 0, run the encoder on the compiled-in GPU\n"
         "                       backend (build with -DGGML_METAL=ON / -DGGML_CUDA=ON\n"
         "                       / -DGGML_VULKAN=ON / -DGGML_OPENCL=ON; only one is\n"
@@ -809,33 +810,17 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
             ids_out  = std::move(dres.token_ids);
             text_out = std::move(dres.text);
         } else {
-            CtcDecodeOptions dopts;
-            if (!model.ctc_lang_ranges.empty()) {
-                if (opts.language.empty()) {
-                    PARAKEET_LOG_ERROR(
-                        "error: this CTC GGUF requires --language <id> "
-                        "(multilingual language masks present)\n");
-                    return 2;
-                }
-                int32_t start = 0;
-                int32_t end   = -1;
-                if (!find_ctc_language_range(model, opts.language, start, end)) {
-                    PARAKEET_LOG_ERROR("error: unknown --language '%s'\n",
-                                       opts.language.c_str());
-                    return 2;
-                }
-                dopts.token_start = start;
-                dopts.token_end   = end;
-            } else if (!opts.language.empty()) {
-                PARAKEET_LOG_ERROR(
-                    "error: --language was set but this GGUF has no "
-                    "parakeet.ctc.lang_* masks\n");
+            try {
+                const CtcDecodeOptions dopts =
+                    resolve_ctc_decode_options(model, opts.language);
+                ids_out = ctc_greedy_decode(
+                    enc_out.logits.data(), enc_out.n_enc_frames, model.vocab_size,
+                    model.blank_id, &dopts);
+                text_out = detokenize(model.vocab, ids_out);
+            } catch (const std::exception & e) {
+                PARAKEET_LOG_ERROR("error: %s\n", e.what());
                 return 2;
             }
-            ids_out = ctc_greedy_decode(
-                enc_out.logits.data(), enc_out.n_enc_frames, model.vocab_size,
-                model.blank_id, &dopts);
-            text_out = detokenize(model.vocab, ids_out);
         }
         times.dec_ms = ms_since(t3);
         times.inference_ms = times.mel_ms + times.enc_ms + times.dec_ms;

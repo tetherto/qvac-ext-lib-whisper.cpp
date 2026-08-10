@@ -2868,6 +2868,39 @@ bool find_ctc_language_range(const ParakeetCtcModel & model,
     return false;
 }
 
+CtcDecodeOptions resolve_ctc_decode_options(const ParakeetCtcModel & model,
+                                            const std::string      & language) {
+    CtcDecodeOptions dopts;
+    if (language.empty()) {
+        if (!model.ctc_lang_ranges.empty()) {
+            throw std::runtime_error(
+                "parakeet: this CTC GGUF requires EngineOptions::language "
+                "(multilingual language masks present)");
+        }
+        return dopts;
+    }
+    // Documented contract: --language / EngineOptions::language is ignored on
+    // monolingual CTC GGUFs that do not advertise lang_* ranges.
+    if (model.ctc_lang_ranges.empty()) {
+        return dopts;
+    }
+    int32_t start = 0;
+    int32_t end   = -1;
+    if (!find_ctc_language_range(model, language, start, end)) {
+        std::string available;
+        for (size_t i = 0; i < model.ctc_lang_ranges.size(); ++i) {
+            if (i) available += ",";
+            available += model.ctc_lang_ranges[i].id;
+        }
+        throw std::runtime_error(
+            "parakeet: unknown CTC language '" + language + "'"
+            " (available: " + available + ")");
+    }
+    dopts.token_start = start;
+    dopts.token_end   = end;
+    return dopts;
+}
+
 void ctc_greedy_decode_window(const float * logits,
                               int           start_frame,
                               int           end_frame,
