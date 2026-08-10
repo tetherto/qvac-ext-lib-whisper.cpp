@@ -172,11 +172,18 @@ bool slow_step(lm_model & model, const int32_t * frames, int width, int n_past,
     ggml_tensor * logits = mark_output(build.graph, ggml_mul_mat(ctx, model.sem_head, normed));
     ggml_tensor * carried = mark_output(build.graph, hp.norm_fast_input ? normed : tail);
 
-    if (!allocate_graph(model.slow_allocr, build.graph, "slow", error)) return false;
+    bool use_sched = false;
+    if (!prepare_graph(model.backend, model.sched, model.buffer_w, model.slow_allocr,
+                       build.graph, "slow", use_sched, error)) {
+        return false;
+    }
     frame_inputs inputs;
     fill_frame_inputs(hp, frames, width, n_past, inputs);
     set_frame_inputs(build.graph, inputs);
-    if (!compute_graph(model.backend, build.graph, n_threads, "slow", error)) return false;
+    if (!compute_graph(model.backend, model.sched, build.graph, use_sched, n_threads,
+                       "slow", error)) {
+        return false;
+    }
 
     read_output(logits, sem_logits);
     read_output(carried, fast_input);
@@ -221,12 +228,19 @@ bool fast_pass(lm_model & model, const fast_source & source, int position, int n
         build.graph,
         ggml_mul_mat(ctx, model.fast_out, rms_norm(ctx, hidden, model.fast_norm, hp.rms_eps)));
 
-    if (!allocate_graph(model.fast_allocr, build.graph, "fast", error)) return false;
+    bool use_sched = false;
+    if (!prepare_graph(model.backend, model.sched, model.buffer_w, model.fast_allocr,
+                       build.graph, "fast", use_sched, error)) {
+        return false;
+    }
     std::vector<float> mask_values(keys);
     fill_causal_mask(mask_values.data(), keys, 1, position, /*window=*/0);
     write_input(build.graph, "mask", mask_values.data(), mask_values.size() * sizeof(float));
     write_input(build.graph, "input", source.data, source.bytes);
-    if (!compute_graph(model.backend, build.graph, n_threads, "fast", error)) return false;
+    if (!compute_graph(model.backend, model.sched, build.graph, use_sched, n_threads,
+                       "fast", error)) {
+        return false;
+    }
 
     if (logits_out) read_output(logits, *logits_out);
     return true;

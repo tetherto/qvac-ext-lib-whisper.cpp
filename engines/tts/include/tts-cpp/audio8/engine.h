@@ -13,9 +13,6 @@
 // codes, which are prepended to the prompt as the speaker's own history. The
 // encoder lives in a separate GGUF, so a text-only build can leave it out.
 //
-// CPU-validated against the reference implementation; the backend plumbing
-// mirrors the other engines so GPU backends can be enabled later.
-
 #include "tts-cpp/backend.h"
 #include "tts-cpp/export.h"
 
@@ -38,8 +35,7 @@ struct EngineOptions {
 
     int n_threads = 0;   // 0 => min(hardware_concurrency, 4)
 
-    // GPU layers to offload; 0 = CPU. Reserved: the engine is CPU-only today
-    // and any positive value is ignored with a warning.
+    // GPU layers to offload; 0 = CPU.
     int n_gpu_layers = 0;
 
     // Sampling. The reference filters candidates by top_k and top_p on the raw

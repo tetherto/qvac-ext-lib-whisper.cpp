@@ -41,6 +41,7 @@ struct options {
     std::string backends_dir;
     int seed = 42;
     int threads = 0;
+    int n_gpu_layers = 0;
     int max_frames = 0;
     int top_k = 50;
     int output_sample_rate = 0;
@@ -58,7 +59,7 @@ void print_usage(const char * program) {
                  "          [--seed N] [--greedy] [--temperature F] [--top-k N] "
                  "[--top-p F]\n"
                  "          [--max-frames N] [--threads N] [--output-sample-rate N]\n"
-                 "          [--backends-dir DIR]\n",
+                 "          [--n-gpu-layers N] [--backends-dir DIR]\n",
                  program);
 }
 
@@ -77,6 +78,7 @@ bool apply_flag(options & opts, const std::string & flag, const char * value) {
     else if (flag == "--backends-dir") opts.backends_dir = value;
     else if (flag == "--seed") opts.seed = std::atoi(value);
     else if (flag == "--threads" || flag == "-t") opts.threads = std::atoi(value);
+    else if (flag == "--n-gpu-layers") opts.n_gpu_layers = std::atoi(value);
     else if (flag == "--max-frames") opts.max_frames = std::atoi(value);
     else if (flag == "--top-k") opts.top_k = std::atoi(value);
     else if (flag == "--output-sample-rate") opts.output_sample_rate = std::atoi(value);
@@ -162,6 +164,7 @@ tts_cpp::audio8::EngineOptions to_engine_options(const options & opts) {
     engine.codec_decoder_gguf_path = opts.codec_decoder;
     engine.codec_encoder_gguf_path = opts.codec_encoder;
     engine.n_threads = opts.threads;
+    engine.n_gpu_layers = opts.n_gpu_layers;
     engine.greedy = opts.greedy;
     engine.seed = opts.seed;
     engine.temperature = opts.temperature;

@@ -43,9 +43,12 @@ void read_ids(ggml_tensor * t, std::vector<int32_t> & out);
 
 // Inputs are written between these two calls: the allocator hands out the
 // buffers, then the graph runs against them.
-bool allocate_graph(ggml_gallocr_t allocr, ggml_cgraph * graph, const char * stage,
-                    std::string * error);
-bool compute_graph(ggml_backend_t backend, ggml_cgraph * graph, int n_threads,
+bool prepare_graph(ggml_backend_t backend, ::tts_cpp::detail::sched_fallback & sched,
+                   ggml_backend_buffer_t weight_buffer, ggml_gallocr_t allocr,
+                   ggml_cgraph * graph, const char * stage, bool & use_sched,
+                   std::string * error);
+bool compute_graph(ggml_backend_t backend, ::tts_cpp::detail::sched_fallback & sched,
+                   ggml_cgraph * graph, bool use_sched, int n_threads,
                    const char * stage, std::string * error);
 
 struct rope_planes {

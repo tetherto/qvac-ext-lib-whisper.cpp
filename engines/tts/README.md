@@ -576,9 +576,9 @@ frame.  Cloning needs no speaker encoder: the codec *encoder* turns a reference
 wav into codes, and those codes plus the reference transcript are prepended to
 the prompt.
 
-**Status — CPU engine, validated against the reference.**  Text-to-speech and
-voice cloning both run in-process; the backend plumbing mirrors the other
-engines so a GPU path can be added without touching the graphs.
+**Status — CPU and desktop Vulkan, validated against the reference.**
+Text-to-speech and voice cloning both run in-process on Linux and Windows
+Vulkan.  Pass `--n-gpu-layers 99` to offload every stage; omit it for CPU.
 
 ### Convert
 
@@ -722,7 +722,7 @@ looks.
 audio8-cli --lm models/audio8-lm-q8_0.gguf \
            --codec-decoder models/audio8-codec-decoder-q8_0.gguf \
            --text "Hello from a fully on-device C++ pipeline." \
-           --out out.wav --threads 8
+           --out out.wav --threads 8 --n-gpu-layers 99
 
 # cloning: add the analysis half, a reference wav and what it says
 audio8-cli --lm models/audio8-lm-q8_0.gguf \

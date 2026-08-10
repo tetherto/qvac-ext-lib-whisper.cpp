@@ -12,6 +12,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "sched_dispatch.h"
 
 #include <cstdint>
 #include <functional>
@@ -93,6 +94,7 @@ struct lm_model {
     ggml_backend_t backend = nullptr;
     ggml_context * ctx_w = nullptr;
     ggml_backend_buffer_t buffer_w = nullptr;
+    ::tts_cpp::detail::sched_fallback sched;
 
     ggml_tensor * tok_emb = nullptr;
     ggml_tensor * codebook_emb = nullptr;
@@ -224,6 +226,7 @@ struct codec_model {
     ggml_backend_t backend = nullptr;
     ggml_context * ctx_w = nullptr;
     ggml_backend_buffer_t buffer_w = nullptr;
+    ::tts_cpp::detail::sched_fallback sched;
     // Both directions run in two graphs: one over the whole sequence at one
     // column per frame, and one over blocks of the sample-rate stack. They get
     // an arena each, because alternating them through one would resize it on
@@ -257,7 +260,8 @@ struct codec_model {
     std::vector<resample_stage> downsample;
 };
 
-bool load_lm(const std::string & path, lm_model & model, std::string * error);
+bool load_lm(const std::string & path, int n_gpu_layers, lm_model & model,
+             std::string * error);
 void free_lm(lm_model & model);
 
 // What a codec GGUF says about itself: which half it holds and the shapes it
@@ -272,7 +276,8 @@ struct codec_header {
 bool peek_codec_header(const std::string & path, codec_header & header,
                        std::string * error);
 
-bool load_codec(const std::string & path, codec_model & model, std::string * error);
+bool load_codec(const std::string & path, int n_gpu_layers, codec_model & model,
+                std::string * error);
 void free_codec(codec_model & model);
 
 // Prompt frames, laid out the way the model reads them: row 0 is the semantic

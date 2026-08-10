@@ -29,6 +29,14 @@
 
 namespace tts_cpp::detail {
 
+enum class GpuBackendRequirement {
+    Any,
+    Vulkan,
+};
+
+bool gpu_backend_satisfies_requirement(const char * backend_name,
+                                       GpuBackendRequirement requirement);
+
 // First-Engine-wins override for the directory `ggml_backend_load_all*()`
 // scans on the first `ensure_backends_loaded()` call. Call before
 // constructing the first Engine; later calls log a one-shot warn and
@@ -80,7 +88,8 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
                                 const char * log_prefix,
                                 int vulkan_device = 0,
                                 bool allow_arm_mali = false,
-                                bool * out_gpu_present_but_unused = nullptr);
+                                bool * out_gpu_present_but_unused = nullptr,
+                                GpuBackendRequirement requirement = GpuBackendRequirement::Any);
 
 // Convenience wrapper that picks up the registered CPU device and
 // returns its init handle. Mirrors parakeet-cpp's

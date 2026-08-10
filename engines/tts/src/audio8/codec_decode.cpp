@@ -166,13 +166,20 @@ bool run_latents(codec_model & model, const int32_t * codes, int n_frames, int n
         mark_output(work.graph, built.semantic);
         mark_output(work.graph, built.residual);
     }
-    if (!allocate_graph(model.allocr, work.graph, "latent", error)) return false;
+    bool use_sched = false;
+    if (!prepare_graph(model.backend, model.sched, model.buffer_w, model.allocr,
+                       work.graph, "latent", use_sched, error)) {
+        return false;
+    }
 
     const std::vector<int32_t> clamped = clamped_codes(model.hp, codes, n_frames);
     write_input(work.graph, CODE_INPUT, clamped.data(), clamped.size() * sizeof(int32_t));
     const std::vector<float> mask = window_mask(model.post.spec, n_frames);
     write_input(work.graph, MASK_INPUT, mask.data(), mask.size() * sizeof(float));
-    if (!compute_graph(model.backend, work.graph, n_threads, "latent", error)) return false;
+    if (!compute_graph(model.backend, model.sched, work.graph, use_sched, n_threads,
+                       "latent", error)) {
+        return false;
+    }
 
     read_output(built.post, post);
     if (taps) {
@@ -219,14 +226,17 @@ bool run_block(codec_model & model, const std::vector<float> & post, const block
     const synthesis_graph built = build_synthesis(work.ctx, model, span.count);
     mark_output(work.graph, built.pcm);
     if (taps) mark_output(work.graph, built.latent);
-    if (!allocate_graph(model.block_allocr, work.graph, "synthesis", error)) {
+    bool use_sched = false;
+    if (!prepare_graph(model.backend, model.sched, model.buffer_w, model.block_allocr,
+                       work.graph, "synthesis", use_sched, error)) {
         return false;
     }
 
     const size_t offset = static_cast<size_t>(span.begin) * hp.latent_dim;
     write_input(work.graph, POST_INPUT, post.data() + offset,
                 static_cast<size_t>(span.count) * hp.latent_dim * sizeof(float));
-    if (!compute_graph(model.backend, work.graph, n_threads, "synthesis", error)) {
+    if (!compute_graph(model.backend, model.sched, work.graph, use_sched, n_threads,
+                       "synthesis", error)) {
         return false;
     }
 
