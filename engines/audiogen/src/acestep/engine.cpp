@@ -247,11 +247,11 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     if (nth < 1) nth = 4;
 
     // Backend for the ggml stages (text-encoder, LM, cond/detok, DiT). These use
-    // only standard ggml ops, so a GPU backend (Metal on Apple, CUDA/Vulkan
-    // elsewhere) can run them; opts.n_gpu_layers > 0 opts in. The VAE gets its
-    // own dedicated backend (see Vae::load) and also follows n_gpu_layers now
-    // that its snake / col2im_1d ops have Metal and Vulkan kernels in the
-    // ggml-speech fork.
+    // standard ggml ops, so Metal, CUDA, Vulkan, and validated Adreno 700+
+    // OpenCL can run them; opts.n_gpu_layers > 0 opts in. The VAE gets its own
+    // dedicated backend (see Vae::load) and also follows n_gpu_layers now that
+    // its snake / col2im_1d ops are validated on Metal, Vulkan, and Adreno
+    // OpenCL in the ggml-speech fork.
     // Falls back to CPU when no GPU backend is registered/available.
     bool on_gpu = false;
     if (opts.n_gpu_layers > 0) {

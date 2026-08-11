@@ -78,9 +78,13 @@ npm --prefix packages/audiogen-ggml run download-models:registry -- \
   --output models/acestep --variant turbo-q4
 ```
 
-Replace `turbo-q4` with `turbo-q8` or `sft`; use `all` to fetch all three
-DiTs. The registry entries record the upstream Hugging Face model-card links,
-but the registry GGUFs are QVAC-built artifacts. The external
+Replace `turbo-q4` with `turbo-q8` or `sft`. The `all` variant fetches all
+three DiTs, but do not then rely on `--models` alone: directory iteration does
+not define which matching DiT is selected. Store each variant in a separate
+directory, or pass the intended file explicitly with `--dit` /
+`EngineOptions::dit_model_path`. The registry entries record the upstream
+Hugging Face model-card links, but the registry GGUFs are QVAC-built artifacts.
+The external
 `Serveurperso/ACE-Step-1.5-GGUF` files above have separate provenance and are
 not the combinations validated by QVAC.
 
