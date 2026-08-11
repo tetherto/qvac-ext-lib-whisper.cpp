@@ -83,7 +83,6 @@ src/parakeet_sortformer.h for the consumer structs):
     sortformer.head.{weight,bias}                                    [Sortformer only]
 """
 
-import argparse
 import io
 import os
 import sys
@@ -94,10 +93,10 @@ import gguf
 import numpy as np
 import torch
 import yaml
+from converter_args import parse_args
 
 
 ARCH = "parakeet-ctc"
-QUANT_CHOICES = ["f32", "f16", "q8_0", "q5_0", "q4_0"]
 
 QUANT_MAP = {
     "q8_0": gguf.GGMLQuantizationType.Q8_0,
@@ -112,22 +111,6 @@ FILE_TYPE_MAP = {
     "q5_0": gguf.LlamaFileType.MOSTLY_Q5_0,
     "q4_0": gguf.LlamaFileType.MOSTLY_Q4_0,
 }
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--ckpt", type=Path, default=Path("models/parakeet-ctc-0.6b.nemo"),
-                   help="Path to .nemo archive (tarball). Downloads from HF if missing.")
-    p.add_argument("--out", type=Path, default=Path("models/parakeet-ctc-0.6b.gguf"),
-                   help="Output GGUF path.")
-    p.add_argument("--quant", choices=QUANT_CHOICES, default="q8_0",
-                   help="Weight dtype for 2D projection matrices. Biases / norms / BN "
-                        "stay at f32. q8_0 default (~2x smaller than f16, bit-equal "
-                        "transcripts on clean speech across CTC/TDT/EOU/Sortformer); "
-                        "pass --quant f16 for the bit-equal floating-point baseline.")
-    p.add_argument("--hf-repo", default="nvidia/parakeet-ctc-0.6b",
-                   help="HF model id to download from if --ckpt is missing.")
-    return p.parse_args()
 
 
 def ensure_ckpt(path: Path, hf_repo: str) -> Path:
@@ -829,7 +812,7 @@ def write_gguf(out: Path, ckpt: Path, cfg: dict, sd: dict, tok_bytes: bytes,
 
 
 def main():
-    args = parse_args()
+    args = parse_args(__doc__)
     ckpt = ensure_ckpt(args.ckpt, args.hf_repo)
     cfg, sd, tok_bytes, multilingual_tok = load_nemo(ckpt)
     args.out.parent.mkdir(parents=True, exist_ok=True)

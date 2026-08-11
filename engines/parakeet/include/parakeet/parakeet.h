@@ -22,11 +22,14 @@
 // metadata at load time):
 //
 //   - Parakeet-CTC 0.6B / 1.1B  -- English transcription
-//   - Parakeet-TDT 0.6B-v3 / 1.1B -- multilingual transcription with
-//     punctuation and capitalisation, RNN-T (LSTM prediction + joint MLP)
+//   - Parakeet-TDT 0.6B-v3 -- multilingual transcription with punctuation
+//     and capitalisation, RNN-T (LSTM prediction + joint MLP)
+//   - Parakeet-TDT 1.1B -- English-only transcription without punctuation
+//     or capitalisation, RNN-T (LSTM prediction + joint MLP)
 //   - Parakeet-EOU 120M (`parakeet_realtime_eou_120m-v1`) -- low-latency
 //     streaming ASR with native `<EOU>` end-of-utterance token
-//   - Sortformer 4-spk — offline diarization; v2 adds sliding-history streaming.
+//   - Sortformer 4-spk -- offline diarization; v1/v2 support sliding-history
+//     streaming and v2.1 adds Audio-Online Speaker Cache streaming.
 
 #include "export.h"
 #include "cli.h"
