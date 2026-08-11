@@ -49,6 +49,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test converter arguments
+        run: python3 -m unittest engines/parakeet/test/test_converter_args.py
+
       - name: Install ccache
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then brew install ccache; else sudo apt-get update -q && sudo apt-get install -y ccache; fi
