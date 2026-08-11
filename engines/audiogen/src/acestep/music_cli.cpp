@@ -136,9 +136,10 @@ int main(int argc, char ** argv) {
     if (arg_val(argc, argv, "--lm"))     o.lm_model_path = arg_val(argc, argv, "--lm");
     if (arg_val(argc, argv, "--text"))   o.text_enc_model_path = arg_val(argc, argv, "--text");
     if (arg_val(argc, argv, "--vae"))    o.vae_model_path = arg_val(argc, argv, "--vae");
-    // Offer every stage to a GPU backend (Metal/CUDA/Vulkan) when one is available.
-    // Engine::create makes the final placement call: the DiT, VAE and encoders use
-    // the GPU; the LM and FSQ detokenizer are allowlisted independently per backend.
+    // Offer every stage to a GPU backend when one is available. Engine::create
+    // selects validated Vulkan/Metal or Adreno 700+ OpenCL where possible; DiT,
+    // VAE and encoders use the selected GPU, while the LM and FSQ detokenizer
+    // apply their independent backend allowlists and generic CPU fallback.
     if (arg_flag(argc, argv, "--gpu"))   o.n_gpu_layers = 99;
     if (arg_val(argc, argv, "--threads")) o.n_threads = atoi(arg_val(argc, argv, "--threads"));
     // Required wherever ggml ships its backends as dlopen'd MODULE .so files

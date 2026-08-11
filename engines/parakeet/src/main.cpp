@@ -41,7 +41,8 @@ void print_usage(const char * argv0) {
         "\n"
         "Single CLI for all four engine families. The GGUF is auto-detected:\n"
         "  CTC        (parakeet-ctc-0.6b/1.1b)        -> transcription\n"
-        "  TDT        (parakeet-tdt-0.6b-v3, 1.1b)    -> multilingual transcription\n"
+        "  TDT 0.6B-v3                               -> multilingual transcription + PnC\n"
+        "  TDT 1.1B                                  -> English-only transcription, no PnC\n"
         "  EOU        (parakeet_realtime_eou_120m-v1) -> low-latency streaming ASR with\n"
         "                                                native end-of-utterance token\n"
         "  Sortformer (diar_sortformer_4spk-v1, v2)   -> 4-speaker diarization\n"
@@ -60,33 +61,31 @@ void print_usage(const char * argv0) {
         "                       (e.g. hi, ta, gu). Required for IndicConformer-style\n"
         "                       GGUFs that advertise parakeet.ctc.lang_* ranges;\n"
         "                       ignored (full-vocab decode) for monolingual CTC.\n"
-        "  --n-gpu-layers N     when > 0, run the encoder on the compiled-in GPU\n"
-        "                       backend (build with -DGGML_METAL=ON / -DGGML_CUDA=ON\n"
-        "                       / -DGGML_VULKAN=ON / -DGGML_OPENCL=ON; only one is\n"
-        "                       active per binary -- CUDA wins over Metal wins over\n"
-        "                       Vulkan wins over OpenCL if multiple are compiled in.\n"
+        "  --n-gpu-layers N     when > 0, run the encoder on one GPU selected from the\n"
+        "                       ggml backend registry. Multiple Metal/CUDA/Vulkan/OpenCL\n"
+        "                       backends may be built or loaded; runtime tiering prefers\n"
+        "                       OpenCL on Adreno 700+, then a registered non-OpenCL GPU,\n"
+        "                       then other OpenCL, with CPU fallback.\n"
         "                       N is only checked >0 today: the whole encoder moves;\n"
         "                       partial layer offload is not implemented.\n"
-        "                       OpenCL note: ggml-opencl is tuned for Adreno (Android);\n"
-        "                       on commodity desktop GPUs build with\n"
-        "                       -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF (the parakeet\n"
-        "                       patch under patches/ relaxes the upstream Adreno-only\n"
-        "                       device whitelist for dev/CI parity testing). Production\n"
-        "                       Adreno deployments leave both at their defaults.\n"
+        "                       Adreno 6xx OpenCL is skipped unless explicitly enabled\n"
+        "                       with PARAKEET_ALLOW_ADRENO_6XX=1. Backend support changes\n"
+        "                       are commits on qvac-ext-ggml@speech, not local patches.\n"
         "  --backends-dir DIR                 directory to scan for dynamically-loaded\n"
         "                                     ggml backend .so/.dll/.dylib files\n"
         "                                     (e.g. libspeech-ggml-vulkan.so,\n"
         "                                     libspeech-ggml-opencl.so,\n"
         "                                     libspeech-ggml-cpu-android_armv8.2_1.so).\n"
         "                                     Forwarded to ggml_backend_load_all_from_path()\n"
-        "                                     on first backend init. Empty => ggml's compile-\n"
-        "                                     time default search path.\n"
+        "                                     by the first Engine/backend initialization;\n"
+        "                                     later Engines reuse that process registry.\n"
+        "                                     Empty => ggml's default search path.\n"
         "  --opencl-cache-dir DIR             persistent OpenCL kernel binary cache directory\n"
-        "                                     (sets $GGML_OPENCL_CACHE_DIR; consumed by\n"
-        "                                     patches/ggml-opencl-program-binary-cache.patch).\n"
-        "                                     Empty string disables the cache; default\n"
-        "                                     resolves to $XDG_CACHE_HOME/ggml/opencl\n"
-        "                                     -> $HOME/.cache/ggml/opencl.\n"
+        "                                     (sets $GGML_OPENCL_CACHE_DIR; consumed by the\n"
+        "                                     qvac-ext-ggml@speech OpenCL backend).\n"
+        "                                     Omitted or empty leaves the process environment\n"
+        "                                     unchanged; without an existing variable, no\n"
+        "                                     Parakeet cache directory is configured.\n"
         "  --opencl-platform NAME_OR_INDEX    select OpenCL platform (sets $GGML_OPENCL_PLATFORM).\n"
         "                                     Useful when several ICDs are loaded e.g.\n"
         "                                     'NVIDIA CUDA' alongside 'rusticl'/'PoCL'.\n"
@@ -107,9 +106,10 @@ void print_usage(const char * argv0) {
         "                       runs the offline encoder once, then emits one segment per\n"
         "                       --stream-chunk-ms window via callback. Transcript is\n"
         "                       byte-equal to the non-streaming path.\n"
-        "  --stream-duplex      enable Mode 3 (cache-aware duplex streaming): feeds the\n"
-        "                       audio into a StreamSession in blocks, runs the encoder per\n"
-        "                       chunk with left-context + right-lookahead, emits segments\n"
+        "  --stream-duplex      enable Mode 3 duplex rolling-context streaming: feeds the\n"
+        "                       audio into a StreamSession in blocks and re-encodes each\n"
+        "                       sliding window with left-context + right-lookahead; there\n"
+        "                       is no encoder KV or convolution cache. Emits segments\n"
         "                       as soon as each chunk is processed. Incurs per-chunk\n"
         "                       encoder cost but first segment lands at ~chunk_ms +\n"
         "                       right_lookahead_ms. Typical WER: ~0 %% on short clean\n"
@@ -134,7 +134,7 @@ void print_usage(const char * argv0) {
         "                       JSON Lines, one per segment. For Sortformer streaming, prints\n"
         "                       speaker segments instead of text.\n"
         "\n"
-        "  --diarization-model PATH         path to a Sortformer GGUF; combined with a CTC/TDT\n"
+        "  --diarization-model PATH         path to a Sortformer GGUF; combined with a CTC/TDT/EOU\n"
         "                                    --model, runs speaker-attributed transcription\n"
         "                                    (writes [start-end] speaker_N: text per segment).\n"
         "                                    Implies --emit text|jsonl per the same flag.\n"
@@ -276,7 +276,7 @@ struct ExtraCliOpts {
     // OpenCL CLI surface: ggml-opencl's runtime knobs are exposed through
     // CLI flags so bench scripts can A/B them without `env VAR=… ./binary`.
     // All four are read by ggml-opencl via getenv() and (for the cache
-    // dir) by `patches/ggml-opencl-program-binary-cache.patch`. Applied
+    // dir) by the qvac-ext-ggml@speech OpenCL backend. Applied
     // via `setenv()` BEFORE any parakeet API call so the backend
     // init cascade picks them up. Empty string for any field => leave
     // the existing process-env value untouched (do not setenv).
@@ -487,7 +487,7 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
     using clock = std::chrono::steady_clock;
 
     // Apply CLI -> $GGML_OPENCL_* env overrides before any backend init
-    // so the `init_gpu_backend()` cascade reads our settings. No-op
+    // so the `init_gpu_backend()` tier policy reads our settings. No-op
     // when the binary was built without -DGGML_OPENCL=ON (the env vars
     // just aren't read by anything).
     apply_opencl_cli_env(extra);
@@ -542,7 +542,7 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
     if (!extra.diarization_model_path.empty()) {
         if (model.model_type == ParakeetModelType::SORTFORMER) {
             PARAKEET_LOG_ERROR("error: --diarization-model expects --model to be a transcription\n"
-                                 "       (CTC/TDT) GGUF; got Sortformer at --model. Swap them.\n");
+                                 "       (CTC/TDT/EOU) GGUF; got Sortformer at --model. Swap them.\n");
             return 5;
         }
 
@@ -1144,8 +1144,8 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
         // ifdef cascade missed entirely) and disambiguates correctly
         // when multiple GPU backends are compiled into the same
         // binary -- ggml_backend_name() prints what was actually
-        // selected by `init_gpu_backend()`'s CUDA -> Metal -> Vulkan ->
-        // OpenCL -> CPU cascade. Format mirrors the legacy strings
+        // selected by `init_gpu_backend()`'s registry tier policy.
+        // Format mirrors the legacy strings
         // ("ggml-metal" / "ggml-cuda" / etc.) so downstream bench
         // sweeps that grep on these labels keep working; we just
         // lower-case ggml_backend_name's "Metal" / "CUDA0" / "OpenCL"

@@ -2,7 +2,8 @@
 
 // Streaming transcription: Mode 2 (full audio, chunked callbacks) and Mode 3 (StreamSession push PCM).
 //
-// Declares StreamSession, StreamingOptions/Segment, and cross-engine StreamEvent (optional VAD and EOU-style signals).
+// Declares StreamSession, StreamingOptions/Segment, and cross-engine StreamEvent
+// callbacks for VAD state changes and EOU end-of-turn signals.
 
 #include "export.h"
 
@@ -16,8 +17,9 @@ namespace parakeet {
 
 // Optional StreamEvent callback: VadStateChanged and EndOfTurn alongside segment text.
 //
-// EOU models emit EndOfTurn when `<EOU>` fires. Sortformer emits VadStateChanged from
-// speaker_probs vs threshold. CTC/TDT can use optional RMS EnergyVad when enabled.
+// EOU models emit EndOfTurn when `<EOU>` fires; this is a turn-boundary signal,
+// not a VAD state transition. Sortformer emits VadStateChanged from speaker_probs
+// versus threshold. CTC/TDT can emit VadStateChanged from optional RMS EnergyVad.
 
 enum class VadState : int {
     Unknown  = 0,
@@ -67,12 +69,12 @@ struct StreamingOptions {
     // Optional; nullptr disables StreamEvent delivery (segment-only streaming).
     StreamEventCallback on_event = nullptr;
 
-    // Energy-VAD fallback. When true, CTC / TDT sessions will compute a
+    // Optional energy VAD. When true, CTC / TDT sessions compute a
     // simple RMS-thresholded VAD over the input PCM and fire
-    // `StreamEventType::VadStateChanged` events on transitions. Always-on
-    // for sessions whose underlying engine (EOU, Sortformer) has its own
-    // native VAD source -- those engines' events take priority. Default
-    // off; opt-in for CTC/TDT consumers that want VadState events.
+    // `StreamEventType::VadStateChanged` events on transitions. Sortformer
+    // provides its own speaker-probability VAD events. EOU emits EndOfTurn,
+    // not VadStateChanged. Default off; opt in for CTC/TDT consumers that
+    // want VadState events.
     bool  enable_energy_vad = false;
 
     // Energy-VAD knobs (dB-scale; applies only when enable_energy_vad).
@@ -109,8 +111,9 @@ struct StreamingSegment {
     // segment whose token list is empty (defensive default).
     bool   starts_word = true;
 
-    // EOU-only: true when this segment ends on `<EOU>`. For CTC/TDT use StreamEvent
-    // EndOfTurn via `on_event` instead; those engines leave this flag false here.
+    // EOU-only: true when this segment contains a decoded `<EOU>` boundary.
+    // The same boundary may be delivered as StreamEventType::EndOfTurn through
+    // `on_event`. CTC/TDT leave this flag false and do not synthesize end-of-turn.
     bool   is_eou_boundary = false;
     float  eot_confidence  = 0.0f;
 

@@ -254,11 +254,11 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     if (nth < 1) nth = 4;
 
     // Backend for the ggml stages (text-encoder, LM, cond/detok, DiT). These use
-    // only standard ggml ops, so a GPU backend (Metal on Apple, CUDA/Vulkan
-    // elsewhere) can run them; opts.n_gpu_layers > 0 opts in. The VAE gets its
-    // own dedicated backend (see Vae::load) and also follows n_gpu_layers now
-    // that its snake / col2im_1d ops have Metal and Vulkan kernels in the
-    // ggml-speech fork.
+    // standard ggml ops, so Metal, CUDA, Vulkan, and validated Adreno 700+
+    // OpenCL can run them; opts.n_gpu_layers > 0 opts in. The VAE gets its own
+    // dedicated backend (see Vae::load) and also follows n_gpu_layers now that
+    // its snake / col2im_1d ops are validated on Metal, Vulkan, and Adreno
+    // OpenCL in the ggml-speech fork.
     // Falls back to CPU when no GPU backend is registered/available.
     bool on_gpu = false;
     if (opts.n_gpu_layers > 0) {
@@ -331,7 +331,7 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     vo.verbose      = v;
     vo.with_encoder = false;
     vo.n_threads    = nth;
-    vo.n_gpu_layers = opts.n_gpu_layers;  // snake / col2im_1d have Metal + Vulkan kernels
+    vo.n_gpu_layers = opts.n_gpu_layers;  // validated on Metal, Vulkan, and Adreno OpenCL
     if (const char * e = std::getenv("ACESTEP_VAE_GPU")) {
         vo.n_gpu_layers = (e[0] == '1') ? 99 : 0;
     }
