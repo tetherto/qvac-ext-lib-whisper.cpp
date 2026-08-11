@@ -118,7 +118,7 @@ Pair any CTC, TDT, or EOU GGUF with a Sortformer GGUF via `--diarization-model` 
 | Parler-TTS large-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | description-conditioned voice |
 | Indic Parler-TTS | tts | 21 Indic | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | Indic prompt BPE tokenizer |
 | Fun-CosyVoice3-0.5B | tts | model-advertised multilingual text | 24 kHz | `f32` | CPU, Metal, OpenCL | Qwen2.5 LM + DiT flow + CausalHiFT; Metal and OpenCL are the validated GPU paths |
-| Audio8-TTS-Preview-0.6B | tts | multilingual | 44.1 kHz | `f32`, `f16`, `q8_0`; LM also `q4_0` | CPU, Vulkan | DualAR + DAC codec, zero-shot cloning from reference audio and transcript |
+| Audio8-TTS-Preview-0.6B | tts | multilingual | 44.1 kHz | `f32`, `f16`, `q8_0`; LM also `q4_0` | CPU, Metal, Vulkan | DualAR + DAC codec, zero-shot cloning from reference audio and transcript |
 
 ### Speech enhancement
 
@@ -253,10 +253,11 @@ package with `SPEECH_BUILD_TTS=ON`.
 ./build/engines/tts/cosyvoice-cli --model-dir models/cosyvoice3-0.5b \
                                   --text "Hello from a fully on-device pipeline." --out out.wav
 
-# Audio8
+# Audio8; drop --n-gpu-layers to stay on the CPU
 ./build/engines/tts/audio8-cli --lm models/audio8-lm-q8_0.gguf \
                                --codec-decoder models/audio8-codec-decoder-q8_0.gguf \
-                               --text "Hello from Audio8." --out out.wav
+                               --text "Hello from Audio8." \
+                               --n-gpu-layers 99 --out out.wav
 ```
 
 `--emotion` and `--pace` work the same way on every engine that supports them;

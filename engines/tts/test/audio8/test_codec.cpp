@@ -186,6 +186,49 @@ bool check_blocked_encode(codec_model & model, const npy_array & audio, int n_th
     return mismatches == 0;
 }
 
+// A budget the whole utterance cannot fit in has to come back as narrower
+// blocks that stay inside it, and the audio has to be the same either way --
+// which together are the whole contract of sizing the block from memory.
+constexpr size_t TIGHT_SCRATCH_BUDGET = 64u * 1024 * 1024;
+
+bool check_budgeted_decode(codec_model & model, const std::vector<int32_t> & codes,
+                           int n_frames, int n_threads, const std::vector<float> & whole) {
+    const int restore_block = model.synthesis_block_frames;
+    const size_t restore_budget = model.synthesis_scratch_budget;
+    model.synthesis_block_frames = 0;
+    model.synthesis_scratch_budget = TIGHT_SCRATCH_BUDGET;
+    std::vector<float> budgeted;
+    std::string error;
+    decode_timing timing;
+    const bool ran = decode_codes(model, codes.data(), n_frames, n_threads, nullptr,
+                                  budgeted, &error, nullptr, &timing);
+    model.synthesis_block_frames = restore_block;
+    model.synthesis_scratch_budget = restore_budget;
+    if (!ran) {
+        std::fprintf(stderr, "budgeted decode: %s\n", error.c_str());
+        return false;
+    }
+    if (timing.block_scratch > TIGHT_SCRATCH_BUDGET) {
+        std::fprintf(stderr, "budgeted: FAIL %d frames a block needs %zu bytes, past %zu\n",
+                     timing.block_frames, timing.block_scratch, TIGHT_SCRATCH_BUDGET);
+        return false;
+    }
+    if (timing.block_frames >= n_frames) {
+        std::fprintf(stderr, "budgeted: FAIL took all %d frames in one block\n", n_frames);
+        return false;
+    }
+    if (budgeted.size() != whole.size()) {
+        std::fprintf(stderr, "budgeted: FAIL %zu samples against %zu\n", budgeted.size(),
+                     whole.size());
+        return false;
+    }
+    std::fprintf(stderr, "  [budgeted] %d frames a block, %.1f MB within the %.1f MB asked\n",
+                 timing.block_frames, timing.block_scratch / (1024.0 * 1024.0),
+                 TIGHT_SCRATCH_BUDGET / (1024.0 * 1024.0));
+    return report("budgeted", compare_f32(budgeted.data(), whole.data(), whole.size()),
+                  WAVEFORM_TOLERANCE);
+}
+
 // Cancellation is only observable between blocks, so both directions run at
 // the narrow block size and stop after the first one. Checking how much came
 // back is what separates a real stop from a pass that ran to the end and
@@ -266,6 +309,7 @@ bool run_decode(codec_model & model, const fixture & data, int n_threads) {
     bool ok = check_stages(taps, data);
     ok &= check_flat("waveform", pcm, data.load("wav"), waveform_tolerance());
     ok &= check_blocked_decode(model, values, n_frames, n_threads, pcm);
+    ok &= check_budgeted_decode(model, values, n_frames, n_threads, pcm);
     ok &= check_cancelled_decode(model, values, n_frames, n_threads);
     return ok;
 }
@@ -345,6 +389,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "load decoder: %s\n", error.c_str());
         return 1;
     }
+    std::printf("backend: %s\n", ggml_backend_name(decoder.backend));
     const bool decoded = run_decode(decoder, data, n_threads);
     free_codec(decoder);
 

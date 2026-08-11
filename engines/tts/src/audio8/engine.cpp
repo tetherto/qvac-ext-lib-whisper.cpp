@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <utility>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -142,6 +143,7 @@ struct Engine::Impl {
     std::unique_ptr<Tokenizer> tokenizer;
     sampling_params sampling;
     std::atomic<bool> cancel_requested{false};
+    StageTimings timings;
 
     std::vector<int32_t> cached_codes;
     int cached_frames = 0;
@@ -186,6 +188,7 @@ struct Engine::Impl {
         const std::vector<float> pcm = at_codec_rate(voice, encoder.hp.sample_rate);
         require(!pcm.empty(), "the voice prompt is empty after resampling");
         std::string error;
+        stage_timer measure(timings.voice_encode_ms);
         if (!encode_audio(encoder, pcm.data(), static_cast<int>(pcm.size()), n_threads,
                           cancel_probe(), cached_codes, cached_frames, &error)) {
             has_cached_voice = false;
@@ -197,14 +200,20 @@ struct Engine::Impl {
         return cached_codes;
     }
 
+    // The reference encode is timed as its own stage, so it runs before the
+    // prompt timer opens and the two stages stay disjoint.
     prompt_frames prompt_for(const std::string & text, const VoicePrompt & voice,
                              int n_threads) {
         const bool cloning = !voice.empty();
+        int frames = 0;
+        const std::vector<int32_t> empty;
+        const std::vector<int32_t> & codes =
+            cloning ? reference_codes(voice, n_threads, frames) : empty;
+
+        stage_timer measure(timings.prompt_ms);
         const PromptSegments segments =
             build_prompt(*tokenizer, text, voice.transcript, cloning);
         if (!cloning) return build_frames(lm.hp, segments, {}, 0);
-        int frames = 0;
-        const std::vector<int32_t> & codes = reference_codes(voice, n_threads, frames);
         require(codes.size() ==
                     static_cast<size_t>(lm.hp.num_codebooks) * static_cast<size_t>(frames),
                 "the encoder returned " + std::to_string(codes.size()) +
@@ -217,6 +226,38 @@ struct Engine::Impl {
     // pick: codebook_size semantic values followed by EOS. Index and codebook
     // value therefore coincide, and EOS is the one index past the end.
     bool is_eos(int index) const { return index == lm.hp.codebook_size; }
+
+    void run_slow(const int32_t * frames, int width, int n_past, int n_threads,
+                  double & sink, std::vector<float> & sem_logits,
+                  std::vector<float> & fast_input) {
+        stage_timer measure(sink);
+        std::string error;
+        if (!slow_step(lm, frames, width, n_past, n_threads, sem_logits, fast_input,
+                       &error)) {
+            throw std::runtime_error(error);
+        }
+    }
+
+    // Greedy expands a whole frame in one graph, but only where the backend can
+    // pick the codes itself; every other picker has to come back to the host
+    // between codebooks, so it keeps the per-position path.
+    void run_fast(const std::vector<float> & fast_input, int semantic, int n_threads,
+                  const code_picker & pick, std::vector<int32_t> & frame) {
+        stage_timer measure(timings.fast_decode_ms);
+        std::string error;
+        const bool chained = sampling.greedy && lm.picks_codes;
+        const bool ok = chained
+                            ? fast_frame(lm, fast_input, semantic, n_threads, frame, &error)
+                            : fast_step(lm, fast_input, semantic, n_threads, pick, frame,
+                                        &error);
+        if (!ok) throw std::runtime_error(error);
+    }
+
+    int pick_semantic(RepetitionAwareSampler & sampler, const std::vector<float> & logits,
+                      std::mt19937 & rng) {
+        stage_timer measure(timings.sample_ms);
+        return sampler.pick(logits, sampling, rng);
+    }
 
     std::vector<int32_t> generate_codes(const prompt_frames & prompt, int n_threads,
                                         int & n_frames) {
@@ -235,11 +276,8 @@ struct Engine::Impl {
 
         std::vector<float> sem_logits;
         std::vector<float> fast_input;
-        std::string error;
-        if (!slow_step(lm, prompt.values.data(), prompt.width, 0, n_threads, sem_logits,
-                       fast_input, &error)) {
-            throw std::runtime_error(error);
-        }
+        run_slow(prompt.values.data(), prompt.width, 0, n_threads, timings.prefill_ms,
+                 sem_logits, fast_input);
 
         std::vector<int32_t> codes;
         std::vector<int32_t> frame;
@@ -247,23 +285,19 @@ struct Engine::Impl {
         n_frames = 0;
         for (int step = 0; step < budget; ++step) {
             check_cancel();
-            const int index = semantic_sampler.pick(sem_logits, sampling, rng);
+            const int index = pick_semantic(semantic_sampler, sem_logits, rng);
             if (is_eos(index)) break;
 
             const int semantic = lm.hp.semantic_begin + index;
-            if (!fast_step(lm, fast_input, semantic, n_threads, pick, frame, &error)) {
-                throw std::runtime_error(error);
-            }
+            run_fast(fast_input, semantic, n_threads, pick, frame);
             codes.insert(codes.end(), frame.begin(), frame.end());
             ++n_frames;
             if (step + 1 == budget) break;
 
             column[0] = semantic;
             std::copy(frame.begin(), frame.end(), column.begin() + 1);
-            if (!slow_step(lm, column.data(), 1, prompt.width + step, n_threads,
-                           sem_logits, fast_input, &error)) {
-                throw std::runtime_error(error);
-            }
+            run_slow(column.data(), 1, prompt.width + step, n_threads,
+                     timings.slow_decode_ms, sem_logits, fast_input);
         }
         return codes;
     }
@@ -282,7 +316,44 @@ struct Engine::Impl {
         return rows;
     }
 
+    void run_codec(const std::vector<int32_t> & frames, int n_frames, int n_threads,
+                   std::vector<float> & pcm) {
+        decode_timing timing;
+        std::string error;
+        if (!decode_codes(decoder, as_codebook_rows(frames, n_frames).data(), n_frames,
+                          n_threads, cancel_probe(), pcm, &error, nullptr, &timing)) {
+            throw std::runtime_error(error);
+        }
+        timings.codec_latent_ms = timing.latent_ms;
+        timings.codec_synth_ms = timing.synthesis_ms;
+        if (opts.verbose) {
+            std::fprintf(stderr, "[audio8-timing] codec block %d frames, %.0f MB scratch\n",
+                         timing.block_frames, timing.block_scratch / (1024.0 * 1024.0));
+        }
+    }
+
+    // resample_for_output is a passthrough at the native rate, and a stage that
+    // did nothing has to report nothing, so the timer only covers real work.
+    void resample(std::vector<float> & pcm, int native) {
+        const int target = opts.output_sample_rate;
+        if (target <= 0 || target == native) return;
+        stage_timer measure(timings.resample_ms);
+        pcm = resample_for_output(std::move(pcm), native, target);
+    }
+
     SynthesisResult run(const std::string & text, const VoicePrompt & voice) {
+        timings = StageTimings();
+        SynthesisResult result;
+        {
+            stage_timer whole(timings.total_ms);
+            result = generate(text, voice);
+        }
+        result.timings = timings;
+        if (opts.verbose) report_timings(result);
+        return result;
+    }
+
+    SynthesisResult generate(const std::string & text, const VoicePrompt & voice) {
         require(!text.empty(), "the text to speak must not be empty");
         cancel_requested.store(false, std::memory_order_relaxed);
         const int n_threads = resolve_threads(opts.n_threads);
@@ -295,20 +366,37 @@ struct Engine::Impl {
 
         SynthesisResult result;
         result.frames = n_frames;
-        std::string error;
-        if (!decode_codes(decoder, as_codebook_rows(frames, n_frames).data(), n_frames,
-                          n_threads, cancel_probe(), result.pcm, &error)) {
-            throw std::runtime_error(error);
-        }
+        result.codes.assign(frames.begin(), frames.end());
+        run_codec(frames, n_frames, n_threads, result.pcm);
 
         const int native = decoder.hp.sample_rate;
-        result.pcm = resample_for_output(std::move(result.pcm), native,
-                                                            opts.output_sample_rate);
+        resample(result.pcm, native);
         result.sample_rate =
             opts.output_sample_rate > 0 ? opts.output_sample_rate : native;
         result.duration_s =
             static_cast<float>(result.pcm.size()) / static_cast<float>(result.sample_rate);
         return result;
+    }
+
+    void report_timings(const SynthesisResult & result) const {
+        const StageTimings & t = result.timings;
+        const std::pair<const char *, double> stages[] = {
+            {"voice-encode", t.voice_encode_ms}, {"prompt", t.prompt_ms},
+            {"prefill", t.prefill_ms},           {"sample", t.sample_ms},
+            {"fast-decode", t.fast_decode_ms},   {"slow-decode", t.slow_decode_ms},
+            {"codec-latent", t.codec_latent_ms}, {"codec-synth", t.codec_synth_ms},
+            {"resample", t.resample_ms},
+        };
+        for (const std::pair<const char *, double> & stage : stages) {
+            std::fprintf(stderr, "[audio8-timing] %-14s %8.1f ms\n", stage.first,
+                         stage.second);
+        }
+        const double realtime =
+            t.total_ms > 0.0 ? 1000.0 * result.duration_s / t.total_ms : 0.0;
+        std::fprintf(stderr,
+                     "[audio8-timing] %-14s %8.1f ms for %d frames, %.2f s audio "
+                     "(%.2fx realtime)\n",
+                     "total", t.total_ms, result.frames, result.duration_s, realtime);
     }
 };
 

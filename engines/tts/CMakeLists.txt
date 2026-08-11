@@ -853,20 +853,25 @@ if (TTS_CPP_BUILD_TESTS)
                  "${_tcb_audio8_ref}/wav.npy" "${_tcb_audio8_ref_clone}/wav.npy"
                  "${_tcb_audio8_ref_wav}")
 
-    if (GGML_VULKAN)
-        tts_cpp_register_test(test-audio8-lm-vulkan
+    # The three Audio8 suites again on one GPU backend, against the same torch
+    # reference and the same fixtures.  Comparing the GPU to the reference rather
+    # than to CPU is what makes this a correctness gate: the two arms are then
+    # independent readings of one ground truth instead of a chain where CPU error
+    # hides GPU error.  AUDIO8_TEST_GPU is what asks the harnesses for the GPU.
+    function(tts_cpp_register_audio8_gpu_tests suffix)
+        tts_cpp_register_test(test-audio8-lm-${suffix}
             EXE      test-audio8-lm
             LABEL    "gpu"
             ARGS     "${_tcb_audio8_lm}" "${_tcb_audio8_ref}"
             REQUIRES "${_tcb_audio8_lm}" "${_tcb_audio8_ref}/sem_logits.npy")
-        tts_cpp_register_test(test-audio8-codec-vulkan
+        tts_cpp_register_test(test-audio8-codec-${suffix}
             EXE      test-audio8-codec
             LABEL    "gpu"
             ARGS     "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}" "${_tcb_audio8_ref}"
             REQUIRES "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}"
                      "${_tcb_audio8_ref}/codec_wav.npy"
                      "${_tcb_audio8_ref}/codec_enc_codes.npy")
-        tts_cpp_register_test(test-audio8-engine-vulkan
+        tts_cpp_register_test(test-audio8-engine-${suffix}
             EXE      test-audio8-engine
             LABEL    "gpu"
             ARGS     "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}"
@@ -874,10 +879,32 @@ if (TTS_CPP_BUILD_TESTS)
             REQUIRES "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}"
                      "${_tcb_audio8_ref}/wav.npy" "${_tcb_audio8_ref_clone}/wav.npy"
                      "${_tcb_audio8_ref_wav}")
-        set_property(TEST test-audio8-lm-vulkan test-audio8-codec-vulkan
-                          test-audio8-engine-vulkan APPEND
+        set_property(TEST test-audio8-lm-${suffix} test-audio8-codec-${suffix}
+                          test-audio8-engine-${suffix} APPEND
                      PROPERTY ENVIRONMENT "AUDIO8_TEST_GPU=1")
+    endfunction()
+
+    # Audio8 allowlist: Vulkan / Metal (audio8/gguf.cpp
+    # GpuBackendRequirement::VulkanOrMetal).
+    if (TTS_CPP_GGML_VULKAN)
+        tts_cpp_register_audio8_gpu_tests(vulkan)
     endif()
+    if (TTS_CPP_GGML_METAL)
+        tts_cpp_register_audio8_gpu_tests(metal)
+    endif()
+
+    # The per-stage breakdown the Metal work is ranked by.  Needs the models but
+    # none of the reference dumps: it checks the accounting, not the numbers.
+    add_executable(test-audio8-timing test/audio8/test_timing.cpp)
+    target_link_libraries(test-audio8-timing PRIVATE tts-cpp ggml)
+    target_include_directories(test-audio8-timing PRIVATE include src)
+    tts_cpp_apply_ccache(test-audio8-timing)
+    tts_cpp_register_test(test-audio8-timing
+        LABEL    "fixture"
+        ARGS     "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}"
+                 "${_tcb_audio8_ref_wav}"
+        REQUIRES "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}"
+                 "${_tcb_audio8_ref_wav}")
 
     # ---- Parler-TTS tests (fixtures from scripts/parler/dump-reference.py) ----
     set(_tcb_parler_core_srcs

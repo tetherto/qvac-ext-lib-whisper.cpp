@@ -10,13 +10,14 @@
 // sequence has to go through at once -- cheap, since it works at one column
 // per frame. The synthesis stack then expands each of those columns into 2048
 // samples, which is where the memory goes, and it is causal with a context of
-// only a dozen frames, so it runs in blocks. That keeps the scratch flat in
-// utterance length instead of the 1.5 GB a whole 24 s take would need.
+// only a dozen frames, so it runs in blocks sized to a memory budget. That
+// keeps the scratch bounded instead of the 1.5 GB a whole 24 s take would need.
 
 #include "audio8/codec_ops.h"
 #include "audio8/graph.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <vector>
 
 namespace tts_cpp {
@@ -208,6 +209,78 @@ block block_at(int first, int n_frames, int context, int block_frames) {
     return span;
 }
 
+// Every block re-runs its own context, so a wider block does strictly less
+// redundant work and hands the backend longer sequences to fill. Scratch is the
+// only thing holding it back, and the allocator can price a width without
+// allocating anything, so the widest affordable width is found by search rather
+// than by a per-model estimate.
+constexpr double SCRATCH_BUDGET_SHARE = 0.25;
+constexpr size_t SCRATCH_BUDGET_CAP = 384u * 1024 * 1024;
+
+size_t scratch_budget(const codec_model & model) {
+    if (model.synthesis_scratch_budget > 0) return model.synthesis_scratch_budget;
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    ggml_backend_dev_memory(ggml_backend_get_device(model.backend), &free_bytes,
+                            &total_bytes);
+    const size_t share = static_cast<size_t>(free_bytes * SCRATCH_BUDGET_SHARE);
+    return std::min(share, SCRATCH_BUDGET_CAP);
+}
+
+size_t block_scratch(codec_model & model, ggml_gallocr_t pricer, int columns,
+                     bool with_taps) {
+    scratch work(AUDIO8_MAX_NODES);
+    if (!work.ok()) return SIZE_MAX;
+    const synthesis_graph built = build_synthesis(work.ctx, model, columns);
+    mark_output(work.graph, built.pcm);
+    if (with_taps) mark_output(work.graph, built.latent);
+    size_t size = 0;
+    ggml_gallocr_reserve_n_size(pricer, work.graph, nullptr, nullptr, &size);
+    return size;
+}
+
+int span_of(int block_frames, int n_frames, int context) {
+    return std::min(block_frames + context, n_frames);
+}
+
+// One frame always runs, even when it is over budget: there is no narrower way
+// to produce audio at all.
+int widest_block(codec_model & model, ggml_gallocr_t pricer, int context, int n_frames,
+                 bool with_taps, size_t budget) {
+    int narrowest = 1;
+    int widest = n_frames;
+    while (narrowest < widest) {
+        const int mid = narrowest + (widest - narrowest + 1) / 2;
+        const size_t cost =
+            block_scratch(model, pricer, span_of(mid, n_frames, context), with_taps);
+        if (cost <= budget) {
+            narrowest = mid;
+        } else {
+            widest = mid - 1;
+        }
+    }
+    return narrowest;
+}
+
+struct block_plan {
+    int frames = 1;
+    size_t scratch = 0;
+};
+
+block_plan plan_blocks(codec_model & model, int context, int n_frames, bool with_taps) {
+    ggml_gallocr_t pricer =
+        ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    block_plan plan;
+    plan.frames = model.synthesis_block_frames > 0
+                      ? std::min(model.synthesis_block_frames, n_frames)
+                      : widest_block(model, pricer, context, n_frames, with_taps,
+                                     scratch_budget(model));
+    plan.scratch =
+        block_scratch(model, pricer, span_of(plan.frames, n_frames, context), with_taps);
+    ggml_gallocr_free(pricer);
+    return plan;
+}
+
 void append_tail(const std::vector<float> & produced, int dropped, int per_column,
                  std::vector<float> & out) {
     const size_t skip = static_cast<size_t>(dropped) * per_column;
@@ -254,11 +327,14 @@ bool run_block(codec_model & model, const std::vector<float> & post, const block
 bool run_synthesis_blocks(codec_model & model, const std::vector<float> & post,
                           int n_frames, int n_threads, const cancel_hook & cancel,
                           std::vector<float> & pcm_out, decode_taps * taps,
-                          std::string * error) {
+                          decode_timing & clock, std::string * error) {
     pcm_out.reserve(static_cast<size_t>(n_frames) * model.hp.frame_size);
     if (taps) taps->latent.clear();
     const int context = synthesis_context(model);
-    const int block_frames = std::max(1, model.synthesis_block_frames);
+    const block_plan plan = plan_blocks(model, context, n_frames, taps != nullptr);
+    const int block_frames = plan.frames;
+    clock.block_frames = plan.frames;
+    clock.block_scratch = plan.scratch;
     for (int first = 0; first < n_frames; first += block_frames) {
         if (cancelled(cancel, error)) return false;
         if (!run_block(model, post, block_at(first, n_frames, context, block_frames),
@@ -290,15 +366,22 @@ bool check_decodable(const codec_model & model, int n_frames, std::string * erro
 bool decode_codes(codec_model & model, const int32_t * codes, int n_frames,
                   int n_threads, const cancel_hook & cancel,
                   std::vector<float> & pcm_out, std::string * error,
-                  decode_taps * taps) {
+                  decode_taps * taps, decode_timing * timing) {
     pcm_out.clear();
     if (!check_decodable(model, n_frames, error)) return false;
     if (n_frames <= 0) return true;
 
+    decode_timing discarded;
+    decode_timing & clock = timing ? *timing : discarded;
+
     std::vector<float> post;
-    if (!run_latents(model, codes, n_frames, n_threads, post, taps, error)) return false;
+    {
+        stage_timer measure(clock.latent_ms);
+        if (!run_latents(model, codes, n_frames, n_threads, post, taps, error)) return false;
+    }
+    stage_timer measure(clock.synthesis_ms);
     return run_synthesis_blocks(model, post, n_frames, n_threads, cancel, pcm_out, taps,
-                                error);
+                                clock, error);
 }
 
 }  // namespace detail

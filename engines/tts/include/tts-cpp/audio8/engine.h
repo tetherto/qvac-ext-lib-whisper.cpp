@@ -13,6 +13,10 @@
 // codes, which are prepended to the prompt as the speaker's own history. The
 // encoder lives in a separate GGUF, so a text-only build can leave it out.
 //
+// Validated against the reference implementation on CPU, Metal, and Vulkan, each
+// compared to the same F32 reference rather than to the other.
+
+
 #include "tts-cpp/backend.h"
 #include "tts-cpp/export.h"
 
@@ -35,7 +39,10 @@ struct EngineOptions {
 
     int n_threads = 0;   // 0 => min(hardware_concurrency, 4)
 
-    // GPU layers to offload; 0 = CPU.
+    // Any positive value puts the whole model on a validated GPU backend, 0
+    // keeps it on CPU. There is no partial offload: this selects the backend the
+    // model runs on rather than splitting layers across two. Falls back to CPU
+    // when no validated GPU is present.
     int n_gpu_layers = 0;
 
     // Sampling. The reference filters candidates by top_k and top_p on the raw
@@ -60,6 +67,25 @@ struct EngineOptions {
     // Directory for dynamically-loaded ggml backends (GGML_BACKEND_DL builds);
     // empty keeps the default search behaviour.
     std::string backends_dir;
+
+    // Print the per-stage timing breakdown of every synthesize() to stderr.
+    // The same numbers are always available in SynthesisResult::timings.
+    bool verbose = false;
+};
+
+// Wall time of each synthesize() stage, in milliseconds. The stages are
+// disjoint, so they sum to total_ms up to the bookkeeping between them.
+struct StageTimings {
+    double voice_encode_ms = 0.0;  // codec encoder over the reference, cloning only
+    double prompt_ms       = 0.0;  // tokenisation and prompt assembly
+    double prefill_ms      = 0.0;  // one slow-AR pass over the whole prompt
+    double sample_ms       = 0.0;  // picking the semantic token of each frame
+    double fast_decode_ms  = 0.0;  // per-frame fast-AR passes and their sampling
+    double slow_decode_ms  = 0.0;  // per-frame slow-AR steps after the prefill
+    double codec_latent_ms = 0.0;  // quantiser banks, post transformer
+    double codec_synth_ms  = 0.0;  // upsampling and the sample-rate stack
+    double resample_ms     = 0.0;  // only when output_sample_rate differs
+    double total_ms        = 0.0;
 };
 
 // A voice to clone: mono float32 at sample_rate, plus what is said in it. The
@@ -79,6 +105,13 @@ struct SynthesisResult {
     int sample_rate = 44100;
     float duration_s = 0.0f;
     int frames = 0;           // codec frames the language model emitted
+    StageTimings timings;
+
+    // The discrete trajectory behind the waveform: num_codebooks values per
+    // frame, frame-major, so codes[f * num_codebooks + b] is codebook b of frame
+    // f. Two runs that agree here differ only in the codec's arithmetic, which
+    // makes this the sharpest way to compare backends or quantisation tiers.
+    std::vector<int> codes;
 };
 
 // Persistent engine. Loads the GGUFs once at construction; synthesize() reuses

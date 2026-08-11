@@ -37,12 +37,6 @@ ggml_tensor * project_heads(ggml_context * ctx, ggml_tensor * weight, ggml_tenso
                            static_cast<int>(x->ne[1]));
 }
 
-ggml_tensor * precise_mul_mat(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * x) {
-    ggml_tensor * result = ggml_mul_mat(ctx, weight, x);
-    ggml_mul_mat_set_prec(result, GGML_PREC_F32);
-    return result;
-}
-
 // K is stored position-major so a step appends one contiguous row per position.
 ggml_tensor * cache_keys(ggml_context * ctx, const kv_cache & cache,
                          const attention_shape & shape, int total) {
@@ -90,7 +84,7 @@ ggml_tensor * attend(ggml_context * ctx, ggml_tensor * query, ggml_tensor * keys
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     ggml_tensor * scores = precise_mul_mat(ctx, keys, query);
     ggml_tensor * weights = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f);
-    ggml_tensor * blended = ggml_mul_mat(ctx, values, weights);
+    ggml_tensor * blended = precise_mul_mat(ctx, values, weights);
     ggml_tensor * merged = ggml_cont(ctx, ggml_permute(ctx, blended, 0, 2, 1, 3));
     return ggml_reshape_2d(ctx, merged, head_dim * n_head, blended->ne[1]);
 }
@@ -104,6 +98,12 @@ ggml_tensor * rotated_query(ggml_context * ctx, const attention_weights & weight
 }
 
 }  // namespace
+
+ggml_tensor * precise_mul_mat(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b) {
+    ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+    ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+    return out;
+}
 
 scratch::scratch(int nodes) {
     ggml_init_params params = {graph_arena(nodes), nullptr, /*no_alloc=*/true};

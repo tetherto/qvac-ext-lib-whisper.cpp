@@ -1,6 +1,8 @@
 #include "audio8/internal.h"
 
+#include "audio8/graph.h"
 #include "backend_selection.h"
+#include "backend_util.h"
 #include "gguf.h"
 #include "gguf_stream.h"
 
@@ -149,10 +151,16 @@ bool load_weights(const gguf_file & file, ggml_backend_t backend, ggml_context *
     return true;
 }
 
+// A capability probe only ever holds its operand and the op asked about.
+constexpr int PROBE_NODES = 2;
+
+// Audio8's GPU path is enabled only on backends its whole graph set has been
+// validated against, stage by stage, against the F32 reference. Anything else
+// falls back to CPU rather than running unverified kernels.
 ggml_backend_t init_backend(int n_gpu_layers) {
     ggml_backend_t backend = ::tts_cpp::detail::init_gpu_backend(
         n_gpu_layers, true, "audio8", 0, false, nullptr,
-        ::tts_cpp::detail::GpuBackendRequirement::Vulkan);
+        ::tts_cpp::detail::GpuBackendRequirement::VulkanOrMetal);
     return backend ? backend : ::tts_cpp::detail::init_cpu_backend();
 }
 
@@ -462,6 +470,16 @@ void read_encoder(tensor_map & map, codec_model & model, const transformer_spec 
     read_quantizer_bank(map, model, /*encoding=*/true);
 }
 
+// The chained frame graph adds the one op the per-position path never builds.
+// Without it the scheduler would reroute every frame through the CPU, which is
+// slower than the path it replaces, so the choice is made from the kernel set.
+bool backend_picks_codes(ggml_backend_t backend, const lm_hparams & hp) {
+    scratch probe(PROBE_NODES);
+    if (!probe.ok()) return false;
+    ggml_tensor * logits = ggml_new_tensor_2d(probe.ctx, GGML_TYPE_F32, hp.codebook_size, 1);
+    return ggml_backend_supports_op(backend, ggml_argmax(probe.ctx, logits));
+}
+
 }  // namespace
 
 bool load_lm(const std::string & path, int n_gpu_layers, lm_model & model,
@@ -524,10 +542,12 @@ bool load_lm(const std::string & path, int n_gpu_layers, lm_model & model,
     ggml_backend_buffer_type_t buffer_type = ggml_backend_get_default_buffer_type(model.backend);
     model.slow_allocr = ggml_gallocr_new(buffer_type);
     model.fast_allocr = ggml_gallocr_new(buffer_type);
-    if (!model.slow_allocr || !model.fast_allocr) {
+    model.frame_allocr = ggml_gallocr_new(buffer_type);
+    if (!model.slow_allocr || !model.fast_allocr || !model.frame_allocr) {
         if (error) *error = "audio8: failed to create the graph allocators";
         return false;
     }
+    model.picks_codes = backend_picks_codes(model.backend, model.hp);
     return true;
 }
 
@@ -535,6 +555,7 @@ void free_lm(lm_model & model) {
     ::tts_cpp::detail::sched_fallback_free(model.sched);
     if (model.slow_allocr) ggml_gallocr_free(model.slow_allocr);
     if (model.fast_allocr) ggml_gallocr_free(model.fast_allocr);
+    if (model.frame_allocr) ggml_gallocr_free(model.frame_allocr);
     free_kv(model.slow_kv);
     free_kv(model.fast_kv);
     if (model.buffer_w) ggml_backend_buffer_free(model.buffer_w);
@@ -542,6 +563,7 @@ void free_lm(lm_model & model) {
     if (model.backend) ggml_backend_free(model.backend);
     model.slow_allocr = nullptr;
     model.fast_allocr = nullptr;
+    model.frame_allocr = nullptr;
     model.buffer_w = nullptr;
     model.ctx_w = nullptr;
     model.backend = nullptr;

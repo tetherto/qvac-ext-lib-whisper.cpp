@@ -38,6 +38,7 @@ struct options {
     std::string ref_text;
     std::string text = "Hello from a fully on-device C plus plus pipeline.";
     std::string out = "audio8_out.wav";
+    std::string codes_out;
     std::string backends_dir;
     int seed = 42;
     int threads = 0;
@@ -48,6 +49,7 @@ struct options {
     float temperature = 0.7f;
     float top_p = 0.9f;
     bool greedy = false;
+    bool verbose = false;
 };
 
 void print_usage(const char * program) {
@@ -59,12 +61,18 @@ void print_usage(const char * program) {
                  "          [--seed N] [--greedy] [--temperature F] [--top-k N] "
                  "[--top-p F]\n"
                  "          [--max-frames N] [--threads N] [--output-sample-rate N]\n"
-                 "          [--n-gpu-layers N] [--backends-dir DIR]\n",
+                 "          [--n-gpu-layers N] [--dump-codes codes.txt]\n"
+                 "          [--backends-dir DIR] [--verbose]\n",
                  program);
 }
 
-bool takes_value(const std::string & flag) {
-    return flag != "--greedy";
+// Flags that stand alone; everything else in apply_flag consumes the next
+// argument.
+bool apply_switch(options & opts, const std::string & flag) {
+    if (flag == "--greedy") opts.greedy = true;
+    else if (flag == "--verbose") opts.verbose = true;
+    else return false;
+    return true;
 }
 
 bool apply_flag(options & opts, const std::string & flag, const char * value) {
@@ -75,10 +83,11 @@ bool apply_flag(options & opts, const std::string & flag, const char * value) {
     else if (flag == "--ref-text") opts.ref_text = value;
     else if (flag == "--text") opts.text = value;
     else if (flag == "--out") opts.out = value;
+    else if (flag == "--dump-codes") opts.codes_out = value;
     else if (flag == "--backends-dir") opts.backends_dir = value;
     else if (flag == "--seed") opts.seed = std::atoi(value);
     else if (flag == "--threads" || flag == "-t") opts.threads = std::atoi(value);
-    else if (flag == "--n-gpu-layers") opts.n_gpu_layers = std::atoi(value);
+    else if (flag == "--n-gpu-layers" || flag == "-ngl") opts.n_gpu_layers = std::atoi(value);
     else if (flag == "--max-frames") opts.max_frames = std::atoi(value);
     else if (flag == "--top-k") opts.top_k = std::atoi(value);
     else if (flag == "--output-sample-rate") opts.output_sample_rate = std::atoi(value);
@@ -91,11 +100,8 @@ bool apply_flag(options & opts, const std::string & flag, const char * value) {
 bool parse_args(int argc, char ** argv, options & opts) {
     for (int index = 1; index < argc; ++index) {
         const std::string flag = argv[index];
-        if (flag == "--greedy") {
-            opts.greedy = true;
-            continue;
-        }
-        if (!takes_value(flag) || index + 1 >= argc) return false;
+        if (apply_switch(opts, flag)) continue;
+        if (index + 1 >= argc) return false;
         if (!apply_flag(opts, flag, argv[++index])) return false;
     }
     return !opts.lm.empty() && !opts.codec_decoder.empty();
@@ -153,6 +159,28 @@ bool write_wav(const std::string & path, const std::vector<float> & pcm, int sam
     return true;
 }
 
+void write_frame(std::FILE * file, const int * frame, int books) {
+    for (int book = 0; book < books; ++book) {
+        std::fprintf(file, book == 0 ? "%d" : ",%d", frame[book]);
+    }
+    std::fputc('\n', file);
+}
+
+// One line per frame, its codebook values comma-separated. Plain text so two
+// runs can be diffed directly to see whether a backend or a quantisation tier
+// changed the discrete trajectory.
+bool write_codes(const std::string & path, const std::vector<int> & codes, int frames) {
+    if (frames <= 0) return false;
+    const int books = static_cast<int>(codes.size()) / frames;
+    std::FILE * file = std::fopen(path.c_str(), "w");
+    if (!file) return false;
+    for (int frame = 0; frame < frames; ++frame) {
+        write_frame(file, codes.data() + static_cast<size_t>(frame) * books, books);
+    }
+    std::fclose(file);
+    return true;
+}
+
 tts_cpp::audio8::VoicePrompt load_voice(const options & opts) {
     if (opts.ref_audio.empty()) return {};
     return tts_cpp::audio8::load_voice_prompt(opts.ref_audio, opts.ref_text);
@@ -172,6 +200,7 @@ tts_cpp::audio8::EngineOptions to_engine_options(const options & opts) {
     engine.top_p = opts.top_p;
     engine.max_frames = opts.max_frames;
     engine.output_sample_rate = opts.output_sample_rate;
+    engine.verbose = opts.verbose;
     engine.backends_dir = opts.backends_dir;
     return engine;
 }
@@ -203,6 +232,11 @@ int main(int argc, char ** argv) {
         const tts_cpp::audio8::SynthesisResult result = speak(engine, opts, voice);
         if (!write_wav(opts.out, result.pcm, result.sample_rate)) {
             std::fprintf(stderr, "cannot write %s\n", opts.out.c_str());
+            return 1;
+        }
+        if (!opts.codes_out.empty() &&
+            !write_codes(opts.codes_out, result.codes, result.frames)) {
+            std::fprintf(stderr, "cannot write %s\n", opts.codes_out.c_str());
             return 1;
         }
         std::printf("%s: %d frames, %.2f s at %d Hz on %s\n", opts.out.c_str(),

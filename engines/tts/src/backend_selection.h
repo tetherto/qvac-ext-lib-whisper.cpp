@@ -30,6 +30,9 @@
 namespace tts_cpp::detail {
 
 // Restricts which registered GPU devices the selection walk may consider.
+// Each engine narrows this to the backends its graphs have been validated on,
+// so a registry holding some other GPU falls back to CPU instead of running
+// unverified kernels.
 // When every enumerated GPU is off-requirement, the CPU fallback reports as
 // "GPU present but unused by policy" (out_gpu_present_but_unused); when a
 // requirement-matching device exists but fails to init, the fallback stays
@@ -40,6 +43,7 @@ namespace tts_cpp::detail {
 enum class GpuBackendRequirement {
     Any,
     Vulkan,
+    VulkanOrMetal,
     MetalOrOpenCL,
 };
 

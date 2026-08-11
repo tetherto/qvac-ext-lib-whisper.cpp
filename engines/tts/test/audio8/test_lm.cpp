@@ -202,6 +202,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "load: %s\n", error.c_str());
         return 1;
     }
+    std::printf("backend: %s\n", ggml_backend_name(model.backend));
 
     step_report report;
     const bool ran = run_steps(model, fixture{argv[2]}, n_threads, report);

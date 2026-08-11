@@ -14,6 +14,7 @@
 #include "ggml-backend.h"
 #include "sched_dispatch.h"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -26,6 +27,27 @@ namespace audio8 {
 namespace detail {
 
 constexpr int AUDIO8_MAX_NODES = 8192;
+
+// Adds the wall time of its scope to `sink`, in milliseconds. Stages are timed
+// by accumulation because most of them are entered once per generated frame.
+class stage_timer {
+public:
+    explicit stage_timer(double & sink)
+        : sink_(sink), start_(std::chrono::steady_clock::now()) {}
+
+    ~stage_timer() {
+        const std::chrono::duration<double, std::milli> elapsed =
+            std::chrono::steady_clock::now() - start_;
+        sink_ += elapsed.count();
+    }
+
+    stage_timer(const stage_timer &) = delete;
+    stage_timer & operator=(const stage_timer &) = delete;
+
+private:
+    double & sink_;
+    std::chrono::steady_clock::time_point start_;
+};
 
 struct lm_hparams {
     int depth = 0;
@@ -117,6 +139,9 @@ struct lm_model {
     // them through one allocator would resize it on every call.
     ggml_gallocr_t slow_allocr = nullptr;
     ggml_gallocr_t fast_allocr = nullptr;
+    ggml_gallocr_t frame_allocr = nullptr;
+    // Whether this backend can pick codes itself, decided once at load time.
+    bool picks_codes = false;
 
     TokenizerData tokenizer;
 };
@@ -247,9 +272,14 @@ struct codec_model {
     // How much of the sample-rate stack each block covers: frames of output
     // when synthesising, columns of the encoder's 512-fold reduction when
     // analysing. Smaller blocks cost less scratch and repeat more work on each
-    // block's context; the defaults keep the repetition well under the
-    // language model's own cost.
-    int synthesis_block_frames = 32;
+    // block's context.
+    //
+    // Synthesis takes zero to mean the widest block whose scratch fits
+    // synthesis_scratch_budget, which is the fastest width available at that
+    // budget; a positive value pins it instead. A zero budget takes a share of
+    // what the backend reports free.
+    int synthesis_block_frames = 0;
+    size_t synthesis_scratch_budget = 0;
     int analysis_block_columns = 128;
 
     conv_weights enc_in;
@@ -310,6 +340,13 @@ bool fast_step(lm_model & model, const std::vector<float> & fast_input, int sema
                int n_threads, const code_picker & pick, std::vector<int32_t> & codes_out,
                std::string * error);
 
+// fast_step's greedy equivalent in one graph instead of num_codebooks graphs,
+// picking each code on the backend. Same codes, one submission: worth roughly a
+// quarter of a millisecond per position on Metal, where a submission costs far
+// more than the kernels it carries. Only call it when `model.picks_codes`.
+bool fast_frame(lm_model & model, const std::vector<float> & fast_input, int semantic,
+                int n_threads, std::vector<int32_t> & codes_out, std::string * error);
+
 // Stage boundaries the parity test compares one at a time, so a divergence
 // names the module that caused it instead of only showing a wrong waveform.
 // Each is channels-inner: [latent_dim, frames], and [latent_dim, 4 * frames]
@@ -328,12 +365,24 @@ using cancel_hook = std::function<bool()>;
 
 constexpr const char * CANCELLED = "audio8: synthesis cancelled";
 
+// The decode pass runs as two graphs with very different shapes, so they are
+// timed apart: the post transformer works one column per frame, the sample-rate
+// stack expands each column into frame_size samples.
+struct decode_timing {
+    double latent_ms = 0.0;
+    double synthesis_ms = 0.0;
+    // The block width synthesis settled on and what the allocator priced it at,
+    // which is the only view of a width chosen from a memory budget.
+    int block_frames = 0;
+    size_t block_scratch = 0;
+};
+
 // codes: [num_codebooks, n_frames] row-major. Writes n_frames * frame_size
 // samples at the codec sample rate.
 bool decode_codes(codec_model & model, const int32_t * codes, int n_frames,
                   int n_threads, const cancel_hook & cancel,
                   std::vector<float> & pcm_out, std::string * error,
-                  decode_taps * taps = nullptr);
+                  decode_taps * taps = nullptr, decode_timing * timing = nullptr);
 
 // The convolutional encoder's output, [latent_dim, 4 * frames], and what the
 // downsampling stages and the pre-module make of it, [latent_dim, frames].

@@ -169,7 +169,8 @@ bool slow_step(lm_model & model, const int32_t * frames, int width, int n_past,
 
     ggml_tensor * tail = ggml_cont(ctx, last_column(ctx, hidden));
     ggml_tensor * normed = rms_norm(ctx, tail, model.norm, hp.rms_eps);
-    ggml_tensor * logits = mark_output(build.graph, ggml_mul_mat(ctx, model.sem_head, normed));
+    ggml_tensor * logits =
+        mark_output(build.graph, precise_mul_mat(ctx, model.sem_head, normed));
     ggml_tensor * carried = mark_output(build.graph, hp.norm_fast_input ? normed : tail);
 
     bool use_sched = false;
@@ -226,7 +227,8 @@ bool fast_pass(lm_model & model, const fast_source & source, int position, int n
                         fast_shape(hp, position), mask, hp.rms_eps);
     ggml_tensor * logits = mark_output(
         build.graph,
-        ggml_mul_mat(ctx, model.fast_out, rms_norm(ctx, hidden, model.fast_norm, hp.rms_eps)));
+        precise_mul_mat(ctx, model.fast_out,
+                        rms_norm(ctx, hidden, model.fast_norm, hp.rms_eps)));
 
     bool use_sched = false;
     if (!prepare_graph(model.backend, model.sched, model.buffer_w, model.fast_allocr,
@@ -252,7 +254,82 @@ int clamp_to_codebook(const lm_hparams & hp, int semantic) {
     return index >= hp.codebook_size ? hp.codebook_size - 1 : index;
 }
 
+// Every fast position attends to the whole frame prefix, so its causal mask is
+// all zeros, and adding zero before the softmax is exact. Passing no mask keeps
+// the chained graph free of ten per-position mask inputs.
+ggml_tensor * fast_logits(ggml_context * ctx, ggml_cgraph * graph, lm_model & model,
+                          ggml_tensor * hidden, int position) {
+    const lm_hparams & hp = model.hp;
+    const rope_planes rope =
+        rope_window(ctx, model.fast_rope_cos, model.fast_rope_sin, position, 1);
+    ggml_tensor * out =
+        run_blocks(ctx, graph, model.fast_blocks, hidden, rope, model.fast_kv,
+                   fast_shape(hp, position), /*mask=*/nullptr, hp.rms_eps);
+    return precise_mul_mat(ctx, model.fast_out,
+                           rms_norm(ctx, out, model.fast_norm, hp.rms_eps));
+}
+
+// Position 0 primes the cache from the slow transformer's hidden state and
+// produces no code; position p reads the code position p-1 chose, so the whole
+// frame is one dependency chain that never leaves the backend.
+std::vector<ggml_tensor *> chain_codes(ggml_context * ctx, ggml_cgraph * graph,
+                                       lm_model & model, ggml_tensor * primed,
+                                       ggml_tensor * first_code) {
+    ggml_build_forward_expand(graph, primed);
+    std::vector<ggml_tensor *> chosen;
+    ggml_tensor * code = first_code;
+    for (int position = 1; position < model.hp.num_codebooks; ++position) {
+        ggml_tensor * hidden = ggml_get_rows(ctx, model.fast_emb, code);
+        code = ggml_argmax(ctx, fast_logits(ctx, graph, model, hidden, position));
+        chosen.push_back(mark_output(graph, code));
+    }
+    return chosen;
+}
+
+void read_chosen(const std::vector<ggml_tensor *> & chosen, std::vector<int32_t> & codes_out) {
+    for (size_t index = 0; index < chosen.size(); ++index) {
+        ggml_backend_tensor_get(chosen[index], &codes_out[index + 1], 0, sizeof(int32_t));
+    }
+}
+
 }  // namespace
+
+// Greedy expansion of one frame in a single graph. The sampled path cannot do
+// this: argmax is the only picker the backend can evaluate, so any other one has
+// to return to the host between positions.
+bool fast_frame(lm_model & model, const std::vector<float> & fast_input, int semantic,
+                int n_threads, std::vector<int32_t> & codes_out, std::string * error) {
+    const lm_hparams & hp = model.hp;
+    scratch build(AUDIO8_MAX_NODES);
+    if (!build.ok()) {
+        if (error) *error = "audio8: failed to create the fast frame context";
+        return false;
+    }
+    ggml_context * ctx = build.ctx;
+    const int32_t first_code = clamp_to_codebook(hp, semantic);
+
+    ggml_tensor * primed =
+        fast_logits(ctx, build.graph, model, input_f32(ctx, "input", hp.fast_hidden, 1), 0);
+    const std::vector<ggml_tensor *> chosen =
+        chain_codes(ctx, build.graph, model, primed, input_i32(ctx, "first_code", 1));
+
+    bool use_sched = false;
+    if (!prepare_graph(model.backend, model.sched, model.buffer_w, model.frame_allocr,
+                       build.graph, "fast frame", use_sched, error)) {
+        return false;
+    }
+    write_input(build.graph, "input", fast_input.data(), fast_input.size() * sizeof(float));
+    write_input(build.graph, "first_code", &first_code, sizeof(first_code));
+    if (!compute_graph(model.backend, model.sched, build.graph, use_sched, n_threads,
+                       "fast frame", error)) {
+        return false;
+    }
+
+    codes_out.assign(hp.num_codebooks, 0);
+    codes_out[0] = first_code;
+    read_chosen(chosen, codes_out);
+    return true;
+}
 
 bool fast_step(lm_model & model, const std::vector<float> & fast_input, int semantic,
                int n_threads, const code_picker & pick, std::vector<int32_t> & codes_out,

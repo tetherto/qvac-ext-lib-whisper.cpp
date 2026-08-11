@@ -49,6 +49,7 @@ std::atomic<bool> g_backends_loaded{false};
 std::atomic<bool> g_backends_dir_warned{false};
 std::atomic<bool> g_opencl_cache_dir_warned{false};
 constexpr const char * VULKAN_BACKEND_NAME = "Vulkan";
+constexpr const char * METAL_BACKEND_NAME = "Metal";
 
 const char * dev_reg_name(ggml_backend_dev_t dev) {
     if (!dev) return "";
@@ -126,14 +127,22 @@ bool gpu_backend_satisfies_requirement(const char * backend_name,
                                        GpuBackendRequirement requirement) {
     if (requirement == GpuBackendRequirement::Any) return true;
     if (!backend_name) return false;
-    if (requirement == GpuBackendRequirement::MetalOrOpenCL) {
-        // Registry names: Metal registers as "Metal" or "MTL" depending on
-        // the ggml build (see backend_util.h backend_is_metal).
-        return std::strcmp(backend_name, "Metal") == 0 ||
-               std::strcmp(backend_name, "MTL") == 0 ||
-               std::strcmp(backend_name, "OpenCL") == 0;
+    switch (requirement) {
+        case GpuBackendRequirement::Vulkan:
+            return std::strcmp(backend_name, VULKAN_BACKEND_NAME) == 0;
+        case GpuBackendRequirement::VulkanOrMetal:
+            return std::strcmp(backend_name, VULKAN_BACKEND_NAME) == 0 ||
+                   std::strcmp(backend_name, METAL_BACKEND_NAME) == 0;
+        case GpuBackendRequirement::MetalOrOpenCL:
+            // Registry names: Metal registers as "Metal" or "MTL" depending on
+            // the ggml build (see backend_util.h backend_is_metal).
+            return std::strcmp(backend_name, "Metal") == 0 ||
+                   std::strcmp(backend_name, "MTL") == 0 ||
+                   std::strcmp(backend_name, "OpenCL") == 0;
+        case GpuBackendRequirement::Any:
+            break;
     }
-    return std::strcmp(backend_name, VULKAN_BACKEND_NAME) == 0;
+    return false;
 }
 
 void set_backends_directory(const std::string & dir) {

@@ -34,6 +34,7 @@ constexpr double GPU_WAVEFORM_TOLERANCE = 1e-4;
 constexpr double GPU_CLONE_MIN_CORRELATION = 0.85;
 constexpr int GPU_LAYERS = 99;
 constexpr const char * VULKAN_BACKEND = "Vulkan";
+constexpr const char * METAL_BACKEND = "Metal";
 
 bool is_gpu_test() {
     return std::getenv("AUDIO8_TEST_GPU") != nullptr;
@@ -73,7 +74,7 @@ tts_cpp::audio8::EngineOptions options_for(const paths & where, const nlohmann::
     opts.n_threads = where.threads;
     opts.greedy = true;
     opts.max_frames = meta.at("max_new_tokens").get<int>();
-    opts.n_gpu_layers = std::getenv("AUDIO8_TEST_GPU") ? GPU_LAYERS : 0;
+    opts.n_gpu_layers = is_gpu_test() ? GPU_LAYERS : 0;
     return opts;
 }
 
@@ -138,6 +139,38 @@ bool check_waveform(const char * tag, const std::vector<float> & got,
     return true;
 }
 
+// The reference dumps [num_codebooks, frames]; the engine reports frame-major.
+// Exact equality is the right bar either way: a code is a codebook index, so one
+// differing value means the trajectory forked, not that it rounded.
+bool check_codes(const char * tag, const std::vector<int> & got, const npy_array & want) {
+    if (want.shape.size() != 2) {
+        std::fprintf(stderr, "%s codes: FAIL reference has rank %zu, expected 2\n", tag,
+                     want.shape.size());
+        return false;
+    }
+    if (got.size() != want.n_elements()) {
+        std::fprintf(stderr, "%s codes: FAIL %zu values, reference has %zu\n", tag,
+                     got.size(), want.n_elements());
+        return false;
+    }
+    const int books = static_cast<int>(want.shape[0]);
+    const int frames = static_cast<int>(want.shape[1]);
+    const int32_t * reference = reinterpret_cast<const int32_t *>(want.data.data());
+    int mismatches = 0;
+    for (int frame = 0; frame < frames; ++frame) {
+        for (int book = 0; book < books; ++book) {
+            const size_t mine = static_cast<size_t>(frame) * books + book;
+            const size_t theirs = static_cast<size_t>(book) * frames + frame;
+            if (got[mine] != reference[theirs]) ++mismatches;
+        }
+    }
+    std::printf("  [%s codes] n=%zu  mismatches=%d\n", tag, got.size(), mismatches);
+    if (mismatches == 0) return true;
+    std::fprintf(stderr, "%s codes: FAIL %d of %zu differ from the reference\n", tag,
+                 mismatches, got.size());
+    return false;
+}
+
 bool check_frames(const char * tag, int got, const nlohmann::json & meta) {
     const int want = meta.at("generated_frames").get<int>();
     if (got == want) return true;
@@ -145,14 +178,16 @@ bool check_frames(const char * tag, int got, const nlohmann::json & meta) {
     return false;
 }
 
+// A GPU arm that quietly fell back to CPU would still pass every numeric check
+// below, so the backend is asserted before its numbers are read as a GPU result.
 bool check_backend(const char * tag, const tts_cpp::audio8::Engine & engine) {
-    if (!std::getenv("AUDIO8_TEST_GPU")) return true;
+    if (!is_gpu_test()) return true;
     const std::string name = engine.backend_name();
-    if (engine.backend_device() == tts_cpp::BackendDevice::GPU &&
-        name.find(VULKAN_BACKEND) != std::string::npos) {
-        return true;
-    }
-    std::fprintf(stderr, "%s: FAIL expected Vulkan, got %s\n", tag, name.c_str());
+    const bool validated = name.find(VULKAN_BACKEND) != std::string::npos ||
+                           name.find(METAL_BACKEND) != std::string::npos;
+    if (engine.backend_device() == tts_cpp::BackendDevice::GPU && validated) return true;
+    std::fprintf(stderr, "%s: FAIL expected a Vulkan or Metal GPU, got %s\n", tag,
+                 name.c_str());
     return false;
 }
 
@@ -244,6 +279,7 @@ bool run_case(const char * tag, const paths & where, const fixture & data, bool 
 
     bool ok = check_backend(tag, engine);
     ok &= check_frames(tag, result.frames, meta);
+    ok &= check_codes(tag, result.codes, data.load("codes"));
     ok &= check_waveform(tag, result.pcm, data.load("wav"), cloning);
     return ok;
 }
