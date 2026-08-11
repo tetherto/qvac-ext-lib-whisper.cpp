@@ -8,8 +8,8 @@
 // used for the reconstruction roundtrip. Both run through a ggml compute graph
 // (CPU by default, or a GPU backend via VaeOptions::n_gpu_layers), using the two
 // custom ops landed in the ggml-speech fork (ggml_col2im_1d for the decoder's
-// transposed convs, ggml_snake for the snake activations) which now have both
-// CPU and Metal kernels.
+// transposed convs, ggml_snake for the snake activations). The pipeline runs on
+// CPU, Metal, Vulkan, and validated OpenCL on Adreno 700+.
 //
 // Latents are laid out time-major: latent[t * 64 + c] for frame t, channel c.
 // Audio is interleaved stereo: pcm[t * 2 + ch]. Upsample factor is 1920, so
@@ -19,7 +19,8 @@
 //     auto vae = tts_cpp::acestep::Vae::load("vae-BF16.gguf");
 //     auto pcm = vae->decode(latent, T_latent);       // -> interleaved 48 kHz stereo
 //
-// Memory scales with the decoded length; decode/encode bounded windows on CPU.
+// Decode uses backend-adaptive overlapping windows for bounded memory on long
+// inputs. Encode is not windowed and allocates one full graph.
 
 #include "audiogen-cpp/export.h"
 
@@ -34,9 +35,8 @@ struct VaeOptions {
     bool verbose      = false;
     bool with_encoder = true;  // load the encoder too (needed for encode()/roundtrip)
     int  n_threads    = 0;     // 0 = hardware concurrency
-    int  n_gpu_layers = 0;     // >0 = run the decode/encode graph on a GPU backend
-                               // (Metal/CUDA/...); the custom snake / col2im_1d ops
-                               // have GPU kernels in the ggml-speech fork. Falls
+    int  n_gpu_layers = 0;     // >0 = run decode/encode on a GPU backend (Metal,
+                               // Vulkan, or validated Adreno 700+ OpenCL). Falls
                                // back to CPU when no GPU backend is available.
     std::string backends_dir;  // dlopen'd ggml backend modules dir; see
                                // EngineOptions::backends_dir. Empty when loaded
@@ -55,7 +55,8 @@ public:
     Vae & operator=(const Vae &) = delete;
 
     // Decode a 64-channel latent (time-major, latent[t*64 + c]) into interleaved
-    // stereo 48 kHz PCM (2 * T_latent * 1920 samples). Empty on failure.
+    // stereo 48 kHz PCM (2 * T_latent * 1920 samples). Long inputs use windows
+    // sized from the active backend's allocation cap. Empty on failure.
     //
     // `on_progress` (optional) is invoked as the decode graph executes, once per
     // computed node, with (done, total) node counts -> fine-grained progress for
@@ -66,8 +67,8 @@ public:
                               const ProgressCb & on_progress = {}) const;
 
     // Encode interleaved stereo 48 kHz PCM (frames*2 samples) into the 64-channel
-    // mean latent (time-major). Sets *T_latent_out. Empty on failure or if the
-    // encoder was not loaded (see VaeOptions::with_encoder).
+    // mean latent (time-major) in one full graph. Sets *T_latent_out. Empty on
+    // failure or if the encoder was not loaded (see VaeOptions::with_encoder).
     std::vector<float> encode(const std::vector<float> & pcm_interleaved, int frames, int * T_latent_out) const;
 
     bool        has_encoder() const;

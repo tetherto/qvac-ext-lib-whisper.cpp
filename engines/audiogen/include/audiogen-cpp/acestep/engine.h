@@ -8,11 +8,17 @@
 // @qvac/tts-ggml addon), so the addon never shells out to a binary and
 // compiles for every platform tts-cpp supports.
 //
-// Pipeline stages (all ggml graphs on the ggml-speech fork, CPU-first):
+// Pipeline stages (all ggml graphs on the ggml-speech fork):
+//     LM (acestep-lm, Qwen3 causal)   -> metadata + acoustic codes
+//     FSQ detokenizer                 -> DiT context latents
 //     text-encoder (Qwen3-Embedding)  -> prompt embeddings
-//     LM (acestep-lm, Qwen3 causal)   -> lyrics + acoustic codes
+//     condition encoder               -> cross-attention states
 //     DiT (diffusion transformer)     -> 64-channel acoustic latent
 //     VAE (AutoencoderOobleck)        -> 48 kHz stereo PCM   [see vae.h]
+//
+// With a GPU selected, DiT, VAE and the encoders use it by default. The LM and
+// detokenizer use the validated Metal/OpenCL and Vulkan/Metal/OpenCL allowlists,
+// respectively, with CPU fallback for unmeasured backends.
 //
 // Port status:
 //   [x] custom ggml ops: ggml_col2im_1d, ggml_snake (CPU) in ggml-speech
@@ -26,8 +32,8 @@
 //   [x] LM Phase-2 CFG (multi-set KV in lm_ggml) + upstream sampling defaults.
 //   [x] LM Phase-1 CoT/metadata auto-gen + metadata FSM (metadata_fsm.h).
 //   [x] is_turbo auto-detect -> steps/shift (turbo 8/3.0, base/sft 50/1.0).
-//   [x] Parity vs acestep.cpp: synth bit-close (corr 0.98-0.99 on same codes);
-//       LM greedy matches upstream argmax (divergence = CPU-F32 vs Metal-F16).
+//   [x] Informal parity vs acestep.cpp: synth correlation measured at 0.98-0.99
+//       on same codes; no reproducible result artifact is committed.
 //   [x] DiT sampler Haar DCW "double" correction (official ACE-Step defaults).
 // Deferred: DiT CFG/APG (guidance>1, base/sft only).
 
@@ -41,8 +47,10 @@
 namespace tts_cpp::acestep {
 
 // GGUF weights for each stage. Either point at a directory holding the four
-// GGUFs (models_dir) and let the engine auto-classify by architecture, or set
-// explicit per-stage paths (explicit wins over the directory scan).
+// GGUFs (models_dir) and let the engine classify by filename substring, or set
+// explicit per-stage paths (explicit wins over the directory scan). Scanned
+// filenames must contain one of the documented stems: embedding/text-enc/textenc,
+// -lm/lm-/_lm/ace-lm/5hz-lm, turbo/dit/v15/sft, or vae.
 struct EngineOptions {
     std::string models_dir;
 
@@ -67,10 +75,10 @@ struct EngineOptions {
     // localise a backend divergence to the stage that introduces it; the
     // directory must already exist. Empty = no dumping and no overhead.
     std::string dump_stages_dir;
-    // NOTE: VAE tiling (windowed decode for bounded memory on long tracks) is
-    // handled internally by vae_model_decode with values tuned to the Metal
-    // buffer limit; it is intentionally not exposed as config to avoid a footgun
-    // (a bad window size reintroduces the iOS decode OOM/segfault).
+    // NOTE: VAE windowed decode probes the active backend's allocation cap and
+    // adapts its window for bounded memory on long tracks. It is intentionally
+    // not exposed as an API option; ACESTEP_VAE_WIN_CORE is diagnostic only.
+    // VAE encode remains a full-graph operation.
 };
 
 struct GenerateParams {
@@ -108,6 +116,7 @@ struct GenerateMetadata {
     std::string keyscale;
     std::string vocal_language;
     int         bpm = 0;
+    // atoi-style numeric prefix: "4/4" and "4foo" -> 4; no prefix -> 0.
     int         timesignature = 0;
     long long   seed = 0;
     int         n_codes = 0;
@@ -126,8 +135,10 @@ using ProgressFn = std::function<bool(const std::string & stage, int step, int t
 
 class AUDIOGEN_API Engine {
 public:
-    // Load all stages. Throws std::runtime_error on failure (missing GGUF,
-    // wrong architecture, alloc failure) or if a stage is not yet ported.
+    // Validate model paths, GGUF metadata, and tokenizers. Stage weights load
+    // lazily inside generate() and are released after use by default. A supported
+    // truthy ACESTEP_KEEP_STAGES value eagerly loads and keeps every stage.
+    // Throws std::runtime_error on missing/invalid models or allocation failure.
     static std::unique_ptr<Engine> create(const EngineOptions & opts);
 
     ~Engine();

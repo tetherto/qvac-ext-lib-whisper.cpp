@@ -324,7 +324,7 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     vo.verbose      = v;
     vo.with_encoder = false;
     vo.n_threads    = nth;
-    vo.n_gpu_layers = opts.n_gpu_layers;  // snake / col2im_1d have Metal + Vulkan kernels
+    vo.n_gpu_layers = opts.n_gpu_layers;  // validated on Metal, Vulkan, and Adreno OpenCL
     if (const char * e = std::getenv("ACESTEP_VAE_GPU")) {
         vo.n_gpu_layers = (e[0] == '1') ? 99 : 0;
     }

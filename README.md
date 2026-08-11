@@ -11,7 +11,7 @@ On-device speech and audio AI in pure C++ on [ggml](https://github.com/tetherto/
 | Desktop | Linux, macOS, Windows |
 | Mobile | Android (arm64-v8a), iOS (arm64) |
 | Backends | CPU, Metal, Vulkan, OpenCL (Adreno), CUDA, Apple Core ML (encoder sidecar) |
-| Quantization | `f32`, `f16`, `bf16`, `q8_0`, `q6_k`, `q5_0`, `q5_1`, `q4_0` (per model, see tables) |
+| Quantization | `f32`, `f16`, `bf16`, `q8_0`, `q6_k`, `q5_0`, `q5_1`, `q4_0`, `q4_k_m` (per model, see tables) |
 | Shared ggml | one `ggml-speech` vcpkg port, built from [qvac-ext-ggml@speech](https://github.com/tetherto/qvac-ext-ggml/tree/speech) |
 | Language | C++17 |
 
@@ -46,8 +46,9 @@ parakeet  wav  -> log-mel -> FastConformer encoder -> CTC | TDT | EOU | Sortform
                                                    -> text | speaker segments | turn boundary
 tts       text -> LM (T3 / Llama / Qwen2.5) -> acoustic tokens -> CFM or flow -> vocoder -> wav
                                                    (+ LavaSR denoise -> bandwidth extension)
-audiogen  caption + lyrics -> text encoder -> ACE-Step LM -> FSQ detokenizer
-                           -> DiT flow matching -> Oobleck VAE -> 48 kHz stereo
+audiogen  caption + lyrics -> ACE-Step LM -> FSQ detokenizer -> text encoder
+                           -> condition encoder -> DiT flow matching
+                           -> Oobleck VAE -> 48 kHz stereo
 ```
 
 ## Repo layout
@@ -126,8 +127,8 @@ Pair any ASR GGUF with a Sortformer GGUF via `--diarization-model` for an attrib
 
 | Model | Engine | Task | Rate | Quantization | Backends | Notes |
 |---|---|---|---|---|---|---|
-| ACE-Step v15 turbo | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal | 8 diffusion steps by default |
-| ACE-Step v15 base / sft | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal | 50 diffusion steps by default |
+| ACE-Step v15 turbo | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0`, `q4_k_m` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 8 diffusion steps by default |
+| ACE-Step v15 sft | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 50 diffusion steps by default |
 
 ## Build
 
@@ -269,6 +270,11 @@ See [Voice conditioning](engines/tts/README.md#voice-conditioning-cross-engine).
 ```
 
 ### Music generation
+
+AudioGen uses four GGUF files for six runtime weight sets. The DiT file also
+contains the FSQ detokenizer and condition encoder; see the
+[AudioGen model setup](engines/audiogen/README.md#model-setup) for validated
+file combinations and registry download instructions.
 
 ```sh
 ./build/engines/audiogen/music-cli --models models/acestep \
