@@ -167,8 +167,16 @@ std::vector<float> cosyvoice_flow_run(model_ctx & m,
                                       const std::vector<float> & embedding, int & out_mel_len,
                                       cosyvoice_timings * tmg = nullptr);
 
+// HiFT f0 predictor alone: mel [80, mel_len] channel-major -> per-frame f0 [Hz].
+std::vector<float> cosyvoice_hift_f0(model_ctx & m,
+                                     const std::vector<float> & mel, int mel_len);
+
 // CausalHiFT vocoder: mel [80, mel_len] channel-major (mel[ch*T + t]) -> 24 kHz
 // float PCM.  Runs f0_predictor + SineGen2 excitation + STFT + decode.
+// f0_override (parity tests) skips the predictor: SineGen2 integrates f0 into
+// sine phases, so cross-backend f0 noise decorrelates the raw waveform unless
+// pinned.
 std::vector<float> cosyvoice_hift_synth(model_ctx & m,
                                         const std::vector<float> & mel, int mel_len, int seed,
-                                        cosyvoice_timings * tmg = nullptr);
+                                        cosyvoice_timings * tmg = nullptr,
+                                        const std::vector<float> * f0_override = nullptr);

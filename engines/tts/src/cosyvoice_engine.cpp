@@ -166,20 +166,16 @@ struct Engine::Impl {
         if (!opts.backends_dir.empty())     det::set_backends_directory(opts.backends_dir);
         if (!opts.opencl_cache_dir.empty()) det::set_opencl_cache_dir(opts.opencl_cache_dir);
 
+        // Selection is constrained to the backends the CosyVoice3 graphs are
+        // parity-gated against (test-cosyvoice-{flow,llm,hift}-gpu):
+        // OpenCL/Adreno since QVAC-22777, Metal since QVAC-22775.  The
+        // requirement filters at the device walk, so on a multi-backend host
+        // a Vulkan device cannot shadow an available Metal one; Vulkan stays
+        // out until a per-stage reference run and a CI device exist for it.
         backend = det::init_gpu_backend(opts.n_gpu_layers, /*verbose=*/false, "cosyvoice",
                                         /*vulkan_device=*/0, /*allow_arm_mali=*/false,
-                                        &gpu_present_but_unused);
-        // CosyVoice3's GPU path is validated on OpenCL (Adreno) only.  Other GPU
-        // backends are declined deliberately: the DiT and CausalHiFT graphs lean
-        // on ops (grouped conv1d, conv_transpose_1d, snake) whose per-backend
-        // numerics have not been parity-gated for this model, and there is no CI
-        // device for them.  Widening this needs a per-stage reference run first.
-        if (backend && !det::backend_is_opencl(backend)) {
-            // init_gpu_backend only reports its own declines, so record ours too.
-            gpu_present_but_unused = true;
-            ggml_backend_free(backend);
-            backend = nullptr;
-        }
+                                        &gpu_present_but_unused,
+                                        det::GpuBackendRequirement::MetalOrOpenCL);
         if (!backend) backend = det::init_cpu_backend();
         if (!backend) throw std::runtime_error("cosyvoice: failed to init a compute backend");
 

@@ -71,10 +71,13 @@ jobs:
           key: ccache-tts-${{ matrix.os }}-${{ github.sha }}
           restore-keys: ccache-tts-${{ matrix.os }}-
 
-      # CPU-only ggml: this lane runs `-LE gpu` tests, and hosted runners
-      # have no Vulkan/OpenCL; Metal is exercised by the gpu lane instead.
-      # Cache key is shared with parakeet-ci.yml so whichever lane builds
-      # first serves both.
+      # CPU-only ggml on BOTH lanes. ubuntu has no GPU; hosted macos-14
+      # exposes Metal but its Apple Paravirtual device has no simdgroup
+      # matmul, so any test that picks up the Metal backend aborts at kernel
+      # encode with "unsupported op 'MUL_MAT'" (tried under QVAC-22775 —
+      # test-metal-ops and even unit tests that auto-probe a GPU died).
+      # Metal runtime coverage needs real Apple silicon. Cache key is shared
+      # with parakeet-ci.yml so whichever lane builds first serves both.
       - name: Build ggml (system ggml, qvac-ext-ggml@${{ env.GGML_BRANCH }})
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
@@ -107,9 +110,10 @@ jobs:
       - name: Build
         run: cmake --build build -j4
 
-      # Excludes gpu (no GPU on hosted runners) and perf (timing gates are
-      # meaningless on shared runners). Model-dependent tests are DISABLED
-      # at configure time when fixtures are absent and report as "Not Run".
+      # Excludes gpu (no usable GPU on hosted runners — see the ggml build
+      # note) and perf (timing gates are meaningless on shared runners).
+      # Model-dependent tests are DISABLED at configure time when fixtures
+      # are absent and report as "Not Run".
       # LD_LIBRARY_PATH: the ggml install ships libqvac-speech-ggml.so whose
       # own dependency on the ggml-cpu/base siblings is resolved transitively
       # — Linux RUNPATH doesn't apply to transitive loads, so the loader
@@ -119,9 +123,11 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
         run: ctest --test-dir build -LE 'gpu|perf' --output-on-failure --timeout 600
 
-  # GPU lane stub: opt-in until self-hosted GPU runners exist. Trial note:
-  # hosted macos-14 exposes Metal, so moving `-L gpu` / the mtl-* suites
-  # into the macOS build-test job is a cheap first experiment.
+  # GPU lane stub: opt-in until self-hosted GPU runners exist. Trial outcome
+  # (QVAC-22775): hosted macos-14 exposes Metal but its Apple Paravirtual
+  # device has no simdgroup matmul — kernel encode aborts with "unsupported
+  # op 'MUL_MAT'" — so the gpu label needs real Apple silicon, not hosted
+  # macOS.
   gpu:
     if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
     runs-on: [self-hosted, gpu]

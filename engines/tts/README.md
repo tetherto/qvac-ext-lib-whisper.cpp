@@ -50,7 +50,7 @@ engine, not every backend ggml can compile.
 | Supertonic 2 | `en`, `ko`, `es`, `pt`, `fr` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Supertonic 3 | 31 languages plus `na` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Parler-TTS mini/large/Indic | English or 21 Indic languages | natural-language description | 44.1 kHz | yes | yes | yes | yes | no |
-| Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice; instruct controls | 24 kHz | yes | no | no | yes | no |
+| Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice; instruct controls | 24 kHz | yes | yes | no | yes | no |
 | Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | no | yes | no | no |
 | LavaSR denoiser | language agnostic | input PCM | rate preserving | yes | yes | yes | yes | yes |
 | LavaSR enhancer | language agnostic | input PCM | 48 kHz | yes | yes | yes | yes | yes |
@@ -551,8 +551,9 @@ python scripts/bench-supertonic-onnx.py \
 
 CosyVoice3 runs a Qwen2.5 speech-token LM, DiT conditional-flow-matching
 network, and CausalHiFT vocoder through `tts_cpp::cosyvoice::Engine`. The
-validated backends are CPU and OpenCL; `n_gpu_layers > 0` selects the OpenCL
-path and other GPU backends are not supported.
+validated backends are CPU, Metal (macOS / iOS), and OpenCL (Adreno);
+`n_gpu_layers > 0` selects the GPU path via the Metal-or-OpenCL requirement
+and other GPU backends fall back to CPU.
 
 Use `cosyvoice-cli` for end-to-end synthesis. The `cosyvoice-hift`,
 `cosyvoice-flow`, and `cosyvoice-llm` executables isolate stages, and

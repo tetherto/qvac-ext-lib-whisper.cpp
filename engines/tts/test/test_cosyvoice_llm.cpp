@@ -11,8 +11,18 @@
 //
 // Usage:
 //   test-cosyvoice-llm --llm-gguf LLM.gguf --in-dir DIR [--min-match 0.99]
+//
+// Set COSYVOICE_TEST_GPU=1 to run the same parity check on the selected GPU
+// backend (mirrors PARLER_TEST_GPU); fails if no GPU backend initializes.
+// The GPU run additionally generates on CPU in-process and requires the GPU
+// trajectory (tokens and stop) to be identical. EOS-position parity is
+// enforceable only cross-backend: even the CPU leg does not reproduce the
+// PyTorch reference's stop step (near-tie logits there), so the reference
+// gate stays a prefix-match while the cross-backend gate catches a backend
+// that keeps generating past the stop the CPU implementation produces.
 
 #include "npy.h"
+#include "backend_selection.h"
 #include "cosyvoice_pipeline.h"
 
 #include <algorithm>
@@ -39,7 +49,18 @@ int main(int argc, char ** argv) {
     }
     if (gguf.empty() || in_dir.empty()) { fprintf(stderr, "missing --llm-gguf / --in-dir\n"); return 2; }
 
-    model_ctx m = cosyvoice_load_gguf(gguf);
+    ggml_backend_t backend = nullptr;
+    if (std::getenv("COSYVOICE_TEST_GPU")) {
+        // Same requirement as the production engine (cosyvoice_engine.cpp), so
+        // on a mixed-backend host the harness validates a backend the engine
+        // would actually select instead of whichever device sorts first.
+        backend = ::tts_cpp::detail::init_gpu_backend(
+            99, /*verbose=*/false, "test-cosyvoice", /*vulkan_device=*/0,
+            /*allow_arm_mali=*/false, /*out_gpu_present_but_unused=*/nullptr,
+            ::tts_cpp::detail::GpuBackendRequirement::MetalOrOpenCL);
+        if (!backend) { fprintf(stderr, "FAIL: COSYVOICE_TEST_GPU set but no GPU backend\n"); return 1; }
+    }
+    model_ctx m = cosyvoice_load_gguf(gguf, backend);
     qwen_hp hp = cosyvoice_qwen_hp(m);  // exercise the GGUF-KV hp path
 
     npy_array tid_a = npy_load(in_dir + "/text_ids.npy");
@@ -63,6 +84,32 @@ int main(int argc, char ** argv) {
     const int max_steps = (int)ref.size() + 16;
     std::vector<int> got = cosyvoice_llm_generate(
         m, hp, text_ids, prompt_stok, max_steps, /*greedy=*/true, seed, /*min_len=*/0);
+
+    if (backend) {
+        // Cross-backend parity against an in-process CPU run. Guards the case
+        // the reference prefix gate cannot see: a GPU backend that reproduces
+        // the prefix but stops differently (e.g. never emits EOS where the
+        // CPU implementation does). The gate is exact equality: greedy Metal
+        // and CPU trajectories measured bit-identical (tokens and stop), so
+        // any difference is a regression, not tolerance-worthy noise.
+        model_ctx m_cpu = cosyvoice_load_gguf(gguf);
+        qwen_hp hp_cpu = cosyvoice_qwen_hp(m_cpu);
+        std::vector<int> got_cpu = cosyvoice_llm_generate(
+            m_cpu, hp_cpu, text_ids, prompt_stok, max_steps, /*greedy=*/true, seed, /*min_len=*/0);
+        size_t first_diff = 0;
+        while (first_diff < std::min(got.size(), got_cpu.size()) &&
+               got[first_diff] == got_cpu[first_diff]) {
+            ++first_diff;
+        }
+        fprintf(stderr, "gpu-vs-cpu: gpu=%zu cpu=%zu tokens\n", got.size(), got_cpu.size());
+        if (got != got_cpu) {
+            fprintf(stderr,
+                    "FAIL: GPU greedy trajectory not identical to CPU "
+                    "(first difference at index %zu)\n",
+                    first_diff);
+            return 1;
+        }
+    }
 
     size_t n = std::min(got.size(), ref.size());
     size_t match = 0;

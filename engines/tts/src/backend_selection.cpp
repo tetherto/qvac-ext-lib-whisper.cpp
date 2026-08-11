@@ -125,7 +125,15 @@ int pick_vulkan_device_index(int requested,
 bool gpu_backend_satisfies_requirement(const char * backend_name,
                                        GpuBackendRequirement requirement) {
     if (requirement == GpuBackendRequirement::Any) return true;
-    return backend_name && std::strcmp(backend_name, VULKAN_BACKEND_NAME) == 0;
+    if (!backend_name) return false;
+    if (requirement == GpuBackendRequirement::MetalOrOpenCL) {
+        // Registry names: Metal registers as "Metal" or "MTL" depending on
+        // the ggml build (see backend_util.h backend_is_metal).
+        return std::strcmp(backend_name, "Metal") == 0 ||
+               std::strcmp(backend_name, "MTL") == 0 ||
+               std::strcmp(backend_name, "OpenCL") == 0;
+    }
+    return std::strcmp(backend_name, VULKAN_BACKEND_NAME) == 0;
 }
 
 void set_backends_directory(const std::string & dir) {
@@ -396,6 +404,7 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
     // Set when a GPU was present but declined BY POLICY (non-allowlisted Android vendor,
     // or Adreno 6xx) so the caller accepts CPU fallback; NOT set when a validated GPU's init failed.
     bool gpu_present_but_unvalidated = false;
+    bool requirement_skipped_gpu = false;
 
     const size_t n_dev = ggml_backend_dev_count();
     for (size_t i = 0; i < n_dev; ++i) {
@@ -412,7 +421,14 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
         const bool   is_opencl = reg_name && std::strcmp(reg_name, "OpenCL") == 0;
         const bool   is_vulkan =
             reg_name && std::strcmp(reg_name, VULKAN_BACKEND_NAME) == 0;
-        if (!gpu_backend_satisfies_requirement(reg_name, requirement)) continue;
+        if (!gpu_backend_satisfies_requirement(reg_name, requirement)) {
+            // Recorded, not flagged: this only becomes a policy CPU fallback
+            // if no requirement-matching device exists at all. Flagging here
+            // would misreport a later init FAILURE of a matching device (e.g.
+            // Vulkan skipped, then OpenCL fails to init) as intentional.
+            requirement_skipped_gpu = true;
+            continue;
+        }
 
         if (is_vulkan) {
             size_t free = 0, total = 0;
@@ -617,6 +633,14 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
                 "%s: no GPU backend available, falling back to CPU\n",
                 log_prefix);
         }
+    }
+    // Requirement-skipped devices count as a policy decline only when no
+    // requirement-matching candidate was enumerated; reaching this point with
+    // non-empty buckets means a matching device was tried and failed to init,
+    // which must not be reported as intentional.
+    if (requirement_skipped_gpu && opencl_adreno_700plus.empty() &&
+        other_gpu.empty() && opencl_other.empty()) {
+        gpu_present_but_unvalidated = true;
     }
     // Report a GPU declined by policy so the caller accepts CPU fallback as correct
     // (not a regression); not set when a validated GPU was tried and failed to init.

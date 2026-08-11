@@ -181,6 +181,34 @@ if (NOT TARGET ggml)
     endif()
 endif()
 
+# GPU-labelled test registration must see which ggml backends exist in both
+# integration modes. The add_subdirectory build exposes the GGML_<BACKEND>
+# options directly and the speech-branch package config re-exports them
+# (GGML_VARIABLES_EXPANDED); GGML_AVAILABLE_BACKENDS is the fallback for a
+# system ggml whose config predates that expansion. Each engine's gpu test
+# variants register only for backends that engine's production allowlist
+# accepts, so an off-allowlist build neither runs unvalidated backends nor
+# silently skips validated ones.
+foreach(_tts_ggml_backend metal vulkan cuda opencl)
+    string(TOUPPER "${_tts_ggml_backend}" _tts_ggml_backend_uc)
+    set(TTS_CPP_GGML_${_tts_ggml_backend_uc} FALSE)
+    if (GGML_${_tts_ggml_backend_uc} OR
+        "ggml-${_tts_ggml_backend}" IN_LIST GGML_AVAILABLE_BACKENDS)
+        set(TTS_CPP_GGML_${_tts_ggml_backend_uc} TRUE)
+    endif()
+endforeach()
+# Parler allowlist: Metal / Vulkan / OpenCL (parler/gguf.cpp).
+set(TTS_CPP_PARLER_GPU FALSE)
+if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_VULKAN OR TTS_CPP_GGML_OPENCL)
+    set(TTS_CPP_PARLER_GPU TRUE)
+endif()
+# CosyVoice3 allowlist: Metal / OpenCL (cosyvoice_engine.cpp
+# GpuBackendRequirement::MetalOrOpenCL).
+set(TTS_CPP_COSYVOICE_GPU FALSE)
+if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_OPENCL)
+    set(TTS_CPP_COSYVOICE_GPU TRUE)
+endif()
+
 # The standalone chatterbox.cpp source carries a bundled-ggml filename-prefix
 # block (helper function, tts_cpp_apply_ggml_prefix loop, and
 # GGML_BACKEND_DL_PROJECT_PREFIX define). This in-tree package does not expose
@@ -664,6 +692,17 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "--flow-gguf" "${_tcb_cosy_flow_gguf}" "--in-dir" "${_tcb_cosy_ref}"
         REQUIRES "${_tcb_cosy_flow_gguf}" "${_tcb_cosy_ref}/flow_mel.npy")
 
+    # Same binaries on the GPU backend — the per-stage reference legs behind
+    # the cosyvoice_engine.cpp allowlist.  Skipped via `ctest -LE gpu`.
+    if (TTS_CPP_COSYVOICE_GPU)
+        tts_cpp_register_test(test-cosyvoice-flow-gpu
+            EXE      test-cosyvoice-flow
+            LABEL    "gpu"
+            ARGS     "--flow-gguf" "${_tcb_cosy_flow_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+            REQUIRES "${_tcb_cosy_flow_gguf}" "${_tcb_cosy_ref}/flow_mel.npy")
+        set_property(TEST test-cosyvoice-flow-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+    endif()
+
     add_executable(test-cosyvoice-llm test/test_cosyvoice_llm.cpp ${_tcb_cosy_core_srcs})
     target_link_libraries(test-cosyvoice-llm PRIVATE ggml)
     target_include_directories(test-cosyvoice-llm PRIVATE ggml/include src)
@@ -673,6 +712,15 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "--llm-gguf" "${_tcb_cosy_llm_gguf}" "--in-dir" "${_tcb_cosy_ref}"
         REQUIRES "${_tcb_cosy_llm_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
 
+    if (TTS_CPP_COSYVOICE_GPU)
+        tts_cpp_register_test(test-cosyvoice-llm-gpu
+            EXE      test-cosyvoice-llm
+            LABEL    "gpu"
+            ARGS     "--llm-gguf" "${_tcb_cosy_llm_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+            REQUIRES "${_tcb_cosy_llm_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
+        set_property(TEST test-cosyvoice-llm-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+    endif()
+
     add_executable(test-cosyvoice-hift test/test_cosyvoice_hift.cpp ${_tcb_cosy_core_srcs})
     target_link_libraries(test-cosyvoice-hift PRIVATE ggml)
     target_include_directories(test-cosyvoice-hift PRIVATE ggml/include src)
@@ -681,6 +729,24 @@ if (TTS_CPP_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "--hift-gguf" "${_tcb_cosy_hift_gguf}" "--in-dir" "${_tcb_cosy_ref}"
         REQUIRES "${_tcb_cosy_hift_gguf}" "${_tcb_cosy_ref}/hift_wav.npy")
+
+    if (TTS_CPP_COSYVOICE_GPU)
+        tts_cpp_register_test(test-cosyvoice-hift-gpu
+            EXE      test-cosyvoice-hift
+            LABEL    "gpu"
+            ARGS     "--hift-gguf" "${_tcb_cosy_hift_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+            REQUIRES "${_tcb_cosy_hift_gguf}" "${_tcb_cosy_ref}/hift_wav.npy")
+        set_property(TEST test-cosyvoice-hift-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+    endif()
+
+    # Deviceless policy test for GpuBackendRequirement filtering (the per-device
+    # predicate of init_gpu_backend); guards the multi-backend selection order.
+    add_executable(test-backend-requirement test/test_backend_requirement.cpp
+        src/backend_selection.cpp)
+    target_link_libraries(test-backend-requirement PRIVATE ggml)
+    target_include_directories(test-backend-requirement PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-backend-requirement)
+    tts_cpp_register_test(test-backend-requirement LABEL "unit")
 
     # Map-in-place loader: byte-exact round-trip + clean failure on a truncated
     # GGUF. Self-contained (writes its own synthetic GGUF), so it always runs.
@@ -936,7 +1002,7 @@ if (TTS_CPP_BUILD_TESTS)
 
     # Same binary on the GPU transposed-conv path (conv_transpose_1d_matmul), which
     # the CPU run never reaches.  Skipped on GPU-less fleets via `ctest -LE gpu`.
-    if (GGML_METAL OR GGML_VULKAN OR GGML_CUDA)
+    if (TTS_CPP_PARLER_GPU)
         tts_cpp_register_test(test-parler-dac-gpu
             EXE      test-parler-dac
             LABEL    "gpu"
@@ -1021,7 +1087,7 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_parler_indic_gguf}" "${_tcb_parler_indic_ref}"
         REQUIRES "${_tcb_parler_indic_gguf}" "${_tcb_parler_indic_ref}/dacrand_wav.npy")
 
-    if (GGML_METAL OR GGML_VULKAN OR GGML_CUDA)
+    if (TTS_CPP_PARLER_GPU)
         tts_cpp_register_test(test-parler-dac-indic-gpu
             EXE      test-parler-dac
             LABEL    "gpu"
@@ -1817,17 +1883,12 @@ if (TTS_CPP_BUILD_TESTS)
     target_link_libraries(test-metal-ops PRIVATE ggml tts-cpp-backend-defs)
     target_include_directories(test-metal-ops PRIVATE ggml/include src)
     tts_cpp_apply_ccache(test-metal-ops)
-    # Metal-only kernel parity check.  Useful only when built with
-    # -DGGML_METAL=ON; skipped on CI fleets without Metal via `ctest -LE gpu`.
-    # GGML_USE_METAL is supplied locally here (rather than via
-    # tts-cpp-backend-defs) because the library itself no longer
-    # consumes the macro -- every #ifdef GGML_USE_<X> in src/ was
-    # removed alongside the registry-only refactor. The test still
-    # uses the macro to gate its direct ggml_backend_metal_init()
-    # call site (it's exercising the Metal-backend implementation
-    # directly, not going through tts-cpp's backend selection).
-    if (GGML_METAL)
-        target_compile_definitions(test-metal-ops PRIVATE GGML_USE_METAL)
+    # Metal-only kernel parity check; skipped on CI fleets without Metal via
+    # `ctest -LE gpu`. The test resolves the Metal device through the backend
+    # registry (no direct ggml_backend_metal_init() call), so it links against
+    # base ggml alone and also works when ggml-metal is a GGML_BACKEND_DL
+    # dlopened backend rather than a linked target.
+    if (TTS_CPP_GGML_METAL)
         tts_cpp_register_test(test-metal-ops LABEL "gpu")
     endif()
 

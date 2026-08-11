@@ -12,10 +12,6 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
-#ifdef GGML_USE_METAL
-#include "ggml-metal.h"
-#endif
-
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -406,15 +402,27 @@ int main() {
     ggml_backend_t cpu = ggml_backend_cpu_init();
     if (!cpu) { fprintf(stderr, "CPU backend init failed\n"); return 1; }
 
+    // Resolved through the backend registry rather than a direct
+    // ggml_backend_metal_init() call: with GGML_BACKEND_DL builds ggml-metal
+    // is dlopened, so the direct entry point is not linked into consumers.
+    ggml_backend_load_all();
     ggml_backend_t gpu = nullptr;
-#ifdef GGML_USE_METAL
-    gpu = ggml_backend_metal_init();
-    fprintf(stderr, "Using Metal backend\n");
-#endif
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        if (reg_name && (std::strcmp(reg_name, "Metal") == 0 ||
+                         std::strcmp(reg_name, "MTL") == 0)) {
+            gpu = ggml_backend_dev_init(dev, nullptr);
+            break;
+        }
+    }
     if (!gpu) {
-        fprintf(stderr, "No GPU backend compiled in; nothing to validate.\n");
+        fprintf(stderr, "No Metal device registered; nothing to validate.\n");
         return 0;
     }
+    fprintf(stderr, "Using Metal backend\n");
 
     int rc = 0;
     rc |= test_quantized_cont_unsupported(cpu, gpu);
@@ -426,6 +434,8 @@ int main() {
     rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/5200, /*IC=*/128, /*OC=*/64,  /*K=*/11, /*s0=*/3, "ups[2]");
     // A small sanity case too.
     rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/10,   /*IC=*/3,   /*OC=*/4,   /*K=*/5,  /*s0=*/2, "tiny");
+    // CosyVoice3 iSTFT shape — the only conv_transpose consumer with OC=1.
+    rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/64,   /*IC=*/34,  /*OC=*/1,   /*K=*/16, /*s0=*/4, "istft");
 
     // MUL_MAT + ADD(bias) fusion (PROGRESS §3.27): CFM transformer hot shapes.
     //   K=256, N=256 — attn to_q / to_k / to_v

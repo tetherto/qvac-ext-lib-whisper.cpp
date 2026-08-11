@@ -1179,7 +1179,7 @@ static std::vector<float> sinegen2_source(const std::vector<float> & f0_wav,
     return source;
 }
 
-static std::vector<float> run_f0_predictor(model_ctx & m, const std::vector<float> & mel, int T_mel) {
+std::vector<float> cosyvoice_hift_f0(model_ctx & m, const std::vector<float> & mel, int T_mel) {
     ggml_init_params gp = cosy_arena(kCosyHiftF0Nodes);
     ggml_context * ctx = ggml_init(gp);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, kCosyHiftF0Nodes, false);
@@ -1442,11 +1442,12 @@ static std::vector<float> run_stft(model_ctx & m, const std::vector<float> & src
 
 std::vector<float> cosyvoice_hift_synth(model_ctx & m,
                                         const std::vector<float> & mel, int mel_len, int seed,
-                                        cosyvoice_timings * tmg) {
+                                        cosyvoice_timings * tmg,
+                                        const std::vector<float> * f0_override) {
     const int T_mel = mel_len;
     const int sampling_rate = kCosyvoiceNativeSampleRate;
     auto t_f0 = cosy_clk::now();
-    auto f0 = run_f0_predictor(m, mel, T_mel);
+    auto f0 = f0_override ? *f0_override : cosyvoice_hift_f0(m, mel, T_mel);
     if (tmg) tmg->hift_f0_ms += cosy_ms_since(t_f0, m.backend);
     int upsample = 8 * 5 * 3 * 4;  // prod(upsample_rates) * hop_len = 480
     int T_wav = T_mel * upsample;

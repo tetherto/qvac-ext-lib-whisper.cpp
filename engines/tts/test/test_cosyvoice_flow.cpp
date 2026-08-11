@@ -10,8 +10,12 @@
 //
 // Usage:
 //   test-cosyvoice-flow --flow-gguf FLOW.gguf --in-dir DIR [--min-cosine 0.99]
+//
+// Set COSYVOICE_TEST_GPU=1 to run the same parity check on the selected GPU
+// backend (mirrors PARLER_TEST_GPU); fails if no GPU backend initializes.
 
 #include "npy.h"
+#include "backend_selection.h"
 #include "cosyvoice_pipeline.h"
 
 #include <cmath>
@@ -33,7 +37,18 @@ int main(int argc, char ** argv) {
     if (gguf.empty() || in_dir.empty()) { fprintf(stderr, "missing --flow-gguf / --in-dir\n"); return 2; }
 
     const int MEL = 80;
-    model_ctx m = cosyvoice_load_gguf(gguf);
+    ggml_backend_t backend = nullptr;
+    if (std::getenv("COSYVOICE_TEST_GPU")) {
+        // Same requirement as the production engine (cosyvoice_engine.cpp), so
+        // on a mixed-backend host the harness validates a backend the engine
+        // would actually select instead of whichever device sorts first.
+        backend = ::tts_cpp::detail::init_gpu_backend(
+            99, /*verbose=*/false, "test-cosyvoice", /*vulkan_device=*/0,
+            /*allow_arm_mali=*/false, /*out_gpu_present_but_unused=*/nullptr,
+            ::tts_cpp::detail::GpuBackendRequirement::MetalOrOpenCL);
+        if (!backend) { fprintf(stderr, "FAIL: COSYVOICE_TEST_GPU set but no GPU backend\n"); return 1; }
+    }
+    model_ctx m = cosyvoice_load_gguf(gguf, backend);
 
     npy_array ptok_a  = npy_load(in_dir + "/prompt_token.npy");
     npy_array stok_a  = npy_load(in_dir + "/speech_tokens.npy");
