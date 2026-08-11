@@ -13,7 +13,10 @@
 #include "acestep/textenc_ggml.h"
 
 #include "acestep/backend_registry.h"
+#include "acestep/cover_noise.h"
 #include "acestep/generate_task.h"
+#include "acestep/generation_conditioning.h"
+#include "acestep/generation_plan.h"
 #include "acestep/stage_placement.h"
 
 #include "ggml-backend.h"
@@ -171,7 +174,7 @@ struct Engine::Impl {
     }
     void ensure_vae(bool with_encoder = false) {
         if (vae && (!with_encoder || vae->has_encoder())) return;
-        if (vae) free_vae();  // reload a resident decoder-only VAE when encoding is required
+        if (vae) free_vae();
         if (opts.verbose) fprintf(stderr, "[acestep-engine] loading VAE\n");
         VaeOptions load_opts = vae_opts;
         load_opts.with_encoder = with_encoder;
@@ -470,42 +473,25 @@ static std::string build_metas(int bpm, const std::string & timesig, const std::
     return buf;
 }
 
-GenerateResult Engine::generate(const GenerateParams & params_in, const ProgressFn & progress) const {
-    Impl *         m = impl_.get();
-    GenerateResult result;
-    result.sample_rate = m->sr;  // VAE may not be resident yet (loaded lazily below)
-    result.channels    = 2;
-    m->cancel_flag.store(false);
+static constexpr int AUDIO_CHANNELS         = 2;
+static constexpr int AUDIO_SAMPLE_RATE      = 48000;
+static constexpr int AUDIO_LATENT_RATE      = 25;
+static constexpr int AUDIO_LATENT_CHANNELS  = 64;
+static constexpr int AUDIO_CODE_FRAME_RATIO = 5;
+static constexpr int TURBO_STEPS            = 8;
+static constexpr int STANDARD_STEPS         = 50;
+static constexpr float TURBO_SHIFT          = 3.0f;
+static constexpr float STANDARD_SHIFT       = 1.0f;
 
-    GenerateParams params = params_in;
-    if (const std::string err = normalize_generate_task(params); !err.empty())
-        throw std::invalid_argument(err);
+using StageReporter = std::function<bool(const char *, int, int)>;
 
-    auto report = [&](const char * stage, int step, int total) -> bool {
-        if (progress && !progress(stage, step, total)) { m->cancel_flag.store(true); return false; }
-        return !m->cancel_flag.load();
-    };
+static long long resolve_seed(long long seed) {
+    if (seed >= 0) return seed;
+    std::random_device random;
+    return (long long) random();
+}
 
-    StageTimes timing;
-    StageDump  dump(m->opts.dump_stages_dir, m->opts.verbose);
-
-    // Sequential loading (default): each stage is loaded via m->ensure_*() right
-    // before its step and freed via m->free_*() right after, so the peak resident
-    // set is one stage, or the cond + text encoders where those two overlap,
-    // rather than all six at once — small enough for a non-entitled iOS app not
-    // to be jetsam-killed. With ACESTEP_KEEP_STAGES=1 every stage is already
-    // resident (create() eager-loaded it), ensure_*() is a no-op, and the free_*()
-    // calls are skipped so nothing is released between generate() calls. Each
-    // stage's lazy-load cost is attributed to its own timing.mark() below — there
-    // is no separate up-front reload phase.
-    const bool low_mem       = !m->keep_stages;
-    const bool cover_nofsq   = params.task_type == TASK_COVER_NOFSQ;
-
-    long long seed = params.seed;
-    if (seed < 0) { std::random_device rd; seed = (long long) rd(); }
-
-    const std::string language = params.vocal_language.empty() ? "en" : params.vocal_language;
-
+static AcePrompt make_prompt(const GenerateParams & params, const std::string & language) {
     AcePrompt prompt;
     prompt.caption        = params.caption;
     prompt.lyrics         = params.lyrics.empty() ? "[Instrumental]" : params.lyrics;
@@ -514,397 +500,536 @@ GenerateResult Engine::generate(const GenerateParams & params_in, const Progress
     prompt.keyscale       = params.keyscale;
     prompt.timesignature  = params.timesignature;
     prompt.vocal_language = language;
+    return prompt;
+}
 
-    // Context latents fed to the DiT: either FSQ-detok(LM codes) or VAE(source).
-    std::vector<float> context_latents;  // [T_25Hz * 64]
-    int                T_5Hz  = 0;
-    int                T_25Hz = 0;
-    std::vector<float> reference_features;
-    int                reference_T = 0;
-    std::vector<float> cover_latents_for_noise;  // clean source latents for cover_noise_strength
+static bool encode_audio(Vae & vae, const std::vector<float> & pcm, const char * stage,
+                         const char * dump_name, const StageReporter & report, bool verbose,
+                         StageDump & dump, StageTimes & timing, EncodedAudio & output) {
+    if (!report(stage, 0, 1)) return false;
 
-    if (cover_nofsq) {
-        // cover-nofsq: skip LM + FSQ; DiT context is the VAE encoding of source_audio.
-        m->ensure_vae(/*with_encoder=*/true);
-        if (!report("source", 0, 1)) return result;
-        const int source_frames = (int) (params.source_audio.size() / 2);
-        context_latents = m->vae->encode(params.source_audio, source_frames, &T_25Hz);
-        if (context_latents.empty() || T_25Hz <= 0)
-            throw std::runtime_error("acestep engine: source audio VAE encode failed");
-        cover_latents_for_noise = context_latents;
-        // Duration is driven by the source length at 25 Hz (acestep ops_resolve_T).
-        prompt.duration = (float) T_25Hz / 25.0f;
-        if (m->opts.verbose)
-            fprintf(stderr, "[acestep-engine] cover-nofsq source: %.2fs -> %d latent frames (%.2fs @ 25 Hz)\n",
-                    (float) source_frames / 48000.0f, T_25Hz, prompt.duration);
-        dump.write("00_source_latent", context_latents, T_25Hz, 64);
-        timing.mark("source");
-        if (!report("source", 1, 1)) return result;
-
-        // Timbre: explicit reference_audio, else reuse the source latents
-        // (acestep.cpp recommends --ref-audio == --src-audio for cover-nofsq).
-        if (!params.reference_audio.empty()) {
-            if (!report("reference", 0, 1)) return result;
-            const int reference_frames = (int) (params.reference_audio.size() / 2);
-            reference_features = m->vae->encode(params.reference_audio, reference_frames, &reference_T);
-            if (reference_features.empty() || reference_T <= 0)
-                throw std::runtime_error("acestep engine: reference audio VAE encode failed");
-            if (m->opts.verbose)
-                fprintf(stderr, "[acestep-engine] reference audio: %.2fs -> %d timbre frames\n",
-                        (float) reference_frames / 48000.0f, reference_T);
-            dump.write("00_reference_latent", reference_features, reference_T, 64);
-            timing.mark("reference");
-            if (!report("reference", 1, 1)) return result;
-        } else {
-            reference_features = context_latents;
-            reference_T        = T_25Hz;
-        }
-
-        if (low_mem) m->free_vae();
-        // No LM / detok on this path.
-        timing.mark("lm");
-        timing.mark("detok");
-    } else {
-        // text2music: optional timbre reference, then LM -> FSQ detok.
-        if (!params.reference_audio.empty()) {
-            if ((params.reference_audio.size() & 1u) != 0)
-                throw std::invalid_argument("acestep engine: reference_audio must be interleaved stereo");
-
-            m->ensure_vae(/*with_encoder=*/true);
-            if (!report("reference", 0, 1)) return result;
-            const int reference_frames = (int) (params.reference_audio.size() / 2);
-            reference_features = m->vae->encode(params.reference_audio, reference_frames, &reference_T);
-            if (reference_features.empty() || reference_T <= 0)
-                throw std::runtime_error("acestep engine: reference audio VAE encode failed");
-            if (m->opts.verbose)
-                fprintf(stderr, "[acestep-engine] reference audio: %.2fs -> %d timbre frames\n",
-                        (float) reference_frames / 48000.0f, reference_T);
-            dump.write("00_reference_latent", reference_features, reference_T, 64);
-            timing.mark("reference");
-            if (!report("reference", 1, 1)) return result;
-
-            if (low_mem) m->free_vae();
-        }
-
-        // ---- 1. LM: caption+lyrics(+metas) -> audio semantic codes (Phase 2) ----
-        if (!report("lm", 0, 1)) return result;
-        std::vector<int> codes;
-        if (!params.audio_codes.empty()) {
-            codes = params.audio_codes;  // parity / cached codes: skip the LM
-            if (m->opts.verbose)
-                fprintf(stderr, "[acestep-engine] using %zu pre-supplied codes (LM skipped)\n", codes.size());
-        } else {
-            m->ensure_lm();  // load the LM just before its step (freed right after)
-            LmSampleParams lp;
-            lp.temperature = params.lm_temperature;
-            lp.top_p       = params.lm_top_p;
-            lp.top_k       = params.lm_top_k;
-            lp.cfg_scale   = params.lm_cfg_scale;
-            // The LM sampler RNG is std::mt19937 (32-bit seed), so truncating here
-            // is intentional and lossless for its purpose; only the DiT noise needs
-            // the full int64 seed (Philox, torch.randn parity), which it gets below.
-            lp.seed        = (uint32_t) seed;
-            lp.verbose     = m->opts.verbose;
-            // Surface incremental Phase-2 progress (the longest stage) so the UI bar
-            // advances while the LM writes audio codes, not only during the DiT.
-            lp.on_step     = [&](int cur, int total) { report("lm", cur, total); };
-
-            // Phase 1: fill missing metadata (bpm/keyscale/duration/timesignature)
-            // from the caption via the FSM, so a bare caption matches the CLI.
-            const bool has_all_metas =
-                prompt.bpm > 0 && prompt.duration > 0 && !prompt.keyscale.empty() && !prompt.timesignature.empty();
-            if (params.lm_phase1 && !has_all_metas) {
-                LmSampleParams p1 = lp;
-                p1.max_new_tokens = 0;  // FSM stops at </think>
-                if (!lm_generate_phase1(m->lm, m->bpe_lm, prompt, p1))
-                    fprintf(stderr, "[acestep-engine] Phase 1 failed; falling back to provided/default metas\n");
-            }
-
-            if (!lm_generate_codes(m->lm, m->bpe_lm, prompt, lp, codes) || codes.empty())
-                throw std::runtime_error("acestep engine: LM produced no audio codes");
-        }
-        if (!report("lm", 1, 1)) return result;
-
-        // The LM is done (codes in hand). Free it now so its weights + KV (~1.1 GB)
-        // are not resident during the rest of the pipeline. Reloaded next generate().
-        if (low_mem) {
-            if (m->lm && m->opts.verbose) fprintf(stderr, "[acestep-engine] freeing LM (low-mem)\n");
-            m->free_lm();
-        }
-        timing.mark("lm");
-        dump.write_ints("01_lm_codes", codes);
-
-        // ---- 2. FSQ detok: codes -> context latents [64, T_25Hz] ----
-        m->ensure_detok();  // load the detokenizer just before its (only) use
-        T_5Hz  = (int) codes.size();
-        T_25Hz = T_5Hz * 5;
-        context_latents.assign((size_t) 64 * T_25Hz, 0.0f);
-        if (detok_model_decode(m->detok, codes.data(), T_5Hz, context_latents.data()) != T_25Hz)
-            throw std::runtime_error("acestep engine: FSQ detokenizer failed");
-        timing.mark("detok");
-        dump.write("02_detok_latent", context_latents, T_25Hz, 64);
-
-        // Detok latents are in hand; the detokenizer is not needed again. Free it.
-        if (low_mem) {
-            if (m->detok && m->opts.verbose) fprintf(stderr, "[acestep-engine] freeing FSQ detokenizer (low-mem)\n");
-            m->free_detok();
-        }
+    const int pcm_frames = (int) (pcm.size() / AUDIO_CHANNELS);
+    output.latent = vae.encode(pcm, pcm_frames, &output.frames);
+    if (output.latent.empty() || output.frames <= 0) {
+        throw std::runtime_error(std::string("acestep engine: ") + stage + " audio VAE encode failed");
     }
 
-    // ---- 3. context [ctx_ch=128, T] = [detok latent[64] | mask[64]=1] ----
-    // dit_cfg was read from GGUF metadata at create() so no resident DiT is needed
-    // to size the context (the DiT itself is loaded lazily just before step 7).
-    const DitConfig & dc     = m->dit_cfg;
-    const int         Oc     = dc.out_channels;            // 64
-    const int         ctx_ch = dc.in_channels - Oc;        // 128
-    const int         patch  = dc.patch_size;              // 2
-    int               T      = ((T_25Hz + patch - 1) / patch) * patch;
+    if (verbose) {
+        fprintf(stderr, "[acestep-engine] %s audio: %.2fs -> %d latent frames\n",
+                stage, (float) pcm_frames / AUDIO_SAMPLE_RATE, output.frames);
+    }
+    dump.write(dump_name, output.latent, output.frames, AUDIO_LATENT_CHANNELS);
+    timing.mark(stage);
+    return report(stage, 1, 1);
+}
 
-    // The cond-encoder supplies the silence frame here and runs its forward at
-    // step 5, so it is needed from now through step 5; load it once, up front.
-    m->ensure_cond();
+static const char * resolve_conditioning_dump_name(const char * stage) {
+    return strcmp(stage, "source") == 0 ? "00_source_latent" : "00_reference_latent";
+}
 
-    std::vector<float> context((size_t) ctx_ch * T, 0.0f);
-    // Padded frames in [T_25Hz, T) are filled with the silence latent (not left
-    // at zero) and the chunk mask stays 1.0 for every frame, matching
-    // acestep.cpp (pipeline-synth-ops.cpp: "decoded latents then silence,
-    // mask = 1.0 (training distribution)"). Zeroing the mask on the tail would
-    // diverge from the reference, which only ever saw 0/1 masks in training.
-    const std::vector<float> & sil = cond_model_silence_frame(m->cond);
-    const float *              silf = sil.empty() ? nullptr : sil.data();
-    for (int t = 0; t < T; t++) {
-        float * dst = context.data() + (size_t) t * ctx_ch;
-        if (t < T_25Hz) {
-            memcpy(dst, context_latents.data() + (size_t) t * Oc, (size_t) Oc * sizeof(float));
-        } else if (silf) {
-            memcpy(dst, silf, (size_t) Oc * sizeof(float));  // silence-latent pad
+static void fill_dit_context_mask(float * frame, int output_channels) {
+    for (int channel = 0; channel < output_channels; ++channel) {
+        frame[output_channels + channel] = 1.0f;
+    }
+}
+
+static void fill_dit_context_frames(std::vector<float> & context, const std::vector<float> & latent,
+                                    const float * silence, int frames, int latent_frames,
+                                    int context_channels, int output_channels) {
+    for (int frame_index = 0; frame_index < frames; ++frame_index) {
+        float * frame = context.data() + (size_t) frame_index * context_channels;
+        if (frame_index < latent_frames) {
+            memcpy(frame, latent.data() + (size_t) frame_index * output_channels,
+                   (size_t) output_channels * sizeof(float));
+        } else if (silence) {
+            memcpy(frame, silence, (size_t) output_channels * sizeof(float));
         }
-        for (int c = 0; c < Oc; c++) dst[Oc + c] = 1.0f;  // chunk mask (training distribution)
+        fill_dit_context_mask(frame, output_channels);
+    }
+}
+
+static std::vector<float> make_dit_context(const std::vector<float> & latent,
+                                           const std::vector<float> & silence, int frames,
+                                           int latent_frames, int context_channels,
+                                           int output_channels) {
+    std::vector<float> context((size_t) context_channels * frames, 0.0f);
+    fill_dit_context_frames(context, latent, silence.empty() ? nullptr : silence.data(),
+                            frames, latent_frames, context_channels, output_channels);
+    return context;
+}
+
+struct GenerationState {
+    GenerateTask task;
+    GenerationPlan plan;
+    long long seed = 0;
+    std::string language;
+    AcePrompt prompt;
+    GenerationConditioning conditioning;
+    std::vector<float> context_latents;
+    int code_frames = 0;
+    int latent_frames = 0;
+    bool low_memory = false;
+};
+
+struct PromptEncoding {
+    std::vector<float> text_hidden;
+    std::vector<float> lyric_embedding;
+    int text_tokens = 0;
+    int lyric_tokens = 0;
+};
+
+struct EncoderConditioning {
+    std::vector<float> context;
+    std::vector<float> hidden;
+    int frames = 0;
+    int context_channels = 0;
+    int sequence = 0;
+    int hidden_size = 0;
+};
+
+struct NoiseSchedule {
+    std::vector<float> noise;
+    std::vector<float> schedule;
+    int steps = 0;
+    float shift = 0.0f;
+};
+
+static GenerationState make_generation_state(const GenerateParams & params, bool keep_stages) {
+    GenerationState state;
+    if (const std::string error = resolve_generate_task(params, state.task); !error.empty()) {
+        throw std::invalid_argument(error);
+    }
+    state.plan = make_generation_plan(params, state.task);
+    state.seed = resolve_seed(params.seed);
+    state.language = params.vocal_language.empty() ? "en" : params.vocal_language;
+    state.prompt = make_prompt(params, state.language);
+    state.low_memory = !keep_stages;
+    return state;
+}
+
+template <typename EngineImpl>
+static bool prepare_audio_conditioning(EngineImpl & engine, const GenerateParams & params,
+                                       GenerationState & state, const StageReporter & report,
+                                       StageDump & dump, StageTimes & timing) {
+    if (!state.plan.encode_source && !state.plan.encode_reference) return true;
+
+    engine.ensure_vae(true);
+    const AudioEncoder encode =
+        [&](const std::vector<float> & pcm, const char * stage, EncodedAudio & output) {
+            return encode_audio(*engine.vae, pcm, stage, resolve_conditioning_dump_name(stage),
+                                report, engine.opts.verbose, dump, timing, output);
+        };
+    if (!prepare_generation_conditioning(params, state.plan, encode, state.conditioning)) return false;
+
+    if (state.plan.encode_source) {
+        state.context_latents = std::move(state.conditioning.source.latent);
+        state.latent_frames = state.conditioning.source.frames;
+        state.prompt.duration = (float) state.latent_frames / AUDIO_LATENT_RATE;
+    }
+    if (state.low_memory) engine.free_vae();
+    return true;
+}
+
+static bool has_complete_metadata(const AcePrompt & prompt) {
+    return prompt.bpm > 0 && prompt.duration > 0 &&
+           !prompt.keyscale.empty() && !prompt.timesignature.empty();
+}
+
+static LmSampleParams make_lm_sample_params(const GenerateParams & params, long long seed,
+                                            bool verbose, const StageReporter & report) {
+    LmSampleParams sample;
+    sample.temperature = params.lm_temperature;
+    sample.top_p = params.lm_top_p;
+    sample.top_k = params.lm_top_k;
+    sample.cfg_scale = params.lm_cfg_scale;
+    sample.seed = (uint32_t) seed;
+    sample.verbose = verbose;
+    sample.on_step = [&](int current, int total) { report("lm", current, total); };
+    return sample;
+}
+
+template <typename EngineImpl>
+static void generate_audio_codes(EngineImpl & engine, const GenerateParams & params,
+                                 GenerationState & state, const StageReporter & report,
+                                 std::vector<int> & codes) {
+    if (!params.audio_codes.empty()) {
+        codes = params.audio_codes;
+        if (engine.opts.verbose) {
+            fprintf(stderr, "[acestep-engine] using %zu pre-supplied codes (LM skipped)\n", codes.size());
+        }
+        return;
     }
 
-    // ---- 4. text-encoder: prompt -> text_hidden; lyric lookup -> lyric_embed ----
-    std::string metas    = build_metas(prompt.bpm, prompt.timesignature, prompt.keyscale, prompt.duration);
-    std::string text_str = std::string("# Instruction\n") + DIT_INSTR_COVER + "\n\n# Caption\n" + prompt.caption +
-                           "\n\n# Metas\n" + metas + "<|endoftext|>\n";
-    std::string lyric_str = std::string("# Languages\n") + language + "\n\n# Lyric\n" + prompt.lyrics + "<|endoftext|>";
+    engine.ensure_lm();
+    const LmSampleParams sample =
+        make_lm_sample_params(params, state.seed, engine.opts.verbose, report);
+    if (params.lm_phase1 && !has_complete_metadata(state.prompt)) {
+        LmSampleParams phase_one = sample;
+        phase_one.max_new_tokens = 0;
+        if (!lm_generate_phase1(engine.lm, engine.bpe_lm, state.prompt, phase_one)) {
+            fprintf(stderr, "[acestep-engine] Phase 1 failed; falling back to provided/default metas\n");
+        }
+    }
+    if (!lm_generate_codes(engine.lm, engine.bpe_lm, state.prompt, sample, codes) || codes.empty()) {
+        throw std::runtime_error("acestep engine: LM produced no audio codes");
+    }
+}
 
-    std::vector<int> text_ids  = bpe_encode(m->bpe_text, text_str, /*add_eos=*/true);
-    std::vector<int> lyric_ids = bpe_encode(m->bpe_text, lyric_str, /*add_eos=*/true);
-    const int        S_text    = (int) text_ids.size();
-    const int        S_lyric   = (int) lyric_ids.size();
+template <typename EngineImpl>
+static bool run_lm_stage(EngineImpl & engine, const GenerateParams & params,
+                         GenerationState & state, const StageReporter & report,
+                         StageDump & dump, StageTimes & timing, std::vector<int> & codes) {
+    if (!report("lm", 0, 1)) return false;
+    generate_audio_codes(engine, params, state, report, codes);
+    if (!report("lm", 1, 1)) return false;
+
+    if (state.low_memory) {
+        if (engine.lm && engine.opts.verbose) fprintf(stderr, "[acestep-engine] freeing LM (low-mem)\n");
+        engine.free_lm();
+    }
+    timing.mark("lm");
+    dump.write_ints("01_lm_codes", codes);
+    return true;
+}
+
+template <typename EngineImpl>
+static void run_detokenizer_stage(EngineImpl & engine, const std::vector<int> & codes,
+                                  GenerationState & state, StageDump & dump, StageTimes & timing) {
+    engine.ensure_detok();
+    state.code_frames = (int) codes.size();
+    state.latent_frames = state.code_frames * AUDIO_CODE_FRAME_RATIO;
+    state.context_latents.assign((size_t) AUDIO_LATENT_CHANNELS * state.latent_frames, 0.0f);
+    if (detok_model_decode(engine.detok, codes.data(), state.code_frames,
+                           state.context_latents.data()) != state.latent_frames) {
+        throw std::runtime_error("acestep engine: FSQ detokenizer failed");
+    }
+    timing.mark("detok");
+    dump.write("02_detok_latent", state.context_latents, state.latent_frames, AUDIO_LATENT_CHANNELS);
+
+    if (state.low_memory) {
+        if (engine.detok && engine.opts.verbose) {
+            fprintf(stderr, "[acestep-engine] freeing FSQ detokenizer (low-mem)\n");
+        }
+        engine.free_detok();
+    }
+}
+
+template <typename EngineImpl>
+static bool prepare_context_latents(EngineImpl & engine, const GenerateParams & params,
+                                    GenerationState & state, const StageReporter & report,
+                                    StageDump & dump, StageTimes & timing) {
+    if (!state.plan.run_lm || !state.plan.run_detokenizer) {
+        timing.mark("lm");
+        timing.mark("detok");
+        return true;
+    }
+
+    std::vector<int> codes;
+    if (!run_lm_stage(engine, params, state, report, dump, timing, codes)) return false;
+    run_detokenizer_stage(engine, codes, state, dump, timing);
+    return true;
+}
+
+struct PromptTokens {
+    std::vector<int32_t> text;
+    std::vector<int32_t> lyrics;
+};
 
 #ifdef ACESTEP_PARITY_DEBUG
-    if (dbg_env("ACESTEP_DUMP_DIR")) {
-        fprintf(stderr, "[acestep-dbg] S_text=%d S_lyric=%d (enc_S=%d)\n", S_text, S_lyric, S_text + S_lyric);
-        fprintf(stderr, "[acestep-dbg] text_ids[0..8]:");
-        for (int i = 0; i < 8 && i < S_text; i++) fprintf(stderr, " %d", text_ids[i]);
-        fprintf(stderr, " ... tail:");
-        for (int i = std::max(0, S_text - 4); i < S_text; i++) fprintf(stderr, " %d", text_ids[i]);
-        fprintf(stderr, "\n[acestep-dbg] lyric_ids[0..8]:");
-        for (int i = 0; i < 8 && i < S_lyric; i++) fprintf(stderr, " %d", lyric_ids[i]);
-        fprintf(stderr, " ... tail:");
-        for (int i = std::max(0, S_lyric - 4); i < S_lyric; i++) fprintf(stderr, " %d", lyric_ids[i]);
-        fprintf(stderr, "\n");
-    }
+static void print_token_range(const std::vector<int> & tokens, int first, int last) {
+    for (int index = first; index < last; ++index) fprintf(stderr, " %d", tokens[(size_t) index]);
+}
+
+static void print_prompt_tokens(const std::vector<int> & text, const std::vector<int> & lyrics) {
+    fprintf(stderr, "[acestep-dbg] S_text=%zu S_lyric=%zu (enc_S=%zu)\n",
+            text.size(), lyrics.size(), text.size() + lyrics.size());
+    fprintf(stderr, "[acestep-dbg] text_ids[0..8]:");
+    print_token_range(text, 0, std::min(8, (int) text.size()));
+    fprintf(stderr, " ... tail:");
+    print_token_range(text, std::max(0, (int) text.size() - 4), (int) text.size());
+    fprintf(stderr, "\n[acestep-dbg] lyric_ids[0..8]:");
+    print_token_range(lyrics, 0, std::min(8, (int) lyrics.size()));
+    fprintf(stderr, " ... tail:");
+    print_token_range(lyrics, std::max(0, (int) lyrics.size() - 4), (int) lyrics.size());
+    fprintf(stderr, "\n");
+}
 #endif
 
-    std::vector<int32_t> text_ids32(text_ids.begin(), text_ids.end());
-    std::vector<int32_t> lyric_ids32(lyric_ids.begin(), lyric_ids.end());
+static PromptTokens tokenize_prompt(const BpeTokenizer & tokenizer, const AcePrompt & prompt,
+                                    const std::string & language) {
+    const std::string metadata =
+        build_metas(prompt.bpm, prompt.timesignature, prompt.keyscale, prompt.duration);
+    const std::string text = std::string("# Instruction\n") + DIT_INSTR_COVER +
+                             "\n\n# Caption\n" + prompt.caption + "\n\n# Metas\n" +
+                             metadata + "<|endoftext|>\n";
+    const std::string lyrics = std::string("# Languages\n") + language +
+                               "\n\n# Lyric\n" + prompt.lyrics + "<|endoftext|>";
+    const std::vector<int> text_ids = bpe_encode(tokenizer, text, true);
+    const std::vector<int> lyric_ids = bpe_encode(tokenizer, lyrics, true);
 
-    m->ensure_textenc();  // load the text-encoder just before its step
-    std::vector<float> text_hidden, lyric_embed;
-    if (!textenc_model_forward(m->textenc, text_ids32.data(), S_text, text_hidden))
+#ifdef ACESTEP_PARITY_DEBUG
+    if (dbg_env("ACESTEP_DUMP_DIR")) print_prompt_tokens(text_ids, lyric_ids);
+#endif
+
+    return {
+        std::vector<int32_t>(text_ids.begin(), text_ids.end()),
+        std::vector<int32_t>(lyric_ids.begin(), lyric_ids.end())
+    };
+}
+
+template <typename EngineImpl>
+static PromptEncoding encode_prompt(EngineImpl & engine, const PromptTokens & tokens,
+                                    GenerationState & state, StageDump & dump, StageTimes & timing) {
+    engine.ensure_textenc();
+    PromptEncoding encoding;
+    encoding.text_tokens = (int) tokens.text.size();
+    encoding.lyric_tokens = (int) tokens.lyrics.size();
+    if (!textenc_model_forward(engine.textenc, tokens.text.data(), encoding.text_tokens,
+                               encoding.text_hidden)) {
         throw std::runtime_error("acestep engine: text-encoder forward failed");
-    if (!textenc_model_embed_lookup(m->textenc, lyric_ids32.data(), S_lyric, lyric_embed))
+    }
+    if (!textenc_model_embed_lookup(engine.textenc, tokens.lyrics.data(), encoding.lyric_tokens,
+                                    encoding.lyric_embedding)) {
         throw std::runtime_error("acestep engine: lyric embed lookup failed");
+    }
     timing.mark("textenc");
-    dump.write("04_text_hidden", text_hidden, S_text, (int) (text_hidden.size() / (size_t) S_text));
-    dump.write("05_lyric_embed", lyric_embed, S_lyric, (int) (lyric_embed.size() / (size_t) S_lyric));
+    dump.write("04_text_hidden", encoding.text_hidden, encoding.text_tokens,
+               (int) (encoding.text_hidden.size() / (size_t) encoding.text_tokens));
+    dump.write("05_lyric_embed", encoding.lyric_embedding, encoding.lyric_tokens,
+               (int) (encoding.lyric_embedding.size() / (size_t) encoding.lyric_tokens));
 
-    // text_hidden + lyric_embed are on the host now; the text-encoder (~742 MB) is
-    // done. Free it before the cond-encoder forward so only one of the two is
-    // resident at a time.
-    if (low_mem) {
-        if (m->textenc && m->opts.verbose) fprintf(stderr, "[acestep-engine] freeing text-encoder (low-mem)\n");
-        m->free_textenc();
+    if (state.low_memory) {
+        if (engine.textenc && engine.opts.verbose) {
+            fprintf(stderr, "[acestep-engine] freeing text-encoder (low-mem)\n");
+        }
+        engine.free_textenc();
     }
+    return encoding;
+}
 
-    // ---- 5. cond-encoder: -> enc_hidden [2048, S_total] ----
-    // text2music feeds one frame of the silence latent to the timbre encoder so
-    // the enc sequence carries the timbre token (packed lyric|timbre|text),
-    // matching acestep.cpp. Without it we drop a token and misalign cross-attn.
-    const std::vector<float> & silence_frame = cond_model_silence_frame(m->cond);
-    const float * timbre_feats = reference_features.empty()
-                                     ? (silence_frame.empty() ? nullptr : silence_frame.data())
-                                     : reference_features.data();
-    const int timbre_S_ref = reference_features.empty() ? (silence_frame.empty() ? 0 : 1) : reference_T;
-
-    std::vector<float> enc_hidden;
-    int                enc_S = 0;
-    if (!cond_model_forward(m->cond, text_hidden.data(), S_text, lyric_embed.data(), S_lyric, timbre_feats,
-                            timbre_S_ref, enc_hidden, &enc_S))
+template <typename EngineImpl>
+static void encode_cross_attention(EngineImpl & engine, const PromptEncoding & prompt,
+                                   const GenerationState & state, EncoderConditioning & output,
+                                   StageDump & dump, StageTimes & timing) {
+    const TimbreInput timbre = resolve_timbre_input(
+        state.plan, state.conditioning.reference, state.context_latents,
+        state.latent_frames, cond_model_silence_frame(engine.cond));
+    if (!cond_model_forward(engine.cond, prompt.text_hidden.data(), prompt.text_tokens,
+                            prompt.lyric_embedding.data(), prompt.lyric_tokens,
+                            timbre.data, timbre.frames, output.hidden, &output.sequence)) {
         throw std::runtime_error("acestep engine: cond-encoder forward failed");
-    const int H_enc = (int) (enc_hidden.size() / (size_t) enc_S);  // 2048
-
-    // Cross-attention conditioning (enc_hidden) is now materialised on the host,
-    // so the cond-encoder (~352 MB) is no longer needed. Free it before the
-    // DiT/VAE so its (wired) buffers don't count against the device memory
-    // ceiling. Reloaded on the next generate().
-    if (low_mem) {
-        if (m->cond && m->opts.verbose) fprintf(stderr, "[acestep-engine] freeing cond-encoder (low-mem)\n");
-        m->free_cond();
     }
+    output.hidden_size = (int) (output.hidden.size() / (size_t) output.sequence);
 
+    if (state.low_memory) {
+        if (engine.cond && engine.opts.verbose) {
+            fprintf(stderr, "[acestep-engine] freeing cond-encoder (low-mem)\n");
+        }
+        engine.free_cond();
+    }
     timing.mark("cond");
-    dump.write("03_context", context, T, ctx_ch);
-    dump.write("06_enc_hidden", enc_hidden, enc_S, H_enc);
+    dump.write("03_context", output.context, output.frames, output.context_channels);
+    dump.write("06_enc_hidden", output.hidden, output.sequence, output.hidden_size);
+}
 
-    // ---- 6. noise [64, T] (Philox, torch.randn parity) ----
-    std::vector<float> noise((size_t) Oc * T);
-    philox_randn(seed, noise.data(), (int) noise.size(), /*bf16_round=*/true);
+template <typename EngineImpl>
+static EncoderConditioning prepare_encoder_conditioning(EngineImpl & engine,
+                                                         GenerationState & state,
+                                                         StageDump & dump, StageTimes & timing) {
+    const DitConfig & config = engine.dit_cfg;
+    const int patch = config.patch_size;
+    EncoderConditioning output;
+    output.frames = ((state.latent_frames + patch - 1) / patch) * patch;
+    output.context_channels = config.in_channels - config.out_channels;
 
-    // cover_noise_strength: blend initial noise toward clean source latents and
-    // truncate the schedule (acestep.cpp ops_init_noise). Applied after Philox
-    // so strength=0 keeps the pure-noise path bit-identical.
-    int n_steps = params.inference_steps > 0 ? params.inference_steps : (dc.is_turbo ? 8 : 50);
-    const float shift = params.shift > 0.0f ? params.shift : (dc.is_turbo ? 3.0f : 1.0f);
-    std::vector<float> schedule;
-    dit_build_schedule(shift, n_steps, schedule);
+    engine.ensure_cond();
+    output.context = make_dit_context(
+        state.context_latents, cond_model_silence_frame(engine.cond), output.frames,
+        state.latent_frames, output.context_channels, config.out_channels);
+    const PromptTokens tokens = tokenize_prompt(engine.bpe_text, state.prompt, state.language);
+    const PromptEncoding prompt = encode_prompt(engine, tokens, state, dump, timing);
+    encode_cross_attention(engine, prompt, state, output, dump, timing);
+    return output;
+}
 
-    if (cover_nofsq && params.cover_noise_strength > 0.0f && !cover_latents_for_noise.empty()) {
-        const float effective_noise_level = 1.0f - params.cover_noise_strength;
-        int         start_idx             = 0;
-        float       best_dist             = std::fabs(schedule[0] - effective_noise_level);
-        for (int i = 1; i < n_steps; i++) {
-            const float dist = std::fabs(schedule[i] - effective_noise_level);
-            if (dist < best_dist) {
-                best_dist = dist;
-                start_idx = i;
-            }
-        }
-        const float nearest_t = schedule[start_idx];
-        for (int t = 0; t < T; t++) {
-            const int     t_src = t < T_25Hz ? t : T_25Hz - 1;
-            const float * src   = cover_latents_for_noise.data() + (size_t) t_src * Oc;
-            float *       n     = noise.data() + (size_t) t * Oc;
-            for (int c = 0; c < Oc; c++) n[c] = nearest_t * n[c] + (1.0f - nearest_t) * src[c];
-        }
-        schedule.erase(schedule.begin(), schedule.begin() + start_idx);
-        n_steps = (int) schedule.size();
-        if (m->opts.verbose)
+static NoiseSchedule prepare_noise(const GenerateParams & params, const GenerationState & state,
+                                   const DitConfig & config, const EncoderConditioning & conditioning,
+                                   bool verbose, StageDump & dump, StageTimes & timing) {
+    NoiseSchedule output;
+    output.noise.resize((size_t) config.out_channels * conditioning.frames);
+    philox_randn(state.seed, output.noise.data(), (int) output.noise.size(), true);
+    output.steps = params.inference_steps > 0
+                       ? params.inference_steps
+                       : (config.is_turbo ? TURBO_STEPS : STANDARD_STEPS);
+    output.shift = params.shift > 0.0f
+                       ? params.shift
+                       : (config.is_turbo ? TURBO_SHIFT : STANDARD_SHIFT);
+    dit_build_schedule(output.shift, output.steps, output.schedule);
+
+    if (state.plan.blend_cover_noise) {
+        const CoverNoiseResult adjustment = apply_cover_noise(
+            output.noise, state.context_latents, conditioning.frames, state.latent_frames,
+            config.out_channels, state.task.cover_noise_strength, output.schedule);
+        output.steps = adjustment.remaining_steps;
+        if (verbose) {
             fprintf(stderr,
                     "[acestep-engine] cover_noise_strength=%.2f -> nearest_t=%.4f remaining_steps=%d\n",
-                    params.cover_noise_strength, nearest_t, n_steps);
+                    state.task.cover_noise_strength, adjustment.nearest_time, output.steps);
+        }
     }
-
     timing.mark("noise");
-    dump.write("07_noise", noise, T, Oc);
+    dump.write("07_noise", output.noise, conditioning.frames, config.out_channels);
+    return output;
+}
 
 #ifdef ACESTEP_PARITY_DEBUG
-    // Debug (env-gated): inject acestep.cpp --dump inputs to isolate the DiT graph.
-    if (const char * p = dbg_env("ACESTEP_INJECT_NOISE"))   dbg_load_dump(p, noise);
-    if (const char * p = dbg_env("ACESTEP_INJECT_CONTEXT")) dbg_load_dump(p, context);
-    if (const char * p = dbg_env("ACESTEP_INJECT_ENC"))     dbg_load_dump(p, enc_hidden);
+static void inject_parity_inputs(NoiseSchedule & noise, EncoderConditioning & conditioning) {
+    if (const char * path = dbg_env("ACESTEP_INJECT_NOISE")) dbg_load_dump(path, noise.noise);
+    if (const char * path = dbg_env("ACESTEP_INJECT_CONTEXT")) dbg_load_dump(path, conditioning.context);
+    if (const char * path = dbg_env("ACESTEP_INJECT_ENC")) dbg_load_dump(path, conditioning.hidden);
+}
+
+static void dump_parity_inputs(const std::vector<float> & latent, const NoiseSchedule & noise,
+                               const EncoderConditioning & conditioning, int output_channels) {
+    const char * directory = dbg_env("ACESTEP_DUMP_DIR");
+    if (!directory) return;
+    const std::string path(directory);
+    dbg_write_dump(path + "/our_dit_output.bin", latent, conditioning.frames, output_channels);
+    dbg_write_dump(path + "/our_noise.bin", noise.noise, conditioning.frames, output_channels);
+    dbg_write_dump(path + "/our_context.bin", conditioning.context, conditioning.frames,
+                   conditioning.context_channels);
+    dbg_write_dump(path + "/our_enc_hidden.bin", conditioning.hidden, conditioning.sequence,
+                   conditioning.hidden_size);
+}
 #endif
 
-    // ---- 7. DiT flow-matching sample -> latent [64, T] ----
-    // Resolve steps/shift from the model type when the caller left them at auto
-    // (0): turbo = 8 steps / shift 3.0, base/sft = 50 steps / shift 1.0.
-    if (m->opts.verbose)
+template <typename EngineImpl>
+static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params,
+                              const GenerationState & state, EncoderConditioning & conditioning,
+                              NoiseSchedule & noise, const StageReporter & report,
+                              StageDump & dump, StageTimes & timing, std::vector<float> & latent) {
+    const DitConfig & config = engine.dit_cfg;
+    if (engine.opts.verbose) {
         fprintf(stderr, "[acestep-engine] DiT: turbo=%d steps=%d shift=%.2f T=%d task=%s\n",
-                (int) dc.is_turbo, n_steps, shift, T, params.task_type.c_str());
+                (int) config.is_turbo, noise.steps, noise.shift,
+                conditioning.frames, state.task.type.c_str());
+    }
+    engine.ensure_dit();
+    if (!report("dit", 0, noise.steps)) return false;
 
-    m->ensure_dit();  // load the DiT (the largest stage) just before diffusion
+    DitSampleParams sample;
+    sample.noise = noise.noise.data();
+    sample.context_latents = conditioning.context.data();
+    sample.enc_hidden = conditioning.hidden.data();
+    sample.enc_S = conditioning.sequence;
+    sample.H_enc = conditioning.hidden_size;
+    sample.T = conditioning.frames;
+    sample.N = 1;
+    sample.schedule = noise.schedule.data();
+    sample.num_steps = noise.steps;
+    sample.real_enc_S = &conditioning.sequence;
+    sample.dcw_enabled = params.dcw_enabled;
+    sample.dcw_scaler = params.dcw_scaler;
+    sample.dcw_high_scaler = params.dcw_high_scaler;
+    sample.on_step = [&](int step, int total) { return report("dit", step, total); };
 
-    if (!report("dit", 0, n_steps)) return result;
-    DitSampleParams sp;
-    sp.noise           = noise.data();
-    sp.context_latents = context.data();
-    sp.enc_hidden      = enc_hidden.data();
-    sp.enc_S           = enc_S;
-    sp.H_enc           = H_enc;
-    sp.T               = T;
-    sp.N               = 1;
-    sp.schedule        = schedule.data();
-    sp.num_steps       = n_steps;
-    sp.real_enc_S      = &enc_S;
-    sp.dcw_enabled     = params.dcw_enabled;
-    sp.dcw_scaler      = params.dcw_scaler;
-    sp.dcw_high_scaler = params.dcw_high_scaler;
-    // Surface per-step diffusion progress (the long pole) to the caller's
-    // ProgressFn; returning false here also honours cooperative cancellation.
-    sp.on_step         = [&](int step, int total) { return report("dit", step, total); };
-
-    std::vector<float> latent;
-    if (!dit_sample(m->dit, sp, latent)) {
-        // dit_sample returns false for BOTH a real compute failure and a
-        // cooperative cancel (its on_step -> report() returned false). Tell them
-        // apart via cancel_flag: on cancel honour the engine contract (empty pcm,
-        // no throw) like the LM and VAE stages; only a genuine failure throws, so
-        // a cancelling ProgressFn never raises across the addon boundary.
-        if (m->cancel_flag.load()) return result;
+    if (!dit_sample(engine.dit, sample, latent)) {
+        if (engine.cancel_flag.load()) return false;
         throw std::runtime_error("acestep engine: DiT sample failed");
     }
-    if (!report("dit", n_steps, n_steps)) return result;
+    if (!report("dit", noise.steps, noise.steps)) return false;
     timing.mark("dit");
-    dump.write("08_dit_latent", latent, T, Oc);
-
-    // The denoised latent is on the host; the DiT (the largest stage) is done.
-    // Free it before the VAE decode so only the VAE is resident for the last step.
-    if (low_mem) {
-        if (m->dit && m->opts.verbose) fprintf(stderr, "[acestep-engine] freeing DiT (low-mem)\n");
-        m->free_dit();
+    dump.write("08_dit_latent", latent, conditioning.frames, config.out_channels);
+    if (state.low_memory) {
+        if (engine.dit && engine.opts.verbose) fprintf(stderr, "[acestep-engine] freeing DiT (low-mem)\n");
+        engine.free_dit();
     }
 
 #ifdef ACESTEP_PARITY_DEBUG
-    // Debug (env-gated): dump our DiT output + inputs for parity vs acestep.cpp.
-    if (const char * dir = dbg_env("ACESTEP_DUMP_DIR")) {
-        const std::string d(dir);
-        dbg_write_dump(d + "/our_dit_output.bin", latent, T, Oc);
-        dbg_write_dump(d + "/our_noise.bin", noise, T, Oc);
-        dbg_write_dump(d + "/our_context.bin", context, T, ctx_ch);
-        dbg_write_dump(d + "/our_enc_hidden.bin", enc_hidden, enc_S, H_enc);
-    }
+    dump_parity_inputs(latent, noise, conditioning, config.out_channels);
 #endif
+    return true;
+}
 
-    // ---- 8. VAE decode -> stereo 48 kHz PCM ----
-    // The decode reports per-node graph progress so the (otherwise opaque) VAE
-    // stage advances the bar instead of freezing at the last DiT step.
-    m->ensure_vae();  // load the VAE just before decode
-    if (!report("vae", 0, 1)) return result;
-    bool vae_ok = true;
-    result.pcm  = m->vae->decode(latent, T, [&](int done, int total) {
-        vae_ok = report("vae", done, total);
-        return vae_ok;
+template <typename EngineImpl>
+static bool decode_audio(EngineImpl & engine, const std::vector<float> & latent,
+                         const EncoderConditioning & conditioning, bool low_memory,
+                         const StageReporter & report, StageDump & dump,
+                         StageTimes & timing, GenerateResult & result) {
+    engine.ensure_vae();
+    if (!report("vae", 0, 1)) return false;
+
+    bool completed = true;
+    result.pcm = engine.vae->decode(latent, conditioning.frames, [&](int done, int total) {
+        completed = report("vae", done, total);
+        return completed;
     });
-    if (!vae_ok) return result;  // cancelled mid-decode
+    if (!completed) return false;
     if (result.pcm.empty()) throw std::runtime_error("acestep engine: VAE decode failed");
     report("vae", 1, 1);
     timing.mark("vae");
-    dump.write("09_vae_pcm", result.pcm, (int) (result.pcm.size() / 2), 2);
-    if (m->opts.verbose) timing.dump(stderr);
+    dump.write("09_vae_pcm", result.pcm, (int) (result.pcm.size() / AUDIO_CHANNELS), AUDIO_CHANNELS);
+    if (engine.opts.verbose) timing.dump(stderr);
 
-    // The VAE is the last stage; free it so nothing is resident between
-    // generate() calls (each stage is reloaded on demand next time).
-    if (low_mem) {
-        if (m->vae && m->opts.verbose) fprintf(stderr, "[acestep-engine] freeing VAE (low-mem)\n");
-        m->free_vae();
+    if (low_memory) {
+        if (engine.vae && engine.opts.verbose) fprintf(stderr, "[acestep-engine] freeing VAE (low-mem)\n");
+        engine.free_vae();
     }
+    return true;
+}
 
-    // ---- metadata ----
-    // Read back from prompt.*, not params.*: Phase 1 gap-fills the prompt in
-    // place (bpm/keyscale/timesignature/vocal_language/caption) from a bare
-    // caption, so params.* may still be empty/zero here.
-    result.metadata.caption        = prompt.caption;
-    result.metadata.lyrics         = prompt.lyrics;
-    result.metadata.keyscale       = prompt.keyscale;
-    result.metadata.vocal_language = prompt.vocal_language;
-    result.metadata.bpm            = prompt.bpm;
-    // timesignature is a string on the prompt ("4/4" / "4"); surface the
-    // numerator as the int metadata field (0 if unset/unparseable).
-    result.metadata.timesignature  = prompt.timesignature.empty() ? 0 : atoi(prompt.timesignature.c_str());
-    result.metadata.seed           = seed;
-    result.metadata.n_codes        = T_5Hz;
+static void populate_metadata(const GenerationState & state, GenerateResult & result) {
+    result.metadata.caption = state.prompt.caption;
+    result.metadata.lyrics = state.prompt.lyrics;
+    result.metadata.keyscale = state.prompt.keyscale;
+    result.metadata.vocal_language = state.prompt.vocal_language;
+    result.metadata.bpm = state.prompt.bpm;
+    result.metadata.timesignature =
+        state.prompt.timesignature.empty() ? 0 : atoi(state.prompt.timesignature.c_str());
+    result.metadata.seed = state.seed;
+    result.metadata.n_codes = state.code_frames;
+}
+
+GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn & progress) const {
+    Impl & engine = *impl_;
+    engine.cancel_flag.store(false);
+
+    GenerateResult result;
+    result.sample_rate = engine.sr;
+    result.channels = AUDIO_CHANNELS;
+
+    GenerationState state = make_generation_state(params, engine.keep_stages);
+    const StageReporter report = [&](const char * stage, int step, int total) {
+        if (progress && !progress(stage, step, total)) {
+            engine.cancel_flag.store(true);
+            return false;
+        }
+        return !engine.cancel_flag.load();
+    };
+    StageTimes timing;
+    StageDump dump(engine.opts.dump_stages_dir, engine.opts.verbose);
+
+    if (!prepare_audio_conditioning(engine, params, state, report, dump, timing)) return result;
+    if (!prepare_context_latents(engine, params, state, report, dump, timing)) return result;
+
+    EncoderConditioning conditioning = prepare_encoder_conditioning(engine, state, dump, timing);
+    NoiseSchedule noise = prepare_noise(
+        params, state, engine.dit_cfg, conditioning, engine.opts.verbose, dump, timing);
+
+#ifdef ACESTEP_PARITY_DEBUG
+    inject_parity_inputs(noise, conditioning);
+#endif
+
+    std::vector<float> latent;
+    if (!sample_dit_latent(engine, params, state, conditioning, noise,
+                           report, dump, timing, latent)) {
+        return result;
+    }
+    if (!decode_audio(engine, latent, conditioning, state.low_memory,
+                      report, dump, timing, result)) {
+        return result;
+    }
+    populate_metadata(state, result);
     return result;
 }
 

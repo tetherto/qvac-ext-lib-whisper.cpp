@@ -83,7 +83,9 @@ endif()
 set(AUDIOGEN_LIB_SOURCES
     src/acestep/vae_gguf.cpp
     src/acestep/vae_ggml.cpp
+    src/acestep/vae_encode_windows.cpp
     src/acestep/vae_api.cpp
+    src/acestep/wav_reader.cpp
     src/acestep/dit_gguf.cpp
     src/acestep/dit_ggml.cpp
     src/acestep/textenc_ggml.cpp
@@ -190,6 +192,13 @@ if (AUDIOGEN_BUILD_TESTS)
     target_include_directories(test-acestep-units PRIVATE include src src/acestep)
     audiogen_apply_ccache(test-acestep-units)
     audiogen_register_test(test-acestep-units LABEL "unit")
+
+    add_executable(test-acestep-integration test/test_acestep_integration.cpp)
+    target_link_libraries(test-acestep-integration PRIVATE audiogen-cpp)
+    target_include_directories(test-acestep-integration PRIVATE include src src/acestep)
+    audiogen_apply_ccache(test-acestep-integration)
+    audiogen_register_test(test-acestep-integration LABEL "integration")
+    set_property(TEST test-acestep-integration PROPERTY SKIP_RETURN_CODE 77)
 endif()
 
 # ---- install / export -----------------------------------------------------

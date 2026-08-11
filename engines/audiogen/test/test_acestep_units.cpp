@@ -15,20 +15,26 @@
 //   6b. vae_shrink_window_core — chunked-decode window vs the backend alloc cap.
 //   7. GPU device types    — discrete and integrated GPUs are selectable.
 //   8. stage placement     — which backend the LM / detokenizer / encoders run on.
-//   9. generate task       — cover/text2music discriminator + strength clamps.
 
 #include "backend_registry.h"
+#include "cover_noise.h"
 #include "dit_ggml.h"
 #include "detok_ggml.h"
 #include "generate_task.h"
+#include "generation_conditioning.h"
+#include "generation_plan.h"
 #include "lm_pipeline.h"
 #include "philox.h"
 #include "stage_placement.h"
+#include "vae_encode_windows.h"
 #include "vae_ggml.h"
+#include "wav_reader.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -495,139 +501,372 @@ void test_placement_env() {
     clear_all();  // leave the environment as found
 }
 
-// 9. generate task validation -----------------------------------------------
-// Locks the cover/text2music discriminator, stereo PCM layout checks, and the
-// strength clamps that the addon and music-cli both rely on before any GGUF
-// is loaded.
-void test_generate_task() {
-    using tts_cpp::acestep::GenerateParams;
+void test_generate_task_kinds() {
     using tts_cpp::acestep::TASK_COVER;
     using tts_cpp::acestep::TASK_COVER_NOFSQ;
     using tts_cpp::acestep::TASK_TEXT2MUSIC;
     using tts_cpp::acestep::is_cover_task;
-    using tts_cpp::acestep::normalize_generate_task;
 
     CHECK(is_cover_task(TASK_COVER));
     CHECK(is_cover_task(TASK_COVER_NOFSQ));
     CHECK(!is_cover_task(TASK_TEXT2MUSIC));
     CHECK(!is_cover_task(""));
-    CHECK(!is_cover_task("text2music"));
+}
 
-    // Defaults: empty task_type => text2music; strengths stay at defaults.
-    {
-        GenerateParams p;
-        CHECK(normalize_generate_task(p).empty());
-        CHECK(p.task_type == TASK_TEXT2MUSIC);
-        CHECK(approx(p.audio_cover_strength, 1.0f));
-        CHECK(approx(p.cover_noise_strength, 0.0f));
-        CHECK(p.source_audio.empty());
-        CHECK(p.reference_audio.empty());
+void test_generate_task_defaults() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::TASK_TEXT2MUSIC;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    params.source_audio.assign(8, 0.25f);
+    params.reference_audio.assign(8, 0.5f);
+    const float * source_data = params.source_audio.data();
+    const float * reference_data = params.reference_audio.data();
+    GenerateTask task;
+    CHECK(resolve_generate_task(params, task).empty());
+    CHECK(task.type == TASK_TEXT2MUSIC);
+    CHECK(approx(task.audio_cover_strength, 1.0f));
+    CHECK(approx(task.cover_noise_strength, 0.0f));
+    CHECK(params.source_audio.data() == source_data);
+    CHECK(params.reference_audio.data() == reference_data);
+}
+
+void test_generate_task_audio_layout() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::TASK_COVER_NOFSQ;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+
+    params.task_type = TASK_COVER_NOFSQ;
+    CHECK(resolve_generate_task(params, task).find("requires source_audio") != std::string::npos);
+
+    params.source_audio.assign(3, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("source_audio must be interleaved stereo") != std::string::npos);
+
+    params.source_audio.assign(4, 0.0f);
+    params.reference_audio.assign(5, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("reference_audio must be interleaved stereo") != std::string::npos);
+
+    params.reference_audio.assign(6, 0.0f);
+    CHECK(resolve_generate_task(params, task).empty());
+}
+
+void test_generate_task_errors() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::TASK_COVER;
+    using tts_cpp::acestep::TASK_COVER_NOFSQ;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+
+    params.task_type = "repaint";
+    CHECK(resolve_generate_task(params, task).find("unsupported task_type") != std::string::npos);
+
+    params.task_type = TASK_COVER;
+    params.source_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("not implemented") != std::string::npos);
+
+    params.task_type = TASK_COVER_NOFSQ;
+    params.audio_cover_strength = 0.5f;
+    CHECK(resolve_generate_task(params, task).find("audio_cover_strength") != std::string::npos);
+}
+
+void test_generate_task_strengths() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+
+    params.audio_cover_strength = 2.0f;
+    params.cover_noise_strength = -0.5f;
+    CHECK(resolve_generate_task(params, task).empty());
+    CHECK(approx(task.audio_cover_strength, 1.0f));
+    CHECK(approx(task.cover_noise_strength, 0.0f));
+
+    params.audio_cover_strength = std::numeric_limits<float>::quiet_NaN();
+    CHECK(resolve_generate_task(params, task).find("must be finite") != std::string::npos);
+
+    params.audio_cover_strength = std::numeric_limits<float>::infinity();
+    CHECK(resolve_generate_task(params, task).find("must be finite") != std::string::npos);
+
+    params.audio_cover_strength = 1.0f;
+    params.cover_noise_strength = std::numeric_limits<float>::quiet_NaN();
+    CHECK(resolve_generate_task(params, task).find("must be finite") != std::string::npos);
+
+    params.cover_noise_strength = std::numeric_limits<float>::infinity();
+    CHECK(resolve_generate_task(params, task).find("must be finite") != std::string::npos);
+}
+
+void test_generation_plans() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::GenerationPlan;
+    using tts_cpp::acestep::TASK_COVER_NOFSQ;
+    using tts_cpp::acestep::make_generation_plan;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+    CHECK(resolve_generate_task(params, task).empty());
+
+    GenerationPlan plan = make_generation_plan(params, task);
+    CHECK(!plan.encode_source);
+    CHECK(!plan.encode_reference);
+    CHECK(plan.run_lm);
+    CHECK(plan.run_detokenizer);
+
+    params.reference_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).empty());
+    plan = make_generation_plan(params, task);
+    CHECK(plan.encode_reference);
+    CHECK(plan.run_lm);
+
+    params.task_type = TASK_COVER_NOFSQ;
+    params.source_audio.assign(4, 0.0f);
+    params.reference_audio.clear();
+    CHECK(resolve_generate_task(params, task).empty());
+    plan = make_generation_plan(params, task);
+    CHECK(plan.encode_source);
+    CHECK(plan.reuse_source_reference);
+    CHECK(!plan.run_lm);
+    CHECK(!plan.run_detokenizer);
+    CHECK(!plan.blend_cover_noise);
+
+    params.reference_audio.assign(4, 0.0f);
+    params.cover_noise_strength = 0.5f;
+    CHECK(resolve_generate_task(params, task).empty());
+    plan = make_generation_plan(params, task);
+    CHECK(plan.encode_reference);
+    CHECK(!plan.reuse_source_reference);
+    CHECK(plan.blend_cover_noise);
+}
+
+void test_generation_conditioning() {
+    using tts_cpp::acestep::AudioEncoder;
+    using tts_cpp::acestep::EncodedAudio;
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::GenerationConditioning;
+    using tts_cpp::acestep::GenerationPlan;
+    using tts_cpp::acestep::TASK_COVER_NOFSQ;
+    using tts_cpp::acestep::TimbreInput;
+    using tts_cpp::acestep::make_generation_plan;
+    using tts_cpp::acestep::prepare_generation_conditioning;
+    using tts_cpp::acestep::resolve_generate_task;
+    using tts_cpp::acestep::resolve_timbre_input;
+
+    GenerateParams params;
+    params.task_type = TASK_COVER_NOFSQ;
+    params.source_audio = { 1.0f, 2.0f, 3.0f, 4.0f };
+    params.reference_audio = { 5.0f, 6.0f };
+
+    GenerateTask task;
+    CHECK(resolve_generate_task(params, task).empty());
+    const GenerationPlan plan = make_generation_plan(params, task);
+
+    int source_calls = 0;
+    int reference_calls = 0;
+    const AudioEncoder encode = [&](const std::vector<float> & pcm, const char * stage, EncodedAudio & output) {
+        if (std::string(stage) == "source") ++source_calls;
+        if (std::string(stage) == "reference") ++reference_calls;
+        output.latent = { pcm.front(), pcm.back() };
+        output.frames = (int) (pcm.size() / 2);
+        return true;
+    };
+
+    GenerationConditioning conditioning;
+    CHECK(prepare_generation_conditioning(params, plan, encode, conditioning));
+    CHECK(source_calls == 1);
+    CHECK(reference_calls == 1);
+    CHECK(conditioning.source.latent.front() == params.source_audio.front());
+    CHECK(conditioning.reference.latent.front() == params.reference_audio.front());
+
+    const std::vector<float> silence = { -1.0f, -1.0f };
+    const TimbreInput explicit_reference =
+        resolve_timbre_input(plan, conditioning.reference, conditioning.source.latent,
+                             conditioning.source.frames, silence);
+    CHECK(explicit_reference.data == conditioning.reference.latent.data());
+    CHECK(explicit_reference.frames == conditioning.reference.frames);
+
+    params.reference_audio.clear();
+    CHECK(resolve_generate_task(params, task).empty());
+    const GenerationPlan reuse_plan = make_generation_plan(params, task);
+    GenerationConditioning reuse_conditioning;
+    CHECK(prepare_generation_conditioning(params, reuse_plan, encode, reuse_conditioning));
+    CHECK(source_calls == 2);
+    CHECK(reference_calls == 1);
+    const TimbreInput reused_source =
+        resolve_timbre_input(reuse_plan, reuse_conditioning.reference, reuse_conditioning.source.latent,
+                             reuse_conditioning.source.frames, silence);
+    CHECK(reused_source.data == reuse_conditioning.source.latent.data());
+    CHECK(reused_source.frames == reuse_conditioning.source.frames);
+}
+
+void test_cover_noise_blending() {
+    using tts_cpp::acestep::CoverNoiseResult;
+    using tts_cpp::acestep::apply_cover_noise;
+
+    std::vector<float> noise = { 1.0f, 1.0f, 2.0f, 2.0f, 3.0f, 3.0f };
+    const std::vector<float> source = { 5.0f, 7.0f, 11.0f, 13.0f };
+    std::vector<float> schedule = { 1.0f, 0.75f, 0.5f, 0.25f };
+
+    const CoverNoiseResult result = apply_cover_noise(noise, source, 3, 2, 2, 0.5f, schedule);
+    CHECK(approx(result.nearest_time, 0.5f));
+    CHECK(result.remaining_steps == 2);
+    CHECK(schedule.size() == 2);
+    CHECK(approx(noise[0], 3.0f));
+    CHECK(approx(noise[1], 4.0f));
+    CHECK(approx(noise[2], 6.5f));
+    CHECK(approx(noise[3], 7.5f));
+    CHECK(approx(noise[4], 7.0f));
+    CHECK(approx(noise[5], 8.0f));
+}
+
+void fill_fake_pcm(std::vector<float> & pcm, int frames) {
+    for (int frame = 0; frame < frames; ++frame) {
+        pcm[(size_t) frame * 2] = (float) frame;
+        pcm[(size_t) frame * 2 + 1] = (float) -frame;
     }
-    // Explicit text2music with optional reference_audio (timbre only).
-    {
-        GenerateParams p;
-        p.task_type = TASK_TEXT2MUSIC;
-        p.reference_audio.assign(4, 0.1f);
-        CHECK(normalize_generate_task(p).empty());
-        CHECK(p.task_type == TASK_TEXT2MUSIC);
-        CHECK(p.reference_audio.size() == 4);
+}
+
+void fill_fake_latent_frame(std::vector<float> & latent, int frame, float value) {
+    using tts_cpp::acestep::VAE_LATENT_CHANNELS;
+    for (int channel = 0; channel < VAE_LATENT_CHANNELS; ++channel) {
+        latent[(size_t) frame * VAE_LATENT_CHANNELS + channel] = value + (float) channel;
     }
-    // text2music does not require source_audio.
-    {
-        GenerateParams p;
-        p.task_type = TASK_TEXT2MUSIC;
-        CHECK(normalize_generate_task(p).empty());
+}
+
+int encode_fake_vae(const float * pcm, int frames, std::vector<float> & latent) {
+    using tts_cpp::acestep::VAE_ENCODER_UPSAMPLE;
+    using tts_cpp::acestep::VAE_LATENT_CHANNELS;
+
+    const int latent_frames = frames / VAE_ENCODER_UPSAMPLE;
+    latent.resize((size_t) latent_frames * VAE_LATENT_CHANNELS);
+    for (int frame = 0; frame < latent_frames; ++frame) {
+        const float value = pcm[(size_t) frame * VAE_ENCODER_UPSAMPLE * 2];
+        fill_fake_latent_frame(latent, frame, value);
     }
-    // Unknown task_type rejected.
-    {
-        GenerateParams p;
-        p.task_type = "repaint";
-        const std::string err = normalize_generate_task(p);
-        CHECK(!err.empty());
-        CHECK(err.find("unsupported task_type") != std::string::npos);
-    }
-    // cover-nofsq requires source_audio.
-    {
-        GenerateParams p;
-        p.task_type = TASK_COVER_NOFSQ;
-        const std::string err = normalize_generate_task(p);
-        CHECK(!err.empty());
-        CHECK(err.find("requires source_audio") != std::string::npos);
-        p.source_audio.assign(4, 0.0f);  // 2 stereo frames
-        CHECK(normalize_generate_task(p).empty());
-    }
-    // Odd-length source_audio rejected (must be interleaved stereo).
-    {
-        GenerateParams p;
-        p.task_type = TASK_COVER_NOFSQ;
-        p.source_audio.assign(3, 0.0f);
-        const std::string err = normalize_generate_task(p);
-        CHECK(!err.empty());
-        CHECK(err.find("source_audio must be interleaved stereo") != std::string::npos);
-    }
-    // Odd-length reference_audio rejected when provided.
-    {
-        GenerateParams p;
-        p.task_type = TASK_COVER_NOFSQ;
-        p.source_audio.assign(4, 0.0f);
-        p.reference_audio.assign(5, 0.0f);
-        const std::string err = normalize_generate_task(p);
-        CHECK(!err.empty());
-        CHECK(err.find("reference_audio must be interleaved stereo") != std::string::npos);
-    }
-    // Even reference_audio accepted alongside cover-nofsq source.
-    {
-        GenerateParams p;
-        p.task_type = TASK_COVER_NOFSQ;
-        p.source_audio.assign(4, 0.2f);
-        p.reference_audio.assign(6, 0.3f);
-        p.cover_noise_strength = 0.25f;
-        CHECK(normalize_generate_task(p).empty());
-        CHECK(approx(p.cover_noise_strength, 0.25f));
-    }
-    // Full cover (FSQ) is accepted at the API but not implemented yet.
-    {
-        GenerateParams p;
-        p.task_type = TASK_COVER;
-        p.source_audio.assign(4, 0.0f);
-        const std::string err = normalize_generate_task(p);
-        CHECK(!err.empty());
-        CHECK(err.find("not implemented") != std::string::npos);
-        CHECK(err.find("cover-nofsq") != std::string::npos);
-    }
-    // audio_cover_strength < 1 not implemented for cover-nofsq.
-    {
-        GenerateParams p;
-        p.task_type            = TASK_COVER_NOFSQ;
-        p.source_audio.assign(4, 0.0f);
-        p.audio_cover_strength = 0.5f;
-        const std::string err  = normalize_generate_task(p);
-        CHECK(!err.empty());
-        CHECK(err.find("audio_cover_strength") != std::string::npos);
-    }
-    // Strength clamps (out of range) for text2music path.
-    {
-        GenerateParams p;
-        p.audio_cover_strength = 2.0f;
-        p.cover_noise_strength = -0.5f;
-        CHECK(normalize_generate_task(p).empty());
-        CHECK(approx(p.audio_cover_strength, 1.0f));
-        CHECK(approx(p.cover_noise_strength, 0.0f));
-    }
-    // Boundary strengths 0 and 1: cover_noise ok; cover strength 0 rejected on cover.
-    {
-        GenerateParams p;
-        p.task_type            = TASK_COVER_NOFSQ;
-        p.source_audio.assign(4, 0.0f);
-        p.audio_cover_strength = 1.0f;
-        p.cover_noise_strength = 0.0f;
-        CHECK(normalize_generate_task(p).empty());
-        p.cover_noise_strength = 1.0f;
-        CHECK(normalize_generate_task(p).empty());
-        CHECK(approx(p.cover_noise_strength, 1.0f));
-        p.audio_cover_strength = 0.0f;
-        CHECK(!normalize_generate_task(p).empty());
-    }
+    return latent_frames;
+}
+
+void test_vae_encode_window_boundaries() {
+    using tts_cpp::acestep::VAE_AUDIO_CHUNK_FRAMES;
+    using tts_cpp::acestep::VAE_AUDIO_OVERLAP_FRAMES;
+    using tts_cpp::acestep::make_vae_encode_window;
+    using tts_cpp::acestep::vae_encode_window_count;
+
+    CHECK(vae_encode_window_count(VAE_AUDIO_CHUNK_FRAMES) == 1);
+    CHECK(vae_encode_window_count(VAE_AUDIO_CHUNK_FRAMES + 1) == 2);
+
+    const auto first = make_vae_encode_window(0, VAE_AUDIO_CHUNK_FRAMES + 1);
+    const auto second = make_vae_encode_window(1, VAE_AUDIO_CHUNK_FRAMES + 1);
+    CHECK(first.window_start == 0);
+    CHECK(second.window_start == second.core_start - VAE_AUDIO_OVERLAP_FRAMES);
+    CHECK(first.core_end == second.core_start);
+}
+
+void test_vae_encode_window_parity() {
+    using tts_cpp::acestep::VAE_AUDIO_CHUNK_FRAMES;
+    using tts_cpp::acestep::VAE_AUDIO_STRIDE_FRAMES;
+    using tts_cpp::acestep::encode_vae_pcm_bounded;
+
+    const int frames = VAE_AUDIO_CHUNK_FRAMES + VAE_AUDIO_STRIDE_FRAMES;
+    std::vector<float> pcm((size_t) frames * 2);
+    fill_fake_pcm(pcm, frames);
+
+    std::vector<float> expected;
+    const int expected_frames = encode_fake_vae(pcm.data(), frames, expected);
+    int actual_frames = 0;
+    const std::vector<float> actual =
+        encode_vae_pcm_bounded(pcm, frames, encode_fake_vae, &actual_frames);
+
+    CHECK(actual_frames == expected_frames);
+    CHECK(actual == expected);
+}
+
+template <typename T>
+void write_test_value(FILE * file, T value) {
+    fwrite(&value, sizeof(T), 1, file);
+}
+
+void write_test_wav(FILE * file, uint16_t channels, const std::vector<int16_t> & samples) {
+    constexpr uint16_t PCM_FORMAT = 1;
+    constexpr uint16_t BITS = 16;
+    constexpr uint32_t RATE = 48000;
+    constexpr uint32_t FORMAT_SIZE = 16;
+
+    const uint16_t block_align = channels * (BITS / 8);
+    const uint32_t byte_rate = RATE * block_align;
+    const uint32_t data_size = (uint32_t) (samples.size() * sizeof(int16_t));
+    const uint32_t riff_size = 36 + data_size;
+
+    fwrite("RIFF", 1, 4, file);
+    write_test_value(file, riff_size);
+    fwrite("WAVE", 1, 4, file);
+    fwrite("fmt ", 1, 4, file);
+    write_test_value(file, FORMAT_SIZE);
+    write_test_value(file, PCM_FORMAT);
+    write_test_value(file, channels);
+    write_test_value(file, RATE);
+    write_test_value(file, byte_rate);
+    write_test_value(file, block_align);
+    write_test_value(file, BITS);
+    fwrite("data", 1, 4, file);
+    write_test_value(file, data_size);
+    fwrite(samples.data(), sizeof(int16_t), samples.size(), file);
+}
+
+FILE * open_test_file() {
+    FILE * file = tmpfile();
+    CHECK(file != nullptr);
+    return file;
+}
+
+void test_wav_reader_mono_and_stereo() {
+    using tts_cpp::acestep::WavReadResult;
+    using tts_cpp::acestep::read_pcm16_wav;
+
+    FILE * mono = open_test_file();
+    if (!mono) return;
+    write_test_wav(mono, 1, { 16384, -16384 });
+    const WavReadResult mono_result = read_pcm16_wav(mono);
+    fclose(mono);
+    CHECK(mono_result.error.empty());
+    CHECK(mono_result.frames == 2);
+    CHECK(approx(mono_result.pcm[0], 0.5f));
+    CHECK(approx(mono_result.pcm[1], 0.5f));
+
+    FILE * stereo = open_test_file();
+    if (!stereo) return;
+    write_test_wav(stereo, 2, { 16384, -16384 });
+    const WavReadResult stereo_result = read_pcm16_wav(stereo);
+    fclose(stereo);
+    CHECK(stereo_result.error.empty());
+    CHECK(stereo_result.frames == 1);
+    CHECK(approx(stereo_result.pcm[0], 0.5f));
+    CHECK(approx(stereo_result.pcm[1], -0.5f));
+}
+
+void test_wav_reader_rejects_multichannel() {
+    using tts_cpp::acestep::WavReadResult;
+    using tts_cpp::acestep::read_pcm16_wav;
+
+    FILE * file = open_test_file();
+    if (!file) return;
+    write_test_wav(file, 3, { 1, 2, 3 });
+    const WavReadResult result = read_pcm16_wav(file);
+    fclose(file);
+    CHECK(!result.error.empty());
+    CHECK(result.pcm.empty());
 }
 
 }  // namespace
@@ -643,7 +882,18 @@ int main() {
     test_backend_device_types();
     test_stage_placement();
     test_placement_env();
-    test_generate_task();
+    test_generate_task_kinds();
+    test_generate_task_defaults();
+    test_generate_task_audio_layout();
+    test_generate_task_errors();
+    test_generate_task_strengths();
+    test_generation_plans();
+    test_generation_conditioning();
+    test_cover_noise_blending();
+    test_vae_encode_window_boundaries();
+    test_vae_encode_window_parity();
+    test_wav_reader_mono_and_stereo();
+    test_wav_reader_rejects_multichannel();
 
     std::fprintf(stderr, "[test-acestep-units] %d/%d checks passed\n", g_checks - g_failures, g_checks);
     return g_failures == 0 ? 0 : 1;

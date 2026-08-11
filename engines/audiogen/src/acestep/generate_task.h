@@ -1,8 +1,5 @@
 #pragma once
 
-// Task-type helpers for Engine::generate. Weight-free so unit tests can cover
-// validation without loading GGUFs.
-
 #include "audiogen-cpp/acestep/engine.h"
 
 #include <algorithm>
@@ -19,37 +16,51 @@ inline bool is_cover_task(const std::string & task) {
     return task == TASK_COVER || task == TASK_COVER_NOFSQ;
 }
 
-// Normalize task_type / cover strengths and return a human-readable error, or
-// empty on success. Does not touch PCM buffers.
-inline std::string normalize_generate_task(GenerateParams & params) {
-    if (params.task_type.empty()) params.task_type = TASK_TEXT2MUSIC;
+struct GenerateTask {
+    std::string type;
+    float       audio_cover_strength = 1.0f;
+    float       cover_noise_strength = 0.0f;
+};
 
-    if (params.task_type != TASK_TEXT2MUSIC && params.task_type != TASK_COVER &&
-        params.task_type != TASK_COVER_NOFSQ) {
-        return "acestep engine: unsupported task_type '" + params.task_type +
+inline float clamp_strength(float value) {
+    return std::clamp(value, 0.0f, 1.0f);
+}
+
+inline std::string resolve_generate_task(const GenerateParams & params, GenerateTask & task) {
+    task.type = params.task_type.empty() ? TASK_TEXT2MUSIC : params.task_type;
+
+    if (task.type != TASK_TEXT2MUSIC && task.type != TASK_COVER &&
+        task.type != TASK_COVER_NOFSQ) {
+        return "acestep engine: unsupported task_type '" + task.type +
                "' (expected text2music|cover|cover-nofsq)";
     }
 
-    params.audio_cover_strength =
-        std::clamp(params.audio_cover_strength, 0.0f, 1.0f);
-    params.cover_noise_strength =
-        std::clamp(params.cover_noise_strength, 0.0f, 1.0f);
+    if (!std::isfinite(params.audio_cover_strength)) {
+        return "acestep engine: audio_cover_strength must be finite";
+    }
+    if (!std::isfinite(params.cover_noise_strength)) {
+        return "acestep engine: cover_noise_strength must be finite";
+    }
 
-    if (!is_cover_task(params.task_type)) return {};
+    task.audio_cover_strength = clamp_strength(params.audio_cover_strength);
+    task.cover_noise_strength = clamp_strength(params.cover_noise_strength);
+
+    if (!params.reference_audio.empty() && (params.reference_audio.size() & 1u) != 0) {
+        return "acestep engine: reference_audio must be interleaved stereo";
+    }
+
+    if (!is_cover_task(task.type)) return {};
 
     if (params.source_audio.empty()) {
-        return "acestep engine: task '" + params.task_type + "' requires source_audio";
+        return "acestep engine: task '" + task.type + "' requires source_audio";
     }
     if ((params.source_audio.size() & 1u) != 0) {
         return "acestep engine: source_audio must be interleaved stereo";
     }
-    if (!params.reference_audio.empty() && (params.reference_audio.size() & 1u) != 0) {
-        return "acestep engine: reference_audio must be interleaved stereo";
-    }
-    if (params.task_type == TASK_COVER) {
+    if (task.type == TASK_COVER) {
         return "acestep engine: task 'cover' is not implemented yet (needs FSQ tokenizer); use cover-nofsq";
     }
-    if (params.audio_cover_strength < 1.0f) {
+    if (task.audio_cover_strength < 1.0f) {
         return "acestep engine: audio_cover_strength < 1 is not implemented yet for cover-nofsq";
     }
     return {};
