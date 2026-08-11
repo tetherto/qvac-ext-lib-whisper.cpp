@@ -27,7 +27,7 @@
 //
 //     EngineOptions opts;
 //     opts.model_dir     = "models/cosyvoice3-0.5b";
-//     opts.n_gpu_layers  = 0;                 // 0 = CPU; >0 = OpenCL
+//     opts.n_gpu_layers  = 0;                 // 0 = CPU; >0 = Metal / OpenCL
 //
 //     Engine engine(opts);
 //     auto result = engine.synthesize("Hello world.");
@@ -131,7 +131,8 @@ struct EngineOptions {
 
     int seed         = 42;
     int n_threads    = 0;   // 0 = leave the backend's default thread pool.
-    int n_gpu_layers = 0;   // 0 = CPU; >0 selects the GPU path (OpenCL/Adreno only).
+    int n_gpu_layers = 0;   // 0 = CPU; >0 selects the GPU path (Metal on Apple,
+                            // OpenCL/Adreno on Android; others fall back to CPU).
 
     // Argmax speech-token decode instead of RAS nucleus sampling.  Sampling is
     // chaotic in the logits -- a 1-ulp difference re-rolls the whole token
@@ -279,7 +280,7 @@ public:
     // Registered name of the resolved backend ("CPU", "Metal", ...).
     std::string backend_name() const;
 
-    // Resolved compute device (CPU or OpenCL).
+    // Resolved compute device (CPU, or GPU for Metal / OpenCL).
     BackendDevice backend_device() const;
 
     // True when a GPU device was present but unusable (fell back to CPU).

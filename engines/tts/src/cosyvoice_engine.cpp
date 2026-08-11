@@ -169,12 +169,14 @@ struct Engine::Impl {
         backend = det::init_gpu_backend(opts.n_gpu_layers, /*verbose=*/false, "cosyvoice",
                                         /*vulkan_device=*/0, /*allow_arm_mali=*/false,
                                         &gpu_present_but_unused);
-        // CosyVoice3's GPU path is validated on OpenCL (Adreno) only.  Other GPU
-        // backends are declined deliberately: the DiT and CausalHiFT graphs lean
-        // on ops (grouped conv1d, conv_transpose_1d, snake) whose per-backend
-        // numerics have not been parity-gated for this model, and there is no CI
-        // device for them.  Widening this needs a per-stage reference run first.
-        if (backend && !det::backend_is_opencl(backend)) {
+        // Allowlist of backends the CosyVoice3 graphs are parity-gated
+        // against (test-cosyvoice-{flow,llm,hift}-gpu): OpenCL/Adreno since
+        // QVAC-22777, Metal since QVAC-22775.  Vulkan stays declined until a
+        // per-stage reference run and a CI device exist for it.
+        const bool backend_validated = backend &&
+            (det::backend_is_metal(backend) ||
+             det::backend_is_opencl(backend));
+        if (backend && !backend_validated) {
             // init_gpu_backend only reports its own declines, so record ours too.
             gpu_present_but_unused = true;
             ggml_backend_free(backend);

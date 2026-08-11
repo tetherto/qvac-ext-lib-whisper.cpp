@@ -664,6 +664,17 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "--flow-gguf" "${_tcb_cosy_flow_gguf}" "--in-dir" "${_tcb_cosy_ref}"
         REQUIRES "${_tcb_cosy_flow_gguf}" "${_tcb_cosy_ref}/flow_mel.npy")
 
+    # Same binaries on the GPU backend — the per-stage reference legs behind
+    # the cosyvoice_engine.cpp allowlist.  Skipped via `ctest -LE gpu`.
+    if (GGML_METAL OR GGML_VULKAN OR GGML_CUDA)
+        tts_cpp_register_test(test-cosyvoice-flow-gpu
+            EXE      test-cosyvoice-flow
+            LABEL    "gpu"
+            ARGS     "--flow-gguf" "${_tcb_cosy_flow_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+            REQUIRES "${_tcb_cosy_flow_gguf}" "${_tcb_cosy_ref}/flow_mel.npy")
+        set_property(TEST test-cosyvoice-flow-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+    endif()
+
     add_executable(test-cosyvoice-llm test/test_cosyvoice_llm.cpp ${_tcb_cosy_core_srcs})
     target_link_libraries(test-cosyvoice-llm PRIVATE ggml)
     target_include_directories(test-cosyvoice-llm PRIVATE ggml/include src)
@@ -673,6 +684,15 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "--llm-gguf" "${_tcb_cosy_llm_gguf}" "--in-dir" "${_tcb_cosy_ref}"
         REQUIRES "${_tcb_cosy_llm_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
 
+    if (GGML_METAL OR GGML_VULKAN OR GGML_CUDA)
+        tts_cpp_register_test(test-cosyvoice-llm-gpu
+            EXE      test-cosyvoice-llm
+            LABEL    "gpu"
+            ARGS     "--llm-gguf" "${_tcb_cosy_llm_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+            REQUIRES "${_tcb_cosy_llm_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
+        set_property(TEST test-cosyvoice-llm-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+    endif()
+
     add_executable(test-cosyvoice-hift test/test_cosyvoice_hift.cpp ${_tcb_cosy_core_srcs})
     target_link_libraries(test-cosyvoice-hift PRIVATE ggml)
     target_include_directories(test-cosyvoice-hift PRIVATE ggml/include src)
@@ -681,6 +701,15 @@ if (TTS_CPP_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "--hift-gguf" "${_tcb_cosy_hift_gguf}" "--in-dir" "${_tcb_cosy_ref}"
         REQUIRES "${_tcb_cosy_hift_gguf}" "${_tcb_cosy_ref}/hift_wav.npy")
+
+    if (GGML_METAL OR GGML_VULKAN OR GGML_CUDA)
+        tts_cpp_register_test(test-cosyvoice-hift-gpu
+            EXE      test-cosyvoice-hift
+            LABEL    "gpu"
+            ARGS     "--hift-gguf" "${_tcb_cosy_hift_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+            REQUIRES "${_tcb_cosy_hift_gguf}" "${_tcb_cosy_ref}/hift_wav.npy")
+        set_property(TEST test-cosyvoice-hift-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+    endif()
 
     # Map-in-place loader: byte-exact round-trip + clean failure on a truncated
     # GGUF. Self-contained (writes its own synthetic GGUF), so it always runs.

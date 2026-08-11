@@ -426,6 +426,8 @@ int main() {
     rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/5200, /*IC=*/128, /*OC=*/64,  /*K=*/11, /*s0=*/3, "ups[2]");
     // A small sanity case too.
     rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/10,   /*IC=*/3,   /*OC=*/4,   /*K=*/5,  /*s0=*/2, "tiny");
+    // CosyVoice3 iSTFT shape — the only conv_transpose consumer with OC=1.
+    rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/64,   /*IC=*/34,  /*OC=*/1,   /*K=*/16, /*s0=*/4, "istft");
 
     // MUL_MAT + ADD(bias) fusion (PROGRESS §3.27): CFM transformer hot shapes.
     //   K=256, N=256 — attn to_q / to_k / to_v

@@ -11,8 +11,12 @@
 //
 // Usage:
 //   test-cosyvoice-llm --llm-gguf LLM.gguf --in-dir DIR [--min-match 0.99]
+//
+// Set COSYVOICE_TEST_GPU=1 to run the same parity check on the selected GPU
+// backend (mirrors PARLER_TEST_GPU); fails if no GPU backend initializes.
 
 #include "npy.h"
+#include "backend_selection.h"
 #include "cosyvoice_pipeline.h"
 
 #include <algorithm>
@@ -39,7 +43,12 @@ int main(int argc, char ** argv) {
     }
     if (gguf.empty() || in_dir.empty()) { fprintf(stderr, "missing --llm-gguf / --in-dir\n"); return 2; }
 
-    model_ctx m = cosyvoice_load_gguf(gguf);
+    ggml_backend_t backend = nullptr;
+    if (std::getenv("COSYVOICE_TEST_GPU")) {
+        backend = ::tts_cpp::detail::init_gpu_backend(99, /*verbose=*/false, "test-cosyvoice");
+        if (!backend) { fprintf(stderr, "FAIL: COSYVOICE_TEST_GPU set but no GPU backend\n"); return 1; }
+    }
+    model_ctx m = cosyvoice_load_gguf(gguf, backend);
     qwen_hp hp = cosyvoice_qwen_hp(m);  // exercise the GGUF-KV hp path
 
     npy_array tid_a = npy_load(in_dir + "/text_ids.npy");

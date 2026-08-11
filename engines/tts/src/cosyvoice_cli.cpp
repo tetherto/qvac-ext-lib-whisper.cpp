@@ -7,8 +7,9 @@
 //   cosyvoice-cli --model-dir models/cosyvoice3-0.5b \
 //       --text "Hello from a fully on-device C++ pipeline." --out out.wav
 //
-// Pass --n-gpu-layers > 0 to select the GPU path (OpenCL/Adreno only; every
-// other GPU is declined and falls back to CPU).  Uses the baked default voice;
+// Pass --n-gpu-layers > 0 to select the GPU path (Metal on Apple, OpenCL on
+// Adreno; every other GPU is declined and falls back to CPU).  Uses the baked
+// default voice;
 // zero-shot from arbitrary reference audio awaits the native S3/CAM++ port.
 
 #include "tts-cpp/cosyvoice/engine.h"
