@@ -43,12 +43,15 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-14]
-        # macOS builds ggml with Metal and runs the gpu-labelled suites;
-        # ubuntu stays CPU-only, sharing its ggml cache with parakeet-ci.yml.
+        # macOS builds ggml with Metal for compile coverage; ubuntu stays
+        # CPU-only, sharing its ggml cache with parakeet-ci.yml. Both exclude
+        # gpu-labelled tests: the hosted macos-14 Apple Paravirtual device has
+        # no simdgroup matmul, so kernel encode aborts with
+        # "unsupported op 'MUL_MAT'" (test-metal-ops needs real Apple silicon).
         include:
           - os: macos-14
             ggml_metal: ON
-            ctest_exclude: 'perf'
+            ctest_exclude: 'gpu|perf'
           - os: ubuntu-24.04
             ggml_metal: OFF
             ctest_exclude: 'gpu|perf'
@@ -119,8 +122,8 @@ jobs:
       - name: Build
         run: cmake --build build -j4
 
-      # ubuntu excludes gpu (no GPU on hosted runners); macOS runs it via
-      # Metal. Both exclude perf (timing gates are meaningless on shared
+      # Both lanes exclude gpu (no usable GPU on hosted runners — see the
+      # matrix note) and perf (timing gates are meaningless on shared
       # runners). Model-dependent tests are DISABLED at configure time when
       # fixtures are absent and report as "Not Run".
       # LD_LIBRARY_PATH: the ggml install ships libqvac-speech-ggml.so whose
@@ -132,9 +135,11 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
         run: ctest --test-dir build -LE '${{ matrix.ctest_exclude }}' --output-on-failure --timeout 600
 
-  # GPU lane stub: opt-in until self-hosted GPU runners exist. Trial note:
-  # hosted macos-14 exposes Metal, so moving `-L gpu` / the mtl-* suites
-  # into the macOS build-test job is a cheap first experiment.
+  # GPU lane stub: opt-in until self-hosted GPU runners exist. Trial outcome
+  # (QVAC-22775): hosted macos-14 exposes Metal but its Apple Paravirtual
+  # device has no simdgroup matmul — kernel encode aborts with "unsupported
+  # op 'MUL_MAT'" — so the gpu label needs real Apple silicon, not hosted
+  # macOS.
   gpu:
     if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
     runs-on: [self-hosted, gpu]
