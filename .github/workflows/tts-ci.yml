@@ -43,18 +43,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-14]
-        # macOS builds ggml with Metal for compile coverage; ubuntu stays
-        # CPU-only, sharing its ggml cache with parakeet-ci.yml. Both exclude
-        # gpu-labelled tests: the hosted macos-14 Apple Paravirtual device has
-        # no simdgroup matmul, so kernel encode aborts with
-        # "unsupported op 'MUL_MAT'" (test-metal-ops needs real Apple silicon).
-        include:
-          - os: macos-14
-            ggml_metal: ON
-            ctest_exclude: 'gpu|perf'
-          - os: ubuntu-24.04
-            ggml_metal: OFF
-            ctest_exclude: 'gpu|perf'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -74,7 +62,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ggml-install
-          key: ggml-install-portable-${{ matrix.os }}${{ matrix.ggml_metal == 'ON' && '-metal' || '' }}-${{ steps.ggml.outputs.sha }}
+          key: ggml-install-portable-${{ matrix.os }}-${{ steps.ggml.outputs.sha }}
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -83,10 +71,13 @@ jobs:
           key: ccache-tts-${{ matrix.os }}-${{ github.sha }}
           restore-keys: ccache-tts-${{ matrix.os }}-
 
-      # ubuntu builds CPU-only ggml (hosted runners have no Vulkan/OpenCL)
-      # and shares its cache key with parakeet-ci.yml so whichever lane
-      # builds first serves both. macOS builds with Metal (its own -metal
-      # cache key) so the gpu-labelled kernel-parity suites run hosted.
+      # CPU-only ggml on BOTH lanes. ubuntu has no GPU; hosted macos-14
+      # exposes Metal but its Apple Paravirtual device has no simdgroup
+      # matmul, so any test that picks up the Metal backend aborts at kernel
+      # encode with "unsupported op 'MUL_MAT'" (tried under QVAC-22775 —
+      # test-metal-ops and even unit tests that auto-probe a GPU died).
+      # Metal runtime coverage needs real Apple silicon. Cache key is shared
+      # with parakeet-ci.yml so whichever lane builds first serves both.
       - name: Build ggml (system ggml, qvac-ext-ggml@${{ env.GGML_BRANCH }})
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
@@ -102,30 +93,27 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
-            -DGGML_METAL=${{ matrix.ggml_metal }} \
+            -DGGML_METAL=OFF \
             -DGGML_BUILD_TESTS=OFF \
             -DGGML_BUILD_EXAMPLES=OFF \
             -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
           cmake --build ggml-src/build -j4
           cmake --install ggml-src/build
 
-      # GGML_METAL is passed here too: find_package(ggml) does not export it,
-      # and the gpu test registrations key off the CMake variable.
       - name: Configure
         run: |
           cmake -S engines/tts -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DTTS_CPP_BUILD_TESTS=ON \
-            -DGGML_METAL=${{ matrix.ggml_metal }} \
             -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
 
       - name: Build
         run: cmake --build build -j4
 
-      # Both lanes exclude gpu (no usable GPU on hosted runners — see the
-      # matrix note) and perf (timing gates are meaningless on shared
-      # runners). Model-dependent tests are DISABLED at configure time when
-      # fixtures are absent and report as "Not Run".
+      # Excludes gpu (no usable GPU on hosted runners — see the ggml build
+      # note) and perf (timing gates are meaningless on shared runners).
+      # Model-dependent tests are DISABLED at configure time when fixtures
+      # are absent and report as "Not Run".
       # LD_LIBRARY_PATH: the ggml install ships libqvac-speech-ggml.so whose
       # own dependency on the ggml-cpu/base siblings is resolved transitively
       # — Linux RUNPATH doesn't apply to transitive loads, so the loader
@@ -133,7 +121,7 @@ jobs:
       - name: Test (non-GPU)
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
-        run: ctest --test-dir build -LE '${{ matrix.ctest_exclude }}' --output-on-failure --timeout 600
+        run: ctest --test-dir build -LE 'gpu|perf' --output-on-failure --timeout 600
 
   # GPU lane stub: opt-in until self-hosted GPU runners exist. Trial outcome
   # (QVAC-22775): hosted macos-14 exposes Metal but its Apple Paravirtual
