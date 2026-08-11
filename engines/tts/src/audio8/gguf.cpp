@@ -470,10 +470,16 @@ void read_encoder(tensor_map & map, codec_model & model, const transformer_spec 
     read_quantizer_bank(map, model, /*encoding=*/true);
 }
 
-// The chained frame graph adds the one op the per-position path never builds.
-// Without it the scheduler would reroute every frame through the CPU, which is
-// slower than the path it replaces, so the choice is made from the kernel set.
+// Chaining a frame into one graph buys exactly one thing: nine fewer command
+// buffers to submit and wait on. The CPU backend has none to collapse -- its
+// compute is a direct call -- so it would take a different greedy tie-break for
+// no gain, because ggml's argmax settles a tie on the last equal logit where
+// argmax_of keeps the first. It stays on the per-position path.
+//
+// The kernel still has to be asked for: without argmax the scheduler would
+// reroute every frame through the CPU, which is slower than the path it replaces.
 bool backend_picks_codes(ggml_backend_t backend, const lm_hparams & hp) {
+    if (::tts_cpp::detail::backend_is_cpu(backend)) return false;
     scratch probe(PROBE_NODES);
     if (!probe.ok()) return false;
     ggml_tensor * logits = ggml_new_tensor_2d(probe.ctx, GGML_TYPE_F32, hp.codebook_size, 1);

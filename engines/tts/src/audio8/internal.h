@@ -341,9 +341,14 @@ bool fast_step(lm_model & model, const std::vector<float> & fast_input, int sema
                std::string * error);
 
 // fast_step's greedy equivalent in one graph instead of num_codebooks graphs,
-// picking each code on the backend. Same codes, one submission: worth roughly a
-// quarter of a millisecond per position on Metal, where a submission costs far
+// picking each code on the backend. One submission rather than ten: worth roughly
+// a quarter of a millisecond per position on Metal, where a submission costs far
 // more than the kernels it carries. Only call it when `model.picks_codes`.
+//
+// Picking on the device means ggml's argmax settles a tie between two equal
+// logits differently from argmax_of, which keeps the first. That is why
+// picks_codes excludes the CPU backend, whose per-position path is the reference
+// for the tie-break and which has no submissions to collapse anyway.
 bool fast_frame(lm_model & model, const std::vector<float> & fast_input, int semantic,
                 int n_threads, std::vector<int32_t> & codes_out, std::string * error);
 
