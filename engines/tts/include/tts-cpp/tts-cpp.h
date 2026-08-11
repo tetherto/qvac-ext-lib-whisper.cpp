@@ -1,24 +1,22 @@
 #pragma once
 
-// Top-level tts-cpp library entry points.
+// Top-level entry point for the multi-engine tts-cpp library.
 //
-// The library currently ships the Chatterbox model pipeline.  Additional
-// engines (e.g. the Chatterbox multilingual model, other TTS backends) will
-// land under the same umbrella and should prefer headers under
-// <tts-cpp/...> for the generic API and <tts-cpp/<engine>/...> for
-// engine-specific details.
+// Persistent synthesis engines are exposed by:
+//   <tts-cpp/chatterbox/engine.h>
+//   <tts-cpp/supertonic/engine.h>
+//   <tts-cpp/parler/engine.h>
+//   <tts-cpp/cosyvoice/engine.h>
+//   <tts-cpp/audio8/engine.h>
+// Speech enhancement is exposed by <tts-cpp/lavasr/denoiser.h> and
+// <tts-cpp/lavasr/enhancer.h>.
 //
 // Two layers of API are exposed today:
 //
-//   1. High-level text -> wav via the CLI dispatcher.  The current
-//      implementation wraps the CLI's argv path; a proper struct-based
-//      public API will land as the code is split out of src/main.cpp.
-//      Until then, callers building against the library can invoke
-//      `tts_cpp_cli_main(argc, argv)` with the same flags accepted by the
-//      `tts-cli` executable.
+//   1. Persistent struct-based Engine APIs in the per-engine headers above.
 //
-//   2. Lower-level per-engine APIs, e.g. the Chatterbox S3Gen + HiFT
-//      back-half in <tts-cpp/chatterbox/s3gen_pipeline.h>.
+//   2. The tts-cli argv dispatcher below and lower-level per-engine APIs such
+//      as <tts-cpp/chatterbox/s3gen_pipeline.h>.
 
 #include "tts-cpp/export.h"
 

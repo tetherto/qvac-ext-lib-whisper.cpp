@@ -10,7 +10,7 @@
 // OpenCL) when requested via EnhancerOptions.  A scalar CPU core is kept as the
 // correctness oracle and as the fallback if graph creation fails.
 // The companion denoiser stage (tts-cpp/lavasr/denoiser.h) runs before this and
-// stays on the CPU (see that header for the rationale).
+// has separate scalar, ggml CPU, and validated GPU execution modes.
 //
 // Usage (e.g. from the tts-ggml addon, after engine->synthesize()):
 //

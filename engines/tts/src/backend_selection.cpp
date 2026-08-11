@@ -48,6 +48,7 @@ std::string    g_recorded_opencl_cache_dir;
 std::atomic<bool> g_backends_loaded{false};
 std::atomic<bool> g_backends_dir_warned{false};
 std::atomic<bool> g_opencl_cache_dir_warned{false};
+constexpr const char * VULKAN_BACKEND_NAME = "Vulkan";
 
 const char * dev_reg_name(ggml_backend_dev_t dev) {
     if (!dev) return "";
@@ -120,6 +121,12 @@ int pick_vulkan_device_index(int requested,
 }
 
 } // namespace
+
+bool gpu_backend_satisfies_requirement(const char * backend_name,
+                                       GpuBackendRequirement requirement) {
+    if (requirement == GpuBackendRequirement::Any) return true;
+    return backend_name && std::strcmp(backend_name, VULKAN_BACKEND_NAME) == 0;
+}
 
 void set_backends_directory(const std::string & dir) {
     std::lock_guard<std::mutex> lock(g_backends_dir_mutex);
@@ -360,7 +367,8 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
                                 const char * log_prefix,
                                 int vulkan_device,
                                 bool allow_arm_mali,
-                                bool * out_gpu_present_but_unused) {
+                                bool * out_gpu_present_but_unused,
+                                GpuBackendRequirement requirement) {
     if (out_gpu_present_but_unused) *out_gpu_present_but_unused = false;
     if (n_gpu_layers <= 0) return nullptr;
     if (!log_prefix) log_prefix = "tts-cpp";
@@ -402,7 +410,9 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
         const char * desc     = ggml_backend_dev_description(dev);
         const char * reg_name = dev_reg_name(dev);
         const bool   is_opencl = reg_name && std::strcmp(reg_name, "OpenCL") == 0;
-        const bool   is_vulkan = reg_name && std::strcmp(reg_name, "Vulkan") == 0;
+        const bool   is_vulkan =
+            reg_name && std::strcmp(reg_name, VULKAN_BACKEND_NAME) == 0;
+        if (!gpu_backend_satisfies_requirement(reg_name, requirement)) continue;
 
         if (is_vulkan) {
             size_t free = 0, total = 0;

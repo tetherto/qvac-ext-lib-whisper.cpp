@@ -37,6 +37,12 @@ ggml_tensor * project_heads(ggml_context * ctx, ggml_tensor * weight, ggml_tenso
                            static_cast<int>(x->ne[1]));
 }
 
+ggml_tensor * precise_mul_mat(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * x) {
+    ggml_tensor * result = ggml_mul_mat(ctx, weight, x);
+    ggml_mul_mat_set_prec(result, GGML_PREC_F32);
+    return result;
+}
+
 // K is stored position-major so a step appends one contiguous row per position.
 ggml_tensor * cache_keys(ggml_context * ctx, const kv_cache & cache,
                          const attention_shape & shape, int total) {
@@ -82,7 +88,7 @@ void append_values(ggml_context * ctx, ggml_cgraph * graph, const kv_cache & cac
 ggml_tensor * attend(ggml_context * ctx, ggml_tensor * query, ggml_tensor * keys,
                      ggml_tensor * values, ggml_tensor * mask, int head_dim, int n_head) {
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    ggml_tensor * scores = ggml_mul_mat(ctx, keys, query);
+    ggml_tensor * scores = precise_mul_mat(ctx, keys, query);
     ggml_tensor * weights = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f);
     ggml_tensor * blended = ggml_mul_mat(ctx, values, weights);
     ggml_tensor * merged = ggml_cont(ctx, ggml_permute(ctx, blended, 0, 2, 1, 3));
@@ -143,17 +149,42 @@ void read_ids(ggml_tensor * t, std::vector<int32_t> & out) {
     ggml_backend_tensor_get(t, out.data(), 0, ggml_nbytes(t));
 }
 
-bool allocate_graph(ggml_gallocr_t allocr, ggml_cgraph * graph, const char * stage,
-                    std::string * error) {
-    if (ggml_gallocr_alloc_graph(allocr, graph)) return true;
-    if (error) *error = std::string("audio8: ") + stage + " graph allocation failed";
-    return false;
+bool prepare_graph(ggml_backend_t backend, ::tts_cpp::detail::sched_fallback & sched,
+                   ggml_backend_buffer_t weight_buffer, ggml_gallocr_t allocr,
+                   ggml_cgraph * graph, const char * stage, bool & use_sched,
+                   std::string * error) {
+    use_sched = ::tts_cpp::detail::sched_force_enabled() ||
+                !::tts_cpp::detail::graph_fully_supported(backend, graph);
+    if (!use_sched) {
+        if (ggml_gallocr_reserve(allocr, graph) && ggml_gallocr_alloc_graph(allocr, graph)) {
+            return true;
+        }
+        if (error) *error = std::string("audio8: ") + stage + " graph allocation failed";
+        return false;
+    }
+    if (::tts_cpp::detail::graph_has_unsupported_preallocated_op(backend, graph)) {
+        if (error) {
+            *error = std::string("audio8: ") + stage +
+                     " graph has an unsupported persistent-buffer operation";
+        }
+        return false;
+    }
+    if (!::tts_cpp::detail::sched_fallback_ensure(
+            sched, backend, 2 * AUDIO8_MAX_NODES, {weight_buffer}) ||
+        !::tts_cpp::detail::sched_fallback_alloc(sched, graph)) {
+        if (error) *error = std::string("audio8: ") + stage + " graph allocation failed";
+        return false;
+    }
+    return true;
 }
 
-bool compute_graph(ggml_backend_t backend, ggml_cgraph * graph, int n_threads,
+bool compute_graph(ggml_backend_t backend, ::tts_cpp::detail::sched_fallback & sched,
+                   ggml_cgraph * graph, bool use_sched, int n_threads,
                    const char * stage, std::string * error) {
-    ::tts_cpp::detail::backend_set_n_threads(backend, n_threads);
-    if (ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS) return true;
+    const ggml_status status =
+        use_sched ? ::tts_cpp::detail::sched_fallback_compute(sched, backend, graph, n_threads)
+                  : ::tts_cpp::detail::direct_compute(backend, graph, n_threads);
+    if (status == GGML_STATUS_SUCCESS) return true;
     if (error) *error = std::string("audio8: ") + stage + " graph compute failed";
     return false;
 }
@@ -180,14 +211,14 @@ ggml_tensor * rms_norm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * weight
 
 ggml_tensor * linear(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * x,
                      ggml_tensor * bias) {
-    ggml_tensor * out = ggml_mul_mat(ctx, weight, x);
+    ggml_tensor * out = precise_mul_mat(ctx, weight, x);
     return bias ? ggml_add(ctx, out, bias) : out;
 }
 
 ggml_tensor * swiglu(ggml_context * ctx, ggml_tensor * w1, ggml_tensor * w2,
                      ggml_tensor * w3, ggml_tensor * x) {
-    ggml_tensor * gate = ggml_silu(ctx, ggml_mul_mat(ctx, w1, x));
-    return ggml_mul_mat(ctx, w2, ggml_mul(ctx, gate, ggml_mul_mat(ctx, w3, x)));
+    ggml_tensor * gate = ggml_silu(ctx, precise_mul_mat(ctx, w1, x));
+    return precise_mul_mat(ctx, w2, ggml_mul(ctx, gate, precise_mul_mat(ctx, w3, x)));
 }
 
 ggml_tensor * attention(ggml_context * ctx, ggml_cgraph * graph,

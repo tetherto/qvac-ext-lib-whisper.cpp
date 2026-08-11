@@ -8,8 +8,8 @@
 //                 the decoder through cross-attention.
 //
 // Pipeline: T5 encoder -> delay-pattern decoder LM (9 DAC codebooks) ->
-// DAC codec decode -> 44.1 kHz mono PCM. CPU-validated; the backend plumbing
-// mirrors the other engines so GPU backends can be enabled later.
+// DAC codec decode -> 44.1 kHz mono PCM. Validated backends are CPU, Metal,
+// Vulkan, and OpenCL; unsupported GPU backends fall back to CPU.
 //
 // Streaming: the synthesize(...on_chunk) overload emits audio in chunks by
 // re-decoding the growing DAC-code prefix, holding back a right margin for seams.

@@ -211,11 +211,16 @@ bool run_block(codec_model & model, const std::vector<float> & audio, const bloc
     }
     ggml_tensor * built = build_conv_stack(work.ctx, model, span.count * stride);
     mark_output(work.graph, built);
-    if (!allocate_graph(model.block_allocr, work.graph, "convolution", error)) return false;
+    bool use_sched = false;
+    if (!prepare_graph(model.backend, model.sched, model.buffer_w, model.block_allocr,
+                       work.graph, "convolution", use_sched, error)) {
+        return false;
+    }
 
     write_input(work.graph, AUDIO_INPUT, audio.data() + span.begin * stride,
                 static_cast<size_t>(span.count) * stride * sizeof(float));
-    if (!compute_graph(model.backend, work.graph, n_threads, "convolution", error)) {
+    if (!compute_graph(model.backend, model.sched, work.graph, use_sched, n_threads,
+                       "convolution", error)) {
         return false;
     }
 
@@ -288,10 +293,15 @@ bool run_analysis(codec_model & model, const std::vector<float> & features, int 
         mark_output(work.graph, built.encoded);
         mark_output(work.graph, built.downsampled);
     }
-    if (!allocate_graph(model.allocr, work.graph, "analysis", error)) return false;
+    bool use_sched = false;
+    if (!prepare_graph(model.backend, model.sched, model.buffer_w, model.allocr,
+                       work.graph, "analysis", use_sched, error)) {
+        return false;
+    }
 
     set_analysis_inputs(work.graph, model, features, positions, n_frames);
-    if (!compute_graph(model.backend, work.graph, n_threads, "analysis", error)) {
+    if (!compute_graph(model.backend, model.sched, work.graph, use_sched, n_threads,
+                       "analysis", error)) {
         return false;
     }
 

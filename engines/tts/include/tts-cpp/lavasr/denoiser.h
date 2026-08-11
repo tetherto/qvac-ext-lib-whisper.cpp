@@ -2,8 +2,8 @@
 
 // Public LavaSR denoiser API — follow-up (denoiser stage).
 //
-// Mirrors the shipped enhancer (tts-cpp/lavasr/enhancer.h): a pure-CPU scalar
-// forward of the UL-UNAS neural denoiser, with ggml used only to parse the GGUF.
+// Mirrors the shipped enhancer (tts-cpp/lavasr/enhancer.h): the default is a
+// scalar CPU forward, with optional ggml CPU or validated GPU graph execution.
 //
 // LavaSR is a two-stage pipeline:
 //   (1) UL-UNAS denoiser (this file) removes noise from the input, then
@@ -37,8 +37,8 @@ namespace tts_cpp::lavasr {
 class TTS_CPP_API Denoiser {
 public:
     // Load the denoiser GGUF.  Throws std::runtime_error on failure (file
-    // missing, wrong architecture, missing/mis-shaped tensors).  n_gpu_layers: 0 = scalar
-    // CPU (default); >0 = ggml GPU graph (Adreno OpenCL); <0 = ggml-CPU (the GPU graph's twin).
+    // missing, wrong architecture, missing/mis-shaped tensors).  n_gpu_layers:
+    // 0 = scalar CPU (default); >0 = ggml GPU graph; <0 = ggml CPU graph.
     static std::unique_ptr<Denoiser> load(const std::string & gguf_path, int n_gpu_layers = 0);
 
     ~Denoiser();

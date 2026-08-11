@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstdio>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -319,12 +318,6 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(new Impl()) {
     if (!opts.backends_dir.empty()) {
         ::tts_cpp::detail::set_backends_directory(opts.backends_dir);
     }
-    if (opts.n_gpu_layers > 0) {
-        std::fprintf(stderr,
-                     "audio8: warning: n_gpu_layers=%d ignored, this engine is "
-                     "CPU-only for now\n",
-                     opts.n_gpu_layers);
-    }
     require(!opts.lm_gguf_path.empty(), "lm_gguf_path is required");
     require(!opts.codec_decoder_gguf_path.empty(), "codec_decoder_gguf_path is required");
 
@@ -341,16 +334,20 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(new Impl()) {
     }
 
     std::string error;
-    if (!load_lm(opts.lm_gguf_path, pimpl_->lm, &error)) throw std::runtime_error(error);
+    if (!load_lm(opts.lm_gguf_path, opts.n_gpu_layers, pimpl_->lm, &error)) {
+        throw std::runtime_error(error);
+    }
     const lm_hparams & lm = pimpl_->lm.hp;
     check_against_lm(lm, decoder.hp, "the codec decoder");
     if (cloning) check_against_lm(lm, encoder.hp, "the codec encoder");
 
-    if (!load_codec(opts.codec_decoder_gguf_path, pimpl_->decoder, &error)) {
+    if (!load_codec(opts.codec_decoder_gguf_path, opts.n_gpu_layers, pimpl_->decoder,
+                    &error)) {
         throw std::runtime_error(error);
     }
     if (cloning) {
-        if (!load_codec(opts.codec_encoder_gguf_path, pimpl_->encoder, &error)) {
+        if (!load_codec(opts.codec_encoder_gguf_path, opts.n_gpu_layers, pimpl_->encoder,
+                        &error)) {
             throw std::runtime_error(error);
         }
         pimpl_->has_encoder = true;

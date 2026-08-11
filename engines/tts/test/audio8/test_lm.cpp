@@ -25,6 +25,17 @@ namespace {
 // token trace has to match exactly.
 constexpr double LOGIT_TOLERANCE = 5e-3;
 constexpr double HIDDEN_TOLERANCE = 2e-3;
+constexpr double GPU_LOGIT_TOLERANCE = 1.5e-2;
+constexpr double GPU_HIDDEN_TOLERANCE = 3e-3;
+constexpr int GPU_LAYERS = 99;
+
+double logit_tolerance() {
+    return std::getenv("AUDIO8_TEST_GPU") ? GPU_LOGIT_TOLERANCE : LOGIT_TOLERANCE;
+}
+
+double hidden_tolerance() {
+    return std::getenv("AUDIO8_TEST_GPU") ? GPU_HIDDEN_TOLERANCE : HIDDEN_TOLERANCE;
+}
 
 struct fixture {
     std::string dir;
@@ -127,11 +138,11 @@ bool run_steps(lm_model & model, const fixture & data, int n_threads, step_repor
         char tag[64];
         std::snprintf(tag, sizeof(tag), "step %2d hidden", step);
         report.ok &= check(tag, carried, as_f32(hidden_ref) + static_cast<size_t>(step) * hp.hidden,
-                           hp.hidden, HIDDEN_TOLERANCE);
+                           hp.hidden, hidden_tolerance());
         std::snprintf(tag, sizeof(tag), "step %2d sem_logits", step);
         report.ok &= check(tag, logits,
                            as_f32(logits_ref) + static_cast<size_t>(step) * logits.size(),
-                           logits.size(), LOGIT_TOLERANCE);
+                           logits.size(), logit_tolerance());
 
         const int semantic = decode_semantic(hp, logits);
         if (semantic != want_semantic[step]) {
@@ -151,7 +162,7 @@ bool run_steps(lm_model & model, const fixture & data, int n_threads, step_repor
         std::snprintf(tag, sizeof(tag), "step %2d fast_logits", step);
         report.ok &= check(tag, fast_logits,
                            as_f32(fast_ref) + static_cast<size_t>(step) * 9 * hp.codebook_size,
-                           hp.codebook_size, LOGIT_TOLERANCE);
+                           hp.codebook_size, logit_tolerance());
         for (int book = 0; book < hp.num_codebooks; ++book) {
             const int32_t want = want_codes[static_cast<size_t>(book) * steps + step];
             if (codes[book] == want) continue;
@@ -186,7 +197,8 @@ int main(int argc, char ** argv) {
 
     lm_model model;
     std::string error;
-    if (!load_lm(argv[1], model, &error)) {
+    const int n_gpu_layers = std::getenv("AUDIO8_TEST_GPU") ? GPU_LAYERS : 0;
+    if (!load_lm(argv[1], n_gpu_layers, model, &error)) {
         std::fprintf(stderr, "load: %s\n", error.c_str());
         return 1;
     }

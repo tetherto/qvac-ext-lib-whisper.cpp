@@ -32,6 +32,7 @@ voices/
 
 # Generated audio
 *.wav
+!test/reference-audio/jfk.wav
 
 # Editor files
 .vscode/

@@ -1,15 +1,18 @@
 # tts-cpp memory model
 
-Steady-state RSS / VRAM behaviour for the two persistent engines and
-the per-process caches they share.  Numbers below were measured on
-Apple M2 (macOS 15.7, arm64) with the supertonic CPU + Metal paths;
+Steady-state RSS / VRAM behavior for the persistent synthesis engines in this
+package. Detailed lifecycle measurements below currently cover Supertonic and
+Chatterbox; Parler, CosyVoice3, and Audio8 also expose persistent Engine APIs
+but do not yet have equivalent cycle measurements documented here. Numbers
+below were measured on Apple M2 (macOS 15.7, arm64) with the Supertonic CPU +
+Metal paths;
 RSS is `mach_task_basic_info::phys_footprint`.  The measurement
 harness is `test/test_supertonic_engine_cycle.cpp`
 (`build/test-supertonic-engine-cycle`).
 
 ## Acceptance criteria (CI gate)
 
-Both engines must satisfy:
+Every persistent engine must satisfy:
 
 - **No monotonic RSS growth** across 100+ `synthesize → destroy` cycles
   (drift < 5 MB).  Enforced for supertonic by
@@ -169,8 +172,8 @@ teardown code in `src/chatterbox_engine.cpp` + `src/chatterbox_tts.cpp`
 
 ### Chatterbox follow-up — known concern
 
-`src/chatterbox_tts.cpp::time_mlp_cache` (line 1270, inside
-`compute_time_mlp`) is a thread_local cache whose destructor calls
+`src/chatterbox_tts.cpp::time_mlp_cache` (inside `compute_time_mlp`) is a
+thread_local cache whose destructor calls
 `ggml_gallocr_free(allocr)` directly (no safe-skip helper).  If a
 worker thread outlives the Engine that populated it and the backend
 has been freed, the thread_local destructor at thread death will

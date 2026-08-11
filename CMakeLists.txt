@@ -9,7 +9,7 @@
 # (cmake -S engines/<name>), which is what the per-engine vcpkg ports and
 # CI lanes use today; this umbrella is additive and is the base for the
 # future single speech port (QIP #94, Ticket 4).
-cmake_minimum_required(VERSION 3.19)
+cmake_minimum_required(VERSION 3.20)
 project(qvac-speech LANGUAGES C CXX)
 
 option(SPEECH_BUILD_WHISPER     "speech: build the whisper engine (third_party/whisper.cpp)" ON)
