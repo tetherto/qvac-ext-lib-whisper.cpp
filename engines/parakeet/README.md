@@ -226,7 +226,22 @@ force ggml, including for parity or benchmarking.
 ## Models and conversion
 
 The engine runs GGUF, not `.nemo`. `scripts/download-all-models.sh` downloads
-NeMo archives only; every downloaded checkpoint must still be converted:
+NeMo archives only; every downloaded checkpoint must still be converted.
+Python is required only for conversion, Core ML export, and NeMo parity tooling;
+runtime inference remains pure C++.
+
+Create an isolated environment using a Python version supported by the selected
+NeMo release:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install torch gguf numpy pyyaml soundfile librosa sentencepiece \
+  "nemo_toolkit[asr]" huggingface_hub
+```
+
+Convert the downloaded checkpoint:
 
 ```bash
 python engines/parakeet/scripts/convert-nemo-to-gguf.py \
@@ -235,11 +250,11 @@ python engines/parakeet/scripts/convert-nemo-to-gguf.py \
   --quant q8_0
 ```
 
-The converter defaults to CTC 0.6B, `q8_0`, and
-`models/parakeet-ctc-0.6b.q8_0.gguf`. For every other checkpoint, pass an
-explicit `--ckpt`, `--hf-repo`, and `--out`; otherwise a missing local
-checkpoint can cause the default CTC repository to be downloaded. Keep the
-quantization in the filename:
+The converter defaults to CTC 0.6B and `q8_0`. When `--out` is omitted, it
+derives `models/parakeet-ctc-0.6b.<quant>.gguf` from `--quant`. For every other
+checkpoint, pass an explicit `--ckpt`, `--hf-repo`, and `--out`; otherwise a
+missing local checkpoint can cause the default CTC repository to be downloaded.
+Keep the quantization in explicit filenames:
 
 ```text
 <model>.q8_0.gguf

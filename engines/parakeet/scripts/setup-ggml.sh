@@ -60,5 +60,5 @@ echo "  -> ok, on ${GGML_BRANCH} at $(git rev-parse --short=8 HEAD)"
 
 echo
 echo "ggml is ready. Next:"
-echo "    cmake -S engines/parakeet -B build-parakeet -DCMAKE_BUILD_TYPE=Release"
-echo "    cmake --build build-parakeet -j"
+echo "    cmake -S \"${REPO_ROOT}\" -B \"${REPO_ROOT}/build\" -DCMAKE_BUILD_TYPE=Release"
+echo "    cmake --build \"${REPO_ROOT}/build\" -j"
