@@ -59,7 +59,7 @@
 //     destruct without an explicit `finalize()` call, any audio that
 //     hadn't yet rolled into a chunk is dropped, the synthetic
 //     `is_final=true` terminator is not emitted (Sortformer), and the
-//     final partial-chunk tail segment is not emitted (CTC/TDT
+//     final partial-chunk tail segment is not emitted (CTC/TDT/EOU
 //     Mode 3). Always call `finalize()` if you care about those.
 
 #include "export.h"
@@ -91,8 +91,8 @@ struct EngineOptions {
     // Leave empty to fall back to ggml's default search path
     // (`ggml_backend_load_all()`), which walks compile-time defaults
     // (`$EXE_DIR`, `LD_LIBRARY_PATH`, ...). Embedded host applications
-    // built with `GGML_BACKEND_DL=ON` (the Android / Linux non-Apple
-    // default; see CMakeLists.txt) should pass an explicit dir
+    // built with `GGML_BACKEND_DL=ON` (including Android prebuilds)
+    // should pass an explicit dir
     // because the .so files ship next to the host's binary in a
     // platform-specific subfolder rather than on the system loader's
     // path.
@@ -106,14 +106,14 @@ struct EngineOptions {
 
     // Sets `$GGML_OPENCL_CACHE_DIR` before the first backend init so
     // ggml-opencl persists `clCreateProgramWithBinary` blobs across
-    // process restarts (see the program-binary-cache patch on
-    // qvac-ext-ggml@speech). Strongly recommended on Android where
+    // process restarts (implemented by qvac-ext-ggml@speech). Strongly
+    // recommended on Android where
     // the cold `clBuildProgram` cost dominates first-utterance
     // latency; pass a writable per-app directory (typically the
     // app's `cacheDir` from the host platform).
     //
     // Honoured only on `__ANDROID__` builds; ignored elsewhere
-    // (desktop OpenCL platforms don't ship the binary-cache patch
+    // (desktop OpenCL platforms don't enable that binary-cache behavior
     // and would otherwise pollute the user's tmpdir).
     //
     // Leave empty to keep the existing `$GGML_OPENCL_CACHE_DIR` env
@@ -124,16 +124,16 @@ struct EngineOptions {
     // Opt-in cold-start mitigation.
     //
     // When `prewarm == true`, the Engine constructor runs one
-    // synthetic forward pass through the encoder (and, on TDT
-    // GGUFs, through the per-step LSTM/joint graphs too) using a
-    // `prewarm_audio_seconds`-long all-zero mel input. The
+    // synthetic encoder-only forward pass using a
+    // `prewarm_audio_seconds`-long all-zero mel input. Decoder
+    // predictor/joint graphs are not executed. The
     // intent is to amortise the *first-call* cold cost into
     // construction:
     //
     //   * Metal:   triggers the MSL → MTLPipelineState compile.
     //   * OpenCL:  triggers `clBuildProgram` for every kernel
     //              variant the encoder graph touches; binaries
-    //              get cached via the program-binary-cache patch 
+    //              get cached by the qvac-ext-ggml@speech backend
     //              when GGML_OPENCL_CACHE_DIR is set.
     //   * Vulkan:  triggers vkCreateGraphicsPipelines.
     //   * CUDA:    triggers cuGraphInstantiate.
@@ -193,9 +193,9 @@ struct EngineOptions {
     std::string language;
 };
 
-// Resolved compute device the Engine is actually running on, after the
-// load-time backend cascade (CUDA / Metal / Vulkan / OpenCL) and any
-// fallbacks (Adreno-tier policy, OpenCL extension probe, missing GPU
+// Resolved compute device the Engine is actually running on, after
+// registry-based runtime tiering and any fallbacks (Adreno policy,
+// OpenCL extension probe, missing GPU
 // build, kernel-init failure). This is the *post-fallback* truth and
 // will not match the user's `EngineOptions::n_gpu_layers` request when
 // a fallback occurred.
@@ -293,20 +293,22 @@ public:
     // the lifetime of the Engine.
     std::string backend_name() const;
 
-    // Compute backend of the FastConformer encoder specifically. Returns
-    // "coreml" when the Apple Core ML (Neural Engine) sidecar is active;
-    // otherwise identical to backend_name(). The decoder (TDT/CTC) always
-    // runs on the ggml backend reported by backend_name().
+    // Reports whether an Apple Core ML encoder sidecar loaded for this model.
+    // Returns "coreml" when loaded; otherwise identical to backend_name().
+    // The documented and validated deployment is an offline TDT encoder. The
+    // TDT decoder always runs on the ggml backend reported by backend_name().
     std::string encoder_backend() const;
 
-    // True when the FastConformer encoder runs on the Apple Core ML (Neural
-    // Engine) sidecar rather than the ggml backend. Always false on non-Apple
-    // builds and whenever the sidecar is absent or failed to initialise.
+    // True when an Apple Core ML encoder sidecar loaded. This is a load-status
+    // query, not a guarantee that every call shape uses Core ML: unsupported
+    // or streaming shapes fall back to ggml. The supported deployment is an
+    // offline TDT encoder. Always false on non-Apple builds and when the
+    // sidecar is absent or failed to initialise.
     bool encoder_on_coreml() const;
 
-    // True when a GPU was detected but the engine fell back to CPU because it is
-    // a known-bad backend (Mali). A CPU backend with this set is expected, not a
-    // regression.
+    // True when a GPU was detected but the engine fell back to CPU because the
+    // available path is known-bad (currently Adreno 6xx OpenCL without the
+    // explicit override). A CPU backend with this set is expected.
     bool gpu_unsupported() const;
 
     struct Impl;

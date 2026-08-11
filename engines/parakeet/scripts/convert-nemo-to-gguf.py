@@ -118,8 +118,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt", type=Path, default=Path("models/parakeet-ctc-0.6b.nemo"),
                    help="Path to .nemo archive (tarball). Downloads from HF if missing.")
-    p.add_argument("--out", type=Path, default=Path("models/parakeet-ctc-0.6b.gguf"),
-                   help="Output GGUF path.")
+    p.add_argument("--out", type=Path,
+                   default=Path("models/parakeet-ctc-0.6b.q8_0.gguf"),
+                   help="Output GGUF path. Name explicit outputs with their quantization, "
+                        "for example <model>.q8_0.gguf or <model>.f16.gguf.")
     p.add_argument("--quant", choices=QUANT_CHOICES, default="q8_0",
                    help="Weight dtype for 2D projection matrices. Biases / norms / BN "
                         "stay at f32. q8_0 default (~2x smaller than f16, bit-equal "
