@@ -404,6 +404,7 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
     // Set when a GPU was present but declined BY POLICY (non-allowlisted Android vendor,
     // or Adreno 6xx) so the caller accepts CPU fallback; NOT set when a validated GPU's init failed.
     bool gpu_present_but_unvalidated = false;
+    bool requirement_skipped_gpu = false;
 
     const size_t n_dev = ggml_backend_dev_count();
     for (size_t i = 0; i < n_dev; ++i) {
@@ -421,9 +422,11 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
         const bool   is_vulkan =
             reg_name && std::strcmp(reg_name, VULKAN_BACKEND_NAME) == 0;
         if (!gpu_backend_satisfies_requirement(reg_name, requirement)) {
-            // A working GPU skipped by the caller's requirement is a policy
-            // decline, so the caller's CPU fallback reports as intentional.
-            gpu_present_but_unvalidated = true;
+            // Recorded, not flagged: this only becomes a policy CPU fallback
+            // if no requirement-matching device exists at all. Flagging here
+            // would misreport a later init FAILURE of a matching device (e.g.
+            // Vulkan skipped, then OpenCL fails to init) as intentional.
+            requirement_skipped_gpu = true;
             continue;
         }
 
@@ -630,6 +633,14 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
                 "%s: no GPU backend available, falling back to CPU\n",
                 log_prefix);
         }
+    }
+    // Requirement-skipped devices count as a policy decline only when no
+    // requirement-matching candidate was enumerated; reaching this point with
+    // non-empty buckets means a matching device was tried and failed to init,
+    // which must not be reported as intentional.
+    if (requirement_skipped_gpu && opencl_adreno_700plus.empty() &&
+        other_gpu.empty() && opencl_other.empty()) {
+        gpu_present_but_unvalidated = true;
     }
     // Report a GPU declined by policy so the caller accepts CPU fallback as correct
     // (not a regression); not set when a validated GPU was tried and failed to init.

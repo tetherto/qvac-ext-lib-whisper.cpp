@@ -185,8 +185,11 @@ endif()
 # integration modes. The add_subdirectory build exposes the GGML_<BACKEND>
 # options directly and the speech-branch package config re-exports them
 # (GGML_VARIABLES_EXPANDED); GGML_AVAILABLE_BACKENDS is the fallback for a
-# system ggml whose config predates that expansion.
-foreach(_tts_ggml_backend metal vulkan cuda)
+# system ggml whose config predates that expansion. Each engine's gpu test
+# variants register only for backends that engine's production allowlist
+# accepts, so an off-allowlist build neither runs unvalidated backends nor
+# silently skips validated ones.
+foreach(_tts_ggml_backend metal vulkan cuda opencl)
     string(TOUPPER "${_tts_ggml_backend}" _tts_ggml_backend_uc)
     set(TTS_CPP_GGML_${_tts_ggml_backend_uc} FALSE)
     if (GGML_${_tts_ggml_backend_uc} OR
@@ -194,9 +197,16 @@ foreach(_tts_ggml_backend metal vulkan cuda)
         set(TTS_CPP_GGML_${_tts_ggml_backend_uc} TRUE)
     endif()
 endforeach()
-set(TTS_CPP_GGML_GPU FALSE)
-if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_VULKAN OR TTS_CPP_GGML_CUDA)
-    set(TTS_CPP_GGML_GPU TRUE)
+# Parler allowlist: Metal / Vulkan / OpenCL (parler/gguf.cpp).
+set(TTS_CPP_PARLER_GPU FALSE)
+if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_VULKAN OR TTS_CPP_GGML_OPENCL)
+    set(TTS_CPP_PARLER_GPU TRUE)
+endif()
+# CosyVoice3 allowlist: Metal / OpenCL (cosyvoice_engine.cpp
+# GpuBackendRequirement::MetalOrOpenCL).
+set(TTS_CPP_COSYVOICE_GPU FALSE)
+if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_OPENCL)
+    set(TTS_CPP_COSYVOICE_GPU TRUE)
 endif()
 
 # The standalone chatterbox.cpp source carries a bundled-ggml filename-prefix
@@ -684,7 +694,7 @@ if (TTS_CPP_BUILD_TESTS)
 
     # Same binaries on the GPU backend — the per-stage reference legs behind
     # the cosyvoice_engine.cpp allowlist.  Skipped via `ctest -LE gpu`.
-    if (TTS_CPP_GGML_GPU)
+    if (TTS_CPP_COSYVOICE_GPU)
         tts_cpp_register_test(test-cosyvoice-flow-gpu
             EXE      test-cosyvoice-flow
             LABEL    "gpu"
@@ -702,7 +712,7 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "--llm-gguf" "${_tcb_cosy_llm_gguf}" "--in-dir" "${_tcb_cosy_ref}"
         REQUIRES "${_tcb_cosy_llm_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
 
-    if (TTS_CPP_GGML_GPU)
+    if (TTS_CPP_COSYVOICE_GPU)
         tts_cpp_register_test(test-cosyvoice-llm-gpu
             EXE      test-cosyvoice-llm
             LABEL    "gpu"
@@ -720,7 +730,7 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "--hift-gguf" "${_tcb_cosy_hift_gguf}" "--in-dir" "${_tcb_cosy_ref}"
         REQUIRES "${_tcb_cosy_hift_gguf}" "${_tcb_cosy_ref}/hift_wav.npy")
 
-    if (TTS_CPP_GGML_GPU)
+    if (TTS_CPP_COSYVOICE_GPU)
         tts_cpp_register_test(test-cosyvoice-hift-gpu
             EXE      test-cosyvoice-hift
             LABEL    "gpu"
@@ -992,7 +1002,7 @@ if (TTS_CPP_BUILD_TESTS)
 
     # Same binary on the GPU transposed-conv path (conv_transpose_1d_matmul), which
     # the CPU run never reaches.  Skipped on GPU-less fleets via `ctest -LE gpu`.
-    if (TTS_CPP_GGML_GPU)
+    if (TTS_CPP_PARLER_GPU)
         tts_cpp_register_test(test-parler-dac-gpu
             EXE      test-parler-dac
             LABEL    "gpu"
@@ -1077,7 +1087,7 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_parler_indic_gguf}" "${_tcb_parler_indic_ref}"
         REQUIRES "${_tcb_parler_indic_gguf}" "${_tcb_parler_indic_ref}/dacrand_wav.npy")
 
-    if (TTS_CPP_GGML_GPU)
+    if (TTS_CPP_PARLER_GPU)
         tts_cpp_register_test(test-parler-dac-indic-gpu
             EXE      test-parler-dac
             LABEL    "gpu"
