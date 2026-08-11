@@ -2076,15 +2076,14 @@ Algorithm (per chunk):
 5. `finalize()` semantics:
    - if `>= 1` sample of new audio sits past the last emitted chunk,
      run one final `process_chunk` over `[max(ring_origin, end -
-     history_samples), end]`, emit each overlapping segment with
-     `is_final = true`. Consumers see real segments tagged final.
-   - if the audio ended exactly on a chunk boundary (no tail), emit a
-     single synthetic terminator with `speaker_id = -1`,
-     `start_s == end_s == emitted_samples / sample_rate`,
+     history_samples), end]` and emit overlapping real segments with
+     `is_final = false`.
+   - after either the tail-present or chunk-aligned path, emit exactly
+     one synthetic terminator with `speaker_id = -1`,
+     `start_s == end_s == emitted_samples / sample_rate`, and
      `is_final = true`. Consumers should treat negative speaker IDs as
-     "session done, no new segment". This avoids the round-1 bug
-     where the last chunk's segments were re-emitted as duplicates
-     with `is_final = true` flipped on.
+     "session done, no new segment". This became unconditional after the
+     tail path was found to return before emitting it.
 6. `cancel()` short-circuits; subsequent `feed_*` calls are no-ops.
 
 Trade-offs (vs the planned full Phase 11.11.2 NeMo-style streaming):
@@ -2157,13 +2156,15 @@ Testing: `test/test_sortformer_streaming.cpp` (built as
 the multi-speaker sample in random burst sizes (1-5000 samples per
 `feed_pcm_f32()` call) and asserts:
 - `>= 1` real segment callback received (`speaker_id >= 0`),
-- exactly one `is_final = true` callback received after `finalize()`
-  (real segment for the tail case, synthetic terminator with
-  `speaker_id = -1` for the chunk-aligned case),
+- exactly one `is_final = true` synthetic terminator with
+  `speaker_id = -1` received after `finalize()`,
+- dedicated chunk-aligned and tail-present sessions both satisfy the
+  same final-marker contract, and a second `finalize()` emits nothing,
 - `max_end` is within the audio duration,
 - no two consecutive callbacks duplicate each other's
   `(speaker_id, start_s, end_s)`,
-- `cancel()` on a half-fed session is idempotent.
+- `cancel()` on a half-fed session is idempotent and suppresses the
+  final terminator.
 
 Verified end-to-end on `diarization-sample-16k.wav`:
 ```

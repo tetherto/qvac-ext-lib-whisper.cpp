@@ -1538,8 +1538,7 @@ struct SortformerStreamSession::Impl {
     void process_chunk(int64_t window_start_sample,
                        int64_t window_end_sample,
                        int64_t emit_start_sample,
-                       int64_t emit_end_sample,
-                       bool    is_final_chunk);
+                       int64_t emit_end_sample);
 
     // Compute remap[local_id] -> session_id by maximising overlap of
     // current chunk's local-ID segments against prev_chunk_full_segments
@@ -1625,8 +1624,7 @@ std::vector<int> SortformerStreamSession::Impl::compute_slot_remap_(
 void SortformerStreamSession::Impl::process_chunk(int64_t window_start_sample,
                                                   int64_t window_end_sample,
                                                   int64_t emit_start_sample,
-                                                  int64_t emit_end_sample,
-                                                  bool    is_final_chunk) {
+                                                  int64_t emit_end_sample) {
     if (cancelled) return;
     if (window_end_sample <= window_start_sample) return;
 
@@ -1677,7 +1675,7 @@ void SortformerStreamSession::Impl::process_chunk(int64_t window_start_sample,
         f.start_s     = window_offset_s + s.start_s;
         f.end_s       = window_offset_s + s.end_s;
         f.chunk_index = chunk_index;
-        f.is_final    = is_final_chunk;
+        f.is_final    = false;
         cur_full.push_back(f);
     }
 
@@ -1712,7 +1710,7 @@ void SortformerStreamSession::Impl::process_chunk(int64_t window_start_sample,
         out.start_s     = std::max(abs_start, emit_lo_s);
         out.end_s       = std::min(abs_end,   emit_hi_s);
         out.chunk_index = chunk_index;
-        out.is_final    = is_final_chunk;
+        out.is_final    = false;
         if (out.end_s - out.start_s < opts.min_segment_ms / 1000.0) continue;
         emitted.push_back(out);
     }
@@ -1807,7 +1805,7 @@ void SortformerStreamSession::Impl::try_emit_chunks() {
             window_start = std::max(ring_origin_sample,
                                     window_end - history_samples);
         }
-        process_chunk(window_start, window_end, emitted_samples, emit_end, /*is_final=*/false);
+        process_chunk(window_start, window_end, emitted_samples, emit_end);
 
         // Trim the ring. v1 keeps the trailing history_ms. AOSC needs to keep
         // chunk_left_context_samples ahead of emit_end so the NEXT chunk's
@@ -1886,9 +1884,7 @@ void SortformerStreamSession::finalize() {
                                     window_end - pimpl_->history_samples);
         }
         pimpl_->process_chunk(window_start, window_end,
-                              pimpl_->emitted_samples, available_end,
-                              /*is_final_chunk=*/true);
-        return;
+                              pimpl_->emitted_samples, available_end);
     }
 
     if (!pimpl_->cancelled && pimpl_->on_segment) {

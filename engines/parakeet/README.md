@@ -357,11 +357,11 @@ avoid relying on the heuristic.
 `SortformerStreamSession::aosc_active()` reports whether the session actually
 took the AOSC path.
 
-Known limitation: on long AOSC inputs, final-event signaling is currently
-nondeterministic and the session can emit no `is_final` marker instead of
-exactly one. The diarization output remains valid. Consumers must call
-`finalize()`, but should not yet rely exclusively on the final marker for AOSC
-session completion.
+Every non-cancelled `finalize()` drains any trailing partial chunk and then
+emits exactly one final synthetic terminator (`speaker_id=-1`,
+`is_final=true`, and `start_s == end_s`). Real speaker segments always remain
+non-final. Repeated `finalize()` calls are idempotent, while cancellation
+suppresses the terminator.
 
 ## CLI and microphone examples
 
