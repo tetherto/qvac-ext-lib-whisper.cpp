@@ -84,8 +84,9 @@ bool check_finalize_path(Engine & engine,
         callbacks.back().is_final &&
         callbacks.back().speaker_id == -1 &&
         callbacks.back().start_s == callbacks.back().end_s;
-    const bool tail_ok =
-        real_tail_is_non_final && (!expect_real_tail || n_real_tail > 0);
+    const bool tail_count_ok =
+        expect_real_tail ? n_real_tail > 0 : n_real_tail == 0;
+    const bool tail_ok = real_tail_is_non_final && tail_count_ok;
     if (stats.n_finals != 1 || stats.n_terminators != 1 ||
         !last_is_terminator || !tail_ok) {
         std::fprintf(

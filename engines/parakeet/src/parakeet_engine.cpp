@@ -13,6 +13,7 @@
 #include "sentencepiece_bpe.h"
 #include "energy_vad.h"
 #include "long_form.h"
+#include "sortformer_finalize.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1863,39 +1864,53 @@ void SortformerStreamSession::feed_pcm_i16(const int16_t * samples, int n_sample
 
 void SortformerStreamSession::finalize() {
     if (!pimpl_) return;
-    if (pimpl_->finalized) return;
-    pimpl_->finalized = true;
-    pimpl_->try_emit_chunks();
-
-    const int64_t available_end = pimpl_->ring_origin_sample + (int64_t) pimpl_->ring.size();
-    if (available_end > pimpl_->emitted_samples) {
-        // Tail chunk: drain whatever remains. AOSC also picks up left context
-        // from before emit_start; right context is whatever's left (typically
-        // zero -- the user is finalizing because no more audio is coming).
-        int64_t window_start;
-        int64_t window_end;
-        if (pimpl_->cache_active) {
-            window_start = std::max(pimpl_->ring_origin_sample,
-                                    pimpl_->emitted_samples - pimpl_->chunk_left_context_samples);
-            window_end   = available_end;
-        } else {
-            window_end   = available_end;
-            window_start = std::max(pimpl_->ring_origin_sample,
-                                    window_end - pimpl_->history_samples);
-        }
-        pimpl_->process_chunk(window_start, window_end,
-                              pimpl_->emitted_samples, available_end);
-    }
-
-    if (!pimpl_->cancelled && pimpl_->on_segment) {
-        StreamingDiarizationSegment terminator;
-        terminator.speaker_id  = -1;
-        terminator.start_s     = (double) pimpl_->emitted_samples / pimpl_->opts.sample_rate;
-        terminator.end_s       = terminator.start_s;
-        terminator.chunk_index = pimpl_->chunk_index;
-        terminator.is_final    = true;
-        pimpl_->on_segment(terminator);
-    }
+    detail::finalize_sortformer_stream(
+        pimpl_->finalized,
+        pimpl_->cancelled,
+        [&] {
+            pimpl_->try_emit_chunks();
+        },
+        [&] {
+            const int64_t available_end =
+                pimpl_->ring_origin_sample + (int64_t) pimpl_->ring.size();
+            return available_end > pimpl_->emitted_samples;
+        },
+        [&] {
+            const int64_t available_end =
+                pimpl_->ring_origin_sample + (int64_t) pimpl_->ring.size();
+            // Tail chunk: drain whatever remains. AOSC also picks up left
+            // context from before emit_start; right context is whatever is
+            // left when no more audio is coming.
+            int64_t window_start;
+            int64_t window_end;
+            if (pimpl_->cache_active) {
+                window_start = std::max(
+                    pimpl_->ring_origin_sample,
+                    pimpl_->emitted_samples - pimpl_->chunk_left_context_samples);
+                window_end = available_end;
+            } else {
+                window_end = available_end;
+                window_start = std::max(
+                    pimpl_->ring_origin_sample,
+                    window_end - pimpl_->history_samples);
+            }
+            pimpl_->process_chunk(
+                window_start,
+                window_end,
+                pimpl_->emitted_samples,
+                available_end);
+        },
+        [&] {
+            if (!pimpl_->on_segment) return;
+            StreamingDiarizationSegment terminator;
+            terminator.speaker_id  = -1;
+            terminator.start_s     =
+                (double) pimpl_->emitted_samples / pimpl_->opts.sample_rate;
+            terminator.end_s       = terminator.start_s;
+            terminator.chunk_index = pimpl_->chunk_index;
+            terminator.is_final    = true;
+            pimpl_->on_segment(terminator);
+        });
 }
 
 void SortformerStreamSession::cancel() {
