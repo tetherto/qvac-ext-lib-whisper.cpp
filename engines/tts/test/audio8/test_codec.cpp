@@ -229,6 +229,38 @@ bool check_budgeted_decode(codec_model & model, const std::vector<int32_t> & cod
                   WAVEFORM_TOLERANCE);
 }
 
+// The share and the cap the budget is built from. Restated here rather than
+// exported, so that changing either one has to be a deliberate edit on both
+// sides instead of a test that agrees with whatever the code now does.
+constexpr size_t BUDGET_CAP = 384u * 1024 * 1024;
+constexpr size_t PLENTIFUL_FREE = 8ull * 1024 * 1024 * 1024;
+constexpr size_t SCARCE_FREE = 200u * 1024 * 1024;
+
+bool check_budget_rule(const char * what, size_t got, size_t want) {
+    if (got == want) return true;
+    std::fprintf(stderr, "budget: FAIL %s gave %zu bytes, wanted %zu\n", what, got, want);
+    return false;
+}
+
+// A backend that cannot report its memory says zero for both figures, and that
+// has to read as "unknown" rather than "none left" -- taking it literally would
+// price every block at one frame and make synthesis slower than the fixed width
+// it replaced.
+bool check_scratch_budget() {
+    bool ok = check_budget_rule("an explicit budget", synthesis_scratch_budget(1234, 0, 0),
+                                1234);
+    ok &= check_budget_rule("a silent backend",
+                            synthesis_scratch_budget(0, 0, 0), BUDGET_CAP);
+    ok &= check_budget_rule("a roomy device",
+                            synthesis_scratch_budget(0, PLENTIFUL_FREE, PLENTIFUL_FREE),
+                            BUDGET_CAP);
+    ok &= check_budget_rule("a device under pressure",
+                            synthesis_scratch_budget(0, SCARCE_FREE, PLENTIFUL_FREE),
+                            SCARCE_FREE / 4);
+    if (ok) std::fprintf(stderr, "  [budget] share and cap and the unknown report\n");
+    return ok;
+}
+
 // Cancellation is only observable between blocks, so both directions run at
 // the narrow block size and stop after the first one. Checking how much came
 // back is what separates a real stop from a pass that ran to the end and
@@ -309,6 +341,7 @@ bool run_decode(codec_model & model, const fixture & data, int n_threads) {
     bool ok = check_stages(taps, data);
     ok &= check_flat("waveform", pcm, data.load("wav"), waveform_tolerance());
     ok &= check_blocked_decode(model, values, n_frames, n_threads, pcm);
+    ok &= check_scratch_budget();
     ok &= check_budgeted_decode(model, values, n_frames, n_threads, pcm);
     ok &= check_cancelled_decode(model, values, n_frames, n_threads);
     return ok;

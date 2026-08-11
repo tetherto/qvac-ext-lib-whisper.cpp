@@ -377,6 +377,12 @@ struct decode_timing {
     size_t block_scratch = 0;
 };
 
+// What synthesis_block_frames == 0 resolves the scratch budget to, given a
+// configured budget and what the backend reports for the device. Separate from
+// the query so the arithmetic can be checked against figures a real device will
+// not produce on demand.
+size_t synthesis_scratch_budget(size_t configured, size_t free_bytes, size_t total_bytes);
+
 // codes: [num_codebooks, n_frames] row-major. Writes n_frames * frame_size
 // samples at the codec sample rate.
 bool decode_codes(codec_model & model, const int32_t * codes, int n_frames,

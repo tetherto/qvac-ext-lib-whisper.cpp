@@ -33,8 +33,9 @@ constexpr double WAVEFORM_TOLERANCE = 5e-5;
 constexpr double GPU_WAVEFORM_TOLERANCE = 1e-4;
 constexpr double GPU_CLONE_MIN_CORRELATION = 0.85;
 constexpr int GPU_LAYERS = 99;
+// Substrings of what ggml names a backend instance: "Vulkan0", "MTL0".
 constexpr const char * VULKAN_BACKEND = "Vulkan";
-constexpr const char * METAL_BACKEND = "Metal";
+constexpr const char * METAL_BACKEND = "MTL";
 
 bool is_gpu_test() {
     return std::getenv("AUDIO8_TEST_GPU") != nullptr;

@@ -9,10 +9,10 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
-#include <utility>
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 namespace tts_cpp {
 namespace audio8 {
@@ -378,8 +378,7 @@ struct Engine::Impl {
         return result;
     }
 
-    void report_timings(const SynthesisResult & result) const {
-        const StageTimings & t = result.timings;
+    static void report_stages(const StageTimings & t) {
         const std::pair<const char *, double> stages[] = {
             {"voice-encode", t.voice_encode_ms}, {"prompt", t.prompt_ms},
             {"prefill", t.prefill_ms},           {"sample", t.sample_ms},
@@ -391,6 +390,11 @@ struct Engine::Impl {
             std::fprintf(stderr, "[audio8-timing] %-14s %8.1f ms\n", stage.first,
                          stage.second);
         }
+    }
+
+    void report_timings(const SynthesisResult & result) const {
+        const StageTimings & t = result.timings;
+        report_stages(t);
         const double realtime =
             t.total_ms > 0.0 ? 1000.0 * result.duration_s / t.total_ms : 0.0;
         std::fprintf(stderr,

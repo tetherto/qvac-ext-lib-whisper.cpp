@@ -580,7 +580,7 @@ the prompt.
 **Status — CPU, Metal, and desktop Vulkan, validated against the reference.**
 Text-to-speech and voice cloning both run in-process on macOS and iOS Metal and
 on Linux and Windows Vulkan.  Pass `--n-gpu-layers 99` to offload every stage;
-omit it for CPU.  On Metal that is **4.3x** CPU at q4_0 and **3.0x** at q8_0 on
+omit it for CPU.  On Metal that is **4.2x** CPU at q4_0 and **3.2x** at q8_0 on
 an iPhone 17, measured on device with both arms in one launch.  At F32 the GPU
 reproduces the CPU code trajectory exactly, frame for frame, which is the
 strongest available statement that the graphs compute the same function;
@@ -757,14 +757,17 @@ model runs on rather than splitting layers across two, so any count above zero
 puts everything on the device and zero keeps it on CPU.  A GPU run copies the
 weights into device memory rather than mapping them, so plan for the GGUF size
 again on top of the file itself.  `--verbose` prints the per-stage times and the
-block width the codec settled on.
+block width the codec settled on, and `--dump-codes` writes the discrete code
+trajectory as one comma-separated line per frame, which two runs can be diffed
+on to see whether a backend or a quantisation tier changed what was generated.
 
 Codec synthesis runs in blocks whose width is chosen from a memory budget rather
 than fixed: the widest block whose scratch fits a quarter of what the backend
-reports free, capped at 384 MiB.  Blocks exist only to bound that scratch — each
-one re-runs the causal context of the one before it — so a wider block is
-strictly less work, and the width never changes the samples.  Set
-`codec_model::synthesis_block_frames` to pin a width or
+reports free, capped at 384 MiB.  A backend that reports no total at all is
+saying it cannot tell rather than that it has nothing, and gets the cap.  Blocks
+exist only to bound that scratch — each one re-runs the causal context of the one
+before it — so a wider block is strictly less work, and the width never changes
+the samples.  Set `codec_model::synthesis_block_frames` to pin a width or
 `synthesis_scratch_budget` to pin the budget.
 
 The same thing through the library, from `<tts-cpp/audio8/engine.h>`:

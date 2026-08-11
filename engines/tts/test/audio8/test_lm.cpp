@@ -108,6 +108,31 @@ struct step_report {
     bool ok = true;
 };
 
+// fast_frame claims to be fast_step's greedy equivalent in one graph. Both are
+// already pinned to the reference codes elsewhere, but only comparing them
+// directly states the claim, and it costs one extra frame to do it. Each frame
+// rewrites the fast cache from position 0, so re-running the frame is safe.
+bool check_chained_frame(lm_model & model, const std::vector<float> & carried, int semantic,
+                         int n_threads, const std::vector<int32_t> & want) {
+    if (!model.picks_codes) {
+        std::printf("  [chained frame] skipped: %s does not pick codes\n",
+                    ggml_backend_name(model.backend));
+        return true;
+    }
+    std::vector<int32_t> codes;
+    std::string error;
+    if (!fast_frame(model, carried, semantic, n_threads, codes, &error)) {
+        std::fprintf(stderr, "chained frame: FAIL %s\n", error.c_str());
+        return false;
+    }
+    if (codes == want) {
+        std::printf("  [chained frame] %zu codes match the per-position path\n", codes.size());
+        return true;
+    }
+    std::fprintf(stderr, "chained frame: FAIL codes differ from the per-position path\n");
+    return false;
+}
+
 bool run_steps(lm_model & model, const fixture & data, int n_threads, step_report & report) {
     const lm_hparams & hp = model.hp;
     const npy_array prompt = data.load("prompt");
@@ -170,6 +195,9 @@ bool run_steps(lm_model & model, const fixture & data, int n_threads, step_repor
                          codes[book], want);
             report.ok = false;
             return true;
+        }
+        if (step == 0) {
+            report.ok &= check_chained_frame(model, carried, semantic, n_threads, codes);
         }
         report.frames = step + 1;
         if (semantic == hp.eos || step + 1 == steps) break;

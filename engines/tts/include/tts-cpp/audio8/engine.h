@@ -16,7 +16,6 @@
 // Validated against the reference implementation on CPU, Metal, and Vulkan, each
 // compared to the same F32 reference rather than to the other.
 
-
 #include "tts-cpp/backend.h"
 #include "tts-cpp/export.h"
 

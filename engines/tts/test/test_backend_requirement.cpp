@@ -29,6 +29,7 @@ void expect(bool cond, const char * what) {
 int main() {
     const auto any    = GpuBackendRequirement::Any;
     const auto vulkan = GpuBackendRequirement::Vulkan;
+    const auto vkmtl  = GpuBackendRequirement::VulkanOrMetal;
     const auto mtlcl  = GpuBackendRequirement::MetalOrOpenCL;
 
     expect(gpu_backend_satisfies_requirement("Metal", any), "Any accepts Metal");
@@ -39,6 +40,13 @@ int main() {
     expect(gpu_backend_satisfies_requirement("Vulkan", vulkan), "Vulkan accepts Vulkan");
     expect(!gpu_backend_satisfies_requirement("Metal", vulkan), "Vulkan rejects Metal");
     expect(!gpu_backend_satisfies_requirement(nullptr, vulkan), "Vulkan rejects unnamed");
+
+    expect(gpu_backend_satisfies_requirement("Vulkan", vkmtl), "VulkanOrMetal accepts Vulkan");
+    expect(gpu_backend_satisfies_requirement("MTL", vkmtl), "VulkanOrMetal accepts MTL");
+    expect(gpu_backend_satisfies_requirement("Metal", vkmtl), "VulkanOrMetal accepts Metal under its former name");
+    expect(!gpu_backend_satisfies_requirement("OpenCL", vkmtl), "VulkanOrMetal rejects OpenCL");
+    expect(!gpu_backend_satisfies_requirement("CUDA", vkmtl), "VulkanOrMetal rejects CUDA");
+    expect(!gpu_backend_satisfies_requirement(nullptr, vkmtl), "VulkanOrMetal rejects unnamed");
 
     expect(gpu_backend_satisfies_requirement("Metal", mtlcl), "MetalOrOpenCL accepts Metal");
     expect(gpu_backend_satisfies_requirement("MTL", mtlcl), "MetalOrOpenCL accepts MTL");

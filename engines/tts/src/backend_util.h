@@ -35,18 +35,31 @@ inline bool backend_is_cpu(ggml_backend_t b) {
     return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
-inline bool backend_is_metal(ggml_backend_t b) {
+// The name-level predicates exist because device selection knows a registry name
+// before it has a backend handle to ask, and both readings have to agree.
+inline bool reg_name_is_metal(const char * n) {
     // ggml-metal's registry name is "MTL" (GGML_METAL_NAME); older ggml reported "Metal".
-    const char * n = backend_reg_name(b);
-    return std::strcmp(n, "MTL") == 0 || std::strcmp(n, "Metal") == 0;
+    return n && (std::strcmp(n, "MTL") == 0 || std::strcmp(n, "Metal") == 0);
+}
+
+inline bool reg_name_is_vulkan(const char * n) {
+    return n && std::strcmp(n, "Vulkan") == 0;
+}
+
+inline bool reg_name_is_opencl(const char * n) {
+    return n && std::strcmp(n, "OpenCL") == 0;
+}
+
+inline bool backend_is_metal(ggml_backend_t b) {
+    return reg_name_is_metal(backend_reg_name(b));
 }
 
 inline bool backend_is_vulkan(ggml_backend_t b) {
-    return std::strcmp(backend_reg_name(b), "Vulkan") == 0;
+    return reg_name_is_vulkan(backend_reg_name(b));
 }
 
 inline bool backend_is_opencl(ggml_backend_t b) {
-    return std::strcmp(backend_reg_name(b), "OpenCL") == 0;
+    return reg_name_is_opencl(backend_reg_name(b));
 }
 
 // Null-safe ASCII case-insensitive substring match: device name capitalisation

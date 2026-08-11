@@ -23,6 +23,23 @@
 namespace tts_cpp {
 namespace audio8 {
 namespace detail {
+
+namespace {
+constexpr double SCRATCH_BUDGET_SHARE = 0.25;
+constexpr size_t SCRATCH_BUDGET_CAP = 384u * 1024 * 1024;
+}  // namespace
+
+size_t synthesis_scratch_budget(size_t configured, size_t free_bytes, size_t total_bytes) {
+    if (configured > 0) return configured;
+    // A zero total is a backend saying it cannot tell rather than a device with
+    // no memory: ggml-metal reports zero for both figures on the OS versions
+    // predating the working-set query. Real pressure shows as a small free
+    // against a nonzero total, and that does have to narrow the blocks.
+    if (total_bytes == 0) return SCRATCH_BUDGET_CAP;
+    const size_t share = static_cast<size_t>(free_bytes * SCRATCH_BUDGET_SHARE);
+    return std::min(share, SCRATCH_BUDGET_CAP);
+}
+
 namespace {
 
 const char * const CODE_INPUT = "codes";
@@ -209,22 +226,13 @@ block block_at(int first, int n_frames, int context, int block_frames) {
     return span;
 }
 
-// Every block re-runs its own context, so a wider block does strictly less
-// redundant work and hands the backend longer sequences to fill. Scratch is the
-// only thing holding it back, and the allocator can price a width without
-// allocating anything, so the widest affordable width is found by search rather
-// than by a per-model estimate.
-constexpr double SCRATCH_BUDGET_SHARE = 0.25;
-constexpr size_t SCRATCH_BUDGET_CAP = 384u * 1024 * 1024;
-
-size_t scratch_budget(const codec_model & model) {
-    if (model.synthesis_scratch_budget > 0) return model.synthesis_scratch_budget;
+size_t device_scratch_budget(const codec_model & model) {
     size_t free_bytes = 0;
     size_t total_bytes = 0;
     ggml_backend_dev_memory(ggml_backend_get_device(model.backend), &free_bytes,
                             &total_bytes);
-    const size_t share = static_cast<size_t>(free_bytes * SCRATCH_BUDGET_SHARE);
-    return std::min(share, SCRATCH_BUDGET_CAP);
+    return synthesis_scratch_budget(model.synthesis_scratch_budget, free_bytes,
+                                    total_bytes);
 }
 
 size_t block_scratch(codec_model & model, ggml_gallocr_t pricer, int columns,
@@ -274,7 +282,7 @@ block_plan plan_blocks(codec_model & model, int context, int n_frames, bool with
     plan.frames = model.synthesis_block_frames > 0
                       ? std::min(model.synthesis_block_frames, n_frames)
                       : widest_block(model, pricer, context, n_frames, with_taps,
-                                     scratch_budget(model));
+                                     device_scratch_budget(model));
     plan.scratch =
         block_scratch(model, pricer, span_of(plan.frames, n_frames, context), with_taps);
     ggml_gallocr_free(pricer);
