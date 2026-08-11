@@ -75,7 +75,13 @@ int main(int argc, char ** argv) {
     const int MEL = 80;
     ggml_backend_t backend = nullptr;
     if (std::getenv("COSYVOICE_TEST_GPU")) {
-        backend = ::tts_cpp::detail::init_gpu_backend(99, /*verbose=*/false, "test-cosyvoice");
+        // Same requirement as the production engine (cosyvoice_engine.cpp), so
+        // on a mixed-backend host the harness validates a backend the engine
+        // would actually select instead of whichever device sorts first.
+        backend = ::tts_cpp::detail::init_gpu_backend(
+            99, /*verbose=*/false, "test-cosyvoice", /*vulkan_device=*/0,
+            /*allow_arm_mali=*/false, /*out_gpu_present_but_unused=*/nullptr,
+            ::tts_cpp::detail::GpuBackendRequirement::MetalOrOpenCL);
         if (!backend) { fprintf(stderr, "FAIL: COSYVOICE_TEST_GPU set but no GPU backend\n"); return 1; }
     }
     model_ctx m = cosyvoice_load_gguf(gguf, backend);

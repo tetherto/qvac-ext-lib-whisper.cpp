@@ -1883,17 +1883,12 @@ if (TTS_CPP_BUILD_TESTS)
     target_link_libraries(test-metal-ops PRIVATE ggml tts-cpp-backend-defs)
     target_include_directories(test-metal-ops PRIVATE ggml/include src)
     tts_cpp_apply_ccache(test-metal-ops)
-    # Metal-only kernel parity check.  Useful only when built with
-    # -DGGML_METAL=ON; skipped on CI fleets without Metal via `ctest -LE gpu`.
-    # GGML_USE_METAL is supplied locally here (rather than via
-    # tts-cpp-backend-defs) because the library itself no longer
-    # consumes the macro -- every #ifdef GGML_USE_<X> in src/ was
-    # removed alongside the registry-only refactor. The test still
-    # uses the macro to gate its direct ggml_backend_metal_init()
-    # call site (it's exercising the Metal-backend implementation
-    # directly, not going through tts-cpp's backend selection).
+    # Metal-only kernel parity check; skipped on CI fleets without Metal via
+    # `ctest -LE gpu`. The test resolves the Metal device through the backend
+    # registry (no direct ggml_backend_metal_init() call), so it links against
+    # base ggml alone and also works when ggml-metal is a GGML_BACKEND_DL
+    # dlopened backend rather than a linked target.
     if (TTS_CPP_GGML_METAL)
-        target_compile_definitions(test-metal-ops PRIVATE GGML_USE_METAL)
         tts_cpp_register_test(test-metal-ops LABEL "gpu")
     endif()
 
