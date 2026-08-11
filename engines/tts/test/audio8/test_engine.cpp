@@ -16,6 +16,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "gpu_arm.h"
 #include "json.hpp"
 #include "npy.h"
 
@@ -33,13 +34,8 @@ constexpr double WAVEFORM_TOLERANCE = 5e-5;
 constexpr double GPU_WAVEFORM_TOLERANCE = 1e-4;
 constexpr double GPU_CLONE_MIN_CORRELATION = 0.85;
 constexpr int GPU_LAYERS = 99;
-// Substrings of what ggml names a backend instance: "Vulkan0", "MTL0".
-constexpr const char * VULKAN_BACKEND = "Vulkan";
-constexpr const char * METAL_BACKEND = "MTL";
 
-bool is_gpu_test() {
-    return std::getenv("AUDIO8_TEST_GPU") != nullptr;
-}
+using audio8_test::is_gpu_test;
 
 struct fixture {
     std::string dir;
@@ -179,17 +175,17 @@ bool check_frames(const char * tag, int got, const nlohmann::json & meta) {
     return false;
 }
 
-// A GPU arm that quietly fell back to CPU would still pass every numeric check
-// below, so the backend is asserted before its numbers are read as a GPU result.
+// A GPU arm that quietly fell back to CPU, or that ran on the other arm's GPU,
+// would still pass every numeric check below, so the backend the arm was
+// registered for is asserted before its numbers are read as that arm's result.
 bool check_backend(const char * tag, const tts_cpp::audio8::Engine & engine) {
     if (!is_gpu_test()) return true;
     const std::string name = engine.backend_name();
-    const bool validated = name.find(VULKAN_BACKEND) != std::string::npos ||
-                           name.find(METAL_BACKEND) != std::string::npos;
-    if (engine.backend_device() == tts_cpp::BackendDevice::GPU && validated) return true;
-    std::fprintf(stderr, "%s: FAIL expected a Vulkan or Metal GPU, got %s\n", tag,
-                 name.c_str());
-    return false;
+    if (engine.backend_device() == tts_cpp::BackendDevice::GPU &&
+        audio8_test::instance_is_requested(name)) {
+        return true;
+    }
+    return audio8_test::report_wrong_gpu(tag, name);
 }
 
 // An encoder from another checkpoint emits fewer rows per frame than the

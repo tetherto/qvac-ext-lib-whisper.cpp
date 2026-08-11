@@ -852,9 +852,18 @@ ctest -R audio8 --output-on-failure
 | `test-audio8-sampler` | filtered score vectors, which is the part of the draw that is reproducible |
 | `test-audio8-ras` | the repetition-aware window: which draws enter it, eligibility, eviction, and the retry's nucleus |
 | `test-audio8-engine` | both public paths end to end against the decoded waveforms, and the refusal of GGUFs that disagree |
+| `test-audio8-timing` | that the per-stage times are disjoint and bounded by the total they are reported against |
+| `test-audio8-cli` | the CLI's flags, `-ngl` and `--n-gpu-layers` among them, and the `--dump-codes` file format |
+| `test-audio8-cli-verbose` | the same flags through the binary: `--verbose` reaching stderr and codes surviving a synthesis |
 
-Every target above except `test-audio8-ras` needs the dumps, so `test-audio8-ras`
-is the only one that runs on a checkout with no models.
+`test-audio8-ras` and `test-audio8-cli` are the two that run on a checkout with
+no models; every other target needs the dumps.
+
+On a build with a GPU backend compiled in, the `lm`, `codec` and `engine`
+suites are registered a second time per backend as `test-audio8-<suite>-metal`
+and `-vulkan`. Each arm names its backend in `AUDIO8_TEST_GPU` and asserts it
+before reading a number, so an arm that fell back to CPU, or that was handed the
+other arm's GPU, fails rather than passing on someone else's result.
 
 The engine test hands the cloning path a wav rather than pre-computed codes, so
 it exercises the codec encoder the way a caller would.

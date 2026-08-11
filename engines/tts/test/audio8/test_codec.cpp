@@ -10,6 +10,7 @@
 // channels-inner, so the comparison transposes as it reads.
 
 #include "audio8/internal.h"
+#include "gpu_arm.h"
 #include "npy.h"
 
 #include <cmath>
@@ -30,9 +31,7 @@ constexpr double GPU_WAVEFORM_TOLERANCE = 1e-4;
 constexpr double GPU_CODE_MISMATCH_RATIO = 1e-2;
 constexpr int GPU_LAYERS = 99;
 
-bool is_gpu_test() {
-    return std::getenv("AUDIO8_TEST_GPU") != nullptr;
-}
+using audio8_test::is_gpu_test;
 
 double latent_tolerance() {
     return is_gpu_test() ? GPU_LATENT_TOLERANCE : LATENT_TOLERANCE;
@@ -417,18 +416,26 @@ int main(int argc, char ** argv) {
 
     codec_model decoder;
     std::string error;
-    const int n_gpu_layers = std::getenv("AUDIO8_TEST_GPU") ? GPU_LAYERS : 0;
+    const int n_gpu_layers = is_gpu_test() ? GPU_LAYERS : 0;
     if (!load_codec(argv[1], n_gpu_layers, decoder, &error)) {
         std::fprintf(stderr, "load decoder: %s\n", error.c_str());
         return 1;
     }
     std::printf("backend: %s\n", ggml_backend_name(decoder.backend));
+    if (!audio8_test::check_requested_gpu("codec", decoder.backend)) {
+        free_codec(decoder);
+        return 1;
+    }
     const bool decoded = run_decode(decoder, data, n_threads);
     free_codec(decoder);
 
     codec_model encoder;
     if (!load_codec(argv[2], n_gpu_layers, encoder, &error)) {
         std::fprintf(stderr, "load encoder: %s\n", error.c_str());
+        return 1;
+    }
+    if (!audio8_test::check_requested_gpu("encoder", encoder.backend)) {
+        free_codec(encoder);
         return 1;
     }
     const bool encoded = run_encode(encoder, data, n_threads);

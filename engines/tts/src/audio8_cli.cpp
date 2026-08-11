@@ -12,14 +12,17 @@
 
 #include "tts-cpp/audio8/engine.h"
 
+#include "audio8/cli.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace cli = tts_cpp::audio8::cli;
 
 namespace {
 
@@ -30,82 +33,7 @@ constexpr uint32_t PCM_FORMAT_CHUNK_BYTES = 16;
 constexpr uint16_t PCM_FORMAT_TAG = 1;
 constexpr uint32_t HEADER_BYTES_AFTER_SIZE = 36;
 
-struct options {
-    std::string lm;
-    std::string codec_decoder;
-    std::string codec_encoder;
-    std::string ref_audio;
-    std::string ref_text;
-    std::string text = "Hello from a fully on-device C plus plus pipeline.";
-    std::string out = "audio8_out.wav";
-    std::string codes_out;
-    std::string backends_dir;
-    int seed = 42;
-    int threads = 0;
-    int n_gpu_layers = 0;
-    int max_frames = 0;
-    int top_k = 50;
-    int output_sample_rate = 0;
-    float temperature = 0.7f;
-    float top_p = 0.9f;
-    bool greedy = false;
-    bool verbose = false;
-};
-
-void print_usage(const char * program) {
-    std::fprintf(stderr,
-                 "usage: %s --lm LM.gguf --codec-decoder DEC.gguf [--text ...] "
-                 "[--out out.wav]\n"
-                 "          [--codec-encoder ENC.gguf --ref-audio ref.wav --ref-text "
-                 "\"...\"]\n"
-                 "          [--seed N] [--greedy] [--temperature F] [--top-k N] "
-                 "[--top-p F]\n"
-                 "          [--max-frames N] [--threads N] [--output-sample-rate N]\n"
-                 "          [--n-gpu-layers N] [--dump-codes codes.txt]\n"
-                 "          [--backends-dir DIR] [--verbose]\n",
-                 program);
-}
-
-// Flags that stand alone; everything else in apply_flag consumes the next
-// argument.
-bool apply_switch(options & opts, const std::string & flag) {
-    if (flag == "--greedy") opts.greedy = true;
-    else if (flag == "--verbose") opts.verbose = true;
-    else return false;
-    return true;
-}
-
-bool apply_flag(options & opts, const std::string & flag, const char * value) {
-    if (flag == "--lm") opts.lm = value;
-    else if (flag == "--codec-decoder") opts.codec_decoder = value;
-    else if (flag == "--codec-encoder") opts.codec_encoder = value;
-    else if (flag == "--ref-audio") opts.ref_audio = value;
-    else if (flag == "--ref-text") opts.ref_text = value;
-    else if (flag == "--text") opts.text = value;
-    else if (flag == "--out") opts.out = value;
-    else if (flag == "--dump-codes") opts.codes_out = value;
-    else if (flag == "--backends-dir") opts.backends_dir = value;
-    else if (flag == "--seed") opts.seed = std::atoi(value);
-    else if (flag == "--threads" || flag == "-t") opts.threads = std::atoi(value);
-    else if (flag == "--n-gpu-layers" || flag == "-ngl") opts.n_gpu_layers = std::atoi(value);
-    else if (flag == "--max-frames") opts.max_frames = std::atoi(value);
-    else if (flag == "--top-k") opts.top_k = std::atoi(value);
-    else if (flag == "--output-sample-rate") opts.output_sample_rate = std::atoi(value);
-    else if (flag == "--temperature") opts.temperature = static_cast<float>(std::atof(value));
-    else if (flag == "--top-p") opts.top_p = static_cast<float>(std::atof(value));
-    else return false;
-    return true;
-}
-
-bool parse_args(int argc, char ** argv, options & opts) {
-    for (int index = 1; index < argc; ++index) {
-        const std::string flag = argv[index];
-        if (apply_switch(opts, flag)) continue;
-        if (index + 1 >= argc) return false;
-        if (!apply_flag(opts, flag, argv[++index])) return false;
-    }
-    return !opts.lm.empty() && !opts.codec_decoder.empty();
-}
+using cli::options;
 
 void write_u32(std::FILE * file, uint32_t value) {
     std::fwrite(&value, sizeof(value), 1, file);
@@ -159,28 +87,6 @@ bool write_wav(const std::string & path, const std::vector<float> & pcm, int sam
     return true;
 }
 
-void write_frame(std::FILE * file, const int * frame, int books) {
-    for (int book = 0; book < books; ++book) {
-        std::fprintf(file, book == 0 ? "%d" : ",%d", frame[book]);
-    }
-    std::fputc('\n', file);
-}
-
-// One line per frame, its codebook values comma-separated. Plain text so two
-// runs can be diffed directly to see whether a backend or a quantisation tier
-// changed the discrete trajectory.
-bool write_codes(const std::string & path, const std::vector<int> & codes, int frames) {
-    if (frames <= 0) return false;
-    const int books = static_cast<int>(codes.size()) / frames;
-    std::FILE * file = std::fopen(path.c_str(), "w");
-    if (!file) return false;
-    for (int frame = 0; frame < frames; ++frame) {
-        write_frame(file, codes.data() + static_cast<size_t>(frame) * books, books);
-    }
-    std::fclose(file);
-    return true;
-}
-
 tts_cpp::audio8::VoicePrompt load_voice(const options & opts) {
     if (opts.ref_audio.empty()) return {};
     return tts_cpp::audio8::load_voice_prompt(opts.ref_audio, opts.ref_text);
@@ -216,8 +122,8 @@ tts_cpp::audio8::SynthesisResult speak(tts_cpp::audio8::Engine & engine,
 
 int main(int argc, char ** argv) {
     options opts;
-    if (!parse_args(argc, argv, opts)) {
-        print_usage(argv[0]);
+    if (!cli::parse_args(argc, argv, opts)) {
+        cli::print_usage(argv[0]);
         return 1;
     }
 
@@ -235,7 +141,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
         if (!opts.codes_out.empty() &&
-            !write_codes(opts.codes_out, result.codes, result.frames)) {
+            !cli::write_codes(opts.codes_out, result.codes, result.frames)) {
             std::fprintf(stderr, "cannot write %s\n", opts.codes_out.c_str());
             return 1;
         }

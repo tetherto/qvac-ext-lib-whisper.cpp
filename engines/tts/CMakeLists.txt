@@ -553,7 +553,7 @@ if (TTS_CPP_BUILD_EXECUTABLES)
 
     # Audio8 end-to-end CLI: text -> 44.1 kHz WAV, with in-process cloning when
     # the codec encoder GGUF is supplied.  See src/audio8_cli.cpp.
-    add_executable(audio8-cli src/audio8_cli.cpp)
+    add_executable(audio8-cli src/audio8_cli.cpp src/audio8/cli.cpp)
     target_link_libraries(audio8-cli PRIVATE tts-cpp)
     target_include_directories(audio8-cli PRIVATE src)
     tts_cpp_apply_ccache(audio8-cli)
@@ -857,7 +857,10 @@ if (TTS_CPP_BUILD_TESTS)
     # reference and the same fixtures.  Comparing the GPU to the reference rather
     # than to CPU is what makes this a correctness gate: the two arms are then
     # independent readings of one ground truth instead of a chain where CPU error
-    # hides GPU error.  AUDIO8_TEST_GPU is what asks the harnesses for the GPU.
+    # hides GPU error.  AUDIO8_TEST_GPU names the backend the arm is for, which
+    # the harnesses assert before reading a number: both arms run the same
+    # binaries, so an arm that only asked for "a GPU" would pass on the other
+    # arm's backend whenever both are compiled in.
     function(tts_cpp_register_audio8_gpu_tests suffix)
         tts_cpp_register_test(test-audio8-lm-${suffix}
             EXE      test-audio8-lm
@@ -881,7 +884,7 @@ if (TTS_CPP_BUILD_TESTS)
                      "${_tcb_audio8_ref_wav}")
         set_property(TEST test-audio8-lm-${suffix} test-audio8-codec-${suffix}
                           test-audio8-engine-${suffix} APPEND
-                     PROPERTY ENVIRONMENT "AUDIO8_TEST_GPU=1")
+                     PROPERTY ENVIRONMENT "AUDIO8_TEST_GPU=${suffix}")
     endfunction()
 
     # Audio8 allowlist: Vulkan / Metal (audio8/gguf.cpp
@@ -905,6 +908,31 @@ if (TTS_CPP_BUILD_TESTS)
                  "${_tcb_audio8_ref_wav}"
         REQUIRES "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}"
                  "${_tcb_audio8_ref_wav}")
+
+    # The CLI's own surface: the flags the bench scripts and the on-device
+    # harness pass, and the code dump two runs get compared on.  No model, so it
+    # runs everywhere.
+    add_executable(test-audio8-cli test/audio8/test_cli.cpp src/audio8/cli.cpp)
+    target_include_directories(test-audio8-cli PRIVATE src)
+    tts_cpp_apply_ccache(test-audio8-cli)
+    tts_cpp_register_test(test-audio8-cli
+        ARGS "${CMAKE_CURRENT_BINARY_DIR}/audio8-cli-test-codes.txt")
+
+    # ...and the same flags through the real binary, where --verbose has to reach
+    # stderr and --dump-codes has to survive a synthesis.  Two frames of it.
+    if (TARGET audio8-cli)
+        tts_cpp_register_test(test-audio8-cli-verbose
+            EXE        audio8-cli
+            LABEL      "fixture"
+            ARGS       "--lm" "${_tcb_audio8_lm}"
+                       "--codec-decoder" "${_tcb_audio8_decoder}"
+                       "--text" "Two frames is enough."
+                       "--greedy" "--max-frames" "2" "--verbose"
+                       "--out" "${CMAKE_CURRENT_BINARY_DIR}/audio8-cli-verbose.wav"
+                       "--dump-codes" "${CMAKE_CURRENT_BINARY_DIR}/audio8-cli-verbose.txt"
+            PASS_REGEX "\\[audio8-timing\\] total"
+            REQUIRES   "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}")
+    endif()
 
     # ---- Parler-TTS tests (fixtures from scripts/parler/dump-reference.py) ----
     set(_tcb_parler_core_srcs

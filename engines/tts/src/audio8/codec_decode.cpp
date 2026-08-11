@@ -27,6 +27,9 @@ namespace detail {
 namespace {
 constexpr double SCRATCH_BUDGET_SHARE = 0.25;
 constexpr size_t SCRATCH_BUDGET_CAP = 384u * 1024 * 1024;
+// The narrowest block that still produces audio, so the floor of every search
+// and the width taken when even it is over budget.
+constexpr int MIN_BLOCK_FRAMES = 1;
 }  // namespace
 
 size_t synthesis_scratch_budget(size_t configured, size_t free_bytes, size_t total_bytes) {
@@ -251,11 +254,9 @@ int span_of(int block_frames, int n_frames, int context) {
     return std::min(block_frames + context, n_frames);
 }
 
-// One frame always runs, even when it is over budget: there is no narrower way
-// to produce audio at all.
 int widest_block(codec_model & model, ggml_gallocr_t pricer, int context, int n_frames,
                  bool with_taps, size_t budget) {
-    int narrowest = 1;
+    int narrowest = MIN_BLOCK_FRAMES;
     int widest = n_frames;
     while (narrowest < widest) {
         const int mid = narrowest + (widest - narrowest + 1) / 2;
@@ -271,7 +272,7 @@ int widest_block(codec_model & model, ggml_gallocr_t pricer, int context, int n_
 }
 
 struct block_plan {
-    int frames = 1;
+    int frames = MIN_BLOCK_FRAMES;
     size_t scratch = 0;
 };
 

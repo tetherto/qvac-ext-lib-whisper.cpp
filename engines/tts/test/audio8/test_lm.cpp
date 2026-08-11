@@ -8,6 +8,7 @@
 // baked RoPE tables and both heads.
 
 #include "audio8/internal.h"
+#include "gpu_arm.h"
 #include "npy.h"
 
 #include <cmath>
@@ -30,11 +31,11 @@ constexpr double GPU_HIDDEN_TOLERANCE = 3e-3;
 constexpr int GPU_LAYERS = 99;
 
 double logit_tolerance() {
-    return std::getenv("AUDIO8_TEST_GPU") ? GPU_LOGIT_TOLERANCE : LOGIT_TOLERANCE;
+    return audio8_test::is_gpu_test() ? GPU_LOGIT_TOLERANCE : LOGIT_TOLERANCE;
 }
 
 double hidden_tolerance() {
-    return std::getenv("AUDIO8_TEST_GPU") ? GPU_HIDDEN_TOLERANCE : HIDDEN_TOLERANCE;
+    return audio8_test::is_gpu_test() ? GPU_HIDDEN_TOLERANCE : HIDDEN_TOLERANCE;
 }
 
 struct fixture {
@@ -225,12 +226,16 @@ int main(int argc, char ** argv) {
 
     lm_model model;
     std::string error;
-    const int n_gpu_layers = std::getenv("AUDIO8_TEST_GPU") ? GPU_LAYERS : 0;
+    const int n_gpu_layers = audio8_test::is_gpu_test() ? GPU_LAYERS : 0;
     if (!load_lm(argv[1], n_gpu_layers, model, &error)) {
         std::fprintf(stderr, "load: %s\n", error.c_str());
         return 1;
     }
     std::printf("backend: %s\n", ggml_backend_name(model.backend));
+    if (!audio8_test::check_requested_gpu("lm", model.backend)) {
+        free_lm(model);
+        return 1;
+    }
 
     step_report report;
     const bool ran = run_steps(model, fixture{argv[2]}, n_threads, report);
