@@ -29,9 +29,17 @@
 
 namespace tts_cpp::detail {
 
+// Restricts which registered GPU devices the selection walk may consider.
+// Devices skipped by the requirement count as "GPU present but unused by
+// policy" (out_gpu_present_but_unused), so a host whose only GPU is
+// off-requirement still reports the policy CPU fallback. Filtering at the
+// walk (rather than post-selection) matters on multi-backend hosts: with a
+// post-selection gate, a Vulkan device sorting first would knock out an
+// available Metal device instead of yielding to it.
 enum class GpuBackendRequirement {
     Any,
     Vulkan,
+    MetalOrOpenCL,
 };
 
 bool gpu_backend_satisfies_requirement(const char * backend_name,

@@ -125,7 +125,15 @@ int pick_vulkan_device_index(int requested,
 bool gpu_backend_satisfies_requirement(const char * backend_name,
                                        GpuBackendRequirement requirement) {
     if (requirement == GpuBackendRequirement::Any) return true;
-    return backend_name && std::strcmp(backend_name, VULKAN_BACKEND_NAME) == 0;
+    if (!backend_name) return false;
+    if (requirement == GpuBackendRequirement::MetalOrOpenCL) {
+        // Registry names: Metal registers as "Metal" or "MTL" depending on
+        // the ggml build (see backend_util.h backend_is_metal).
+        return std::strcmp(backend_name, "Metal") == 0 ||
+               std::strcmp(backend_name, "MTL") == 0 ||
+               std::strcmp(backend_name, "OpenCL") == 0;
+    }
+    return std::strcmp(backend_name, VULKAN_BACKEND_NAME) == 0;
 }
 
 void set_backends_directory(const std::string & dir) {
@@ -412,7 +420,12 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
         const bool   is_opencl = reg_name && std::strcmp(reg_name, "OpenCL") == 0;
         const bool   is_vulkan =
             reg_name && std::strcmp(reg_name, VULKAN_BACKEND_NAME) == 0;
-        if (!gpu_backend_satisfies_requirement(reg_name, requirement)) continue;
+        if (!gpu_backend_satisfies_requirement(reg_name, requirement)) {
+            // A working GPU skipped by the caller's requirement is a policy
+            // decline, so the caller's CPU fallback reports as intentional.
+            gpu_present_but_unvalidated = true;
+            continue;
+        }
 
         if (is_vulkan) {
             size_t free = 0, total = 0;

@@ -18,8 +18,10 @@
 // (mirrors PARLER_TEST_GPU).  The GPU run gates in two steps: SineGen2
 // integrates f0 into sine phases, so sub-Hz cross-backend f0 noise
 // decorrelates the raw waveform with no audible effect.  (1) GPU f0 must
-// match CPU f0 at cosine >= --min-f0-cosine; (2) the GPU synth runs with
-// the CPU f0 pinned and faces the same --min-corr waveform gate.
+// match CPU f0 in length, at cosine >= --min-f0-cosine, and within
+// --max-f0-hz-diff per frame (cosine alone is scale-invariant and would
+// accept an octave error); (2) the GPU synth runs with the CPU f0 pinned
+// and faces the same --min-corr waveform gate.
 
 #include "npy.h"
 #include "backend_selection.h"
@@ -56,6 +58,7 @@ int main(int argc, char ** argv) {
     std::string gguf, in_dir;
     double min_corr = 0.90;
     double min_f0_cosine = 0.9999;
+    double max_f0_hz_diff = 5.0;
     int seed = 42;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -63,8 +66,9 @@ int main(int argc, char ** argv) {
         else if (a == "--in-dir" && i + 1 < argc) in_dir = argv[++i];
         else if (a == "--min-corr" && i + 1 < argc) min_corr = std::atof(argv[++i]);
         else if (a == "--min-f0-cosine" && i + 1 < argc) min_f0_cosine = std::atof(argv[++i]);
+        else if (a == "--max-f0-hz-diff" && i + 1 < argc) max_f0_hz_diff = std::atof(argv[++i]);
         else if (a == "--seed" && i + 1 < argc) seed = std::atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s --hift-gguf HIFT.gguf --in-dir DIR [--min-corr 0.90] [--min-f0-cosine 0.9999]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s --hift-gguf HIFT.gguf --in-dir DIR [--min-corr 0.90] [--min-f0-cosine 0.9999] [--max-f0-hz-diff 5.0]\n", argv[0]); return 2; }
     }
     if (gguf.empty() || in_dir.empty()) { fprintf(stderr, "missing --hift-gguf / --in-dir\n"); return 2; }
 
@@ -91,10 +95,24 @@ int main(int argc, char ** argv) {
         model_ctx m_cpu = cosyvoice_load_gguf(gguf);
         std::vector<float> f0_cpu = cosyvoice_hift_f0(m_cpu, mel, T_mel);
         std::vector<float> f0_gpu = cosyvoice_hift_f0(m, mel, T_mel);
+        if (f0_gpu.size() != f0_cpu.size()) {
+            fprintf(stderr, "FAIL: GPU f0 length %zu != CPU %zu\n",
+                    f0_gpu.size(), f0_cpu.size());
+            return 1;
+        }
+        // Cosine catches shape divergence but is scale-invariant (an octave
+        // error scores 1.0), so the unpinned GPU f0 additionally faces an
+        // absolute per-frame Hz bound against the CPU trajectory.
         double f0_cos = cosine(f0_cpu, f0_gpu);
-        fprintf(stderr, "f0 cpu-vs-gpu cosine = %.6f  (threshold %.4f, %d frames)\n",
-                f0_cos, min_f0_cosine, T_mel);
-        if (!(f0_cos >= min_f0_cosine)) {
+        double max_hz = 0;
+        for (size_t i = 0; i < f0_cpu.size(); ++i) {
+            max_hz = std::max(max_hz, (double)std::fabs(f0_gpu[i] - f0_cpu[i]));
+        }
+        fprintf(stderr,
+                "f0 cpu-vs-gpu cosine = %.6f (>= %.4f)  max |diff| = %.3f Hz "
+                "(<= %.1f), %d frames\n",
+                f0_cos, min_f0_cosine, max_hz, max_f0_hz_diff, T_mel);
+        if (!(f0_cos >= min_f0_cosine) || !(max_hz <= max_f0_hz_diff)) {
             fprintf(stderr, "FAIL: GPU f0 predictor diverged from CPU\n");
             return 1;
         }
