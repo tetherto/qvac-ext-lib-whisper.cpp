@@ -26,12 +26,18 @@
 #include <vector>
 
 // ---------- GGUF loader (same as test_s3gen.cpp) ----------
+// Internal linkage is load-bearing: chatterbox_tts.cpp and
+// cosyvoice_pipeline.h define global `model_ctx` types with different
+// layouts; external linkage here would fold the implicit destructors into
+// one COMDAT and run it against the wrong layout (see chatterbox_tts.cpp).
+namespace {
 struct model_ctx {
     ggml_backend_t backend = nullptr;
     ggml_context * ctx_w = nullptr;
     ggml_backend_buffer_t buffer_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
 };
+} // namespace
 
 static model_ctx load_s3gen_gguf(const std::string & path) {
     model_ctx m;

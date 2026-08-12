@@ -113,6 +113,13 @@ static bool backend_is_arm_mali(ggml_backend_t b) {
 // GGUF loader + helpers
 // ============================================================================
 
+// Internal linkage is load-bearing: cosyvoice_pipeline.h defines a global
+// `model_ctx` with a different layout, and mel2wav.cpp carries a third. With
+// external linkage the linker folds their identically-mangled implicit
+// destructors into one COMDAT and every ctx runs whichever survived --
+// destroying members at another struct's offsets (observed as a SIGSEGV in
+// ~sched_fallback on the Vulkan load path, where a bool was read as this).
+namespace {
 struct model_ctx {
     ggml_backend_t backend = nullptr;
     // Scheduler bundle [backend, CPU-last] (sched_dispatch.h) routing ops the
@@ -144,6 +151,7 @@ struct model_ctx {
     // detected once at load time. Gates the CFM unfused-attention fix below.
     bool  is_mali     = false;
 };
+} // namespace
 
 // Allocate a graph on the model scheduler — like the single-backend gallocr
 // path, but lets sched route unsupported ops to CPU. sched allocates at alloc
