@@ -2,7 +2,7 @@
 // walk. Runs devicelessly: gpu_backend_satisfies_requirement() is the exact
 // predicate init_gpu_backend() applies per registered device, so pinning it
 // pins which devices each requirement may consider. The multi-backend case
-// this guards: with MetalOrOpenCL, a Vulkan device that sorts first must be
+// this guards: with Metal|OpenCL, a Vulkan device that sorts first must be
 // skipped at the walk (leaving Metal selectable) instead of winning selection
 // and being rejected afterwards, which would drop a Metal-capable host to CPU.
 
@@ -27,11 +27,15 @@ void expect(bool cond, const char * what) {
 } // namespace
 
 int main() {
-    const auto any      = GpuBackendRequirement::Any;
-    const auto vulkan   = GpuBackendRequirement::Vulkan;
-    const auto vkmtl    = GpuBackendRequirement::VulkanOrMetal;
-    const auto mtlcl    = GpuBackendRequirement::MetalOrOpenCL;
-    const auto mtlclvk  = GpuBackendRequirement::MetalOrOpenCLOrVulkan;
+    const auto any     = GpuBackendRequirement::Any;
+    const auto vulkan  = GpuBackendRequirement::Vulkan;
+    const auto opencl  = GpuBackendRequirement::OpenCL;
+    const auto vkmtl   = GpuBackendRequirement::Vulkan | GpuBackendRequirement::Metal;
+    const auto mtlcl   = GpuBackendRequirement::Metal  | GpuBackendRequirement::OpenCL;
+    // Every backend either engine has validated: Audio8 asks for this set on
+    // every platform, CosyVoice3 on desktop (cosyvoice_gpu_requirement()).
+    const auto vkmtlcl = GpuBackendRequirement::Vulkan | GpuBackendRequirement::Metal |
+                         GpuBackendRequirement::OpenCL;
 
     expect(gpu_backend_satisfies_requirement("Metal", any), "Any accepts Metal");
     expect(gpu_backend_satisfies_requirement("Vulkan", any), "Any accepts Vulkan");
@@ -42,26 +46,33 @@ int main() {
     expect(!gpu_backend_satisfies_requirement("Metal", vulkan), "Vulkan rejects Metal");
     expect(!gpu_backend_satisfies_requirement(nullptr, vulkan), "Vulkan rejects unnamed");
 
-    expect(gpu_backend_satisfies_requirement("Vulkan", vkmtl), "VulkanOrMetal accepts Vulkan");
-    expect(gpu_backend_satisfies_requirement("MTL", vkmtl), "VulkanOrMetal accepts MTL");
-    expect(gpu_backend_satisfies_requirement("Metal", vkmtl), "VulkanOrMetal accepts Metal under its former name");
-    expect(!gpu_backend_satisfies_requirement("OpenCL", vkmtl), "VulkanOrMetal rejects OpenCL");
-    expect(!gpu_backend_satisfies_requirement("CUDA", vkmtl), "VulkanOrMetal rejects CUDA");
-    expect(!gpu_backend_satisfies_requirement(nullptr, vkmtl), "VulkanOrMetal rejects unnamed");
+    expect(gpu_backend_satisfies_requirement("OpenCL", opencl), "OpenCL accepts OpenCL");
+    expect(!gpu_backend_satisfies_requirement("Vulkan", opencl), "OpenCL rejects Vulkan");
+    expect(!gpu_backend_satisfies_requirement("MTL", opencl), "OpenCL rejects MTL");
+    expect(!gpu_backend_satisfies_requirement(nullptr, opencl), "OpenCL rejects unnamed");
 
-    expect(gpu_backend_satisfies_requirement("Metal", mtlcl), "MetalOrOpenCL accepts Metal");
-    expect(gpu_backend_satisfies_requirement("MTL", mtlcl), "MetalOrOpenCL accepts MTL");
-    expect(gpu_backend_satisfies_requirement("OpenCL", mtlcl), "MetalOrOpenCL accepts OpenCL");
-    expect(!gpu_backend_satisfies_requirement("Vulkan", mtlcl), "MetalOrOpenCL rejects Vulkan");
-    expect(!gpu_backend_satisfies_requirement("CUDA", mtlcl), "MetalOrOpenCL rejects CUDA");
-    expect(!gpu_backend_satisfies_requirement(nullptr, mtlcl), "MetalOrOpenCL rejects unnamed");
+    expect(gpu_backend_satisfies_requirement("Vulkan", vkmtl), "Vulkan|Metal accepts Vulkan");
+    expect(gpu_backend_satisfies_requirement("MTL", vkmtl), "Vulkan|Metal accepts MTL");
+    expect(gpu_backend_satisfies_requirement("Metal", vkmtl), "Vulkan|Metal accepts Metal under its former name");
+    expect(!gpu_backend_satisfies_requirement("OpenCL", vkmtl), "Vulkan|Metal rejects OpenCL");
+    expect(!gpu_backend_satisfies_requirement("CUDA", vkmtl), "Vulkan|Metal rejects CUDA");
+    expect(!gpu_backend_satisfies_requirement(nullptr, vkmtl), "Vulkan|Metal rejects unnamed");
 
-    expect(gpu_backend_satisfies_requirement("Metal", mtlclvk), "MetalOrOpenCLOrVulkan accepts Metal");
-    expect(gpu_backend_satisfies_requirement("MTL", mtlclvk), "MetalOrOpenCLOrVulkan accepts MTL");
-    expect(gpu_backend_satisfies_requirement("OpenCL", mtlclvk), "MetalOrOpenCLOrVulkan accepts OpenCL");
-    expect(gpu_backend_satisfies_requirement("Vulkan", mtlclvk), "MetalOrOpenCLOrVulkan accepts Vulkan");
-    expect(!gpu_backend_satisfies_requirement("CUDA", mtlclvk), "MetalOrOpenCLOrVulkan rejects CUDA");
-    expect(!gpu_backend_satisfies_requirement(nullptr, mtlclvk), "MetalOrOpenCLOrVulkan rejects unnamed");
+    expect(gpu_backend_satisfies_requirement("Metal", mtlcl), "Metal|OpenCL accepts Metal");
+    expect(gpu_backend_satisfies_requirement("MTL", mtlcl), "Metal|OpenCL accepts MTL");
+    expect(gpu_backend_satisfies_requirement("OpenCL", mtlcl), "Metal|OpenCL accepts OpenCL");
+    expect(!gpu_backend_satisfies_requirement("Vulkan", mtlcl), "Metal|OpenCL rejects Vulkan");
+    expect(!gpu_backend_satisfies_requirement("CUDA", mtlcl), "Metal|OpenCL rejects CUDA");
+    expect(!gpu_backend_satisfies_requirement(nullptr, mtlcl), "Metal|OpenCL rejects unnamed");
+
+    // The three-backend set admits everything it names and still excludes CUDA,
+    // so widening it for OpenCL did not silently turn into Any.
+    expect(gpu_backend_satisfies_requirement("Vulkan", vkmtlcl), "Vulkan|Metal|OpenCL accepts Vulkan");
+    expect(gpu_backend_satisfies_requirement("MTL", vkmtlcl), "Vulkan|Metal|OpenCL accepts MTL");
+    expect(gpu_backend_satisfies_requirement("Metal", vkmtlcl), "Vulkan|Metal|OpenCL accepts Metal under its former name");
+    expect(gpu_backend_satisfies_requirement("OpenCL", vkmtlcl), "Vulkan|Metal|OpenCL accepts OpenCL");
+    expect(!gpu_backend_satisfies_requirement("CUDA", vkmtlcl), "Vulkan|Metal|OpenCL rejects CUDA");
+    expect(!gpu_backend_satisfies_requirement(nullptr, vkmtlcl), "Vulkan|Metal|OpenCL rejects unnamed");
 
     if (g_failures) {
         fprintf(stderr, "%d requirement checks failed\n", g_failures);
