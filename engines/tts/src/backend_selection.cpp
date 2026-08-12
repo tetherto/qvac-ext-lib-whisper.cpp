@@ -435,6 +435,23 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
             continue;
         }
 
+        // ARM Mali / Immortalis is engine opt-in on EVERY platform, not just
+        // Android: the miscompute and uncatchable-ggml_abort() risks that make
+        // it opt-in are properties of the driver stack, not of the OS (a
+        // Linux SBC exposes the same Mali through Vulkan). Checked before the
+        // Vulkan bookkeeping so a declined Mali can neither win selection nor
+        // be reached through a vulkan_device pin or the -1 auto-pick.
+        if (is_arm_mali(name, desc) && !allow_arm_mali) {
+            gpu_present_but_unvalidated = true;
+            if (verbose) {
+                fprintf(stderr,
+                    "%s: GPU '%s' (%s) is ARM Mali/Immortalis, which this engine "
+                    "has not opted into; skipping (falling through to CPU)\n",
+                    log_prefix, name ? name : "?", desc ? desc : "?");
+            }
+            continue;
+        }
+
         if (is_vulkan) {
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(dev, &free, &total);

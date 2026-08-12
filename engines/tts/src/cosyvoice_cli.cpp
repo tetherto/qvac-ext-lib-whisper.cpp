@@ -17,10 +17,12 @@
 #include "voice_controls_cli.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <string>
 #include <vector>
@@ -37,6 +39,17 @@ static void write_wav(const std::string & path, const std::vector<float> & wav, 
     std::fwrite("data", 1, 4, f); std::fwrite(&data_size, 4, 1, f);
     for (float x : wav) { float c = std::max(-1.0f, std::min(1.0f, x)); int16_t v = (int16_t)std::lrintf(c * 32767.0f); std::fwrite(&v, 2, 1, f); }
     std::fclose(f);
+}
+
+// Whole-string parse for --vulkan-device: atoi would turn "abc" into
+// adapter 0 and "1abc" into adapter 1, defeating the option's
+// fail-loud contract. Accepts -1 (auto-pick) or a nonnegative index.
+static bool parse_vulkan_device(const char * s, int & out) {
+    int v = 0;
+    const auto r = std::from_chars(s, s + std::strlen(s), v);
+    if (r.ec != std::errc() || r.ptr != s + std::strlen(s) || v < -1) return false;
+    out = v;
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -64,7 +77,13 @@ int main(int argc, char ** argv) {
         else if (a == "--voice-gguf" && i + 1 < argc) voice_gguf = argv[++i];
         else if (a == "--seed" && i + 1 < argc) seed = std::atoi(argv[++i]);
         else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) n_gpu_layers = std::atoi(argv[++i]);
-        else if (a == "--vulkan-device" && i + 1 < argc) vulkan_device = std::atoi(argv[++i]);
+        else if (a == "--vulkan-device" && i + 1 < argc) {
+            if (!parse_vulkan_device(argv[++i], vulkan_device)) {
+                fprintf(stderr, "cosyvoice-cli: --vulkan-device expects -1 or a nonnegative "
+                                "adapter index, got \"%s\"\n", argv[i]);
+                return 1;
+            }
+        }
         else if ((a == "--threads" || a == "-t") && i + 1 < argc) n_threads = std::atoi(argv[++i]);
         else if (a == "--backends-dir" && i + 1 < argc) backends_dir = argv[++i];
         else if (a == "--opencl-cache-dir" && i + 1 < argc) opencl_cache_dir = argv[++i];

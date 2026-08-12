@@ -202,14 +202,20 @@ set(TTS_CPP_PARLER_GPU FALSE)
 if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_VULKAN OR TTS_CPP_GGML_OPENCL)
     set(TTS_CPP_PARLER_GPU TRUE)
 endif()
-# CosyVoice3 allowlist: Metal / OpenCL everywhere, Vulkan on desktop only
-# (cosyvoice_gpu_requirement() in cosyvoice_pipeline.h). The NOT ANDROID
-# guard mirrors the runtime split: an Android Vulkan-only build must not
-# register gpu test variants whose harness requirement would refuse every
-# device and hard-fail instead of skipping.
+# CosyVoice3 allowlist: Metal / OpenCL everywhere, Vulkan on Windows and
+# non-Android Linux only (cosyvoice_gpu_requirement() in
+# cosyvoice_pipeline.h -- keep the two conditions in lockstep). The
+# platform guard mirrors the runtime split: a build whose only GPU
+# backend the runtime requirement would refuse (Android or Apple
+# Vulkan-only) must not register gpu test variants that would hard-fail
+# instead of skipping.
 set(TTS_CPP_COSYVOICE_GPU FALSE)
+set(_tts_cosy_vulkan_platform FALSE)
+if (WIN32 OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
+    set(_tts_cosy_vulkan_platform TRUE)
+endif()
 if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_OPENCL OR
-    (TTS_CPP_GGML_VULKAN AND NOT ANDROID))
+    (TTS_CPP_GGML_VULKAN AND _tts_cosy_vulkan_platform))
     set(TTS_CPP_COSYVOICE_GPU TRUE)
 endif()
 
@@ -723,6 +729,21 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "--llm-gguf" "${_tcb_cosy_llm_gguf}" "--in-dir" "${_tcb_cosy_ref}"
             REQUIRES "${_tcb_cosy_llm_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
         set_property(TEST test-cosyvoice-llm-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        # Quantized-weight variants: mul_mat_f32acc specifically changes the
+        # f16/quantized accumulation paths (ggml-vulkan reduces those in f16
+        # under PREC_DEFAULT), which the f32 fixture cannot exercise. Same
+        # binary and gates; the cross-backend leg compares CPU and GPU on the
+        # same quantized GGUF, so the f32-derived reference prefix still
+        # applies. Auto-disabled when the quantized fixture is not staged.
+        foreach(_tcb_cosy_quant q8_0 q4_0)
+            set(_tcb_cosy_llm_quant_gguf "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-${_tcb_cosy_quant}.gguf")
+            tts_cpp_register_test(test-cosyvoice-llm-gpu-${_tcb_cosy_quant}
+                EXE      test-cosyvoice-llm
+                LABEL    "gpu"
+                ARGS     "--llm-gguf" "${_tcb_cosy_llm_quant_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+                REQUIRES "${_tcb_cosy_llm_quant_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
+            set_property(TEST test-cosyvoice-llm-gpu-${_tcb_cosy_quant} APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        endforeach()
     endif()
 
     add_executable(test-cosyvoice-hift test/test_cosyvoice_hift.cpp ${_tcb_cosy_core_srcs})
@@ -751,6 +772,23 @@ if (TTS_CPP_BUILD_TESTS)
     target_include_directories(test-backend-requirement PRIVATE ggml/include src)
     tts_cpp_apply_ccache(test-backend-requirement)
     tts_cpp_register_test(test-backend-requirement LABEL "unit")
+
+    # Non-contiguous-input guard in cosyvoice_conv1d_f32: a strided view must
+    # match the pre-contiguous reference bit-for-bit on CPU, and (gpu variant)
+    # the built graph must stay fully supported on the selected GPU backend
+    # instead of demoting to the sched-fallback path. Synthetic inputs; no
+    # fixtures.
+    add_executable(test-cosyvoice-conv1d test/test_cosyvoice_conv1d.cpp ${_tcb_cosy_core_srcs})
+    target_link_libraries(test-cosyvoice-conv1d PRIVATE ggml)
+    target_include_directories(test-cosyvoice-conv1d PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-cosyvoice-conv1d)
+    tts_cpp_register_test(test-cosyvoice-conv1d LABEL "unit")
+    if (TTS_CPP_COSYVOICE_GPU)
+        tts_cpp_register_test(test-cosyvoice-conv1d-gpu
+            EXE   test-cosyvoice-conv1d
+            LABEL "gpu")
+        set_property(TEST test-cosyvoice-conv1d-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+    endif()
 
     # Map-in-place loader: byte-exact round-trip + clean failure on a truncated
     # GGUF. Self-contained (writes its own synthetic GGUF), so it always runs.

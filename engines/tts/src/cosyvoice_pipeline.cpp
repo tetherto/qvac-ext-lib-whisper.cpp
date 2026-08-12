@@ -415,7 +415,7 @@ static ggml_tensor * mish(ggml_context * c, ggml_tensor * x) {
 // Grouped conv1d over time. x: [Nlen, Cin, B] (ne0=time), weight [K, Cin/groups, Cout].
 //
 // Emitted per (group, batch) with a 2-D signal and the im2col matrix as operand
-// A -- the same operand order conv1d_f32 uses.  Both details are load-bearing on
+// A -- the same operand order cosyvoice_conv1d_f32 uses.  Both details are load-bearing on
 // GPU backends that fuse IM2COL into the GEMM: the fusion is refused when the
 // signal is batched or when the im2col is src[1].  Unfused, materialising that
 // matrix costs an order of magnitude more than the convolution's own arithmetic
@@ -449,7 +449,9 @@ static ggml_tensor * conv1d_grouped(ggml_context * c, ggml_tensor * w, ggml_tens
 
 // Plain conv1d over time: input [Nlen, Cin, B] (ne0=time), weight [K, Cin, Cout].
 // im2col FIRST, kernel SECOND (conv1d operand order matters here).
-static ggml_tensor * conv1d_f32(ggml_context * c, ggml_tensor * w, ggml_tensor * x,
+// Non-static: test-cosyvoice-conv1d pins the non-contiguous-input guard
+// (declared in cosyvoice_pipeline.h).
+ggml_tensor * cosyvoice_conv1d_f32(ggml_context * c, ggml_tensor * w, ggml_tensor * x,
                                 int stride, int padding, int dilation) {
     // ggml-vulkan's IM2COL supports_op requires a contiguous signal; a view
     // reaching it would demote the whole stage to the sched-fallback path.
@@ -868,11 +870,11 @@ static void build_flow_frontend(model_ctx & m, const std::vector<int32_t> & toki
     ggml_tensor * x = ggml_cont(c, ggml_permute(c, e, 1, 0, 2, 3));
     ggml_tensor * res = x;
     ggml_tensor * xp = ggml_pad_ext(c, x, 0, 3, 0, 0, 0, 0, 0, 0);
-    ggml_tensor * h = conv1d_f32(c, T(m, "flow/pre_lookahead_layer/conv1/weight"), xp, 1, 0, 1);
+    ggml_tensor * h = cosyvoice_conv1d_f32(c, T(m, "flow/pre_lookahead_layer/conv1/weight"), xp, 1, 0, 1);
     h = ggml_add(c, h, ggml_reshape_2d(c, T(m, "flow/pre_lookahead_layer/conv1/bias"), 1, 1024));
     h = ggml_leaky_relu(c, h, 0.01f, false);
     ggml_tensor * hpad = ggml_pad_ext(c, h, 2, 0, 0, 0, 0, 0, 0, 0);
-    h = conv1d_f32(c, T(m, "flow/pre_lookahead_layer/conv2/weight"), hpad, 1, 0, 1);
+    h = cosyvoice_conv1d_f32(c, T(m, "flow/pre_lookahead_layer/conv2/weight"), hpad, 1, 0, 1);
     h = ggml_add(c, h, ggml_reshape_2d(c, T(m, "flow/pre_lookahead_layer/conv2/bias"), 1, MEL));
     h = ggml_add(c, h, res);
     ggml_tensor * h3 = ggml_reshape_3d(c, h, 1, T_tok, MEL);
@@ -1210,7 +1212,7 @@ std::vector<float> cosyvoice_hift_f0(model_ctx & m, const std::vector<float> & m
         int pl = (i == 0) ? 0 : (K - 1);
         int pr = (i == 0) ? (K - 1) : 0;
         ggml_tensor * xp = ggml_pad_ext(ctx, x, pl, pr, 0, 0, 0, 0, 0, 0);
-        x = conv1d_f32(ctx, w, xp, 1, 0, 1);
+        x = cosyvoice_conv1d_f32(ctx, w, xp, 1, 0, 1);
         x = ggml_add(ctx, x, ggml_reshape_2d(ctx, b, 1, C_out));
         x = ggml_unary(ctx, x, GGML_UNARY_OP_ELU);
     }
@@ -1298,11 +1300,11 @@ static std::vector<float> run_hift_decode(model_ctx & m,
             int pad2 = (k_sz - 1);
             ggml_tensor * xt = snake(ctx, x, p.a1, p.ia1);
             xt = ggml_pad_ext(ctx, xt, pad1, 0, 0, 0, 0, 0, 0, 0);
-            xt = conv1d_f32(ctx, p.c1w, xt, 1, 0, dilation);
+            xt = cosyvoice_conv1d_f32(ctx, p.c1w, xt, 1, 0, dilation);
             xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, p.c1b, 1, C));
             xt = snake(ctx, xt, p.a2, p.ia2);
             xt = ggml_pad_ext(ctx, xt, pad2, 0, 0, 0, 0, 0, 0, 0);
-            xt = conv1d_f32(ctx, p.c2w, xt, 1, 0, 1);
+            xt = cosyvoice_conv1d_f32(ctx, p.c2w, xt, 1, 0, 1);
             xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, p.c2b, 1, C));
             x = ggml_add(ctx, x, xt);
         }
@@ -1312,7 +1314,7 @@ static std::vector<float> run_hift_decode(model_ctx & m,
     ggml_tensor * cpw = T(m, "hift/conv_pre/weight");
     ggml_tensor * cpb = T(m, "hift/conv_pre/bias");
     ggml_tensor * x = ggml_pad_ext(ctx, mel_in, 0, 4, 0, 0, 0, 0, 0, 0);
-    x = conv1d_f32(ctx, cpw, x, 1, 0, 1);
+    x = cosyvoice_conv1d_f32(ctx, cpw, x, 1, 0, 1);
     x = ggml_add(ctx, x, ggml_reshape_2d(ctx, cpb, 1, BASE_CH));
 
     for (int i = 0; i < 3; ++i) {
@@ -1322,7 +1324,7 @@ static std::vector<float> run_hift_decode(model_ctx & m,
         int64_t T_up = x->ne[0] * ups_rates[i];
         x = ggml_interpolate(ctx, x, T_up, x->ne[1], x->ne[2], x->ne[3], GGML_SCALE_MODE_NEAREST);
         x = ggml_pad_ext(ctx, x, ups_ksizes[i] - 1, 0, 0, 0, 0, 0, 0, 0);
-        x = conv1d_f32(ctx, uw, x, 1, 0, 1);
+        x = cosyvoice_conv1d_f32(ctx, uw, x, 1, 0, 1);
         x = ggml_add(ctx, x, ggml_reshape_2d(ctx, ub, 1, ups_ch[i]));
         // CausalHiFTGenerator.decode: ReflectionPad1d((1,0)) at the LAST upsample,
         // AFTER the upsample conv and BEFORE the source fusion.  Omitting this
@@ -1338,7 +1340,7 @@ static std::vector<float> run_hift_decode(model_ctx & m,
         int sd_pad    = sd_stride - 1;
         int sd_oc     = (int)sw->ne[2];
         ggml_tensor * sin_pad = ggml_pad_ext(ctx, s_stft_in, sd_pad, 0, 0, 0, 0, 0, 0, 0);
-        ggml_tensor * si = conv1d_f32(ctx, sw, sin_pad, sd_stride, 0, 1);
+        ggml_tensor * si = cosyvoice_conv1d_f32(ctx, sw, sin_pad, sd_stride, 0, 1);
         si = ggml_add(ctx, si, ggml_reshape_2d(ctx, sb, 1, sd_oc));
         auto srb = load_rb("hift/source_resblocks/" + std::to_string(i), ups_ch[i]);
         si = rb_forward(srb, si, ups_ch[i], src_rb_dilations[i], src_rb_ksizes[i]);
@@ -1359,7 +1361,7 @@ static std::vector<float> run_hift_decode(model_ctx & m,
     ggml_tensor * cp2w = T(m, "hift/conv_post/weight");
     ggml_tensor * cp2b = T(m, "hift/conv_post/bias");
     x = ggml_pad_ext(ctx, x, 6, 0, 0, 0, 0, 0, 0, 0);
-    x = conv1d_f32(ctx, cp2w, x, 1, 0, 1);
+    x = cosyvoice_conv1d_f32(ctx, cp2w, x, 1, 0, 1);
     x = ggml_add(ctx, x, ggml_reshape_2d(ctx, cp2b, 1, NFFT2));
 
     int T_out = (int)x->ne[0];
@@ -1433,7 +1435,7 @@ static std::vector<float> run_stft(model_ctx & m, const std::vector<float> & src
     ggml_tensor * s_padded = reflect_pad_1d(ctx, s, n_fft / 2, n_fft / 2);
     ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_fft, 1, 2 * F);
     ggml_set_name(k, "k"); ggml_set_input(k);
-    ggml_tensor * spec = conv1d_f32(ctx, k, s_padded, hop, 0, 1);
+    ggml_tensor * spec = cosyvoice_conv1d_f32(ctx, k, s_padded, hop, 0, 1);
     ggml_set_name(spec, "spec"); ggml_set_output(spec);
     ggml_build_forward_expand(gf, spec);
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));

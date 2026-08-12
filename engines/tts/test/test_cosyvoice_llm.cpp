@@ -38,22 +38,61 @@
 // that the C++ generator consumes as the stop signal (and does not emit).
 static const int SPEECH_TOKEN_MAX = 6561;
 
+// Whole-string parse with range validation: atof/atoi would turn junk into
+// 0 and a negative length budget into a huge size_t bound, silently
+// neutralizing the parity gates this binary exists to enforce.
+static bool parse_ratio_arg(const char * s, double & out) {
+    char * end = nullptr;
+    const double v = std::strtod(s, &end);
+    if (end == s || !end || *end != '\0' || !(v >= 0.0 && v <= 1.0)) return false;
+    out = v;
+    return true;
+}
+static bool parse_nonneg_arg(const char * s, int & out) {
+    char * end = nullptr;
+    const long v = std::strtol(s, &end, 10);
+    if (end == s || !end || *end != '\0' || v < 0 || v > 1000000) return false;
+    out = (int)v;
+    return true;
+}
+
+static size_t count_matching_tokens(const std::vector<int> & a, const std::vector<int> & b) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t match = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (a[i] == b[i]) ++match;
+    }
+    return match;
+}
+
+static size_t first_difference(const std::vector<int> & a, const std::vector<int> & b) {
+    size_t i = 0;
+    while (i < std::min(a.size(), b.size()) && a[i] == b[i]) ++i;
+    return i;
+}
+
 int main(int argc, char ** argv) {
     std::string gguf, in_dir;
     double min_match = 0.99;
     double xb_min_match = 1.0;
     int xb_max_len_diff = 0;
     int seed = 0;
-    for (int i = 1; i < argc; ++i) {
+    bool args_ok = true;
+    for (int i = 1; i < argc && args_ok; ++i) {
         std::string a = argv[i];
         if (a == "--llm-gguf" && i + 1 < argc) gguf = argv[++i];
         else if (a == "--in-dir" && i + 1 < argc) in_dir = argv[++i];
-        else if (a == "--min-match" && i + 1 < argc) min_match = std::atof(argv[++i]);
-        else if (a == "--xb-min-match" && i + 1 < argc) xb_min_match = std::atof(argv[++i]);
-        else if (a == "--xb-max-len-diff" && i + 1 < argc) xb_max_len_diff = std::atoi(argv[++i]);
+        else if (a == "--min-match" && i + 1 < argc) args_ok = parse_ratio_arg(argv[++i], min_match);
+        else if (a == "--xb-min-match" && i + 1 < argc) args_ok = parse_ratio_arg(argv[++i], xb_min_match);
+        else if (a == "--xb-max-len-diff" && i + 1 < argc) args_ok = parse_nonneg_arg(argv[++i], xb_max_len_diff);
         else if (a == "--seed" && i + 1 < argc) seed = std::atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s --llm-gguf LLM.gguf --in-dir DIR [--min-match 0.99]\n"
-                               "          [--xb-min-match 1.0] [--xb-max-len-diff 0]\n", argv[0]); return 2; }
+        else args_ok = false;
+    }
+    if (!args_ok) {
+        fprintf(stderr, "usage: %s --llm-gguf LLM.gguf --in-dir DIR [--min-match 0.99]\n"
+                        "          [--xb-min-match 1.0] [--xb-max-len-diff 0]\n"
+                        "match thresholds take [0,1]; the length budget takes a nonnegative int\n", argv[0]);
+        return 2;
     }
     if (gguf.empty() || in_dir.empty()) { fprintf(stderr, "missing --llm-gguf / --in-dir\n"); return 2; }
 
@@ -111,14 +150,9 @@ int main(int argc, char ** argv) {
         qwen_hp hp_cpu = cosyvoice_qwen_hp(m_cpu);
         std::vector<int> got_cpu = cosyvoice_llm_generate(
             m_cpu, hp_cpu, text_ids, prompt_stok, max_steps, /*greedy=*/true, seed, /*min_len=*/0);
-        size_t first_diff = 0;
-        while (first_diff < std::min(got.size(), got_cpu.size()) &&
-               got[first_diff] == got_cpu[first_diff]) {
-            ++first_diff;
-        }
+        const size_t first_diff = first_difference(got, got_cpu);
         const size_t n_xb = std::min(got.size(), got_cpu.size());
-        size_t match_xb = 0;
-        for (size_t i = 0; i < n_xb; ++i) if (got[i] == got_cpu[i]) ++match_xb;
+        const size_t match_xb = count_matching_tokens(got, got_cpu);
         const double ratio_xb = n_xb ? (double)match_xb / (double)n_xb : 0.0;
         const size_t len_diff = std::max(got.size(), got_cpu.size()) - n_xb;
         const bool exact_required =
@@ -140,8 +174,7 @@ int main(int argc, char ** argv) {
     }
 
     size_t n = std::min(got.size(), ref.size());
-    size_t match = 0;
-    for (size_t i = 0; i < n; ++i) if (got[i] == ref[i]) ++match;
+    size_t match = count_matching_tokens(got, ref);
     double ratio = n ? (double)match / (double)n : 0.0;
 
     fprintf(stderr, "greedy tokens: got=%zu ref=%zu  match=%zu/%zu (%.4f, threshold %.4f)\n",

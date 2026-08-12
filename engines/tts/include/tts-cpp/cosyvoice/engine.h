@@ -3,8 +3,9 @@
 // Persistent CosyVoice3 engine (Fun-CosyVoice3-0.5B / 1.5B).
 //
 // Native C++/ggml implementation of Fun-CosyVoice3 on CPU or the validated
-// OpenCL GPU path. It uses the same persistent Engine shape as the other
-// synthesis families and returns 24 kHz speech.
+// per-platform GPU paths: Metal (macOS / iOS), Vulkan (desktop Linux /
+// Windows), and OpenCL (Android / Adreno). It uses the same persistent
+// Engine shape as the other synthesis families and returns 24 kHz speech.
 //
 // Pipeline:
 //   text --(Qwen2 BPE tokenizer)--> Qwen2.5 LM --> speech tokens [0, 6561)
@@ -289,7 +290,7 @@ public:
     // Registered name of the resolved backend ("CPU", "Metal", ...).
     std::string backend_name() const;
 
-    // Resolved compute device (CPU, or GPU for Metal / OpenCL).
+    // Resolved compute device (CPU, or GPU for Metal / Vulkan / OpenCL).
     BackendDevice backend_device() const;
 
     // True when a GPU device was present but unusable (fell back to CPU).

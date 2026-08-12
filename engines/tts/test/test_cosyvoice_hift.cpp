@@ -15,13 +15,20 @@
 //   test-cosyvoice-hift --hift-gguf HIFT.gguf --in-dir DIR [--min-corr 0.90]
 //
 // Set COSYVOICE_TEST_GPU=1 to run the check on the selected GPU backend
-// (mirrors PARLER_TEST_GPU).  The GPU run gates in two steps: SineGen2
+// (mirrors PARLER_TEST_GPU).  The GPU run gates in four steps: SineGen2
 // integrates f0 into sine phases, so sub-Hz cross-backend f0 noise
 // decorrelates the raw waveform with no audible effect.  (1) GPU f0 must
 // match CPU f0 in length, at cosine >= --min-f0-cosine, and within
 // --max-f0-hz-diff per frame (cosine alone is scale-invariant and would
-// accept an octave error); (2) the GPU synth runs with the CPU f0 pinned
-// and faces the same --min-corr waveform gate.
+// accept an octave error); (2) the voiced/unvoiced decision each f0 frame
+// implies may flip on at most --max-voiced-flips frames (the Hz bound is
+// blind to a pair straddling SineGen2's voiced threshold); (3) unpinned
+// production legs — each backend synthesizing with its own f0, exactly as
+// the engine runs — must agree on their 10 ms RMS energy envelopes at
+// >= --min-env-corr (phase-insensitive, so the f0-noise decorrelation does
+// not mask a real synthesis regression); (4) the GPU synth runs once more
+// with the CPU f0 pinned and faces the same --min-corr waveform gate
+// against the PyTorch reference.
 
 #include "npy.h"
 #include "backend_selection.h"
@@ -54,11 +61,43 @@ static double cosine(const std::vector<float> & a, const std::vector<float> & b)
     return dot / (std::sqrt(na) * std::sqrt(nb));
 }
 
+// SineGen2's voiced/unvoiced switch (cosyvoice_pipeline.cpp voiced_threshold):
+// an f0 pair straddling it produces qualitatively different excitation, which
+// the Hz bound alone cannot see when the true f0 sits near the threshold.
+static const float kVoicedThresholdHz = 10.0f;
+
+static size_t count_voiced_flips(const std::vector<float> & a, const std::vector<float> & b) {
+    size_t flips = 0;
+    const size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+        if ((a[i] > kVoicedThresholdHz) != (b[i] > kVoicedThresholdHz)) ++flips;
+    }
+    return flips;
+}
+
+// Frame RMS energy at a 10 ms hop. Phase-insensitive: cross-backend f0 noise
+// decorrelates the raw waveform (SineGen2 integrates f0 into sine phases), so
+// the unpinned production legs are compared on their energy envelopes.
+static std::vector<float> energy_envelope(const std::vector<float> & wav) {
+    const size_t hop = 240;
+    std::vector<float> env;
+    env.reserve(wav.size() / hop + 1);
+    for (size_t start = 0; start < wav.size(); start += hop) {
+        const size_t end = std::min(start + hop, wav.size());
+        double acc = 0;
+        for (size_t i = start; i < end; ++i) acc += (double)wav[i] * wav[i];
+        env.push_back((float)std::sqrt(acc / (double)(end - start)));
+    }
+    return env;
+}
+
 int main(int argc, char ** argv) {
     std::string gguf, in_dir;
     double min_corr = 0.90;
     double min_f0_cosine = 0.9999;
     double max_f0_hz_diff = 5.0;
+    double min_env_corr = 0.90;
+    size_t max_voiced_flips = 0;
     int seed = 42;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -67,8 +106,24 @@ int main(int argc, char ** argv) {
         else if (a == "--min-corr" && i + 1 < argc) min_corr = std::atof(argv[++i]);
         else if (a == "--min-f0-cosine" && i + 1 < argc) min_f0_cosine = std::atof(argv[++i]);
         else if (a == "--max-f0-hz-diff" && i + 1 < argc) max_f0_hz_diff = std::atof(argv[++i]);
+        else if (a == "--min-env-corr" && i + 1 < argc) {
+            char * end = nullptr;
+            min_env_corr = std::strtod(argv[++i], &end);
+            if (end == argv[i] || *end != '\0' || !(min_env_corr >= 0.0 && min_env_corr <= 1.0)) {
+                fprintf(stderr, "--min-env-corr takes [0,1], got \"%s\"\n", argv[i]); return 2;
+            }
+        }
+        else if (a == "--max-voiced-flips" && i + 1 < argc) {
+            char * end = nullptr;
+            const long v = std::strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || v < 0) {
+                fprintf(stderr, "--max-voiced-flips takes a nonnegative int, got \"%s\"\n", argv[i]); return 2;
+            }
+            max_voiced_flips = (size_t)v;
+        }
         else if (a == "--seed" && i + 1 < argc) seed = std::atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s --hift-gguf HIFT.gguf --in-dir DIR [--min-corr 0.90] [--min-f0-cosine 0.9999] [--max-f0-hz-diff 5.0]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s --hift-gguf HIFT.gguf --in-dir DIR [--min-corr 0.90] [--min-f0-cosine 0.9999] [--max-f0-hz-diff 5.0]\n"
+                               "          [--min-env-corr 0.90] [--max-voiced-flips 0]\n", argv[0]); return 2; }
     }
     if (gguf.empty() || in_dir.empty()) { fprintf(stderr, "missing --hift-gguf / --in-dir\n"); return 2; }
 
@@ -122,6 +177,39 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "FAIL: GPU f0 predictor diverged from CPU\n");
             return 1;
         }
+        // The Hz bound is blind to the voiced/unvoiced switch: a pair
+        // straddling SineGen2's threshold changes the excitation
+        // qualitatively even inside the bound, so decision parity is gated
+        // separately.
+        const size_t flips = count_voiced_flips(f0_cpu, f0_gpu);
+        fprintf(stderr, "f0 voiced-decision flips = %zu (<= %zu, threshold %.1f Hz)\n",
+                flips, max_voiced_flips, (double)kVoicedThresholdHz);
+        if (flips > max_voiced_flips) {
+            fprintf(stderr, "FAIL: GPU f0 flips voiced decisions against CPU\n");
+            return 1;
+        }
+        // Unpinned production leg: each backend synthesizes with its OWN f0,
+        // exactly as the engine runs it. Raw-waveform correlation is not
+        // meaningful here (f0 noise decorrelates phases), so the legs are
+        // compared on their 10 ms RMS energy envelopes.
+        std::vector<float> wav_gpu_unpinned = cosyvoice_hift_synth(m, mel, T_mel, seed);
+        std::vector<float> wav_cpu_unpinned = cosyvoice_hift_synth(m_cpu, mel, T_mel, seed);
+        if (wav_gpu_unpinned.size() != wav_cpu_unpinned.size()) {
+            fprintf(stderr, "FAIL: unpinned GPU waveform length %zu != CPU %zu\n",
+                    wav_gpu_unpinned.size(), wav_cpu_unpinned.size());
+            return 1;
+        }
+        const std::vector<float> env_gpu = energy_envelope(wav_gpu_unpinned);
+        const std::vector<float> env_cpu = energy_envelope(wav_cpu_unpinned);
+        const double env_corr = pearson(env_gpu.data(), env_cpu.data(), env_gpu.size());
+        fprintf(stderr, "unpinned energy-envelope corr = %.6f (>= %.4f, %zu frames)\n",
+                env_corr, min_env_corr, env_gpu.size());
+        if (!(env_corr >= min_env_corr)) {
+            fprintf(stderr, "FAIL: unpinned GPU synthesis energy envelope diverged from CPU\n");
+            return 1;
+        }
+        // Pinned diagnostic leg (kept): CPU f0 into the GPU synthesizer makes
+        // the raw waveform comparable against the PyTorch reference below.
         wav = cosyvoice_hift_synth(m, mel, T_mel, seed, nullptr, &f0_cpu);
     } else {
         wav = cosyvoice_hift_synth(m, mel, T_mel, seed);
