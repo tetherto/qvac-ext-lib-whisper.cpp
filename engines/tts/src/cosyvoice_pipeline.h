@@ -18,6 +18,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "backend_selection.h"
 #include "sched_dispatch.h"
 #include "cosyvoice_mmap.h"
 
@@ -32,6 +33,21 @@
 // public engine re-exports it on SynthesisResult::sample_rate (a static_assert
 // in cosyvoice_engine.cpp keeps the public constant in lock-step with this one).
 constexpr int kCosyvoiceNativeSampleRate = 24000;
+
+// GPU admission policy shared by the engine and the per-stage parity
+// harnesses (test-cosyvoice-{flow,llm,hift}), so the backends a test
+// validates are exactly the backends the engine will select. Desktop
+// admits Vulkan alongside Metal and OpenCL; Android stays on the
+// OpenCL/Adreno + Metal set: admitting Vulkan there would let an
+// always-vendor-allowed Samsung Xclipse device offload through a
+// backend no reference run covers, instead of declining to CPU.
+inline ::tts_cpp::detail::GpuBackendRequirement cosyvoice_gpu_requirement() {
+#if defined(__ANDROID__)
+    return ::tts_cpp::detail::GpuBackendRequirement::MetalOrOpenCL;
+#else
+    return ::tts_cpp::detail::GpuBackendRequirement::MetalOrOpenCLOrVulkan;
+#endif
+}
 
 // ---- resident model (weights + compute backend) ----------------------------
 // Move-only: owns a sched bundle that cannot be copied.

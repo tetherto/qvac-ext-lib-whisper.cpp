@@ -45,6 +45,7 @@ enum class GpuBackendRequirement {
     Vulkan,
     VulkanOrMetal,
     MetalOrOpenCL,
+    MetalOrOpenCLOrVulkan,
 };
 
 bool gpu_backend_satisfies_requirement(const char * backend_name,

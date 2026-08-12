@@ -202,10 +202,14 @@ set(TTS_CPP_PARLER_GPU FALSE)
 if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_VULKAN OR TTS_CPP_GGML_OPENCL)
     set(TTS_CPP_PARLER_GPU TRUE)
 endif()
-# CosyVoice3 allowlist: Metal / OpenCL (cosyvoice_engine.cpp
-# GpuBackendRequirement::MetalOrOpenCL).
+# CosyVoice3 allowlist: Metal / OpenCL everywhere, Vulkan on desktop only
+# (cosyvoice_gpu_requirement() in cosyvoice_pipeline.h). The NOT ANDROID
+# guard mirrors the runtime split: an Android Vulkan-only build must not
+# register gpu test variants whose harness requirement would refuse every
+# device and hard-fail instead of skipping.
 set(TTS_CPP_COSYVOICE_GPU FALSE)
-if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_OPENCL)
+if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_OPENCL OR
+    (TTS_CPP_GGML_VULKAN AND NOT ANDROID))
     set(TTS_CPP_COSYVOICE_GPU TRUE)
 endif()
 

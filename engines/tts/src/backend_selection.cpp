@@ -132,6 +132,9 @@ bool gpu_backend_satisfies_requirement(const char * backend_name,
             return reg_name_is_vulkan(backend_name) || reg_name_is_metal(backend_name);
         case GpuBackendRequirement::MetalOrOpenCL:
             return reg_name_is_metal(backend_name) || reg_name_is_opencl(backend_name);
+        case GpuBackendRequirement::MetalOrOpenCLOrVulkan:
+            return reg_name_is_metal(backend_name) || reg_name_is_opencl(backend_name) ||
+                   reg_name_is_vulkan(backend_name);
         case GpuBackendRequirement::Any:
             break;
     }

@@ -27,7 +27,7 @@
 //
 //     EngineOptions opts;
 //     opts.model_dir     = "models/cosyvoice3-0.5b";
-//     opts.n_gpu_layers  = 0;                 // 0 = CPU; >0 = Metal / OpenCL
+//     opts.n_gpu_layers  = 0;                 // 0 = CPU; >0 = Metal / OpenCL / Vulkan
 //
 //     Engine engine(opts);
 //     auto result = engine.synthesize("Hello world.");
@@ -132,7 +132,16 @@ struct EngineOptions {
     int seed         = 42;
     int n_threads    = 0;   // 0 = leave the backend's default thread pool.
     int n_gpu_layers = 0;   // 0 = CPU; >0 selects the GPU path (Metal on Apple,
-                            // OpenCL/Adreno on Android; others fall back to CPU).
+                            // OpenCL/Adreno on Android, Vulkan on desktop;
+                            // others fall back to CPU).
+
+    // Vulkan adapter index, consulted only when the selection walk lands on
+    // Vulkan.  0 (default) = first adapter in registry order; N > 0 = the Nth
+    // adapter (0-indexed), throwing on out-of-range so a CLI typo fails loud
+    // instead of silently falling back to CPU; -1 = auto-pick argmax(free
+    // VRAM) with a UMA bias that skips integrated adapters whenever a
+    // discrete one is visible (see backend_selection.h).
+    int vulkan_device = 0;
 
     // Argmax speech-token decode instead of RAS nucleus sampling.  Sampling is
     // chaotic in the logits -- a 1-ulp difference re-rolls the whole token

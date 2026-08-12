@@ -121,7 +121,7 @@ bool write_tokens(const std::string & path, const std::vector<int> & toks) {
 void usage(const char * a0) {
     fprintf(stderr,
         "usage: %s --model-dir DIR [--text TEXT]\n"
-        "          [--n-gpu-layers N] [--threads N] [--seed 42] [--greedy]\n"
+        "          [--n-gpu-layers N] [--vulkan-device N] [--threads N] [--seed 42] [--greedy]\n"
         "          [--runs 3] [--warmup 1]\n"
         "          [--tokens-out FILE]  pin: write the LM trajectory this run used\n"
         "          [--tokens-in FILE]   pin: reuse a trajectory (skips the LM)\n"
@@ -134,7 +134,7 @@ void usage(const char * a0) {
 int main(int argc, char ** argv) {
     std::string model_dir, text = "The quick brown fox jumps over the lazy dog.";
     std::string tokens_out, tokens_in, wav_out, json_out, backends_dir, opencl_cache_dir;
-    int seed = 42, n_gpu_layers = 0, n_threads = 0, runs = 3, warmup = 1;
+    int seed = 42, n_gpu_layers = 0, n_threads = 0, runs = 3, warmup = 1, vulkan_device = 0;
     bool greedy = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -142,6 +142,7 @@ int main(int argc, char ** argv) {
         if (a == "--model-dir" && i + 1 < argc) model_dir = argv[++i];
         else if (a == "--text" && i + 1 < argc) text = argv[++i];
         else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) n_gpu_layers = std::atoi(argv[++i]);
+        else if (a == "--vulkan-device" && i + 1 < argc) vulkan_device = std::atoi(argv[++i]);
         else if ((a == "--threads" || a == "-t") && i + 1 < argc) n_threads = std::atoi(argv[++i]);
         else if (a == "--seed" && i + 1 < argc) seed = std::atoi(argv[++i]);
         else if (a == "--runs" && i + 1 < argc) runs = std::atoi(argv[++i]);
@@ -162,6 +163,7 @@ int main(int argc, char ** argv) {
     opts.seed             = seed;
     opts.greedy           = greedy;
     opts.n_gpu_layers     = n_gpu_layers;
+    opts.vulkan_device    = vulkan_device;
     opts.n_threads        = n_threads;
     if (!backends_dir.empty())     opts.backends_dir     = backends_dir;
     if (!opencl_cache_dir.empty()) opts.opencl_cache_dir = opencl_cache_dir;
@@ -252,6 +254,7 @@ int main(int argc, char ** argv) {
             os << "  \"backend\": \"" << json_escape(engine.backend_name()) << "\",\n";
             os << "  \"gpu_declined\": " << (engine.gpu_unsupported() ? "true" : "false") << ",\n";
             os << "  \"n_gpu_layers\": " << n_gpu_layers << ",\n";
+            os << "  \"vulkan_device\": " << vulkan_device << ",\n";
             os << "  \"threads\": " << n_threads << ",\n";
             os << "  \"greedy\": " << (greedy ? "true" : "false") << ",\n";
             os << "  \"tokens_pinned\": " << (tokens_in.empty() ? "false" : "true") << ",\n";

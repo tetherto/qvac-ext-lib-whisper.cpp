@@ -33,5 +33,11 @@ int main() {
           "Vulkan selection must reject CUDA");
     check(!gpu_backend_satisfies_requirement(nullptr, GpuBackendRequirement::Vulkan),
           "Vulkan selection must reject an unnamed backend");
+    check(gpu_backend_satisfies_requirement(VULKAN_BACKEND,
+                                            GpuBackendRequirement::MetalOrOpenCLOrVulkan),
+          "MetalOrOpenCLOrVulkan selection must accept Vulkan");
+    check(!gpu_backend_satisfies_requirement(CUDA_BACKEND,
+                                             GpuBackendRequirement::MetalOrOpenCLOrVulkan),
+          "MetalOrOpenCLOrVulkan selection must reject CUDA");
     return failures == 0 ? 0 : 1;
 }

@@ -81,7 +81,7 @@ int main(int argc, char ** argv) {
         backend = ::tts_cpp::detail::init_gpu_backend(
             99, /*verbose=*/false, "test-cosyvoice", /*vulkan_device=*/0,
             /*allow_arm_mali=*/false, /*out_gpu_present_but_unused=*/nullptr,
-            ::tts_cpp::detail::GpuBackendRequirement::MetalOrOpenCL);
+            cosyvoice_gpu_requirement());
         if (!backend) { fprintf(stderr, "FAIL: COSYVOICE_TEST_GPU set but no GPU backend\n"); return 1; }
     }
     model_ctx m = cosyvoice_load_gguf(gguf, backend);
