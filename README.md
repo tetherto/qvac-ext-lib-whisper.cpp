@@ -293,32 +293,49 @@ file combinations and registry download instructions.
 
 ### ASR, end-of-utterance, diarization
 
-CI numbers, `q8_0` GGUFs, 1 warmup plus 5 timed runs, host `qvac-ubuntu2204-x64-gpu` (CPU: Intel Core i5-13500, GPU: NVIDIA RTX 4000 SFF Ada, Vulkan). Full table: [engines/parakeet/README.md](engines/parakeet/README.md#ci-benchmarks-latest-ggml-speech-linux-x86-64).
+CI numbers from the published `@qvac/asr-ggml@0.1.1` addon ([run 31603189415](https://github.com/tetherto/qvac/actions/runs/31603189415), 2026-08-12), `q8_0` GGUFs, 1 warmup plus 5 timed runs, host `qvac-ubuntu2204-x64-gpu` (CPU: Intel Core i5-13500, GPU: NVIDIA RTX 4000 SFF Ada, Vulkan). Full table: [engines/parakeet/README.md](engines/parakeet/README.md#performance).
 
 | Model | CPU RTF | CPU wall | Vulkan RTF | Vulkan wall |
 |---|--:|--:|--:|--:|
-| Parakeet CTC | 0.078 | 1572 ms | 0.0023 | 47 ms |
-| Parakeet TDT | 0.083 | 1670 ms | 0.0035 | 71 ms |
-| Parakeet EOU | 0.030 | 607 ms | 0.0052 | 105 ms |
-| Sortformer | 0.025 | 508 ms | 0.0020 | 40 ms |
+| Parakeet CTC | 0.112 | 2256 ms | 0.0022 | 43 ms |
+| Parakeet TDT | 0.130 | 2607 ms | 0.0044 | 88 ms |
+| Parakeet EOU | 0.051 | 1034 ms | 0.0034 | 68 ms |
+| Sortformer | 0.046 | 922 ms | 0.0019 | 38 ms |
+| Sortformer streaming | 0.032 | 646 ms | 0.0034 | 69 ms |
+| Whisper base | 0.035 | 699 ms | 0.0057 | 117 ms |
+| Whisper small | 0.122 | 2453 ms | 0.0098 | 200 ms |
 
 ### Text-to-speech
 
-CI numbers, `q4_0` GGUFs, same host. Full table: [engines/tts/README.md](engines/tts/README.md#performance).
+CI numbers from the published `@qvac/tts-ggml@0.6.2` addon ([run 31603192731](https://github.com/tetherto/qvac/actions/runs/31603192731), 2026-08-12), `q4_0` GGUFs, same host. Full table: [engines/tts/README.md](engines/tts/README.md#performance).
 
 | Model | CPU RTF | Vulkan RTF | Vulkan wall | Vulkan tok/s |
 |---|--:|--:|--:|--:|
-| Chatterbox Turbo | 1.34 | 0.090 | 368 ms | 186 |
-| Chatterbox Multilingual | 4.31 | 0.189 | 1097 ms | 73 |
-| Supertonic | 0.079 | n/a | n/a | n/a |
+| Chatterbox Turbo | 1.54 | 0.099 | 410 ms | 173 |
+| Chatterbox Multilingual | 5.81 | 0.182 | 1036 ms | 77 |
+| Supertonic | 0.113 | 0.018 | 78 ms | 952 |
+| Supertonic Multilingual | 0.101 | 0.013 | 84 ms | 1087 |
+| Supertonic 3 | 0.225 | 0.029 | 118 ms | 631 |
 
-That CI run has no Supertonic GPU lane, so its Vulkan columns are unrecorded rather than unsupported.
+### Brain-computer interface
+
+CI numbers from the published `@qvac/bci-whispercpp@0.6.0` addon ([run 31602627344](https://github.com/tetherto/qvac/actions/runs/31602627344), 2026-08-12), `ggml-bci-windowed` model. Throughput in tokens/s, higher is better.
+
+| Host | CPU tok/s | Vulkan tok/s | Vulkan wall |
+|---|--:|--:|--:|
+| Linux x86-64 (i5-13500 / RTX 4000 SFF Ada) | 27.0 | 355.6 | 42 ms |
+| Windows x64 (`qvac-win25-x64-gpu`) | 20.1 | 36.0 | 349 ms |
+| Linux arm64 (`ubuntu-24.04-arm`, CPU-only lane) | 16.8 | n/a | n/a |
+
+The macOS arm64 lane runs on the GitHub-hosted `macos-26` runner, whose virtualised Metal device is not representative (6.6 tok/s vs 398 tok/s on the previously used self-hosted M-series box), so it is omitted here.
 
 ### Apple silicon
 
 | Model | Host | Backend | Quantization | RTF | vs real-time |
 |---|---|---|---|--:|--:|
-| Parakeet TDT 0.6b v3 | Apple silicon, host not recorded | Metal | `q8_0` | 0.006 | 160x |
+| Parakeet TDT 0.6b v3 | Mac mini M4 (CI, `mac-mini-m4-gpu`) | Metal | `q8_0` | 0.015 | 67x |
+| Parakeet CTC | Mac mini M4 (CI, `mac-mini-m4-gpu`) | Metal | `q8_0` | 0.011 | 88x |
+| Whisper small | Mac mini M4 (CI, `mac-mini-m4-gpu`) | Metal | `q8_0` | 0.027 | 37x |
 | Chatterbox Turbo | Mac Studio M3 Ultra | Metal | `q4_0` | 0.16 | 6.4x |
 | Chatterbox Turbo | Mac Studio M3 Ultra | CPU (NEON) | `q4_0` | 1.05 | 0.96x |
 | Chatterbox Multilingual (`--cfm-steps 7`) | Mac Studio M3 Ultra | Metal | `q4_0` | 0.30 | 3.3x |
