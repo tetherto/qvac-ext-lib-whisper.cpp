@@ -54,13 +54,13 @@ void print_usage(const char * argv0) {
         "usage: %s --asr-model <gguf> --diar-model <gguf> [options]\n"
         "\n"
         "Captures the default input device at 16 kHz mono and runs both a\n"
-        "transcription engine (CTC/TDT/EOU) and a Sortformer diarization engine\n"
+        "transcription engine (CTC/RNN-T/TDT/EOU) and a Sortformer diarization engine\n"
         "on the same audio stream. Each transcript segment is tagged with\n"
         "the speaker whose live diarization range overlaps it the most.\n"
         "Press Ctrl-C to stop; tail audio is flushed before exit.\n"
         "\n"
         "options:\n"
-        "  --asr-model PATH               path to a CTC, TDT, or EOU GGUF (required)\n"
+        "  --asr-model PATH               path to a CTC, RNN-T, TDT, or EOU GGUF (required)\n"
         "  --diar-model PATH              path to a Sortformer GGUF (required)\n"
         "  --asr-n-gpu-layers N           ASR engine GPU offload (Metal/CUDA build)\n"
         "  --diar-n-gpu-layers N          Sortformer engine GPU offload\n"
@@ -203,7 +203,7 @@ int main(int argc, char ** argv) {
     asr_eopts.n_threads       = args.n_threads;
     Engine asr_engine(asr_eopts);
     if (asr_engine.is_diarization_model()) {
-        std::fprintf(stderr, "error: --asr-model %s is a Sortformer GGUF; expected CTC, TDT, or EOU\n",
+        std::fprintf(stderr, "error: --asr-model %s is a Sortformer GGUF; expected CTC, RNN-T, TDT, or EOU\n",
                      args.asr_model_path.c_str());
         return 1;
     }

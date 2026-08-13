@@ -2,7 +2,7 @@
 
 // GGUF-backed FastConformer encoder: loader, ggml encoder graph, CTC head, greedy decode.
 //
-// Holds shared configuration and tensor handles for CTC, TDT, EOU, and Sortformer GGUFs.
+// Holds shared configuration and tensor handles for CTC, RNN-T, TDT, EOU, and Sortformer GGUFs.
 
 #include "mel_preprocess.h"
 #include "sentencepiece_bpe.h"
@@ -69,7 +69,7 @@ struct EncoderConfig {
     bool use_bias                 = true;
     float layer_norm_eps          = 1.0e-5f;
 
-    // Streaming / cache-aware encoder knobs (currently EOU-only; CTC/TDT
+    // Streaming / cache-aware encoder knobs (EOU and Unified metadata; CTC/TDT
     // GGUFs leave these at the offline defaults). `att_context_left/right`
     // are in **post-subsampling encoder frames**, matching NeMo's
     // `att_context_size`. `conv_causal` and `causal_downsampling` flip
@@ -81,11 +81,18 @@ struct EncoderConfig {
     int  att_context_left         = -1;     // -1 = unrestricted
     int  att_context_right        = -1;
     bool att_chunked_limited      = false;
+    bool att_dynamic_chunking     = false;
+    bool conv_dynamic_chunking    = false;
 
     int  tdt_pred_hidden          = 640;
     int  tdt_pred_rnn_layers      = 2;
     int  tdt_joint_hidden         = 640;
     int  tdt_num_durations        = 5;
+
+    int  rnnt_pred_hidden          = 640;
+    int  rnnt_pred_rnn_layers      = 2;
+    int  rnnt_joint_hidden         = 640;
+    int  rnnt_max_symbols_per_step = 10;
 
     // EOU-specific (parakeet_realtime_eou_120m-v1).
     // Predictor + joint dims mirror TDT's, but EOU has 1 LSTM layer
@@ -198,8 +205,11 @@ struct TdtWeights {
     ggml_tensor * joint_out_b  = nullptr;
 };
 
+using RnntWeights = TdtWeights;
+
 enum class ParakeetModelType {
     CTC,
+    RNNT,
     TDT,
     EOU,
     SORTFORMER,
@@ -253,7 +263,7 @@ struct SortformerWeights {
 };
 
 // Universal Parakeet model object. Carries the encoder + decoder
-// weights for whichever engine the GGUF declares (CTC, TDT, or
+// weights for whichever engine the GGUF declares (CTC, RNN-T, TDT, or
 // Sortformer); `model_type` selects which decoder fields are populated.
 // Named `ParakeetCtcModel` for historical reasons (the CTC pipeline
 // landed first); `ParakeetModel` is the recommended new name and is
@@ -300,6 +310,7 @@ struct ParakeetCtcModel {
     SubsamplingWeights       subsampling;
     std::vector<BlockWeights> blocks;
     CtcHeadWeights            ctc;
+    RnntWeights               rnnt;
     TdtWeights                tdt;
     EouWeights                eou;
     SortformerWeights         sortformer;
@@ -343,6 +354,7 @@ int load_from_gguf(const std::string & gguf_path,
                    bool                verbose);
 
 void print_model_summary(const ParakeetCtcModel & m);
+const char * model_type_name(ParakeetModelType model_type);
 
 bool        model_has_gpu_backend(const ParakeetCtcModel & m);
 // True when a GPU was detected but routed to CPU as a known-bad backend (Mali).

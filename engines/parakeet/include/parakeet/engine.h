@@ -2,7 +2,7 @@
 
 // Loaded GGUF inference: transcribe, stream, diarize, and backend metadata behind one Engine class.
 //
-// Loads weights once; subsequent calls pay mel + encoder + decode only. Model kind (CTC, TDT,
+// Loads weights once; subsequent calls pay mel + encoder + decode only. Model kind (CTC, RNN-T, TDT,
 // EOU, Sortformer) comes from GGUF metadata.
 //
 // Transcription:
@@ -59,7 +59,7 @@
 //     destruct without an explicit `finalize()` call, any audio that
 //     hadn't yet rolled into a chunk is dropped, the synthetic
 //     `is_final=true` terminator is not emitted (Sortformer), and the
-//     final partial-chunk tail segment is not emitted (CTC/TDT/EOU
+//     final partial-chunk tail segment is not emitted (CTC/RNN-T/TDT/EOU
 //     Mode 3). Always call `finalize()` if you care about those.
 
 #include "export.h"

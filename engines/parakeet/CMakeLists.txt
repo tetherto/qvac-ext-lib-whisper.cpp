@@ -549,6 +549,7 @@ if (PARAKEET_BUILD_TESTS)
     # tests at the f16 GGUFs and leave q8_0 in place for everything else.
     set(_qvp_ctc_q8_gguf   "${PARAKEET_TEST_MODEL_DIR}/parakeet-ctc-0.6b.q8_0.gguf")
     set(_qvp_ctc_f16_gguf  "${PARAKEET_TEST_MODEL_DIR}/parakeet-ctc-0.6b.f16.gguf")
+    set(_qvp_rnnt_q8_gguf  "${PARAKEET_TEST_MODEL_DIR}/parakeet-unified-en-0.6b.q8_0.gguf")
     set(_qvp_tdt_q8_gguf   "${PARAKEET_TEST_MODEL_DIR}/parakeet-tdt-0.6b-v3.q8_0.gguf")
     set(_qvp_tdt_f16_gguf  "${PARAKEET_TEST_MODEL_DIR}/parakeet-tdt-0.6b-v3.f16.gguf")
     set(_qvp_eou_q8_gguf   "${PARAKEET_TEST_MODEL_DIR}/parakeet_realtime_eou_120m-v1.q8_0.gguf")
@@ -629,6 +630,11 @@ if (PARAKEET_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "--model" "${_qvp_ctc_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
+    parakeet_register_test(test-streaming-rnnt
+        LABEL    "fixture"
+        EXE      test-parakeet-streaming
+        ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
 
     add_executable(test-eou-streaming test/test_eou_streaming.cpp)
     target_link_libraries(test-eou-streaming PRIVATE qvac-parakeet)
@@ -702,6 +708,21 @@ if (PARAKEET_BUILD_TESTS)
     parakeet_apply_backend_defs(test-mel-fft-parity)
     parakeet_register_test(test-mel-fft-parity LABEL "unit")
 
+    add_executable(test-rnnt test/test_rnnt.cpp)
+    target_link_libraries(test-rnnt PRIVATE qvac-parakeet)
+    target_include_directories(test-rnnt PRIVATE src include ggml/include)
+    parakeet_apply_backend_defs(test-rnnt)
+    parakeet_register_test(test-rnnt LABEL "unit")
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(
+            NAME test-converter-rnnt
+            COMMAND ${Python3_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/test/test_convert_nemo_to_gguf.py")
+        set_property(TEST test-converter-rnnt PROPERTY LABELS unit)
+    endif()
+
     # Regression gate for the round-1 capture_intermediates flag.
     # Asserts run_encoder(capture=true) and (capture=false) produce
     # bit-equal encoder_out + logits on a CTC GGUF.
@@ -727,6 +748,11 @@ if (PARAKEET_BUILD_TESTS)
         EXE      test-encoder-capture-parity
         ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+    parakeet_register_test(test-encoder-capture-parity-rnnt
+        LABEL    "fixture"
+        EXE      test-encoder-capture-parity
+        ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
     parakeet_register_test(test-encoder-capture-parity-eou
         LABEL    "fixture"
         EXE      test-encoder-capture-parity
@@ -982,6 +1008,11 @@ if (PARAKEET_BUILD_TESTS)
         EXE      test-decoder-determinism
         ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+    parakeet_register_test(test-decoder-determinism-rnnt
+        LABEL    "fixture"
+        EXE      test-decoder-determinism
+        ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}" "--threads" "4"
+        REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
     parakeet_register_test(test-decoder-determinism-eou
         LABEL    "fixture"
         EXE      test-decoder-determinism
@@ -1029,6 +1060,18 @@ if (PARAKEET_BUILD_TESTS)
             LABEL    "gpu"
             ARGS     "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}"
             REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
+        parakeet_register_test(test-streaming-rnnt-vulkan
+            LABEL    "gpu"
+            EXE      test-parakeet-streaming
+            ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+                     "--threads" "4" "--n-gpu-layers" "1"
+            REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
+        parakeet_register_test(test-decoder-determinism-rnnt-vulkan
+            LABEL    "gpu"
+            EXE      test-decoder-determinism
+            ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+                     "--threads" "4" "--n-gpu-layers" "1"
+            REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
     endif()
 endif()
 

@@ -138,8 +138,9 @@ latent_graph build_latents(ggml_context * ctx, const codec_model & model, int n_
     latent_graph built;
     built.semantic = sum_quantizers(ctx, model.semantic_quantizers, codes, 0);
     built.residual = sum_quantizers(ctx, model.residual_quantizers, codes, 1);
-    built.post = window_forward(ctx, model.post,
-                                ggml_add(ctx, built.semantic, built.residual), mask);
+    built.post =
+        window_forward(ctx, model.post, ggml_add(ctx, built.semantic, built.residual),
+                       mask, model.precise_outputs);
     return built;
 }
 

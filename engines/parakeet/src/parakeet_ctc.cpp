@@ -538,6 +538,29 @@ ggml_tensor * maybe_tensor(ggml_context * ctx, const std::string & name) {
     return ggml_get_tensor(ctx, name.c_str());
 }
 
+void load_transducer_weights(ggml_context * ctx,
+                             const std::string & prefix,
+                             int pred_rnn_layers,
+                             TdtWeights & weights) {
+    weights.predict_embed = require_tensor(ctx, prefix + ".predict.embed.weight");
+    for (int layer = 0; layer < pred_rnn_layers; ++layer) {
+        const std::string path =
+            prefix + ".predict.lstm." + std::to_string(layer) + ".";
+        TdtLstmLayer lstm_layer;
+        lstm_layer.w_ih = require_tensor(ctx, path + "w_ih");
+        lstm_layer.w_hh = require_tensor(ctx, path + "w_hh");
+        lstm_layer.b_ih = require_tensor(ctx, path + "b_ih");
+        lstm_layer.b_hh = require_tensor(ctx, path + "b_hh");
+        weights.lstm.push_back(lstm_layer);
+    }
+    weights.joint_enc_w = require_tensor(ctx, prefix + ".joint.enc.weight");
+    weights.joint_enc_b = require_tensor(ctx, prefix + ".joint.enc.bias");
+    weights.joint_pred_w = require_tensor(ctx, prefix + ".joint.pred.weight");
+    weights.joint_pred_b = require_tensor(ctx, prefix + ".joint.pred.bias");
+    weights.joint_out_w = require_tensor(ctx, prefix + ".joint.out.weight");
+    weights.joint_out_b = require_tensor(ctx, prefix + ".joint.out.bias");
+}
+
 std::string get_str(const gguf_context * g, const std::string & k, const std::string & fallback) {
     const int id = find_key(g, k);
     if (id < 0) return fallback;
@@ -1050,6 +1073,9 @@ int load_from_gguf(const std::string & gguf_path,
     {
         const std::string conv_ctx = get_str(g, "parakeet.encoder.conv_context_size", "default");
         out_model.encoder_cfg.conv_causal = (conv_ctx == "causal");
+        const std::string conv_style =
+            get_str(g, "parakeet.encoder.conv_context_style", "regular");
+        out_model.encoder_cfg.conv_dynamic_chunking = (conv_style == "dcc");
     }
     {
         const int id_l = find_key(g, "parakeet.encoder.att_context_size_left");
@@ -1060,18 +1086,35 @@ int load_from_gguf(const std::string & gguf_path,
     {
         const std::string style = get_str(g, "parakeet.encoder.att_context_style", "regular");
         out_model.encoder_cfg.att_chunked_limited = (style == "chunked_limited");
+        out_model.encoder_cfg.att_dynamic_chunking =
+            (style == "chunked_limited_with_rc");
     }
 
     out_model.supports_streaming = get_bool(g, "parakeet.encoder.streaming.enabled", false);
 
     const std::string mtype_str = get_str(g, "parakeet.model.type", "ctc");
-    if      (mtype_str == "tdt")        out_model.model_type = ParakeetModelType::TDT;
+    if      (mtype_str == "rnnt")       out_model.model_type = ParakeetModelType::RNNT;
+    else if (mtype_str == "tdt")        out_model.model_type = ParakeetModelType::TDT;
     else if (mtype_str == "eou")        out_model.model_type = ParakeetModelType::EOU;
     else if (mtype_str == "sortformer") out_model.model_type = ParakeetModelType::SORTFORMER;
     else                                out_model.model_type = ParakeetModelType::CTC;
 
     // Optional variant tag (empty for legacy GGUFs that predate the key).
     out_model.model_variant = get_str(g, "parakeet.model_variant", "");
+
+    if (out_model.model_type == ParakeetModelType::RNNT) {
+        out_model.encoder_cfg.rnnt_pred_hidden =
+            get_u32(g, "parakeet.rnnt.pred_hidden", 640);
+        out_model.encoder_cfg.rnnt_pred_rnn_layers =
+            get_u32(g, "parakeet.rnnt.pred_rnn_layers", 2);
+        out_model.encoder_cfg.rnnt_joint_hidden =
+            get_u32(g, "parakeet.rnnt.joint_hidden", 640);
+        out_model.encoder_cfg.rnnt_max_symbols_per_step =
+            get_u32(g, "parakeet.rnnt.max_symbols_per_step", 10);
+        out_model.vocab_size = get_u32(g, "parakeet.rnnt.vocab_size", 1024);
+        out_model.blank_id =
+            get_u32(g, "parakeet.rnnt.blank_id", out_model.vocab_size);
+    }
 
     if (out_model.model_type == ParakeetModelType::TDT) {
         out_model.encoder_cfg.tdt_pred_hidden     = get_u32(g, "parakeet.tdt.pred_hidden",     640);
@@ -1316,23 +1359,14 @@ int load_from_gguf(const std::string & gguf_path,
         out_model.sortformer.head_h2h_b = require_tensor(impl->ctx, "sortformer.head.first_hidden_to_hidden.bias");
         out_model.sortformer.head_h2s_w = require_tensor(impl->ctx, "sortformer.head.single_hidden_to_spks.weight");
         out_model.sortformer.head_h2s_b = require_tensor(impl->ctx, "sortformer.head.single_hidden_to_spks.bias");
+    } else if (out_model.model_type == ParakeetModelType::RNNT) {
+        load_transducer_weights(
+            impl->ctx, "rnnt",
+            out_model.encoder_cfg.rnnt_pred_rnn_layers, out_model.rnnt);
     } else {
-        out_model.tdt.predict_embed = require_tensor(impl->ctx, "tdt.predict.embed.weight");
-        for (int l = 0; l < out_model.encoder_cfg.tdt_pred_rnn_layers; ++l) {
-            const std::string pl = "tdt.predict.lstm." + std::to_string(l) + ".";
-            TdtLstmLayer lyr;
-            lyr.w_ih = require_tensor(impl->ctx, pl + "w_ih");
-            lyr.w_hh = require_tensor(impl->ctx, pl + "w_hh");
-            lyr.b_ih = require_tensor(impl->ctx, pl + "b_ih");
-            lyr.b_hh = require_tensor(impl->ctx, pl + "b_hh");
-            out_model.tdt.lstm.push_back(lyr);
-        }
-        out_model.tdt.joint_enc_w  = require_tensor(impl->ctx, "tdt.joint.enc.weight");
-        out_model.tdt.joint_enc_b  = require_tensor(impl->ctx, "tdt.joint.enc.bias");
-        out_model.tdt.joint_pred_w = require_tensor(impl->ctx, "tdt.joint.pred.weight");
-        out_model.tdt.joint_pred_b = require_tensor(impl->ctx, "tdt.joint.pred.bias");
-        out_model.tdt.joint_out_w  = require_tensor(impl->ctx, "tdt.joint.out.weight");
-        out_model.tdt.joint_out_b  = require_tensor(impl->ctx, "tdt.joint.out.bias");
+        load_transducer_weights(
+            impl->ctx, "tdt",
+            out_model.encoder_cfg.tdt_pred_rnn_layers, out_model.tdt);
     }
 
     if (impl->backend_blas) {
@@ -1422,11 +1456,19 @@ ggml_backend_sched_t model_sched(const ParakeetCtcModel & m) {
     return m.impl ? m.impl->sched : nullptr;
 }
 
+const char * model_type_name(ParakeetModelType model_type) {
+    switch (model_type) {
+        case ParakeetModelType::RNNT:       return "rnnt";
+        case ParakeetModelType::TDT:        return "tdt";
+        case ParakeetModelType::EOU:        return "eou";
+        case ParakeetModelType::SORTFORMER: return "sortformer";
+        case ParakeetModelType::CTC:
+        default:                            return "ctc";
+    }
+}
+
 void print_model_summary(const ParakeetCtcModel & m) {
-    const char * mt = "ctc";
-    if (m.model_type == ParakeetModelType::TDT)        mt = "tdt";
-    else if (m.model_type == ParakeetModelType::EOU)        mt = "eou";
-    else if (m.model_type == ParakeetModelType::SORTFORMER) mt = "sortformer";
+    const char * mt = model_type_name(m.model_type);
     PARAKEET_LOG_INFO("parakeet-%s loaded:\n", mt);
     const char * conv_norm = m.encoder_cfg.conv_norm_type == ConvNormType::LayerNorm ? "ln" : "bn";
     PARAKEET_LOG_INFO("  encoder: d_model=%d n_layers=%d n_heads=%d head_dim=%d ff_dim=%d conv_k=%d sub=%dx xscaling=%d untie=%d use_bias=%d conv_norm=%s\n",
@@ -1435,12 +1477,20 @@ void print_model_summary(const ParakeetCtcModel & m) {
                       m.encoder_cfg.subsampling_factor,
                       (int) m.encoder_cfg.xscaling, (int) m.encoder_cfg.untie_biases,
                       (int) m.encoder_cfg.use_bias, conv_norm);
-    if (m.encoder_cfg.att_chunked_limited || m.encoder_cfg.causal_downsampling || m.encoder_cfg.conv_causal) {
+    if (m.encoder_cfg.att_chunked_limited ||
+        m.encoder_cfg.att_dynamic_chunking ||
+        m.encoder_cfg.conv_dynamic_chunking ||
+        m.encoder_cfg.causal_downsampling ||
+        m.encoder_cfg.conv_causal) {
         PARAKEET_LOG_INFO("  streaming: att_ctx=[%d,%d] style=%s causal_ds=%d conv_ctx=%s\n",
                           m.encoder_cfg.att_context_left, m.encoder_cfg.att_context_right,
-                          m.encoder_cfg.att_chunked_limited ? "chunked_limited" : "regular",
+                          m.encoder_cfg.att_dynamic_chunking
+                              ? "chunked_limited_with_rc"
+                              : (m.encoder_cfg.att_chunked_limited ? "chunked_limited" : "regular"),
                           (int) m.encoder_cfg.causal_downsampling,
-                          m.encoder_cfg.conv_causal ? "causal" : "default");
+                          m.encoder_cfg.conv_dynamic_chunking
+                              ? "dcc"
+                              : (m.encoder_cfg.conv_causal ? "causal" : "default"));
     }
     PARAKEET_LOG_INFO("  preproc: sr=%d n_fft=%d win=%d hop=%d n_mels=%d preemph=%.2f log_guard=%.2e\n",
                       m.mel_cfg.sample_rate, m.mel_cfg.n_fft, m.mel_cfg.win_length,
@@ -1449,6 +1499,15 @@ void print_model_summary(const ParakeetCtcModel & m) {
     if (m.model_type == ParakeetModelType::CTC) {
         PARAKEET_LOG_INFO("  ctc:     vocab=%d blank=%d langs=%zu\n",
                           m.vocab_size, m.blank_id, m.ctc_lang_ranges.size());
+    } else if (m.model_type == ParakeetModelType::RNNT) {
+        PARAKEET_LOG_INFO(
+            "  rnnt:    vocab=%d blank=%d pred_hidden=%d pred_layers=%d "
+            "joint_hidden=%d max_syms=%d\n",
+            m.vocab_size, m.blank_id,
+            m.encoder_cfg.rnnt_pred_hidden,
+            m.encoder_cfg.rnnt_pred_rnn_layers,
+            m.encoder_cfg.rnnt_joint_hidden,
+            m.encoder_cfg.rnnt_max_symbols_per_step);
     } else if (m.model_type == ParakeetModelType::EOU) {
         PARAKEET_LOG_INFO("  eou:     vocab=%d blank=%d eou_id=%d eob_id=%d "
                           "pred_hidden=%d pred_layers=%d joint_hidden=%d "

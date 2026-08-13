@@ -123,12 +123,14 @@ ggml_tensor * feed_forward_block(ggml_context * ctx, const scaled_block_weights 
     return scaled_residual(ctx, x, branch, block.ffn_scale);
 }
 
-attention_shape shape_for(const transformer_spec & spec, int length) {
+attention_shape shape_for(const transformer_spec & spec, int length,
+                          bool precise_attention_values) {
     attention_shape shape;
     shape.n_head = spec.n_head;
     shape.n_kv = spec.n_kv;
     shape.head_dim = spec.head_dim;
     shape.width = length;
+    shape.precise_values = precise_attention_values;
     return shape;
 }
 
@@ -246,11 +248,13 @@ ggml_tensor * convnext_block(ggml_context * ctx, const convnext_weights & block,
 }
 
 ggml_tensor * window_forward(ggml_context * ctx, const window_transformer & transformer,
-                             ggml_tensor * x, ggml_tensor * mask) {
+                             ggml_tensor * x, ggml_tensor * mask,
+                             bool precise_attention_values) {
     const transformer_spec & spec = transformer.spec;
     const rope_planes rope = rope_window(ctx, transformer.rope_cos, transformer.rope_sin,
                                          /*first=*/0, length_of(x));
-    const attention_shape shape = shape_for(spec, length_of(x));
+    const attention_shape shape =
+        shape_for(spec, length_of(x), precise_attention_values);
     for (const scaled_block_weights & block : transformer.blocks) {
         x = attend_block(ctx, block, x, rope, shape, mask, spec.norm_eps);
         x = feed_forward_block(ctx, block, x, spec.norm_eps);

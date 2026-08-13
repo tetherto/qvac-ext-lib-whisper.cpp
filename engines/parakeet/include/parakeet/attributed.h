@@ -1,6 +1,6 @@
 #pragma once
 
-// Speaker-attributed transcription: Sortformer segments + ASR text per slice (CTC/TDT/EOU).
+// Speaker-attributed transcription: Sortformer segments + ASR text per slice (CTC/RNN-T/TDT/EOU).
 
 #include "export.h"
 #include "engine.h"

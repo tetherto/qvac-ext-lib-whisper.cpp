@@ -1,8 +1,8 @@
 #pragma once
 
-// TDT (token-and-duration transducer) decoder on FastConformer encoder output (run_encoder).
+// RNN-T and TDT decoders on FastConformer encoder output (run_encoder).
 //
-// Prediction LSTM, joint MLP, duration head, and greedy decode over encoder frames.
+// Prediction LSTM, joint MLP, optional duration head, and greedy decode over encoder frames.
 // GPU paths run per-step ops as ggml graphs on the loaded backend; CPU decode uses
 // host GEMV/LSTM with weights prepared at load time.
 //
@@ -23,6 +23,16 @@ struct ggml_backend_buffer;
 typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
 
 namespace parakeet {
+
+struct TransducerGraphOutputs {
+    ggml_tensor * token = nullptr;
+    ggml_tensor * duration = nullptr;
+};
+
+TransducerGraphOutputs build_transducer_argmax_outputs(ggml_context * ctx,
+                                                       ggml_tensor * logits,
+                                                       int token_count,
+                                                       int duration_count);
 
 // Per-layer host-dequantised LSTM weights, used by the CPU fallback path
 // (per-step ggml-graph dispatch on the CPU backend has too much overhead
@@ -185,6 +195,11 @@ struct TdtDecodeState {
     int  carry_frames      = 0;
 };
 
+using RnntRuntimeWeights = TdtRuntimeWeights;
+using RnntDecodeOptions = TdtDecodeOptions;
+using RnntDecodeResult = TdtDecodeResult;
+using RnntDecodeState = TdtDecodeState;
+
 int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & out);
 
 void tdt_init_state(TdtRuntimeWeights & W,
@@ -206,5 +221,23 @@ int tdt_greedy_decode(const ParakeetCtcModel & model,
                       int T_enc, int D_enc,
                       const TdtDecodeOptions & opts,
                       TdtDecodeResult & result);
+
+int rnnt_decode_window(const ParakeetCtcModel & model,
+                       RnntRuntimeWeights & weights,
+                       const float * encoder_out_window,
+                       int n_frames,
+                       int encoder_dim,
+                       const RnntDecodeOptions & options,
+                       RnntDecodeState & state,
+                       std::vector<int32_t> & out_tokens,
+                       int & out_steps);
+
+int rnnt_greedy_decode(const ParakeetCtcModel & model,
+                       RnntRuntimeWeights & weights,
+                       const float * encoder_out,
+                       int encoder_frames,
+                       int encoder_dim,
+                       const RnntDecodeOptions & options,
+                       RnntDecodeResult & result);
 
 }

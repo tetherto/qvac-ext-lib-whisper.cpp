@@ -47,6 +47,56 @@ double ms_since(std::chrono::steady_clock::time_point a) {
     return duration_cast<microseconds>(steady_clock::now() - a).count() / 1000.0;
 }
 
+bool is_transducer(ParakeetModelType model_type) {
+    return model_type == ParakeetModelType::RNNT ||
+           model_type == ParakeetModelType::TDT;
+}
+
+TdtDecodeOptions transducer_decode_options(const ParakeetCtcModel & model) {
+    TdtDecodeOptions options;
+    if (model.model_type == ParakeetModelType::RNNT) {
+        options.max_symbols_per_step =
+            model.encoder_cfg.rnnt_max_symbols_per_step;
+    }
+    return options;
+}
+
+int decode_transducer_window(const ParakeetCtcModel & model,
+                             TdtRuntimeWeights & weights,
+                             const float * encoder_out,
+                             int frames,
+                             int encoder_dim,
+                             TdtDecodeState & state,
+                             std::vector<int32_t> & tokens,
+                             int & steps) {
+    const TdtDecodeOptions options = transducer_decode_options(model);
+    if (model.model_type == ParakeetModelType::RNNT) {
+        return rnnt_decode_window(
+            model, weights, encoder_out, frames, encoder_dim,
+            options, state, tokens, steps);
+    }
+    return tdt_decode_window(
+        model, weights, encoder_out, frames, encoder_dim,
+        options, state, tokens, steps);
+}
+
+int decode_transducer(const ParakeetCtcModel & model,
+                       TdtRuntimeWeights & weights,
+                       const float * encoder_out,
+                       int frames,
+                       int encoder_dim,
+                       TdtDecodeResult & result) {
+    const TdtDecodeOptions options = transducer_decode_options(model);
+    if (model.model_type == ParakeetModelType::RNNT) {
+        return rnnt_greedy_decode(
+            model, weights, encoder_out, frames, encoder_dim,
+            options, result);
+    }
+    return tdt_greedy_decode(
+        model, weights, encoder_out, frames, encoder_dim,
+        options, result);
+}
+
 // ── Long-form offline encoder windowing ───────────────────────────────────
 // See EngineOptions::long_form_window_frames and src/long_form.h.
 
@@ -204,8 +254,8 @@ struct Engine::Impl {
     ParakeetCtcModel    model;
     std::atomic<bool>   cancel_flag{false};
 
-    TdtRuntimeWeights   tdt_rt;
-    bool                tdt_ready = false;
+    TdtRuntimeWeights   transducer_rt;
+    bool                transducer_ready = false;
 
     EouRuntimeWeights   eou_rt;
     bool                eou_ready = false;
@@ -319,11 +369,11 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(std::make_unique<Impl>()) {
                                  "' (rc=" + std::to_string(rc) + ")");
     }
 
-    if (pimpl_->model.model_type == ParakeetModelType::TDT) {
-        if (tdt_prepare_runtime(pimpl_->model, pimpl_->tdt_rt) != 0) {
-            throw std::runtime_error("Engine: tdt_prepare_runtime failed");
+    if (is_transducer(pimpl_->model.model_type)) {
+        if (tdt_prepare_runtime(pimpl_->model, pimpl_->transducer_rt) != 0) {
+            throw std::runtime_error("Engine: transducer runtime preparation failed");
         }
-        pimpl_->tdt_ready = true;
+        pimpl_->transducer_ready = true;
     }
     if (pimpl_->model.model_type == ParakeetModelType::EOU) {
         if (eou_prepare_runtime(pimpl_->model, pimpl_->eou_rt) != 0) {
@@ -350,13 +400,7 @@ const EngineOptions & Engine::options() const {
 }
 
 std::string Engine::model_type() const {
-    switch (pimpl_->model.model_type) {
-        case ParakeetModelType::TDT:        return "tdt";
-        case ParakeetModelType::EOU:        return "eou";
-        case ParakeetModelType::SORTFORMER: return "sortformer";
-        case ParakeetModelType::CTC:
-        default:                            return "ctc";
-    }
+    return model_type_name(pimpl_->model.model_type);
 }
 
 bool Engine::is_diarization_model() const {
@@ -365,6 +409,7 @@ bool Engine::is_diarization_model() const {
 
 bool Engine::is_transcription_model() const {
     return pimpl_->model.model_type == ParakeetModelType::CTC ||
+           pimpl_->model.model_type == ParakeetModelType::RNNT ||
            pimpl_->model.model_type == ParakeetModelType::TDT  ||
            pimpl_->model.model_type == ParakeetModelType::EOU;
 }
@@ -481,14 +526,14 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
     const auto t_dec = clock::now();
     std::vector<int32_t> ids;
     std::string text;
-    if (pimpl_->model.model_type == ParakeetModelType::TDT) {
-        TdtDecodeOptions dopts;
+    if (is_transducer(pimpl_->model.model_type)) {
         TdtDecodeResult  dres;
-        if (int rc = tdt_greedy_decode(pimpl_->model, pimpl_->tdt_rt,
-                                       enc_out.encoder_out.data(),
-                                       enc_out.n_enc_frames, enc_out.d_model,
-                                       dopts, dres); rc != 0) {
-            throw std::runtime_error("parakeet::Engine::transcribe_samples: tdt_greedy_decode failed (rc=" +
+        if (int rc = decode_transducer(
+                pimpl_->model, pimpl_->transducer_rt,
+                enc_out.encoder_out.data(),
+                enc_out.n_enc_frames, enc_out.d_model,
+                dres); rc != 0) {
+            throw std::runtime_error("parakeet::Engine::transcribe_samples: transducer decode failed (rc=" +
                                      std::to_string(rc) + ")");
         }
         ids  = std::move(dres.token_ids);
@@ -634,13 +679,18 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
 
     const auto t_dec = clock::now();
 
-    const bool is_tdt = (pimpl_->model.model_type == ParakeetModelType::TDT);
+    const bool has_transducer = is_transducer(pimpl_->model.model_type);
     const bool is_eou = (pimpl_->model.model_type == ParakeetModelType::EOU);
 
     int32_t prev_token = -1;
-    TdtDecodeState tdt_state;
+    TdtDecodeState transducer_state;
     EouDecodeState eou_state;
-    if (is_tdt) tdt_init_state(pimpl_->tdt_rt, (int) pimpl_->model.blank_id, tdt_state);
+    if (has_transducer) {
+        tdt_init_state(
+            pimpl_->transducer_rt,
+            (int) pimpl_->model.blank_id,
+            transducer_state);
+    }
     if (is_eou && eou_init_state(pimpl_->eou_rt, eou_state) != 0) {
         throw std::runtime_error("Engine: eou_init_state failed");
     }
@@ -658,17 +708,17 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
 
         std::vector<int32_t> win_tokens;
         int eou_boundaries_in_chunk = 0;
-        if (is_tdt) {
-            TdtDecodeOptions dopts;
+        if (has_transducer) {
             int steps = 0;
             const float * win_enc = enc_out.encoder_out.data()
                                   + static_cast<size_t>(start) * enc_out.d_model;
-            if (int rc = tdt_decode_window(pimpl_->model, pimpl_->tdt_rt,
-                                           win_enc, end - start, enc_out.d_model,
-                                           dopts, tdt_state, win_tokens, steps);
+            if (int rc = decode_transducer_window(
+                    pimpl_->model, pimpl_->transducer_rt,
+                    win_enc, end - start, enc_out.d_model,
+                    transducer_state, win_tokens, steps);
                 rc != 0) {
                 throw std::runtime_error("parakeet::Engine::transcribe_samples_stream: "
-                                         "tdt_decode_window failed (rc=" + std::to_string(rc) + ")");
+                                         "transducer decode failed (rc=" + std::to_string(rc) + ")");
             }
         } else if (is_eou) {
             EouDecodeOptions dopts;
@@ -1089,7 +1139,7 @@ struct StreamSession::Impl {
     int     chunk_index    = 0;
     int64_t emitted_samples = 0;
     int32_t prev_token     = -1;
-    TdtDecodeState tdt_state;
+    TdtDecodeState transducer_state;
     EouDecodeState eou_state;
 
     std::string             cumulative_text;
@@ -1098,7 +1148,7 @@ struct StreamSession::Impl {
     bool finalized = false;
     bool cancelled = false;
 
-    // Optional EnergyVad for CTC/TDT when enable_energy_vad and no native VAD exists.
+    // Optional EnergyVad for CTC/RNN-T/TDT when enable_energy_vad and no native VAD exists.
     std::unique_ptr<EnergyVad> energy_vad;
     int64_t total_pcm_seen = 0;
 
@@ -1171,17 +1221,17 @@ void StreamSession::Impl::process_window(const float * window_samples, int windo
     const auto t_dec = clock::now();
     std::vector<int32_t> win_tokens;
     int  eou_boundaries_in_chunk = 0;
-    if (engine_impl->model.model_type == ParakeetModelType::TDT) {
-        TdtDecodeOptions dopts;
+    if (is_transducer(engine_impl->model.model_type)) {
         int steps = 0;
         const int n_frames = std::max(0, center_end_frame - left_drop_frames);
         const float * win_enc = enc_out.encoder_out.data()
                               + static_cast<size_t>(left_drop_frames) * enc_out.d_model;
-        if (int rc = tdt_decode_window(engine_impl->model, engine_impl->tdt_rt,
-                                       win_enc, n_frames, enc_out.d_model,
-                                       dopts, tdt_state, win_tokens, steps);
+        if (int rc = decode_transducer_window(
+                engine_impl->model, engine_impl->transducer_rt,
+                win_enc, n_frames, enc_out.d_model,
+                transducer_state, win_tokens, steps);
             rc != 0) {
-            throw std::runtime_error("StreamSession: tdt_decode_window failed (rc=" +
+            throw std::runtime_error("StreamSession: transducer decode failed (rc=" +
                                      std::to_string(rc) + ")");
         }
     } else if (engine_impl->model.model_type == ParakeetModelType::EOU) {
@@ -1414,10 +1464,13 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
     impl->left_history.reserve(impl->left_context_samples);
     impl->pending.reserve(impl->chunk_samples + impl->right_lookahead_samples);
 
-    if (pimpl_->model.model_type == ParakeetModelType::TDT) {
-        tdt_init_state(pimpl_->tdt_rt, (int) pimpl_->model.blank_id, impl->tdt_state);
+    if (is_transducer(pimpl_->model.model_type)) {
+        tdt_init_state(
+            pimpl_->transducer_rt,
+            (int) pimpl_->model.blank_id,
+            impl->transducer_state);
     }
-    // Optional EnergyVad for CTC/TDT only (EOU uses `<EOU>`; Sortformer uses SortformerStreamSession).
+    // Optional EnergyVad for CTC/RNN-T/TDT only (EOU uses `<EOU>`; Sortformer uses SortformerStreamSession).
     if (opts.enable_energy_vad &&
         pimpl_->model.model_type != ParakeetModelType::EOU) {
         impl->energy_vad = std::make_unique<EnergyVad>(
