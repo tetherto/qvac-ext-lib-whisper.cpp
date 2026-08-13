@@ -675,8 +675,11 @@ if (TTS_CPP_BUILD_TESTS)
     set(_tcb_audio8_lm          "${TTS_CPP_TEST_MODEL_DIR}/audio8-lm-f32.gguf")
     set(_tcb_audio8_decoder     "${TTS_CPP_TEST_MODEL_DIR}/audio8-codec-decoder-f32.gguf")
     set(_tcb_audio8_encoder     "${TTS_CPP_TEST_MODEL_DIR}/audio8-codec-encoder-f32.gguf")
+    set(_tcb_audio8_lm_q8       "${TTS_CPP_TEST_MODEL_DIR}/audio8-lm-q8_0.gguf")
+    set(_tcb_audio8_decoder_q8  "${TTS_CPP_TEST_MODEL_DIR}/audio8-codec-decoder-q8_0.gguf")
     set(_tcb_audio8_ref         "${TTS_CPP_TEST_REF_DIR}/audio8-ref")
     set(_tcb_audio8_ref_clone   "${TTS_CPP_TEST_REF_DIR}/audio8-ref-clone")
+    set(_tcb_audio8_gpu_layers  99)
     # The recording the cloning fixtures were enrolled from, which the engine
     # test hands to the codec encoder instead of pre-computed codes.
     set(_tcb_audio8_ref_wav     "${TTS_CPP_TEST_AUDIO_DIR}/audio8-reference-en.wav")
@@ -933,6 +936,19 @@ if (TTS_CPP_BUILD_TESTS)
     # GpuBackendRequirement::VulkanOrMetal).
     if (TTS_CPP_GGML_VULKAN)
         tts_cpp_register_audio8_gpu_tests(vulkan)
+        if (TARGET audio8-cli)
+            tts_cpp_register_test(test-audio8-cli-vulkan-q8_0
+                EXE        audio8-cli
+                LABEL      "gpu"
+                ARGS       "--lm" "${_tcb_audio8_lm_q8}"
+                           "--codec-decoder" "${_tcb_audio8_decoder_q8}"
+                           "--text" "Audio8 Vulkan q8 regression."
+                           "--greedy" "--max-frames" "2"
+                           "--n-gpu-layers" "${_tcb_audio8_gpu_layers}"
+                           "--out" "${CMAKE_CURRENT_BINARY_DIR}/audio8-vulkan-q8_0.wav"
+                PASS_REGEX "on Vulkan"
+                REQUIRES   "${_tcb_audio8_lm_q8}" "${_tcb_audio8_decoder_q8}")
+        endif()
     endif()
     if (TTS_CPP_GGML_METAL)
         tts_cpp_register_audio8_gpu_tests(metal)

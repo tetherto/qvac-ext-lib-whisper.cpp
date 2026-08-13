@@ -62,12 +62,16 @@ ggml_tensor * last_column(ggml_context * ctx, ggml_tensor * x) {
     return ggml_view_2d(ctx, x, x->ne[0], 1, x->nb[1], offset);
 }
 
-attention_shape slow_shape(const lm_hparams & hp, int width, int n_past) {
-    return {hp.n_head, hp.n_kv, hp.head_dim, width, n_past, 0};
+attention_shape slow_shape(const lm_model & model, int width, int n_past) {
+    const lm_hparams & hp = model.hp;
+    return {hp.n_head, hp.n_kv, hp.head_dim, width, n_past, 0,
+            model.precise_outputs};
 }
 
-attention_shape fast_shape(const lm_hparams & hp, int position) {
-    return {hp.fast_n_head, hp.fast_n_kv, hp.fast_head_dim, 1, position, 0};
+attention_shape fast_shape(const lm_model & model, int position) {
+    const lm_hparams & hp = model.hp;
+    return {hp.fast_n_head, hp.fast_n_kv, hp.fast_head_dim, 1, position, 0,
+            model.precise_outputs};
 }
 
 bool is_semantic(const lm_hparams & hp, int32_t token) {
@@ -165,12 +169,12 @@ bool slow_step(lm_model & model, const int32_t * frames, int width, int n_past,
     ggml_tensor * hidden = embed_frames(ctx, model, width);
     const rope_planes rope = rope_window(ctx, model.rope_cos, model.rope_sin, n_past, width);
     hidden = run_blocks(ctx, build.graph, model.blocks, hidden, rope, model.slow_kv,
-                        slow_shape(hp, width, n_past), mask, hp.rms_eps);
+                        slow_shape(model, width, n_past), mask, hp.rms_eps);
 
     ggml_tensor * tail = ggml_cont(ctx, last_column(ctx, hidden));
     ggml_tensor * normed = rms_norm(ctx, tail, model.norm, hp.rms_eps);
-    ggml_tensor * logits =
-        mark_output(build.graph, precise_mul_mat(ctx, model.sem_head, normed));
+    ggml_tensor * logits = mark_output(
+        build.graph, multiply_mat(ctx, model.sem_head, normed, model.precise_outputs));
     ggml_tensor * carried = mark_output(build.graph, hp.norm_fast_input ? normed : tail);
 
     bool use_sched = false;
@@ -224,11 +228,12 @@ bool fast_pass(lm_model & model, const fast_source & source, int position, int n
     const rope_planes rope = rope_window(ctx, model.fast_rope_cos, model.fast_rope_sin,
                                          position, 1);
     hidden = run_blocks(ctx, build.graph, model.fast_blocks, hidden, rope, model.fast_kv,
-                        fast_shape(hp, position), mask, hp.rms_eps);
-    ggml_tensor * logits = mark_output(
-        build.graph,
-        precise_mul_mat(ctx, model.fast_out,
-                        rms_norm(ctx, hidden, model.fast_norm, hp.rms_eps)));
+                        fast_shape(model, position), mask, hp.rms_eps);
+    ggml_tensor * logits =
+        mark_output(build.graph,
+                    multiply_mat(ctx, model.fast_out,
+                                 rms_norm(ctx, hidden, model.fast_norm, hp.rms_eps),
+                                 model.precise_outputs));
 
     bool use_sched = false;
     if (!prepare_graph(model.backend, model.sched, model.buffer_w, model.fast_allocr,
@@ -264,9 +269,10 @@ ggml_tensor * fast_logits(ggml_context * ctx, ggml_cgraph * graph, lm_model & mo
         rope_window(ctx, model.fast_rope_cos, model.fast_rope_sin, position, 1);
     ggml_tensor * out =
         run_blocks(ctx, graph, model.fast_blocks, hidden, rope, model.fast_kv,
-                   fast_shape(hp, position), /*mask=*/nullptr, hp.rms_eps);
-    return precise_mul_mat(ctx, model.fast_out,
-                           rms_norm(ctx, out, model.fast_norm, hp.rms_eps));
+                   fast_shape(model, position), /*mask=*/nullptr, hp.rms_eps);
+    return multiply_mat(ctx, model.fast_out,
+                        rms_norm(ctx, out, model.fast_norm, hp.rms_eps),
+                        model.precise_outputs);
 }
 
 // Position 0 primes the cache from the slow transformer's hidden state and

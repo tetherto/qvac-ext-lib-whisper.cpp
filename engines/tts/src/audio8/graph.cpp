@@ -80,11 +80,12 @@ void append_values(ggml_context * ctx, ggml_cgraph * graph, const kv_cache & cac
 }
 
 ggml_tensor * attend(ggml_context * ctx, ggml_tensor * query, ggml_tensor * keys,
-                     ggml_tensor * values, ggml_tensor * mask, int head_dim, int n_head) {
+                     ggml_tensor * values, ggml_tensor * mask, int head_dim, int n_head,
+                     bool precise_values) {
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     ggml_tensor * scores = precise_mul_mat(ctx, keys, query);
     ggml_tensor * weights = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f);
-    ggml_tensor * blended = precise_mul_mat(ctx, values, weights);
+    ggml_tensor * blended = multiply_mat(ctx, values, weights, precise_values);
     ggml_tensor * merged = ggml_cont(ctx, ggml_permute(ctx, blended, 0, 2, 1, 3));
     return ggml_reshape_2d(ctx, merged, head_dim * n_head, blended->ne[1]);
 }
@@ -103,6 +104,11 @@ ggml_tensor * precise_mul_mat(ggml_context * ctx, ggml_tensor * a, ggml_tensor *
     ggml_tensor * out = ggml_mul_mat(ctx, a, b);
     ggml_mul_mat_set_prec(out, GGML_PREC_F32);
     return out;
+}
+
+ggml_tensor * multiply_mat(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b,
+                           bool precise) {
+    return precise ? precise_mul_mat(ctx, a, b) : ggml_mul_mat(ctx, a, b);
 }
 
 scratch::scratch(int nodes) {
@@ -237,7 +243,7 @@ ggml_tensor * attention(ggml_context * ctx, ggml_cgraph * graph,
     ggml_tensor * keys = ggml_permute(ctx, cache_keys(ctx, cache, shape, total), 0, 2, 1, 3);
     ggml_tensor * values = cache_values(ctx, cache, shape, total);
     ggml_tensor * merged = attend(ctx, query, keys, values, mask, shape.head_dim,
-                                  shape.n_head);
+                                  shape.n_head, shape.precise_values);
     return linear(ctx, weights.wo, merged, nullptr);
 }
 
@@ -252,7 +258,7 @@ ggml_tensor * windowed_attention(ggml_context * ctx, const attention_weights & w
     ggml_tensor * keys = ggml_permute(ctx, apply_rope(ctx, key, rope), 0, 2, 1, 3);
     ggml_tensor * values = ggml_cont(ctx, ggml_permute(ctx, value, 1, 2, 0, 3));
     ggml_tensor * merged = attend(ctx, query, keys, values, mask, shape.head_dim,
-                                  shape.n_head);
+                                  shape.n_head, shape.precise_values);
     return linear(ctx, weights.wo, merged, nullptr);
 }
 
