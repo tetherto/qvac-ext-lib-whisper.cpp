@@ -185,6 +185,18 @@ struct Engine::Impl {
         if (!backend) backend = det::init_cpu_backend();
         if (!backend) throw std::runtime_error("cosyvoice: failed to init a compute backend");
 
+        // ~Impl does not run when the constructor throws, so every throw
+        // below this point (tokenizer/voice.gguf load, cloning validation)
+        // would leak the backend without this guard; it is disarmed once
+        // construction succeeds.
+        struct BackendGuard {
+            ggml_backend_t & b;
+            bool armed = true;
+            ~BackendGuard() {
+                if (armed && b) { ggml_backend_free(b); b = nullptr; }
+            }
+        } backend_guard{backend};
+
         llm_path_  = llm_path;
         flow_path_ = flow_path;
         hift_path_ = hift_path;
@@ -242,6 +254,8 @@ struct Engine::Impl {
                     opts.prompt_text.empty() ? "no transcript: cross-lingual mode"
                                              : "transcript given: zero-shot mode");
         }
+
+        backend_guard.armed = false;
     }
 
     ~Impl() {
@@ -263,6 +277,7 @@ struct Engine::Impl {
                            std::vector<int> * out_tokens = nullptr) {
         std::string prompt_text;
         std::vector<int> lm_prompt_stok;
+        bool cross_lingual = false;
         if (!instruct.empty()) {
             // Instruct mode (dialects / accents / emotion / pace / volume):
             // the natural-language instruction sits in the LM prompt *before*
@@ -284,6 +299,7 @@ struct Engine::Impl {
             // instead of continuing the reference clip's language.
             prompt_text = detail::build_lm_prompt_zero_shot("");
             lm_prompt_stok = {};
+            cross_lingual = true;
         } else {
             // Zero-shot: transcript precedence explicit > baked voice > fallback.
             // (`cloned` implies opts.prompt_text is non-empty here, so a cloned
@@ -300,8 +316,15 @@ struct Engine::Impl {
         std::vector<int> text_ids = tokenizer.encode(prompt_text);
         text_ids.insert(text_ids.end(), tts_ids.begin(), tts_ids.end());
 
-        const int min_len   = 2 * (int)tts_ids.size();     // min_token_text_ratio
-        const int max_steps = 50 * ((int)tts_ids.size() + 1); // generous cap
+        // Length-guard basis mirrors upstream, which scales min/max on the
+        // tokens that are NOT LM prompt text.  Upstream cross-lingual deletes
+        // prompt_text and carries the <|endofprompt|> template inside
+        // tts_text, so the template tokens count toward its basis; our port
+        // keeps the template in prompt_text, so add them back explicitly or
+        // short cross-lingual text could reach EOS earlier than upstream.
+        const int lm_basis  = cross_lingual ? (int)text_ids.size() : (int)tts_ids.size();
+        const int min_len   = 2 * lm_basis;       // min_token_text_ratio
+        const int max_steps = 50 * (lm_basis + 1); // generous cap
         const bool greedy   = opts.greedy;
 
         // Stage 1 — LM: text ids -> speech tokens (freed at scope end). A pinned

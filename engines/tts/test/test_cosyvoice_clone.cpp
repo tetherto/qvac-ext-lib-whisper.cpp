@@ -36,6 +36,15 @@
 //     0.3 s reference, must both throw at construction — never silently fall
 //     back to the baked voice.
 //
+//  D. Cross-lingual LM path, unforced.  A real greedy decode of a very short
+//     text in cross-lingual mode must respect the upstream minimum-length
+//     basis: upstream carries the <|endofprompt|> template inside tts_text
+//     there (prompt_text is deleted), so the template's ~7 BPE tokens count
+//     toward min_len = 2 x basis.  Without that, EOS can legally fire after
+//     2 x n_text tokens — 2 tokens for a one-token text — truncating short
+//     utterances.  The decode loop hard-masks EOS below min_len, so the
+//     token-count floor asserts the basis directly.
+//
 // --prompt-text defaults to the zero_shot_prompt.wav transcript baked into
 // voice.gguf (the canonical fixture pair).
 
@@ -336,6 +345,27 @@ int main(int argc, char ** argv) {
         std::remove(wav_short.c_str());
         if (!threw) {
             fprintf(stderr, "FAIL: 0.3 s reference did not throw\n");
+            return 1;
+        }
+    }
+
+    fprintf(stderr, "[D] cross-lingual LM path (unforced greedy decode, short text)\n");
+    {
+        EngineOptions o = base_opts();
+        o.force_speech_tokens.clear();
+        o.greedy = true;
+        o.reference_audio = wav;
+        Engine eng(o);
+        const SynthesisResult res = eng.synthesize("Hi.");
+        // Conservative floor: the bare template is ~7 BPE tokens plus the
+        // text's own, so min_len is at least ~16; 14 leaves margin for
+        // tokenizer drift while still failing the broken basis (which allows
+        // EOS from ~2 tokens on this text).
+        fprintf(stderr, "      %zu speech tokens, %zu samples\n",
+                res.speech_tokens.size(), res.pcm.size());
+        if (res.speech_tokens.size() < 14 || res.pcm.empty()) {
+            fprintf(stderr, "FAIL: cross-lingual min-length basis does not cover "
+                            "the template tokens\n");
             return 1;
         }
     }

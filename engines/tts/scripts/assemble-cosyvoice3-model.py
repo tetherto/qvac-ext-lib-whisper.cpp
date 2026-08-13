@@ -61,10 +61,21 @@ def main():
         args.vocab: "vocab.json",
         args.merges: "merges.txt",
     }
-    if args.s3tok:
-        targets[args.s3tok] = os.path.basename(args.s3tok)
-    if args.campplus:
-        targets[args.campplus] = os.path.basename(args.campplus)
+    # The engine discovers these under model_dir by prefix
+    # (resolve_component: cosyvoice3-s3tok*.gguf / cosyvoice3-campplus*.gguf),
+    # so an arbitrary converter output name would assemble fine but never be
+    # found at load time.  Reject early instead.
+    for opt, path, prefix in (("--s3tok", args.s3tok, "cosyvoice3-s3tok"),
+                              ("--campplus", args.campplus, "cosyvoice3-campplus")):
+        if path is None:
+            continue
+        name = os.path.basename(path)
+        if not (name.startswith(prefix) and name.endswith(".gguf")):
+            raise SystemExit(
+                f"{opt}: {name} does not match {prefix}*.gguf; the engine "
+                f"resolves cloning models by that prefix under model_dir - "
+                f"rename the file (converter defaults already conform)")
+        targets[path] = name
     for src, name in targets.items():
         if not os.path.isfile(src):
             raise SystemExit(f"missing input: {src}")

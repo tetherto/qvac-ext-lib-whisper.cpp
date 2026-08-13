@@ -28,9 +28,18 @@ bool read_f32_tensor(const std::string & gguf_path, const char * name,
         gguf_free(g); if (tmp) ggml_free(tmp);
         return false;
     }
+    if (t->type != GGML_TYPE_F32) {
+        // The buffer below is sized in floats; a wider type would make the
+        // byte read overflow it, so reject anything the converters would
+        // never write.
+        err = std::string(name) + " in " + gguf_path + " has type " +
+              ggml_type_name(t->type) + " (want f32; re-run the converter)";
+        gguf_free(g); if (tmp) ggml_free(tmp);
+        return false;
+    }
     out.resize((size_t)ggml_nelements(t));
     ::tts_cpp::detail::gguf_stream_reader reader(g, gguf_path);
-    const bool ok = reader.ok() && reader.to_host(name, out.data(), ggml_nbytes(t));
+    const bool ok = reader.ok() && reader.to_host(name, out.data(), out.size() * sizeof(float));
     gguf_free(g); if (tmp) ggml_free(tmp);
     if (!ok) err = std::string("failed to read ") + name + " from " + gguf_path;
     return ok;
