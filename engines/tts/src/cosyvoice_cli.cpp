@@ -17,10 +17,12 @@
 #include "voice_controls_cli.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <string>
 #include <vector>
@@ -39,6 +41,17 @@ static void write_wav(const std::string & path, const std::vector<float> & wav, 
     std::fclose(f);
 }
 
+// Whole-string parse for --vulkan-device: atoi would turn "abc" into
+// adapter 0 and "1abc" into adapter 1, defeating the option's
+// fail-loud contract. Accepts -1 (auto-pick) or a nonnegative index.
+static bool parse_vulkan_device(const char * s, int & out) {
+    int v = 0;
+    const auto r = std::from_chars(s, s + std::strlen(s), v);
+    if (r.ec != std::errc() || r.ptr != s + std::strlen(s) || v < -1) return false;
+    out = v;
+    return true;
+}
+
 int main(int argc, char ** argv) {
     using namespace tts_cpp::cosyvoice;
     std::string model_dir, text = "Hello from a fully on-device C plus plus pipeline.";
@@ -48,7 +61,7 @@ int main(int argc, char ** argv) {
     std::string out = "cosyvoice_out.wav", prompt_text, voice_gguf;
     std::string backends_dir, opencl_cache_dir;
     VoiceControls controls;
-    int seed = 42, n_gpu_layers = 0, n_threads = 0;
+    int seed = 42, n_gpu_layers = 0, n_threads = 0, vulkan_device = 0;
     bool greedy = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -64,6 +77,13 @@ int main(int argc, char ** argv) {
         else if (a == "--voice-gguf" && i + 1 < argc) voice_gguf = argv[++i];
         else if (a == "--seed" && i + 1 < argc) seed = std::atoi(argv[++i]);
         else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) n_gpu_layers = std::atoi(argv[++i]);
+        else if (a == "--vulkan-device" && i + 1 < argc) {
+            if (!parse_vulkan_device(argv[++i], vulkan_device)) {
+                fprintf(stderr, "cosyvoice-cli: --vulkan-device expects -1 or a nonnegative "
+                                "adapter index, got \"%s\"\n", argv[i]);
+                return 1;
+            }
+        }
         else if ((a == "--threads" || a == "-t") && i + 1 < argc) n_threads = std::atoi(argv[++i]);
         else if (a == "--backends-dir" && i + 1 < argc) backends_dir = argv[++i];
         else if (a == "--opencl-cache-dir" && i + 1 < argc) opencl_cache_dir = argv[++i];
@@ -74,7 +94,7 @@ int main(int argc, char ** argv) {
                 "          [--emotion NAME] [--pace slow|moderate|fast] [--instruct \"...\"]\n"
                 "          [--list-emotions] [--list-paces]\n"
                 "          [--out out.wav] [--seed N] [--greedy] [--n-gpu-layers N] [--threads N]\n"
-                "          [--backends-dir DIR] [--opencl-cache-dir DIR]\n"
+                "          [--vulkan-device N] [--backends-dir DIR] [--opencl-cache-dir DIR]\n"
                 "\n"
                 "CosyVoice3 is trained on one instruction per synthesis: set at most one of\n"
                 "--emotion / --pace / --instruct (pace=moderate counts as unset).\n"
@@ -89,6 +109,7 @@ int main(int argc, char ** argv) {
     opts.seed = seed;
     opts.greedy = greedy;
     opts.n_gpu_layers = n_gpu_layers;
+    opts.vulkan_device = vulkan_device;
     opts.n_threads = n_threads;
     opts.default_controls = controls;
     if (!prompt_text.empty()) opts.prompt_text = prompt_text;

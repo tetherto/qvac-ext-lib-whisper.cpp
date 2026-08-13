@@ -3,8 +3,9 @@
 // Persistent CosyVoice3 engine (Fun-CosyVoice3-0.5B / 1.5B).
 //
 // Native C++/ggml implementation of Fun-CosyVoice3 on CPU or the validated
-// OpenCL GPU path. It uses the same persistent Engine shape as the other
-// synthesis families and returns 24 kHz speech.
+// per-platform GPU paths: Metal (macOS / iOS), Vulkan (desktop Linux /
+// Windows), and OpenCL (Android / Adreno). It uses the same persistent
+// Engine shape as the other synthesis families and returns 24 kHz speech.
 //
 // Pipeline:
 //   text --(Qwen2 BPE tokenizer)--> Qwen2.5 LM --> speech tokens [0, 6561)
@@ -27,7 +28,7 @@
 //
 //     EngineOptions opts;
 //     opts.model_dir     = "models/cosyvoice3-0.5b";
-//     opts.n_gpu_layers  = 0;                 // 0 = CPU; >0 = Metal / OpenCL
+//     opts.n_gpu_layers  = 0;                 // 0 = CPU; >0 = Metal / OpenCL / Vulkan
 //
 //     Engine engine(opts);
 //     auto result = engine.synthesize("Hello world.");
@@ -132,7 +133,16 @@ struct EngineOptions {
     int seed         = 42;
     int n_threads    = 0;   // 0 = leave the backend's default thread pool.
     int n_gpu_layers = 0;   // 0 = CPU; >0 selects the GPU path (Metal on Apple,
-                            // OpenCL/Adreno on Android; others fall back to CPU).
+                            // OpenCL/Adreno on Android, Vulkan on desktop;
+                            // others fall back to CPU).
+
+    // Vulkan adapter index, consulted only when the selection walk lands on
+    // Vulkan.  0 (default) = first adapter in registry order; N > 0 = the Nth
+    // adapter (0-indexed), throwing on out-of-range so a CLI typo fails loud
+    // instead of silently falling back to CPU; -1 = auto-pick argmax(free
+    // VRAM) with a UMA bias that skips integrated adapters whenever a
+    // discrete one is visible (see backend_selection.h).
+    int vulkan_device = 0;
 
     // Argmax speech-token decode instead of RAS nucleus sampling.  Sampling is
     // chaotic in the logits -- a 1-ulp difference re-rolls the whole token
@@ -280,7 +290,7 @@ public:
     // Registered name of the resolved backend ("CPU", "Metal", ...).
     std::string backend_name() const;
 
-    // Resolved compute device (CPU, or GPU for Metal / OpenCL).
+    // Resolved compute device (CPU, or GPU for Metal / Vulkan / OpenCL).
     BackendDevice backend_device() const;
 
     // True when a GPU device was present but unusable (fell back to CPU).

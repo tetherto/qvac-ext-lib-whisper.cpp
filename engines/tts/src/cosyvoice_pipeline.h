@@ -18,6 +18,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "backend_selection.h"
 #include "sched_dispatch.h"
 #include "cosyvoice_mmap.h"
 
@@ -32,6 +33,24 @@
 // public engine re-exports it on SynthesisResult::sample_rate (a static_assert
 // in cosyvoice_engine.cpp keeps the public constant in lock-step with this one).
 constexpr int kCosyvoiceNativeSampleRate = 24000;
+
+// GPU admission policy shared by the engine and the per-stage parity
+// harnesses (test-cosyvoice-{flow,llm,hift}), so the backends a test
+// validates are exactly the backends the engine will select. Vulkan is
+// admitted positively on Windows and non-Android Linux -- the platforms
+// its reference runs cover -- rather than "everywhere but Android":
+// on Apple a MoltenVK registration with Metal unavailable must not let
+// Vulkan win, and on Android an always-vendor-allowed Samsung Xclipse
+// device must keep declining to CPU instead of offloading through a
+// backend no reference run covers. TTS_CPP_COSYVOICE_GPU in
+// CMakeLists.txt mirrors this condition for gpu test registration.
+inline ::tts_cpp::detail::GpuBackendRequirement cosyvoice_gpu_requirement() {
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+    return ::tts_cpp::detail::GpuBackendRequirement::MetalOrOpenCLOrVulkan;
+#else
+    return ::tts_cpp::detail::GpuBackendRequirement::MetalOrOpenCL;
+#endif
+}
 
 // ---- resident model (weights + compute backend) ----------------------------
 // Move-only: owns a sched bundle that cannot be copied.
@@ -170,6 +189,14 @@ std::vector<float> cosyvoice_flow_run(model_ctx & m,
 // HiFT f0 predictor alone: mel [80, mel_len] channel-major -> per-frame f0 [Hz].
 std::vector<float> cosyvoice_hift_f0(model_ctx & m,
                                      const std::vector<float> & mel, int mel_len);
+
+// Plain conv1d graph builder: input [Nlen, Cin, B] (ne0=time), weight
+// [K, Cin, Cout]. Guards its im2col with ggml_cont, so a strided view input
+// stays on the backend's direct path instead of demoting the whole stage to
+// the sched-fallback (ggml-vulkan's IM2COL requires a contiguous signal).
+// Exposed for test-cosyvoice-conv1d, which pins exactly that guard.
+ggml_tensor * cosyvoice_conv1d_f32(ggml_context * c, ggml_tensor * w, ggml_tensor * x,
+                                   int stride, int padding, int dilation);
 
 // CausalHiFT vocoder: mel [80, mel_len] channel-major (mel[ch*T + t]) -> 24 kHz
 // float PCM.  Runs f0_predictor + SineGen2 excitation + STFT + decode.

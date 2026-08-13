@@ -14,6 +14,7 @@
 #include "tts-cpp/cosyvoice/engine.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -121,7 +122,7 @@ bool write_tokens(const std::string & path, const std::vector<int> & toks) {
 void usage(const char * a0) {
     fprintf(stderr,
         "usage: %s --model-dir DIR [--text TEXT]\n"
-        "          [--n-gpu-layers N] [--threads N] [--seed 42] [--greedy]\n"
+        "          [--n-gpu-layers N] [--vulkan-device N] [--threads N] [--seed 42] [--greedy]\n"
         "          [--runs 3] [--warmup 1]\n"
         "          [--tokens-out FILE]  pin: write the LM trajectory this run used\n"
         "          [--tokens-in FILE]   pin: reuse a trajectory (skips the LM)\n"
@@ -129,12 +130,23 @@ void usage(const char * a0) {
         "          [--wav-out FILE] [--json-out FILE]\n", a0);
 }
 
+// Whole-string parse for --vulkan-device: atoi would turn "abc" into
+// adapter 0 and "1abc" into adapter 1, defeating the option's
+// fail-loud contract. Accepts -1 (auto-pick) or a nonnegative index.
+bool parse_vulkan_device(const char * s, int & out) {
+    int v = 0;
+    const auto r = std::from_chars(s, s + std::strlen(s), v);
+    if (r.ec != std::errc() || r.ptr != s + std::strlen(s) || v < -1) return false;
+    out = v;
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
     std::string model_dir, text = "The quick brown fox jumps over the lazy dog.";
     std::string tokens_out, tokens_in, wav_out, json_out, backends_dir, opencl_cache_dir;
-    int seed = 42, n_gpu_layers = 0, n_threads = 0, runs = 3, warmup = 1;
+    int seed = 42, n_gpu_layers = 0, n_threads = 0, runs = 3, warmup = 1, vulkan_device = 0;
     bool greedy = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -142,6 +154,13 @@ int main(int argc, char ** argv) {
         if (a == "--model-dir" && i + 1 < argc) model_dir = argv[++i];
         else if (a == "--text" && i + 1 < argc) text = argv[++i];
         else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) n_gpu_layers = std::atoi(argv[++i]);
+        else if (a == "--vulkan-device" && i + 1 < argc) {
+            if (!parse_vulkan_device(argv[++i], vulkan_device)) {
+                fprintf(stderr, "cosyvoice-bench: --vulkan-device expects -1 or a nonnegative "
+                                "adapter index, got \"%s\"\n", argv[i]);
+                return 1;
+            }
+        }
         else if ((a == "--threads" || a == "-t") && i + 1 < argc) n_threads = std::atoi(argv[++i]);
         else if (a == "--seed" && i + 1 < argc) seed = std::atoi(argv[++i]);
         else if (a == "--runs" && i + 1 < argc) runs = std::atoi(argv[++i]);
@@ -162,6 +181,7 @@ int main(int argc, char ** argv) {
     opts.seed             = seed;
     opts.greedy           = greedy;
     opts.n_gpu_layers     = n_gpu_layers;
+    opts.vulkan_device    = vulkan_device;
     opts.n_threads        = n_threads;
     if (!backends_dir.empty())     opts.backends_dir     = backends_dir;
     if (!opencl_cache_dir.empty()) opts.opencl_cache_dir = opencl_cache_dir;
@@ -252,6 +272,7 @@ int main(int argc, char ** argv) {
             os << "  \"backend\": \"" << json_escape(engine.backend_name()) << "\",\n";
             os << "  \"gpu_declined\": " << (engine.gpu_unsupported() ? "true" : "false") << ",\n";
             os << "  \"n_gpu_layers\": " << n_gpu_layers << ",\n";
+            os << "  \"vulkan_device\": " << vulkan_device << ",\n";
             os << "  \"threads\": " << n_threads << ",\n";
             os << "  \"greedy\": " << (greedy ? "true" : "false") << ",\n";
             os << "  \"tokens_pinned\": " << (tokens_in.empty() ? "false" : "true") << ",\n";

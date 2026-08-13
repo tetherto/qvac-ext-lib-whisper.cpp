@@ -27,12 +27,16 @@
 #include <vector>
 
 // ---------- helpers ----------
+// Internal linkage: the tts-cpp lib this links defines other global
+// `model_ctx` layouts (cosyvoice_pipeline.h); see chatterbox_tts.cpp.
+namespace {
 struct model_ctx {
     ggml_backend_t backend = nullptr;
     ggml_context * ctx_w = nullptr;
     ggml_backend_buffer_t buffer_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
 };
+} // namespace
 
 static model_ctx load_s3gen_gguf(const std::string & path) {
     model_ctx m;

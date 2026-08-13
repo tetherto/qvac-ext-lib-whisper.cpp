@@ -384,6 +384,18 @@ static ggml_tensor * linear(ggml_context * c, ggml_tensor * w, ggml_tensor * b, 
     if (b) y = ggml_add(c, y, ggml_reshape_3d(c, b, b->ne[0], 1, 1));
     return y;
 }
+// f32-accumulating matmul for the LM graphs.  Backends may reduce precision
+// under GGML_PREC_DEFAULT: ggml-vulkan accumulates in f16 for f16/quantized
+// weights and on coopmat2 hardware rewrites even f32 x f32 into f16 operands.
+// Greedy speech-token decode turns a single near-tie argmax flip into a fully
+// divergent trajectory, and the cross-backend parity gate on the LM is exact
+// equality, so every LM reduction requests f32 explicitly.  A no-op on the
+// CPU, Metal, and OpenCL paths (they accumulate in f32 and ignore the flag).
+static ggml_tensor * mul_mat_f32acc(ggml_context * c, ggml_tensor * a, ggml_tensor * b) {
+    ggml_tensor * y = ggml_mul_mat(c, a, b);
+    ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+    return y;
+}
 static ggml_tensor * ln_noaffine(ggml_context * c, ggml_tensor * x) { return ggml_norm(c, x, 1e-6f); }
 static ggml_tensor * adaln_modulate(ggml_context * c, ggml_tensor * x_ln,
                                     ggml_tensor * scale, ggml_tensor * shift) {
@@ -403,7 +415,7 @@ static ggml_tensor * mish(ggml_context * c, ggml_tensor * x) {
 // Grouped conv1d over time. x: [Nlen, Cin, B] (ne0=time), weight [K, Cin/groups, Cout].
 //
 // Emitted per (group, batch) with a 2-D signal and the im2col matrix as operand
-// A -- the same operand order conv1d_f32 uses.  Both details are load-bearing on
+// A -- the same operand order cosyvoice_conv1d_f32 uses.  Both details are load-bearing on
 // GPU backends that fuse IM2COL into the GEMM: the fusion is refused when the
 // signal is batched or when the im2col is src[1].  Unfused, materialising that
 // matrix costs an order of magnitude more than the convolution's own arithmetic
@@ -437,8 +449,13 @@ static ggml_tensor * conv1d_grouped(ggml_context * c, ggml_tensor * w, ggml_tens
 
 // Plain conv1d over time: input [Nlen, Cin, B] (ne0=time), weight [K, Cin, Cout].
 // im2col FIRST, kernel SECOND (conv1d operand order matters here).
-static ggml_tensor * conv1d_f32(ggml_context * c, ggml_tensor * w, ggml_tensor * x,
+// Non-static: test-cosyvoice-conv1d pins the non-contiguous-input guard
+// (declared in cosyvoice_pipeline.h).
+ggml_tensor * cosyvoice_conv1d_f32(ggml_context * c, ggml_tensor * w, ggml_tensor * x,
                                 int stride, int padding, int dilation) {
+    // ggml-vulkan's IM2COL supports_op requires a contiguous signal; a view
+    // reaching it would demote the whole stage to the sched-fallback path.
+    if (!ggml_is_contiguous(x)) x = ggml_cont(c, x);
     ggml_tensor * im = ggml_im2col(c, w, x, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
     ggml_tensor * r = ggml_mul_mat(c,
         ggml_reshape_2d(c, im, im->ne[0], im->ne[2] * im->ne[1]),
@@ -461,9 +478,9 @@ ggml_tensor * build_qwen(ggml_context * c, const model_ctx & m, const qwen_hp & 
     const float scale = 1.0f / std::sqrt((float)HD);
     for (int i = 0; i < hp.depth; ++i) {
         ggml_tensor * h = rmsnorm(c, x, G(m, lb(i, "in_ln/weight")), hp.eps);
-        ggml_tensor * q = ggml_add(c, ggml_mul_mat(c, G(m, lb(i, "q_proj/weight")), h), G(m, lb(i, "q_proj/bias")));
-        ggml_tensor * k = ggml_add(c, ggml_mul_mat(c, G(m, lb(i, "k_proj/weight")), h), G(m, lb(i, "k_proj/bias")));
-        ggml_tensor * v = ggml_add(c, ggml_mul_mat(c, G(m, lb(i, "v_proj/weight")), h), G(m, lb(i, "v_proj/bias")));
+        ggml_tensor * q = ggml_add(c, mul_mat_f32acc(c, G(m, lb(i, "q_proj/weight")), h), G(m, lb(i, "q_proj/bias")));
+        ggml_tensor * k = ggml_add(c, mul_mat_f32acc(c, G(m, lb(i, "k_proj/weight")), h), G(m, lb(i, "k_proj/bias")));
+        ggml_tensor * v = ggml_add(c, mul_mat_f32acc(c, G(m, lb(i, "v_proj/weight")), h), G(m, lb(i, "v_proj/bias")));
         q = ggml_reshape_3d(c, q, HD, NH, L);
         k = ggml_reshape_3d(c, k, HD, NKV, L);
         v = ggml_reshape_3d(c, v, HD, NKV, L);
@@ -472,24 +489,24 @@ ggml_tensor * build_qwen(ggml_context * c, const model_ctx & m, const qwen_hp & 
         ggml_tensor * qh = ggml_reshape_4d(c, ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3)), HD, L, G_, NKV);
         ggml_tensor * kh = ggml_reshape_4d(c, ggml_cont(c, ggml_permute(c, k, 0, 2, 1, 3)), HD, L, 1, NKV);
         ggml_tensor * vh = ggml_reshape_4d(c, ggml_cont(c, ggml_permute(c, v, 0, 2, 1, 3)), HD, L, 1, NKV);
-        ggml_tensor * sc = ggml_mul_mat(c, kh, qh);
+        ggml_tensor * sc = mul_mat_f32acc(c, kh, qh);
         sc = ggml_soft_max_ext(c, sc, mask, scale, 0.0f);
         ggml_tensor * vt = ggml_cont(c, ggml_permute(c, vh, 1, 0, 2, 3));
-        ggml_tensor * o = ggml_mul_mat(c, vt, sc);
+        ggml_tensor * o = mul_mat_f32acc(c, vt, sc);
         o = ggml_cont(c, ggml_permute(c, o, 0, 3, 1, 2));
         o = ggml_reshape_3d(c, o, HD, NH, L);
         o = ggml_reshape_2d(c, o, static_cast<int64_t>(HD) * NH, L);
-        o = ggml_mul_mat(c, G(m, lb(i, "o_proj/weight")), o);
+        o = mul_mat_f32acc(c, G(m, lb(i, "o_proj/weight")), o);
         x = ggml_add(c, x, o);
         ggml_tensor * hn = rmsnorm(c, x, G(m, lb(i, "post_ln/weight")), hp.eps);
-        ggml_tensor * gate = ggml_silu(c, ggml_mul_mat(c, G(m, lb(i, "gate/weight")), hn));
-        ggml_tensor * up   = ggml_mul_mat(c, G(m, lb(i, "up/weight")), hn);
-        ggml_tensor * down = ggml_mul_mat(c, G(m, lb(i, "down/weight")), ggml_mul(c, gate, up));
+        ggml_tensor * gate = ggml_silu(c, mul_mat_f32acc(c, G(m, lb(i, "gate/weight")), hn));
+        ggml_tensor * up   = mul_mat_f32acc(c, G(m, lb(i, "up/weight")), hn);
+        ggml_tensor * down = mul_mat_f32acc(c, G(m, lb(i, "down/weight")), ggml_mul(c, gate, up));
         x = ggml_add(c, x, down);
     }
     x = rmsnorm(c, x, G(m, "lm/norm/weight"), hp.eps);
     ggml_set_name(x, "hidden"); ggml_set_output(x);
-    return ggml_mul_mat(c, G(m, "lm/llm_decoder/weight"), x);
+    return mul_mat_f32acc(c, G(m, "lm/llm_decoder/weight"), x);
 }
 
 // Per-layer KV cache holding POST-rope K / (unroped) V, resident in a backend
@@ -550,9 +567,9 @@ static std::vector<float> qwen_step_kv(model_ctx & m, const qwen_hp & hp,
     ggml_tensor * xx = x;
     for (int i = 0; i < hp.depth; ++i) {
         ggml_tensor * h = rmsnorm(c, xx, G(m, lb(i,"in_ln/weight")), hp.eps);
-        ggml_tensor * q = ggml_add(c, ggml_mul_mat(c, G(m,lb(i,"q_proj/weight")), h), G(m,lb(i,"q_proj/bias")));
-        ggml_tensor * k = ggml_add(c, ggml_mul_mat(c, G(m,lb(i,"k_proj/weight")), h), G(m,lb(i,"k_proj/bias")));
-        ggml_tensor * v = ggml_add(c, ggml_mul_mat(c, G(m,lb(i,"v_proj/weight")), h), G(m,lb(i,"v_proj/bias")));
+        ggml_tensor * q = ggml_add(c, mul_mat_f32acc(c, G(m,lb(i,"q_proj/weight")), h), G(m,lb(i,"q_proj/bias")));
+        ggml_tensor * k = ggml_add(c, mul_mat_f32acc(c, G(m,lb(i,"k_proj/weight")), h), G(m,lb(i,"k_proj/bias")));
+        ggml_tensor * v = ggml_add(c, mul_mat_f32acc(c, G(m,lb(i,"v_proj/weight")), h), G(m,lb(i,"v_proj/bias")));
         q = ggml_reshape_3d(c, q, HD, NH, Lq);
         k = ggml_reshape_3d(c, k, HD, NKV, Lq);
         v = ggml_reshape_3d(c, v, HD, NKV, Lq);
@@ -578,22 +595,22 @@ static std::vector<float> qwen_step_kv(model_ctx & m, const qwen_hp & hp,
         ggml_tensor * qh = ggml_reshape_4d(c, ggml_cont(c, ggml_permute(c, q, 0,2,1,3)), HD, Lq, G_, NKV);
         ggml_tensor * kh = ggml_reshape_4d(c, ggml_cont(c, ggml_permute(c, kc, 0,2,1,3)), HD, Lk, 1, NKV);
         ggml_tensor * vh = ggml_reshape_4d(c, ggml_cont(c, ggml_permute(c, vc, 0,2,1,3)), HD, Lk, 1, NKV);
-        ggml_tensor * sc = ggml_mul_mat(c, kh, qh);          // [Lk, Lq, G, NKV]
+        ggml_tensor * sc = mul_mat_f32acc(c, kh, qh);        // [Lk, Lq, G, NKV]
         sc = ggml_soft_max_ext(c, sc, mask, scale, 0.0f);
         ggml_tensor * vt = ggml_cont(c, ggml_permute(c, vh, 1,0,2,3)); // [Lk, HD, 1, NKV]
-        ggml_tensor * o = ggml_mul_mat(c, vt, sc);           // [HD, Lq, G, NKV]
+        ggml_tensor * o = mul_mat_f32acc(c, vt, sc);         // [HD, Lq, G, NKV]
         o = ggml_cont(c, ggml_permute(c, o, 0,3,1,2));       // [HD, G, NKV, Lq]
         o = ggml_reshape_2d(c, o, static_cast<int64_t>(HD) * NH, Lq);
-        o = ggml_mul_mat(c, G(m, lb(i,"o_proj/weight")), o);
+        o = mul_mat_f32acc(c, G(m, lb(i,"o_proj/weight")), o);
         xx = ggml_add(c, xx, o);
         ggml_tensor * hn = rmsnorm(c, xx, G(m, lb(i,"post_ln/weight")), hp.eps);
-        ggml_tensor * gate = ggml_silu(c, ggml_mul_mat(c, G(m,lb(i,"gate/weight")), hn));
-        ggml_tensor * up   = ggml_mul_mat(c, G(m,lb(i,"up/weight")), hn);
-        ggml_tensor * down = ggml_mul_mat(c, G(m,lb(i,"down/weight")), ggml_mul(c, gate, up));
+        ggml_tensor * gate = ggml_silu(c, mul_mat_f32acc(c, G(m,lb(i,"gate/weight")), hn));
+        ggml_tensor * up   = mul_mat_f32acc(c, G(m,lb(i,"up/weight")), hn);
+        ggml_tensor * down = mul_mat_f32acc(c, G(m,lb(i,"down/weight")), ggml_mul(c, gate, up));
         xx = ggml_add(c, xx, down);
     }
     xx = rmsnorm(c, xx, G(m, "lm/norm/weight"), hp.eps);
-    ggml_tensor * logits = ggml_mul_mat(c, G(m, "lm/llm_decoder/weight"), xx); // [VS, Lq]
+    ggml_tensor * logits = mul_mat_f32acc(c, G(m, "lm/llm_decoder/weight"), xx); // [VS, Lq]
     ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
     for (int i = 0; i < hp.depth; ++i) { ggml_build_forward_expand(gf, cpy_k[i]); ggml_build_forward_expand(gf, cpy_v[i]); }
@@ -853,11 +870,11 @@ static void build_flow_frontend(model_ctx & m, const std::vector<int32_t> & toki
     ggml_tensor * x = ggml_cont(c, ggml_permute(c, e, 1, 0, 2, 3));
     ggml_tensor * res = x;
     ggml_tensor * xp = ggml_pad_ext(c, x, 0, 3, 0, 0, 0, 0, 0, 0);
-    ggml_tensor * h = conv1d_f32(c, T(m, "flow/pre_lookahead_layer/conv1/weight"), xp, 1, 0, 1);
+    ggml_tensor * h = cosyvoice_conv1d_f32(c, T(m, "flow/pre_lookahead_layer/conv1/weight"), xp, 1, 0, 1);
     h = ggml_add(c, h, ggml_reshape_2d(c, T(m, "flow/pre_lookahead_layer/conv1/bias"), 1, 1024));
     h = ggml_leaky_relu(c, h, 0.01f, false);
     ggml_tensor * hpad = ggml_pad_ext(c, h, 2, 0, 0, 0, 0, 0, 0, 0);
-    h = conv1d_f32(c, T(m, "flow/pre_lookahead_layer/conv2/weight"), hpad, 1, 0, 1);
+    h = cosyvoice_conv1d_f32(c, T(m, "flow/pre_lookahead_layer/conv2/weight"), hpad, 1, 0, 1);
     h = ggml_add(c, h, ggml_reshape_2d(c, T(m, "flow/pre_lookahead_layer/conv2/bias"), 1, MEL));
     h = ggml_add(c, h, res);
     ggml_tensor * h3 = ggml_reshape_3d(c, h, 1, T_tok, MEL);
@@ -1195,7 +1212,7 @@ std::vector<float> cosyvoice_hift_f0(model_ctx & m, const std::vector<float> & m
         int pl = (i == 0) ? 0 : (K - 1);
         int pr = (i == 0) ? (K - 1) : 0;
         ggml_tensor * xp = ggml_pad_ext(ctx, x, pl, pr, 0, 0, 0, 0, 0, 0);
-        x = conv1d_f32(ctx, w, xp, 1, 0, 1);
+        x = cosyvoice_conv1d_f32(ctx, w, xp, 1, 0, 1);
         x = ggml_add(ctx, x, ggml_reshape_2d(ctx, b, 1, C_out));
         x = ggml_unary(ctx, x, GGML_UNARY_OP_ELU);
     }
@@ -1283,11 +1300,11 @@ static std::vector<float> run_hift_decode(model_ctx & m,
             int pad2 = (k_sz - 1);
             ggml_tensor * xt = snake(ctx, x, p.a1, p.ia1);
             xt = ggml_pad_ext(ctx, xt, pad1, 0, 0, 0, 0, 0, 0, 0);
-            xt = conv1d_f32(ctx, p.c1w, xt, 1, 0, dilation);
+            xt = cosyvoice_conv1d_f32(ctx, p.c1w, xt, 1, 0, dilation);
             xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, p.c1b, 1, C));
             xt = snake(ctx, xt, p.a2, p.ia2);
             xt = ggml_pad_ext(ctx, xt, pad2, 0, 0, 0, 0, 0, 0, 0);
-            xt = conv1d_f32(ctx, p.c2w, xt, 1, 0, 1);
+            xt = cosyvoice_conv1d_f32(ctx, p.c2w, xt, 1, 0, 1);
             xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, p.c2b, 1, C));
             x = ggml_add(ctx, x, xt);
         }
@@ -1297,7 +1314,7 @@ static std::vector<float> run_hift_decode(model_ctx & m,
     ggml_tensor * cpw = T(m, "hift/conv_pre/weight");
     ggml_tensor * cpb = T(m, "hift/conv_pre/bias");
     ggml_tensor * x = ggml_pad_ext(ctx, mel_in, 0, 4, 0, 0, 0, 0, 0, 0);
-    x = conv1d_f32(ctx, cpw, x, 1, 0, 1);
+    x = cosyvoice_conv1d_f32(ctx, cpw, x, 1, 0, 1);
     x = ggml_add(ctx, x, ggml_reshape_2d(ctx, cpb, 1, BASE_CH));
 
     for (int i = 0; i < 3; ++i) {
@@ -1307,7 +1324,7 @@ static std::vector<float> run_hift_decode(model_ctx & m,
         int64_t T_up = x->ne[0] * ups_rates[i];
         x = ggml_interpolate(ctx, x, T_up, x->ne[1], x->ne[2], x->ne[3], GGML_SCALE_MODE_NEAREST);
         x = ggml_pad_ext(ctx, x, ups_ksizes[i] - 1, 0, 0, 0, 0, 0, 0, 0);
-        x = conv1d_f32(ctx, uw, x, 1, 0, 1);
+        x = cosyvoice_conv1d_f32(ctx, uw, x, 1, 0, 1);
         x = ggml_add(ctx, x, ggml_reshape_2d(ctx, ub, 1, ups_ch[i]));
         // CausalHiFTGenerator.decode: ReflectionPad1d((1,0)) at the LAST upsample,
         // AFTER the upsample conv and BEFORE the source fusion.  Omitting this
@@ -1323,7 +1340,7 @@ static std::vector<float> run_hift_decode(model_ctx & m,
         int sd_pad    = sd_stride - 1;
         int sd_oc     = (int)sw->ne[2];
         ggml_tensor * sin_pad = ggml_pad_ext(ctx, s_stft_in, sd_pad, 0, 0, 0, 0, 0, 0, 0);
-        ggml_tensor * si = conv1d_f32(ctx, sw, sin_pad, sd_stride, 0, 1);
+        ggml_tensor * si = cosyvoice_conv1d_f32(ctx, sw, sin_pad, sd_stride, 0, 1);
         si = ggml_add(ctx, si, ggml_reshape_2d(ctx, sb, 1, sd_oc));
         auto srb = load_rb("hift/source_resblocks/" + std::to_string(i), ups_ch[i]);
         si = rb_forward(srb, si, ups_ch[i], src_rb_dilations[i], src_rb_ksizes[i]);
@@ -1344,7 +1361,7 @@ static std::vector<float> run_hift_decode(model_ctx & m,
     ggml_tensor * cp2w = T(m, "hift/conv_post/weight");
     ggml_tensor * cp2b = T(m, "hift/conv_post/bias");
     x = ggml_pad_ext(ctx, x, 6, 0, 0, 0, 0, 0, 0, 0);
-    x = conv1d_f32(ctx, cp2w, x, 1, 0, 1);
+    x = cosyvoice_conv1d_f32(ctx, cp2w, x, 1, 0, 1);
     x = ggml_add(ctx, x, ggml_reshape_2d(ctx, cp2b, 1, NFFT2));
 
     int T_out = (int)x->ne[0];
@@ -1418,7 +1435,7 @@ static std::vector<float> run_stft(model_ctx & m, const std::vector<float> & src
     ggml_tensor * s_padded = reflect_pad_1d(ctx, s, n_fft / 2, n_fft / 2);
     ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_fft, 1, 2 * F);
     ggml_set_name(k, "k"); ggml_set_input(k);
-    ggml_tensor * spec = conv1d_f32(ctx, k, s_padded, hop, 0, 1);
+    ggml_tensor * spec = cosyvoice_conv1d_f32(ctx, k, s_padded, hop, 0, 1);
     ggml_set_name(spec, "spec"); ggml_set_output(spec);
     ggml_build_forward_expand(gf, spec);
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));

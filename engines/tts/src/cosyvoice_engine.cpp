@@ -167,15 +167,15 @@ struct Engine::Impl {
         if (!opts.opencl_cache_dir.empty()) det::set_opencl_cache_dir(opts.opencl_cache_dir);
 
         // Selection is constrained to the backends the CosyVoice3 graphs are
-        // parity-gated against (test-cosyvoice-{flow,llm,hift}-gpu):
-        // OpenCL/Adreno since QVAC-22777, Metal since QVAC-22775.  The
+        // parity-gated against (test-cosyvoice-{flow,llm,hift}-gpu): OpenCL
+        // on Adreno, Metal on Apple, and Vulkan on desktop hosts.  The
         // requirement filters at the device walk, so on a multi-backend host
-        // a Vulkan device cannot shadow an available Metal one; Vulkan stays
-        // out until a per-stage reference run and a CI device exist for it.
+        // an off-policy device cannot shadow an admitted one; the per-platform
+        // split (Android keeps Vulkan out) lives in cosyvoice_gpu_requirement().
         backend = det::init_gpu_backend(opts.n_gpu_layers, /*verbose=*/false, "cosyvoice",
-                                        /*vulkan_device=*/0, /*allow_arm_mali=*/false,
+                                        opts.vulkan_device, /*allow_arm_mali=*/false,
                                         &gpu_present_but_unused,
-                                        det::GpuBackendRequirement::MetalOrOpenCL);
+                                        cosyvoice_gpu_requirement());
         if (!backend) backend = det::init_cpu_backend();
         if (!backend) throw std::runtime_error("cosyvoice: failed to init a compute backend");
 
