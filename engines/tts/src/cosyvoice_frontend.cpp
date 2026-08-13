@@ -9,9 +9,37 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 namespace {
+
+bool all_samples_finite(const std::vector<float> & wav) {
+    for (const float s : wav) {
+        if (!std::isfinite(s)) return false;
+    }
+    return true;
+}
+
+// Per-utterance column-mean subtraction over the (T, 80) fbank, matching the
+// upstream extract_feature() normalisation CAM++ expects.
+void mean_center_fbank(std::vector<float> & fbank, int T) {
+    std::vector<float> col_mean(80, 0.0f);
+    for (int t = 0; t < T; ++t)
+        for (int c = 0; c < 80; ++c) col_mean[c] += fbank[(size_t)t * 80 + c];
+    for (int c = 0; c < 80; ++c) col_mean[c] /= (float)T;
+    for (int t = 0; t < T; ++t)
+        for (int c = 0; c < 80; ++c) fbank[(size_t)t * 80 + c] -= col_mean[c];
+}
+
+// CAM++ runs on the scalar CPU reference path regardless of the engine
+// backend: the ggml-graph variant produces an antipodal embedding on real
+// voice input, and the bake runs once per voice, so correctness wins.
+bool campplus_embed_forced_scalar(const std::vector<float> & fbank, int T,
+                                  const campplus_weights & w,
+                                  std::vector<float> & out_emb) {
+    return campplus_embed(fbank, T, w, /*backend=*/nullptr, out_emb);
+}
 
 // Pull one host-resident F32 tensor out of a GGUF via the streamed reader
 // (no full-file staging; the caller only needs the small filterbanks).
@@ -58,6 +86,12 @@ bool cosyvoice_frontend_run(const std::string & reference_wav,
     int sr = 0;
     if (!wav_load(reference_wav, wav, sr) || wav.empty() || sr <= 0) {
         err = "cannot load reference audio " + reference_wav;
+        return false;
+    }
+    if (!all_samples_finite(wav)) {
+        // Float WAVs can legally carry NaN/inf payloads; they would propagate
+        // through every downstream tensor and bake unusable conditioning.
+        err = "reference audio contains non-finite samples: " + reference_wav;
         return false;
     }
     const double dur = (double)wav.size() / (double)sr;
@@ -119,18 +153,8 @@ bool cosyvoice_frontend_run(const std::string & reference_wav,
         return false;
     }
     const int T_fb = (int)(fbank.size() / 80);
-    std::vector<float> col_mean(80, 0.0f);
-    for (int t = 0; t < T_fb; ++t)
-        for (int c = 0; c < 80; ++c) col_mean[c] += fbank[(size_t)t * 80 + c];
-    for (int c = 0; c < 80; ++c) col_mean[c] /= (float)T_fb;
-    for (int t = 0; t < T_fb; ++t)
-        for (int c = 0; c < 80; ++c) fbank[(size_t)t * 80 + c] -= col_mean[c];
-
-    // Scalar CPU path on purpose: the ggml-graph CAM++ variant produces an
-    // antipodal embedding vs the scalar/Python reference on real voice input
-    // (cos ~ -0.19 instead of ~1.0).  CAM++ runs once per voice bake
-    // (~500 ms), so correctness wins over the graph speed-up here.
-    if (!campplus_embed(fbank, T_fb, cam_w, /*backend=*/nullptr, out.embedding)) {
+    mean_center_fbank(fbank, T_fb);
+    if (!campplus_embed_forced_scalar(fbank, T_fb, cam_w, out.embedding)) {
         err = "CAM++ embedding failed on " + reference_wav;
         return false;
     }

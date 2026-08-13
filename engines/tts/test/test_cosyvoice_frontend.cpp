@@ -31,10 +31,10 @@
 //
 // Guards mode (no fixtures, always-on unit test):
 //   ./build/test-cosyvoice-frontend --guards-only
-// Exercises the fail-closed paths: sub-0.5 s and over-30 s references and a
-// missing tokenizer GGUF must all return errors, and a valid duration with a
-// bogus GGUF path must fail with the tokenizer error (proving the duration
-// gate runs first).
+// Exercises the fail-closed paths: sub-0.5 s and over-30 s references, a
+// NaN-bearing float WAV, and a missing wav must all return their specific
+// errors, and a valid input with a bogus GGUF path must fail with the
+// tokenizer error (proving the audio gates run first).
 //
 // COSYVOICE_TEST_GPU=1 runs the tokenizer encoder on the engine-selected GPU.
 
@@ -47,6 +47,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -67,8 +68,11 @@ bool all_finite(const std::vector<float> & v) {
     return true;
 }
 
-// Minimal float32 WAV writer for the synthetic guard inputs.
-bool write_wav_f32(const std::string & path, int sr, double seconds) {
+// Minimal float32 WAV writer for the synthetic guard inputs.  With
+// inject_nan set, one sample in the middle carries a NaN payload — legal in
+// IEEE-float WAV and exactly what the front-end must reject.
+bool write_wav_f32(const std::string & path, int sr, double seconds,
+                   bool inject_nan = false) {
     const uint32_t n = (uint32_t)(sr * seconds);
     const uint32_t data_bytes = n * 4;
     FILE * f = fopen(path.c_str(), "wb");
@@ -80,7 +84,8 @@ bool write_wav_f32(const std::string & path, int sr, double seconds) {
     u32((uint32_t)sr); u32((uint32_t)sr * 4); u16(4); u16(32);
     fwrite("data", 1, 4, f); u32(data_bytes);
     for (uint32_t i = 0; i < n; ++i) {
-        const float v = 0.1f * std::sin(2.0 * 3.14159265358979 * 220.0 * i / sr);
+        float v = 0.1f * std::sin(2.0 * 3.14159265358979 * 220.0 * i / sr);
+        if (inject_nan && i == n / 2) v = std::numeric_limits<float>::quiet_NaN();
         fwrite(&v, 4, 1, f);
     }
     fclose(f);
@@ -92,9 +97,11 @@ int run_guards() {
     const std::string wav_short = dir + "/cosyvoice-frontend-guard-short.wav";
     const std::string wav_long  = dir + "/cosyvoice-frontend-guard-long.wav";
     const std::string wav_ok    = dir + "/cosyvoice-frontend-guard-ok.wav";
+    const std::string wav_nan   = dir + "/cosyvoice-frontend-guard-nan.wav";
     if (!write_wav_f32(wav_short, 16000, 0.3) ||
         !write_wav_f32(wav_long, 16000, 31.0) ||
-        !write_wav_f32(wav_ok, 16000, 1.0)) {
+        !write_wav_f32(wav_ok, 16000, 1.0) ||
+        !write_wav_f32(wav_nan, 16000, 1.0, /*inject_nan=*/true)) {
         fprintf(stderr, "FAIL: cannot write synthetic wavs\n");
         return 1;
     }
@@ -124,6 +131,13 @@ int run_guards() {
         rc = 1;
     }
     err.clear();
+    if (cosyvoice_frontend_run(wav_nan, "missing.gguf", "missing.gguf",
+                               nullptr, 0, out, err) ||
+        err.find("non-finite") == std::string::npos) {
+        fprintf(stderr, "FAIL: NaN-bearing reference accepted (err='%s')\n", err.c_str());
+        rc = 1;
+    }
+    err.clear();
     if (cosyvoice_frontend_run(dir + "/no-such-file.wav", "missing.gguf",
                                "missing.gguf", nullptr, 0, out, err) ||
         err.find("cannot load reference audio") == std::string::npos) {
@@ -134,6 +148,7 @@ int run_guards() {
     std::remove(wav_short.c_str());
     std::remove(wav_long.c_str());
     std::remove(wav_ok.c_str());
+    std::remove(wav_nan.c_str());
     if (rc == 0) fprintf(stderr, "PASS (guards)\n");
     return rc;
 }

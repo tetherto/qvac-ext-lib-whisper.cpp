@@ -876,6 +876,57 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-mel-thread-safety)
     tts_cpp_register_test(test-mel-thread-safety LABEL "unit")
 
+    # Branch coverage for assemble-cosyvoice3-model.py (add-on name
+    # validation, inputs already at their destination, copy + symlink modes).
+    # Registered only when a Python interpreter is available.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME test-assemble-cosyvoice3-model
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_assemble_cosyvoice3_model.py")
+        set_property(TEST test-assemble-cosyvoice3-model PROPERTY LABELS "unit")
+    endif()
+
+    # CLI-level coverage for the cloning flags: the engine harnesses bypass
+    # argument parsing, so a mapping regression would not fail them.  The
+    # synthesis legs are fixture-gated like the other cosyvoice tests and pin
+    # the engine's mode log; FAIL_REGULAR_EXPRESSION keeps a failed synthesis
+    # from passing on the log line alone.  The missing-value leg is
+    # always-on: PASS_REGEX requires the usage text.
+    if (TARGET cosyvoice-cli)
+        tts_cpp_register_test(test-cosyvoice-cli-clone-zero-shot
+            EXE        cosyvoice-cli
+            LABEL      "fixture"
+            PASS_REGEX "zero-shot mode"
+            ARGS       "--model-dir" "${TTS_CPP_TEST_MODEL_DIR}"
+                       "--reference-audio" "${_tcb_cosy_prompt_wav}"
+                       "--prompt-text" "reference transcript" "--text" "Hi." "--greedy"
+                       "--out" "cosyvoice-cli-clone-zs.wav"
+            REQUIRES   "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-f32.gguf"
+                       "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                       "${_tcb_cosy_prompt_wav}")
+        set_property(TEST test-cosyvoice-cli-clone-zero-shot PROPERTY
+            FAIL_REGULAR_EXPRESSION "cosyvoice-cli: error")
+        tts_cpp_register_test(test-cosyvoice-cli-clone-cross-lingual
+            EXE        cosyvoice-cli
+            LABEL      "fixture"
+            PASS_REGEX "cross-lingual mode"
+            ARGS       "--model-dir" "${TTS_CPP_TEST_MODEL_DIR}"
+                       "--reference-audio" "${_tcb_cosy_prompt_wav}"
+                       "--text" "Hi." "--greedy"
+                       "--out" "cosyvoice-cli-clone-xl.wav"
+            REQUIRES   "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-f32.gguf"
+                       "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                       "${_tcb_cosy_prompt_wav}")
+        set_property(TEST test-cosyvoice-cli-clone-cross-lingual PROPERTY
+            FAIL_REGULAR_EXPRESSION "cosyvoice-cli: error")
+        tts_cpp_register_test(test-cosyvoice-cli-clone-missing-value
+            EXE        cosyvoice-cli
+            LABEL      "unit"
+            PASS_REGEX "usage:"
+            ARGS       "--reference-audio")
+    endif()
+
     # ---- CosyVoice3 engine-level cloning ---------------------------------
     # Full-engine legs with the LM trajectory pinned: cloned-vs-baked
     # waveform equivalence (voice.gguf was enrolled from the same wav),
