@@ -195,12 +195,14 @@ static std::vector<float> mel_graph_run(
     ggml_backend_tensor_set(t_neg_sin, neg_sin_basis.data(), 0, neg_sin_basis.size() * sizeof(float));
     ggml_backend_tensor_set(t_mel_fb,  mel_fb.data(),        0, mel_fb.size()        * sizeof(float));
 
-    // Build graph
+    // Build graph.  The metadata arena is call-local on purpose: engines bake
+    // voice conditioning concurrently (one construction per thread), and a
+    // shared static here corrupts graph metadata under that load.  It is a
+    // few tens of KB, so per-call allocation is noise next to the matmuls.
     const int max_nodes = 32;
     const size_t buf_size = ggml_tensor_overhead() * max_nodes +
                             ggml_graph_overhead_custom(max_nodes, false);
-    static std::vector<uint8_t> buf;
-    buf.resize(buf_size);
+    std::vector<uint8_t> buf(buf_size);
     ggml_init_params gp = { buf_size, buf.data(), /*no_alloc=*/ true };
     ggml_context * gctx = ggml_init(gp);
     ggml_cgraph * gf = ggml_new_graph_custom(gctx, max_nodes, false);

@@ -860,6 +860,22 @@ if (TTS_CPP_BUILD_TESTS)
         set_property(TEST test-cosyvoice-frontend-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
     endif()
 
+    # Thread-safety guard for the shared mel/fbank extraction (concurrent
+    # engine constructions bake voice conditioning in parallel).  Synthetic
+    # inputs; no fixtures.
+    add_executable(test-mel-thread-safety
+        test/test_mel_thread_safety.cpp
+        src/voice_features.cpp
+        src/mel_extract_stft.cpp
+        src/backend_selection.cpp)
+    target_link_libraries(test-mel-thread-safety PRIVATE ggml)
+    target_include_directories(test-mel-thread-safety PRIVATE ggml/include src)
+    if (OpenMP_CXX_FOUND)
+        target_link_libraries(test-mel-thread-safety PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    tts_cpp_apply_ccache(test-mel-thread-safety)
+    tts_cpp_register_test(test-mel-thread-safety LABEL "unit")
+
     # ---- CosyVoice3 engine-level cloning ---------------------------------
     # Full-engine legs with the LM trajectory pinned: cloned-vs-baked
     # waveform equivalence (voice.gguf was enrolled from the same wav),

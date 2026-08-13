@@ -60,6 +60,13 @@ bool parse_bounded_arg(const char * s, double lo, double hi, double & out) {
     return true;
 }
 
+bool all_finite(const std::vector<float> & v) {
+    for (const float x : v) {
+        if (!std::isfinite(x)) return false;
+    }
+    return true;
+}
+
 // Minimal float32 WAV writer for the synthetic guard inputs.
 bool write_wav_f32(const std::string & path, int sr, double seconds) {
     const uint32_t n = (uint32_t)(sr * seconds);
@@ -198,6 +205,13 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "      tokens=%zu mel_len1=%d emb=%zu\n",
             got.prompt_stok.size(), got.mel_len1, got.embedding.size());
+    // Max-abs loops skip NaN (fabs(NaN) > max is false) and a NaN cosine is
+    // not below any bound, so non-finite outputs would pass every threshold
+    // below; reject them up front.
+    if (!all_finite(got.prompt_feat) || !all_finite(got.embedding)) {
+        fprintf(stderr, "FAIL: non-finite values in prompt_feat/embedding\n");
+        return 1;
+    }
     if (got.mel_len1 != 2 * (int)got.prompt_stok.size()) {
         fprintf(stderr, "FAIL: mel_len1 %d != 2 * n_tokens %zu\n",
                 got.mel_len1, got.prompt_stok.size());
@@ -265,6 +279,7 @@ int main(int argc, char ** argv) {
     const double cosine = dot / (std::sqrt(na) * std::sqrt(nb) + 1e-12);
     fprintf(stderr, "      embedding: cosine=%.6f (bound %.4f) max_abs=%.4e (bound %.4e)\n",
             cosine, min_emb_cosine, emb_ma, max_emb_abs);
+    if (!std::isfinite(cosine)) { fprintf(stderr, "FAIL: non-finite embedding cosine\n"); return 1; }
     if (cosine < min_emb_cosine) { fprintf(stderr, "FAIL: embedding cosine below bound\n"); return 1; }
     if (emb_ma > max_emb_abs) { fprintf(stderr, "FAIL: embedding max_abs above bound\n"); return 1; }
 

@@ -45,6 +45,20 @@
 //     utterances.  The decode loop hard-masks EOS below min_len, so the
 //     token-count floor asserts the basis directly.
 //
+//  E. Prefill composition, unforced.  Legs A-C pin the LM trajectory, so a
+//     regression that silently drops the transcript or the reference speech
+//     tokens from the LM prefill would not fail them.  Two checks: the
+//     zero-shot and cross-lingual greedy trajectories for the same text must
+//     differ (the reference prompt block demonstrably conditions the LM),
+//     and the prefill composition reported in StageTimings must track the
+//     mode — prompt speech tokens present in zero-shot and absent in
+//     cross-lingual, text-id count growing with the transcript.  Trajectory
+//     INEQUALITY across different transcripts is deliberately not asserted:
+//     greedy argmax after a strong same-reference speech prompt is robust to
+//     distant-context logit shifts, and empirically two transcripts can
+//     yield identical argmax sequences while both being present in the
+//     prefill.
+//
 // --prompt-text defaults to the zero_shot_prompt.wav transcript baked into
 // voice.gguf (the canonical fixture pair).
 
@@ -89,6 +103,13 @@ bool write_wav_f32(const std::string & path, int sr, double seconds) {
         fwrite(&v, 4, 1, f);
     }
     fclose(f);
+    return true;
+}
+
+bool all_finite(const std::vector<float> & v) {
+    for (const float x : v) {
+        if (!std::isfinite(x)) return false;
+    }
     return true;
 }
 
@@ -240,6 +261,12 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "FAIL: empty synthesis output\n");
         return 1;
     }
+    // NaN comparisons are false, so a NaN-filled output would sail through
+    // every threshold below; reject it up front.
+    if (!all_finite(pcm_baked) || !all_finite(pcm_cloned)) {
+        fprintf(stderr, "FAIL: non-finite samples in synthesis output\n");
+        return 1;
+    }
     if (pcm_baked.size() != pcm_cloned.size()) {
         fprintf(stderr, "FAIL: cloned length %zu != baked %zu (prompt-token count "
                         "must match for the same reference clip)\n",
@@ -283,6 +310,10 @@ int main(int argc, char ** argv) {
                     "output speaker cosine = %.6f (baseline: baked split-half %.6f - margin %.2f), "
                     "%zu samples\n",
             mel_cos, min_mel_cosine, spk_cos, self_cos, spk_margin, pcm_baked.size());
+    if (!std::isfinite(mel_cos) || !std::isfinite(spk_cos) || !std::isfinite(self_cos)) {
+        fprintf(stderr, "FAIL: non-finite comparison metric\n");
+        return 1;
+    }
     if (mel_cos < min_mel_cosine || spk_cos < self_cos - spk_margin) {
         fprintf(stderr, "FAIL: cloned output diverges from the baked voice it was "
                         "enrolled from\n");
@@ -300,6 +331,10 @@ int main(int argc, char ** argv) {
     if (pcm_xl.size() != pcm_cloned.size()) {
         fprintf(stderr, "FAIL: cross-lingual length %zu != zero-shot %zu\n",
                 pcm_xl.size(), pcm_cloned.size());
+        return 1;
+    }
+    if (!all_finite(pcm_xl)) {
+        fprintf(stderr, "FAIL: non-finite samples in cross-lingual output\n");
         return 1;
     }
     double xl_ma = 0.0;
@@ -350,6 +385,8 @@ int main(int argc, char ** argv) {
     }
 
     fprintf(stderr, "[D] cross-lingual LM path (unforced greedy decode, short text)\n");
+    std::vector<int> xl_tokens;
+    StageTimings xl_timings;
     {
         EngineOptions o = base_opts();
         o.force_speech_tokens.clear();
@@ -366,6 +403,46 @@ int main(int argc, char ** argv) {
         if (res.speech_tokens.size() < 14 || res.pcm.empty()) {
             fprintf(stderr, "FAIL: cross-lingual min-length basis does not cover "
                             "the template tokens\n");
+            return 1;
+        }
+        xl_tokens = res.speech_tokens;
+        xl_timings = res.timings;
+    }
+
+    fprintf(stderr, "[E] prefill composition (unforced greedy zero-shot)\n");
+    {
+        auto greedy_zero_shot = [&](const std::string & transcript) {
+            EngineOptions o = base_opts();
+            o.force_speech_tokens.clear();
+            o.greedy = true;
+            o.reference_audio = wav;
+            o.prompt_text = transcript;
+            Engine eng(o);
+            return eng.synthesize("Hi.");
+        };
+        const SynthesisResult zs = greedy_zero_shot(prompt_text);
+        const SynthesisResult zs_long = greedy_zero_shot(
+            prompt_text + " And several additional words to lengthen the transcript.");
+        fprintf(stderr, "      prefill: zs text_ids=%d prompt_stok=%d, "
+                        "zs_long text_ids=%d, xl text_ids=%d prompt_stok=%d\n",
+                zs.timings.n_text_ids, zs.timings.n_prompt_speech_tokens,
+                zs_long.timings.n_text_ids,
+                xl_timings.n_text_ids, xl_timings.n_prompt_speech_tokens);
+        if (zs.speech_tokens == xl_tokens) {
+            fprintf(stderr, "FAIL: zero-shot and cross-lingual decode identically - "
+                            "the reference prompt block is not conditioning the LM\n");
+            return 1;
+        }
+        if (zs.timings.n_prompt_speech_tokens <= 0 ||
+            xl_timings.n_prompt_speech_tokens != 0) {
+            fprintf(stderr, "FAIL: prompt speech tokens must be present in zero-shot "
+                            "and absent in cross-lingual\n");
+            return 1;
+        }
+        if (zs.timings.n_text_ids <= xl_timings.n_text_ids ||
+            zs_long.timings.n_text_ids <= zs.timings.n_text_ids) {
+            fprintf(stderr, "FAIL: text-id count does not grow with the transcript - "
+                            "the transcript is not entering the LM prefill\n");
             return 1;
         }
     }

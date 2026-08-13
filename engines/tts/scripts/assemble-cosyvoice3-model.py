@@ -80,6 +80,12 @@ def main():
         if not os.path.isfile(src):
             raise SystemExit(f"missing input: {src}")
         dst = os.path.join(args.out, name)
+        # An input already living in --out under its final name would be
+        # deleted by the replace below (or turned into a self-referencing
+        # symlink); leave it untouched instead.
+        if os.path.exists(dst) and os.path.samefile(src, dst):
+            print(f"keep  {name:28s} (already in place)")
+            continue
         if os.path.lexists(dst):
             os.remove(dst)
         if args.symlink:

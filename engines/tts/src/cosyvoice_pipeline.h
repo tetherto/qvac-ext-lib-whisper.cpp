@@ -164,6 +164,12 @@ struct cosyvoice_timings {
     int n_speech_tokens = 0;   // tokens the LM emitted
     int tm              = 0;   // flow frames in  (prompt + generated)
     int mel_len         = 0;   // mel frames out  (after the prompt trim)
+
+    // LM prefill composition (filled by the engine even when a pinned
+    // trajectory skips the LM): template + transcript + text ids, and the
+    // reference/baked prompt speech tokens the LM continues from.
+    int n_text_ids             = 0;
+    int n_prompt_speech_tokens = 0;
 };
 
 // ---- high-level engine stages (in-memory, no file I/O) --------------------

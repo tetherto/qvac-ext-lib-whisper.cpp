@@ -252,6 +252,15 @@ struct StageTimings {
     int n_speech_tokens = 0;
     int tm              = 0;   // flow frames in (prompt + generated)
     int mel_len         = 0;   // mel frames out (after the prompt trim)
+
+    // Composition of the LM prefill this call constructed (also filled when a
+    // pinned trajectory skips the LM): text ids = template + transcript +
+    // synthesis text; prompt speech tokens = the reference/baked tokens the
+    // LM continues from (0 in instruct and cross-lingual modes).  Lets
+    // callers and tests verify the prompt actually carries what the mode
+    // promises without re-deriving tokenization.
+    int n_text_ids            = 0;
+    int n_prompt_speech_tokens = 0;
 };
 
 struct SynthesisResult {

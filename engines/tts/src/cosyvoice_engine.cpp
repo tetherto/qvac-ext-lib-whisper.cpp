@@ -327,6 +327,11 @@ struct Engine::Impl {
         const int max_steps = 50 * (lm_basis + 1); // generous cap
         const bool greedy   = opts.greedy;
 
+        if (tmg) {
+            tmg->n_text_ids             = (int) text_ids.size();
+            tmg->n_prompt_speech_tokens = (int) lm_prompt_stok.size();
+        }
+
         // Stage 1 — LM: text ids -> speech tokens (freed at scope end). A pinned
         // trajectory skips the LM entirely -- sampling is chaotic in the logits,
         // so pinning is the only way two backends run the flow and vocoder over
@@ -426,6 +431,8 @@ SynthesisResult Engine::synthesize(const std::string & text,
     result.timings.n_speech_tokens  = tmg.n_speech_tokens;
     result.timings.tm               = tmg.tm;
     result.timings.mel_len          = tmg.mel_len;
+    result.timings.n_text_ids       = tmg.n_text_ids;
+    result.timings.n_prompt_speech_tokens = tmg.n_prompt_speech_tokens;
 
     const bool streaming = pimpl_->opts.stream_chunk_tokens > 0 && static_cast<bool>(on_chunk);
     if (!streaming) {
