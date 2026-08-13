@@ -126,8 +126,13 @@ void usage(const char * a0) {
         "          [--runs 3] [--warmup 1]\n"
         "          [--tokens-out FILE]  pin: write the LM trajectory this run used\n"
         "          [--tokens-in FILE]   pin: reuse a trajectory (skips the LM)\n"
+        "          [--reference-audio REF.wav [--prompt-text \"transcript\"]]  voice cloning\n"
+        "          [--s3tok-gguf FILE] [--campplus-gguf FILE]\n"
         "          [--backends-dir DIR] [--opencl-cache-dir DIR]\n"
-        "          [--wav-out FILE] [--json-out FILE]\n", a0);
+        "          [--wav-out FILE] [--json-out FILE]\n"
+        "\n"
+        "With --reference-audio, load: includes the one-time cloning bake (tokenizer +\n"
+        "CAM++ + prompt mel); it is not part of the per-synthesis numbers.\n", a0);
 }
 
 // Whole-string parse for --vulkan-device: atoi would turn "abc" into
@@ -146,6 +151,7 @@ bool parse_vulkan_device(const char * s, int & out) {
 int main(int argc, char ** argv) {
     std::string model_dir, text = "The quick brown fox jumps over the lazy dog.";
     std::string tokens_out, tokens_in, wav_out, json_out, backends_dir, opencl_cache_dir;
+    std::string reference_audio, prompt_text, s3tok_gguf, campplus_gguf;
     int seed = 42, n_gpu_layers = 0, n_threads = 0, runs = 3, warmup = 1, vulkan_device = 0;
     bool greedy = false;
 
@@ -166,6 +172,10 @@ int main(int argc, char ** argv) {
         else if (a == "--runs" && i + 1 < argc) runs = std::atoi(argv[++i]);
         else if (a == "--warmup" && i + 1 < argc) warmup = std::atoi(argv[++i]);
         else if (a == "--greedy") greedy = true;
+        else if (a == "--reference-audio" && i + 1 < argc) reference_audio = argv[++i];
+        else if (a == "--prompt-text" && i + 1 < argc) prompt_text = argv[++i];
+        else if (a == "--s3tok-gguf" && i + 1 < argc) s3tok_gguf = argv[++i];
+        else if (a == "--campplus-gguf" && i + 1 < argc) campplus_gguf = argv[++i];
         else if (a == "--tokens-out" && i + 1 < argc) tokens_out = argv[++i];
         else if (a == "--tokens-in" && i + 1 < argc) tokens_in = argv[++i];
         else if (a == "--wav-out" && i + 1 < argc) wav_out = argv[++i];
@@ -183,6 +193,10 @@ int main(int argc, char ** argv) {
     opts.n_gpu_layers     = n_gpu_layers;
     opts.vulkan_device    = vulkan_device;
     opts.n_threads        = n_threads;
+    if (!reference_audio.empty()) opts.reference_audio  = reference_audio;
+    if (!prompt_text.empty())     opts.prompt_text      = prompt_text;
+    if (!s3tok_gguf.empty())      opts.s3tok_gguf_path  = s3tok_gguf;
+    if (!campplus_gguf.empty())   opts.campplus_gguf_path = campplus_gguf;
     if (!backends_dir.empty())     opts.backends_dir     = backends_dir;
     if (!opencl_cache_dir.empty()) opts.opencl_cache_dir = opencl_cache_dir;
 
@@ -276,6 +290,8 @@ int main(int argc, char ** argv) {
             os << "  \"threads\": " << n_threads << ",\n";
             os << "  \"greedy\": " << (greedy ? "true" : "false") << ",\n";
             os << "  \"tokens_pinned\": " << (tokens_in.empty() ? "false" : "true") << ",\n";
+            // load_ms includes the one-time cloning bake when cloned=true.
+            os << "  \"cloned\": " << (reference_audio.empty() ? "false" : "true") << ",\n";
             os << "  \"seed\": " << seed << ",\n";
             os << "  \"runs\": " << runs << ",\n";
             os << "  \"warmup\": " << warmup << ",\n";

@@ -147,6 +147,11 @@ static void check_prompt_templates() {
               "instruct template");
     expect_eq(build_lm_prompt_zero_shot("T"), "You are a helpful assistant.<|endofprompt|>T",
               "zero-shot template");
+    // Cross-lingual cloning prompts with the empty transcript; the bare
+    // template must still carry <|endofprompt|>, which the CosyVoice3 LM
+    // requires somewhere in its text input (upstream asserts on its token).
+    expect_eq(build_lm_prompt_zero_shot(""), "You are a helpful assistant.<|endofprompt|>",
+              "cross-lingual (empty-transcript) template");
     if (build_lm_prompt_instruct("A") == build_lm_prompt_zero_shot("A")) {
         fail("the two prompt templates must stay distinct");
     }

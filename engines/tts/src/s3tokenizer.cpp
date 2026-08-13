@@ -75,6 +75,7 @@ bool s3tokv2_load(const std::string & path, s3tokv2_weights & w)
     w.sample_rate  = (int)u32("s3tokv2.sample_rate",   16000);
     w.rope_theta   = f32("s3tokv2.rope_theta",         10000.0f);
     w.rope_max_pos = (int)u32("s3tokv2.rope_max_pos",  2048);
+    w.version      = (int)u32("s3tokv2.tokenizer_version", 2);
 
     // Remember where the encoder weights live; build_encoder_ctx streams them
     // straight into the backend buffer (no host mirror) from this file.
@@ -345,50 +346,13 @@ static bool build_encoder_ctx(encoder_ctx & ec, const s3tokv2_weights & w,
     ec.ctx = ggml_init(ip);
     if (!ec.ctx) { fprintf(stderr, "s3tokv2: ggml_init failed\n"); return false; }
 
-    // Conv weights: stored as ne=[k, in, out] in GGUF (= PyTorch (out, in, k)).
-    ec.conv1_w = add_weight_f32_3d(ec.ctx, 3, w.n_mels, w.n_state, "s3tokv2/conv1_w");
-    ec.conv1_b = add_weight_f32_1d(ec.ctx, w.n_state, "s3tokv2/conv1_b");
-    ec.conv2_w = add_weight_f32_3d(ec.ctx, 3, w.n_state, w.n_state, "s3tokv2/conv2_w");
-    ec.conv2_b = add_weight_f32_1d(ec.ctx, w.n_state, "s3tokv2/conv2_b");
-
-    ec.blocks.resize(w.n_layer);
-    for (int i = 0; i < w.n_layer; ++i) {
-        auto & B = ec.blocks[i];
-        std::string prefix = "s3tokv2/blk" + std::to_string(i);
-        B.attn_ln_w = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/attn_ln_w").c_str());
-        B.attn_ln_b = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/attn_ln_b").c_str());
-        B.q_w       = add_weight_f32_2d(ec.ctx, w.n_state, w.n_state, (prefix + "/q_w").c_str());
-        B.q_b       = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/q_b").c_str());
-        B.k_w       = add_weight_f32_2d(ec.ctx, w.n_state, w.n_state, (prefix + "/k_w").c_str());
-        B.v_w       = add_weight_f32_2d(ec.ctx, w.n_state, w.n_state, (prefix + "/v_w").c_str());
-        B.v_b       = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/v_b").c_str());
-        B.out_w     = add_weight_f32_2d(ec.ctx, w.n_state, w.n_state, (prefix + "/out_w").c_str());
-        B.out_b     = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/out_b").c_str());
-        // Depth-wise conv1d weight: (out=1280, in=1, k=31) in PyTorch, stored
-        // as ne=[k, in=1, out=1280] in GGUF.
-        B.fsmn_w    = add_weight_f32_3d(ec.ctx, w.fsmn_kernel, 1, w.n_state,
-                                        (prefix + "/fsmn_w").c_str());
-        B.mlp_ln_w  = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/mlp_ln_w").c_str());
-        B.mlp_ln_b  = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/mlp_ln_b").c_str());
-        const int mlp_hidden = w.n_state * w.mlp_ratio;
-        B.mlp0_w    = add_weight_f32_2d(ec.ctx, w.n_state, mlp_hidden,(prefix + "/mlp0_w").c_str());
-        B.mlp0_b    = add_weight_f32_1d(ec.ctx, mlp_hidden,           (prefix + "/mlp0_b").c_str());
-        B.mlp2_w    = add_weight_f32_2d(ec.ctx, mlp_hidden, w.n_state,(prefix + "/mlp2_w").c_str());
-        B.mlp2_b    = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/mlp2_b").c_str());
-    }
-
-    // Allocate backend buffer for weights.
-    ec.buffer = ggml_backend_alloc_ctx_tensors(ec.ctx, ec.backend);
-    if (!ec.buffer) { fprintf(stderr, "s3tokv2: alloc weights buffer failed\n"); return false; }
-
-    // Stream the encoder weights straight from the GGUF into the freshly
-    // allocated backend tensors, 8 MiB at a time (gguf_stream.h) — no full-
-    // size host std::vector mirror, so the bake never holds host(458 MB) +
-    // backend(449 MB) co-resident.  Re-open with no_alloc=true so the GGUF
-    // metadata carries no data blob; the reader resolves offsets against `g`
-    // and pulls bytes from the file handle.  The backend tensors keep the
-    // ec.ctx names; the GGUF names differ, so each stream is keyed by its
-    // GGUF tensor name (identical bytes either way → numerically identical).
+    // Open the GGUF before declaring the weight tensors: the large 2-D block
+    // projection weights adopt the file's stored type (F32, F16 or Q8_0), so
+    // compressed tokenizer GGUFs load as-is — ggml_mul_mat handles those
+    // src0 types natively on every backend.  Everything else (stems, FSMN
+    // depthwise convs, norms, biases) is written F32 by the converters and
+    // stays declared F32; a type mismatch there fails the size check in
+    // to_backend rather than loading garbage.
     ggml_context * gmeta = nullptr;
     gguf_init_params gp = { /*.no_alloc=*/ true, /*.ctx=*/ &gmeta };
     gguf_context * g = gguf_init_from_file(w.gguf_path.c_str(), gp);
@@ -399,8 +363,69 @@ static bool build_encoder_ctx(encoder_ctx & ec, const s3tokv2_weights & w,
     tts_cpp::detail::gguf_stream_reader reader(g, w.gguf_path);
     if (!reader.ok()) { gguf_free(g); if (gmeta) ggml_free(gmeta); return false; }
 
+    auto add_weight_matmul_2d = [&](int64_t a, int64_t b,
+                                    const std::string & gguf_name,
+                                    const std::string & name) {
+        ggml_tensor * src = gmeta ? ggml_get_tensor(gmeta, gguf_name.c_str()) : nullptr;
+        const ggml_type ty = src ? src->type : GGML_TYPE_F32;
+        ggml_tensor * t = ggml_new_tensor_2d(ec.ctx, ty, a, b);
+        ggml_set_name(t, name.c_str());
+        return t;
+    };
+
+    // Conv weights: stored as ne=[k, in, out] in GGUF (= PyTorch (out, in, k)).
+    ec.conv1_w = add_weight_f32_3d(ec.ctx, 3, w.n_mels, w.n_state, "s3tokv2/conv1_w");
+    ec.conv1_b = add_weight_f32_1d(ec.ctx, w.n_state, "s3tokv2/conv1_b");
+    ec.conv2_w = add_weight_f32_3d(ec.ctx, 3, w.n_state, w.n_state, "s3tokv2/conv2_w");
+    ec.conv2_b = add_weight_f32_1d(ec.ctx, w.n_state, "s3tokv2/conv2_b");
+
+    ec.blocks.resize(w.n_layer);
+    for (int i = 0; i < w.n_layer; ++i) {
+        auto & B = ec.blocks[i];
+        std::string prefix = "s3tokv2/blk" + std::to_string(i);
+        const std::string gpre = "s3tokv2/encoder/blocks/" + std::to_string(i);
+        B.attn_ln_w = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/attn_ln_w").c_str());
+        B.attn_ln_b = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/attn_ln_b").c_str());
+        B.q_w       = add_weight_matmul_2d(w.n_state, w.n_state, gpre + "/attn/query/weight", prefix + "/q_w");
+        B.q_b       = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/q_b").c_str());
+        B.k_w       = add_weight_matmul_2d(w.n_state, w.n_state, gpre + "/attn/key/weight",   prefix + "/k_w");
+        B.v_w       = add_weight_matmul_2d(w.n_state, w.n_state, gpre + "/attn/value/weight", prefix + "/v_w");
+        B.v_b       = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/v_b").c_str());
+        B.out_w     = add_weight_matmul_2d(w.n_state, w.n_state, gpre + "/attn/out/weight",   prefix + "/out_w");
+        B.out_b     = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/out_b").c_str());
+        // Depth-wise conv1d weight: (out=1280, in=1, k=31) in PyTorch, stored
+        // as ne=[k, in=1, out=1280] in GGUF.
+        B.fsmn_w    = add_weight_f32_3d(ec.ctx, w.fsmn_kernel, 1, w.n_state,
+                                        (prefix + "/fsmn_w").c_str());
+        B.mlp_ln_w  = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/mlp_ln_w").c_str());
+        B.mlp_ln_b  = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/mlp_ln_b").c_str());
+        const int mlp_hidden = w.n_state * w.mlp_ratio;
+        B.mlp0_w    = add_weight_matmul_2d(w.n_state, mlp_hidden, gpre + "/mlp/0/weight", prefix + "/mlp0_w");
+        B.mlp0_b    = add_weight_f32_1d(ec.ctx, mlp_hidden,           (prefix + "/mlp0_b").c_str());
+        B.mlp2_w    = add_weight_matmul_2d(mlp_hidden, w.n_state, gpre + "/mlp/2/weight", prefix + "/mlp2_w");
+        B.mlp2_b    = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/mlp2_b").c_str());
+    }
+
+    // Allocate backend buffer for weights.
+    ec.buffer = ggml_backend_alloc_ctx_tensors(ec.ctx, ec.backend);
+    if (!ec.buffer) {
+        fprintf(stderr, "s3tokv2: alloc weights buffer failed\n");
+        gguf_free(g); if (gmeta) ggml_free(gmeta);
+        return false;
+    }
+
+    // Stream the encoder weights straight from the GGUF into the freshly
+    // allocated backend tensors, 8 MiB at a time (gguf_stream.h) — no full-
+    // size host std::vector mirror, so the bake never holds host(458 MB) +
+    // backend(449 MB) co-resident.  `g`/`reader` were opened with
+    // no_alloc=true above (the metadata carries no data blob); the reader
+    // resolves offsets against `g` and pulls bytes from the file handle.
+    // The backend tensors keep the ec.ctx names; the GGUF names differ, so
+    // each stream is keyed by its GGUF tensor name (identical bytes either
+    // way → numerically identical).
+    //
     // dst's nbytes must equal the GGUF entry's payload (to_backend asserts
-    // this); shapes/dtypes match s3tokv2_load's host layout exactly, so the
+    // this); shapes/dtypes match the declarations above exactly, so the
     // raw bytes written are identical to the previous host-vector copy.
     auto stream = [&](ggml_tensor * dst, const std::string & gguf_name) {
         return reader.to_backend(gguf_name.c_str(), dst);

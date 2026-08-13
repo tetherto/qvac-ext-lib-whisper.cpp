@@ -329,18 +329,19 @@ std::vector<float> mel_extract_stft_hann_ggml(
     const std::vector<float> & wav,
     const std::vector<float> & mel_fb,
     int n_fft, int hop, int win, int n_mels,
-    int center_mode, float power_exp, float log_floor);
+    int center_mode, float power_exp, float log_floor, float mag_eps);
 std::vector<float> fbank_kaldi_80_ggml(const std::vector<float> & wav_16k,
                                        const std::vector<float> & mel_fb);
 
 std::vector<float> mel_extract_24k_80(const std::vector<float> & wav_24k,
-                                      const std::vector<float> & mel_filterbank)
+                                      const std::vector<float> & mel_filterbank,
+                                      float mag_eps)
 {
     // center=False, magnitude (power_exp=1), log-compress with 1e-5 floor,
     // transpose to (T, 80).
     return mel_extract_stft_hann_ggml(wav_24k, mel_filterbank,
         /*n_fft=*/1920, /*hop=*/480, /*win=*/1920, /*n_mels=*/80,
-        /*center=*/0, /*power_exp=*/1.0f, /*log_floor=*/1e-5f);
+        /*center=*/0, /*power_exp=*/1.0f, /*log_floor=*/1e-5f, mag_eps);
 }
 
 // =============================================================================
@@ -476,7 +477,7 @@ std::vector<float> mel_extract_16k_40(const std::vector<float> & wav_16k,
     // NO log (mel_type='amp', normalized_mels=False), transpose to (T, 40).
     return mel_extract_stft_hann_ggml(wav_16k, mel_filterbank,
         /*n_fft=*/400, /*hop=*/160, /*win=*/400, /*n_mels=*/40,
-        /*center=*/1, /*power_exp=*/2.0f, /*log_floor=*/-1.0f);
+        /*center=*/1, /*power_exp=*/2.0f, /*log_floor=*/-1.0f, /*mag_eps=*/0.0f);
 }
 
 // ---------------------------------------------------------------------------

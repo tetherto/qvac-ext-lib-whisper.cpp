@@ -288,6 +288,7 @@ set(TTS_CPP_LIB_SOURCES
     # also used by the cosyvoice-{llm,flow,hift} parity CLIs below.
     src/cosyvoice_pipeline.cpp
     src/cosyvoice_instruct.cpp
+    src/cosyvoice_frontend.cpp
     src/cosyvoice_engine.cpp
     src/mtl_tokenizer.cpp
     src/text_preprocess.cpp
@@ -762,6 +763,132 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "--hift-gguf" "${_tcb_cosy_hift_gguf}" "--in-dir" "${_tcb_cosy_ref}"
             REQUIRES "${_tcb_cosy_hift_gguf}" "${_tcb_cosy_ref}/hift_wav.npy")
         set_property(TEST test-cosyvoice-hift-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+    endif()
+
+    # ---- speech_tokenizer_v3 (CosyVoice3 zero-shot cloning front-end) -----
+    # Fixtures come from scripts/dump-s3tokenizer-v3-reference.py; the GGUFs
+    # from scripts/convert-s3tokenizer-v3-to-gguf.py.  Asserting harness (the
+    # chatterbox test-s3tokenizer only reports): exact token count, minimum
+    # exact-match ratio, elementwise log-mel bound.  The f16/q8_0 variants
+    # exercise the type-adopting weight loader; q8_0's looser bound is the
+    # measured FSQ near-boundary flip rate with margin.
+    set(_tcb_cosy_s3tok_f32  "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-s3tok-f32.gguf")
+    set(_tcb_cosy_s3tok_ref  "${TTS_CPP_TEST_REF_DIR}/s3tok-v3-ref")
+
+    add_executable(test-s3tokenizer-v3
+        test/test_s3tokenizer_v3.cpp
+        src/s3tokenizer.cpp
+        src/backend_selection.cpp)
+    target_link_libraries(test-s3tokenizer-v3 PRIVATE ggml)
+    target_include_directories(test-s3tokenizer-v3 PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-s3tokenizer-v3)
+    tts_cpp_register_test(test-s3tokenizer-v3
+        LABEL    "fixture"
+        ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--in-dir" "${_tcb_cosy_s3tok_ref}"
+        REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
+    foreach(_tcb_s3tok_quant f16 q8_0)
+        set(_tcb_cosy_s3tok_quant_gguf "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-s3tok-${_tcb_s3tok_quant}.gguf")
+        if (_tcb_s3tok_quant STREQUAL "q8_0")
+            set(_tcb_s3tok_match "--min-token-match" "0.93")
+        else()
+            set(_tcb_s3tok_match "")
+        endif()
+        tts_cpp_register_test(test-s3tokenizer-v3-${_tcb_s3tok_quant}
+            EXE      test-s3tokenizer-v3
+            LABEL    "fixture"
+            ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_quant_gguf}" "--in-dir" "${_tcb_cosy_s3tok_ref}" ${_tcb_s3tok_match}
+            REQUIRES "${_tcb_cosy_s3tok_quant_gguf}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
+    endforeach()
+    if (TTS_CPP_COSYVOICE_GPU)
+        tts_cpp_register_test(test-s3tokenizer-v3-gpu
+            EXE      test-s3tokenizer-v3
+            LABEL    "gpu"
+            ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--in-dir" "${_tcb_cosy_s3tok_ref}"
+            REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
+        set_property(TEST test-s3tokenizer-v3-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        set(_tcb_cosy_s3tok_q8_gguf "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-s3tok-q8_0.gguf")
+        tts_cpp_register_test(test-s3tokenizer-v3-gpu-q8_0
+            EXE      test-s3tokenizer-v3
+            LABEL    "gpu"
+            ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_q8_gguf}" "--in-dir" "${_tcb_cosy_s3tok_ref}" "--min-token-match" "0.93"
+            REQUIRES "${_tcb_cosy_s3tok_q8_gguf}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
+        set_property(TEST test-s3tokenizer-v3-gpu-q8_0 APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+    endif()
+
+    # ---- CosyVoice3 cloning front-end round-trip -------------------------
+    # Runs the native reference-audio front-end on the exact wav the baked
+    # voice.gguf was enrolled from and asserts it reproduces the upstream
+    # frontend_zero_shot tensors in cosyvoice3-ref (tokens / prompt mel /
+    # CAM++ embedding + the 2:1 alignment invariant).  The guards variant is
+    # fixture-free and pins the fail-closed paths (duration bounds, missing
+    # GGUF/wav) on every checkout.
+    set(_tcb_cosy_campplus_gguf "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-campplus-f32.gguf")
+    set(_tcb_cosy_prompt_wav    "${_tcb_cosy_ref}/zero_shot_prompt.wav")
+
+    add_executable(test-cosyvoice-frontend
+        test/test_cosyvoice_frontend.cpp
+        src/cosyvoice_frontend.cpp
+        src/s3tokenizer.cpp
+        src/campplus.cpp
+        src/voice_features.cpp
+        src/mel_extract_stft.cpp
+        src/backend_selection.cpp)
+    target_link_libraries(test-cosyvoice-frontend PRIVATE ggml)
+    target_include_directories(test-cosyvoice-frontend PRIVATE ggml/include src)
+    if (OpenMP_CXX_FOUND)
+        target_link_libraries(test-cosyvoice-frontend PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    tts_cpp_apply_ccache(test-cosyvoice-frontend)
+    tts_cpp_register_test(test-cosyvoice-frontend-guards
+        EXE   test-cosyvoice-frontend
+        LABEL "unit"
+        ARGS  "--guards-only")
+    tts_cpp_register_test(test-cosyvoice-frontend
+        LABEL    "fixture"
+        ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--campplus-gguf" "${_tcb_cosy_campplus_gguf}"
+                 "--wav" "${_tcb_cosy_prompt_wav}" "--in-dir" "${_tcb_cosy_ref}"
+        REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                 "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/prompt_stok.npy")
+    if (TTS_CPP_COSYVOICE_GPU)
+        tts_cpp_register_test(test-cosyvoice-frontend-gpu
+            EXE      test-cosyvoice-frontend
+            LABEL    "gpu"
+            ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--campplus-gguf" "${_tcb_cosy_campplus_gguf}"
+                     "--wav" "${_tcb_cosy_prompt_wav}" "--in-dir" "${_tcb_cosy_ref}"
+            REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                     "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/prompt_stok.npy")
+        set_property(TEST test-cosyvoice-frontend-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+    endif()
+
+    # ---- CosyVoice3 engine-level cloning ---------------------------------
+    # Full-engine legs with the LM trajectory pinned: cloned-vs-baked
+    # waveform equivalence (voice.gguf was enrolled from the same wav),
+    # cross-lingual-vs-zero-shot bit-equality (the mode may only change the
+    # LM prompt), and the fail-closed constructor paths.  Needs the full
+    # model dir (llm/flow/hift/voice + s3tok/campplus).
+    add_executable(test-cosyvoice-clone test/test_cosyvoice_clone.cpp)
+    target_link_libraries(test-cosyvoice-clone PRIVATE tts-cpp ggml)
+    target_include_directories(test-cosyvoice-clone PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-cosyvoice-clone)
+    tts_cpp_register_test(test-cosyvoice-clone
+        LABEL    "fixture"
+        ARGS     "--model-dir" "${TTS_CPP_TEST_MODEL_DIR}" "--wav" "${_tcb_cosy_prompt_wav}"
+                 "--tokens-npy" "${_tcb_cosy_ref}/gen_tokens.npy" "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--campplus-gguf" "${_tcb_cosy_campplus_gguf}"
+        REQUIRES "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-f32.gguf"
+                 "${TTS_CPP_TEST_MODEL_DIR}/voice.gguf"
+                 "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                 "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/gen_tokens.npy")
+    if (TTS_CPP_COSYVOICE_GPU)
+        tts_cpp_register_test(test-cosyvoice-clone-gpu
+            EXE      test-cosyvoice-clone
+            LABEL    "gpu"
+            ARGS     "--model-dir" "${TTS_CPP_TEST_MODEL_DIR}" "--wav" "${_tcb_cosy_prompt_wav}"
+                     "--tokens-npy" "${_tcb_cosy_ref}/gen_tokens.npy" "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--campplus-gguf" "${_tcb_cosy_campplus_gguf}"
+            REQUIRES "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-f32.gguf"
+                     "${TTS_CPP_TEST_MODEL_DIR}/voice.gguf"
+                     "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                     "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/gen_tokens.npy")
+        set_property(TEST test-cosyvoice-clone-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
     endif()
 
     # Deviceless policy test for GpuBackendRequirement filtering (the per-device

@@ -6,19 +6,24 @@
 // placeholder audio.
 //
 // Model directory layout (resolve_component discovers these under model_dir):
-//   cosyvoice3-llm*.gguf    Qwen2.5-0.5B speech LM
-//   cosyvoice3-flow*.gguf   DiT conditional-flow-matching estimator
-//   cosyvoice3-hift*.gguf   CausalHiFT vocoder
-//   voice.gguf              baked default voice (prompt tensors)
-//   vocab.json / merges.txt Qwen2 byte-level BPE frontend
+//   cosyvoice3-llm*.gguf      Qwen2.5-0.5B speech LM
+//   cosyvoice3-flow*.gguf     DiT conditional-flow-matching estimator
+//   cosyvoice3-hift*.gguf     CausalHiFT vocoder
+//   voice.gguf                baked default voice (prompt tensors)
+//   vocab.json / merges.txt   Qwen2 byte-level BPE frontend
+//   cosyvoice3-s3tok*.gguf    speech_tokenizer_v3 (only with reference_audio)
+//   cosyvoice3-campplus*.gguf CAM++ speaker encoder (only with reference_audio)
 //
-// Zero-shot cloning from arbitrary reference audio still needs the native S3
-// tokenizer + CAM++ port (stage 6); until then the baked default voice is used.
+// Zero-shot / cross-lingual cloning: with reference_audio set, the native
+// front-end (cosyvoice_frontend.cpp) bakes the four prompt tensors from the
+// recording at construction, replacing voice.gguf's; prompt_text selects the
+// mode (transcript given = zero-shot, empty = cross-lingual).
 
 #include "tts-cpp/cosyvoice/engine.h"
 
 #include "backend_selection.h"
 #include "backend_util.h"
+#include "cosyvoice_frontend.h"
 #include "cosyvoice_instruct.h"
 #include "cosyvoice_pipeline.h"
 #include "qwen_tokenizer.h"
@@ -127,6 +132,12 @@ struct Engine::Impl {
     int                voice_mel_len1 = 0;
     std::vector<float> voice_embedding;     // 192-d CAM++ embedding
     std::string        voice_prompt_text;   // baked reference transcript (voice.gguf)
+    // True when the voice_* tensors were baked from opts.reference_audio at
+    // construction instead of loaded from voice.gguf.  Gates the zero-shot /
+    // cross-lingual branch in run(): a cloned voice must never fall back to
+    // the baked transcript or kDefaultTranscript, which describe the baked
+    // clip rather than the reference recording.
+    bool               cloned = false;
 
     std::atomic_bool cancel_flag{false};
 
@@ -155,11 +166,6 @@ struct Engine::Impl {
         require(voice_path, "voice.gguf");
         require(vocab_path, "vocab.json");
         require(merges_path, "merges.txt");
-
-        if (!opts.reference_audio.empty()) {
-            fprintf(stderr, "cosyvoice: reference_audio is set but native S3/CAM++ "
-                            "is not yet ported; using the baked default voice.\n");
-        }
 
         // ---- backend selection -------------------------------------------
         namespace det = ::tts_cpp::detail;
@@ -200,6 +206,42 @@ struct Engine::Impl {
         }
         voice_mel_len1     = (int)(voice_prompt_feat.size() / 80);
         voice_prompt_text  = cosyvoice_gguf_meta_str(voice_path, "voice.prompt_text", "");
+
+        // ---- zero-shot voice cloning bake (optional) ---------------------
+        // Runs the native front-end once and overwrites the baked-voice
+        // tensors above.  Every failure throws: silently keeping the baked
+        // voice would synthesise with the wrong speaker, which the caller has
+        // no way to detect.
+        if (!opts.reference_audio.empty()) {
+            const std::string s3tok_path = resolve_component(
+                opts.s3tok_gguf_path, opts.model_dir, "cosyvoice3-s3tok", false);
+            const std::string campplus_path = resolve_component(
+                opts.campplus_gguf_path, opts.model_dir, "cosyvoice3-campplus", false);
+            require(s3tok_path,
+                    "speech tokenizer gguf (cosyvoice3-s3tok*.gguf; required when reference_audio is set)");
+            require(campplus_path,
+                    "CAM++ gguf (cosyvoice3-campplus*.gguf; required when reference_audio is set)");
+
+            cosyvoice_prompt ref;
+            std::string err;
+            if (!cosyvoice_frontend_run(opts.reference_audio, s3tok_path, campplus_path,
+                                        backend, opts.n_threads, ref, err)) {
+                throw std::runtime_error("cosyvoice: voice cloning failed: " + err);
+            }
+            voice_prompt_stok.assign(ref.prompt_stok.begin(), ref.prompt_stok.end());
+            voice_prompt_token = voice_prompt_stok;
+            voice_prompt_feat  = std::move(ref.prompt_feat);
+            voice_mel_len1     = ref.mel_len1;
+            voice_embedding    = std::move(ref.embedding);
+            // The baked transcript describes the baked clip, not this
+            // reference; without opts.prompt_text run() goes cross-lingual.
+            voice_prompt_text.clear();
+            cloned = true;
+            fprintf(stderr, "cosyvoice: cloned voice from %s (%zu prompt tokens, %s)\n",
+                    opts.reference_audio.c_str(), voice_prompt_stok.size(),
+                    opts.prompt_text.empty() ? "no transcript: cross-lingual mode"
+                                             : "transcript given: zero-shot mode");
+        }
     }
 
     ~Impl() {
@@ -231,8 +273,21 @@ struct Engine::Impl {
             // dialect/style.
             prompt_text = detail::build_lm_prompt_instruct(instruct);
             lm_prompt_stok = {};  // dropped in instruct mode
+        } else if (cloned && opts.prompt_text.empty()) {
+            // Cross-lingual cloning: no transcript for the reference, so the
+            // LM gets the bare template (which still carries the
+            // <|endofprompt|> marker the CosyVoice3 LM requires) and NO
+            // prompt speech tokens — upstream frontend_cross_lingual ==
+            // frontend_zero_shot minus prompt_text minus
+            // llm_prompt_speech_token.  The flow tensors keep the cloned
+            // timbre; the LM is free to speak the target language natively
+            // instead of continuing the reference clip's language.
+            prompt_text = detail::build_lm_prompt_zero_shot("");
+            lm_prompt_stok = {};
         } else {
             // Zero-shot: transcript precedence explicit > baked voice > fallback.
+            // (`cloned` implies opts.prompt_text is non-empty here, so a cloned
+            // voice never picks up the baked metadata or kDefaultTranscript.)
             const std::string transcript =
                 !opts.prompt_text.empty()    ? opts.prompt_text
                 : !voice_prompt_text.empty() ? voice_prompt_text
