@@ -49,7 +49,8 @@ ggml_tensor * residual_stack(ggml_context * ctx, const std::vector<residual_unit
 // Runs the whole sequence through a window transformer; x is [dim, length] and
 // comes back the same shape.
 ggml_tensor * window_forward(ggml_context * ctx, const window_transformer & transformer,
-                             ggml_tensor * x, ggml_tensor * mask);
+                             ggml_tensor * x, ggml_tensor * mask,
+                             bool precise_attention_values);
 
 // Fills a [length, length] mask for a transformer that sees its whole sequence
 // at once.

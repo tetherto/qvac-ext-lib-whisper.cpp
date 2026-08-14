@@ -144,8 +144,15 @@ void normalise_lufs(std::vector<float> & wav, int sr, double target_lufs = -27.0
 // convert-s3gen-to-gguf.py.
 //
 // Returns a row-major (T_mel, 80) tensor, where T_mel = (L_wav + 2*720 - 1920) / 480 + 1.
+//
+// `mag_eps` is added to the power spectrum before the magnitude sqrt.  The
+// matcha / HiFiGAN mel this mirrors computes sqrt(|spec|^2 + 1e-9); the
+// CosyVoice3 cloning front-end passes that epsilon to match its upstream
+// prompt_feat bit-tight.  The default 0 keeps the established Chatterbox
+// prompt_feat baseline unchanged.
 std::vector<float> mel_extract_24k_80(const std::vector<float> & wav_24k,
-                                      const std::vector<float> & mel_filterbank);
+                                      const std::vector<float> & mel_filterbank,
+                                      float mag_eps = 0.0f);
 
 // Compute the 40-channel mel *power* spectrogram at 16 kHz that VoiceEncoder
 // consumes, matching voice_encoder.melspec.melspectrogram with its default

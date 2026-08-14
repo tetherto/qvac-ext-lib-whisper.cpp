@@ -11,9 +11,12 @@
 //   text --(Qwen2 BPE tokenizer)--> Qwen2.5 LM --> speech tokens [0, 6561)
 //        --> DiT conditional-flow-matching (Euler ODE) --> mel
 //        --> CausalHiFT vocoder --> 24 kHz mono PCM
-//   Zero-shot voice cloning adds: reference audio --> S3 tokenizer (prompt
-//   tokens) + CAM++ (192-d speaker embedding).  Iteration 1 uses a baked voice
-//   (voice.gguf); the native S3 tokenizer + CAM++ path is a follow-up.  Instruct
+//   Zero-shot voice cloning adds: reference audio --> speech_tokenizer_v3
+//   (prompt tokens) + CAM++ (192-d speaker embedding) + prompt mel, all
+//   computed natively at construction when reference_audio is set; otherwise
+//   the baked voice.gguf tensors are used.  With a reference transcript
+//   (prompt_text) the LM is prompted zero-shot; without one the engine runs
+//   the cross-lingual variant (timbre only, no LM prompt tokens).  Instruct
 //   mode (VoiceControls) selects an emotion / pace, or a raw dialect / volume /
 //   style instruction, mirroring CosyVoice3 inference_instruct2.
 //
@@ -106,11 +109,26 @@ struct EngineOptions {
     std::string merges_path;
     std::string voice_gguf_path;
 
-    // ---- Zero-shot voice cloning (optional) ----
-    // Reserved: cloning from arbitrary reference audio needs the native S3
-    // tokenizer + CAM++ port (s3tok/campplus GGUFs above), which is a follow-up.
-    // If set, iteration 1 logs a warning and falls back to the baked voice.
-    // reference_audio = a few seconds of clean speech; prompt_text = its transcript.
+    // ---- Zero-shot / cross-lingual voice cloning (optional) ----
+    // reference_audio: path to a mono recording of the target speaker
+    // (0.5-30 s hard limits; 5-15 s of clean speech recommended).  At
+    // construction the native front-end tokenizes it (speech_tokenizer_v3),
+    // extracts the CAM++ speaker embedding and the prompt mel, and replaces
+    // the baked voice.gguf tensors.  Requires the s3tok + campplus GGUFs
+    // (resolved from model_dir as cosyvoice3-s3tok*.gguf /
+    // cosyvoice3-campplus*.gguf when the explicit paths above are empty);
+    // construction THROWS if they are missing or the audio is unusable —
+    // there is deliberately no silent fallback to the baked voice.
+    //
+    // prompt_text selects the cloning mode, mirroring the upstream frontends:
+    //  - verbatim transcript of the reference => zero-shot (the LM is
+    //    prompted with transcript + reference speech tokens; best fidelity
+    //    when synthesizing the same language as the reference);
+    //  - empty => cross-lingual (timbre-only conditioning through the flow;
+    //    the LM gets no reference prompt, best when the target language
+    //    differs from the reference).
+    // Without reference_audio, prompt_text still overrides the baked voice's
+    // transcript metadata (voice.gguf voice.prompt_text) for the LM prompt.
     std::string reference_audio;
     std::string prompt_text;
 
@@ -234,6 +252,15 @@ struct StageTimings {
     int n_speech_tokens = 0;
     int tm              = 0;   // flow frames in (prompt + generated)
     int mel_len         = 0;   // mel frames out (after the prompt trim)
+
+    // Composition of the LM prefill this call constructed (also filled when a
+    // pinned trajectory skips the LM): text ids = template + transcript +
+    // synthesis text; prompt speech tokens = the reference/baked tokens the
+    // LM continues from (0 in instruct and cross-lingual modes).  Lets
+    // callers and tests verify the prompt actually carries what the mode
+    // promises without re-deriving tokenization.
+    int n_text_ids            = 0;
+    int n_prompt_speech_tokens = 0;
 };
 
 struct SynthesisResult {

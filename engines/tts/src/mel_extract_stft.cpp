@@ -136,13 +136,16 @@ static std::vector<float> build_kaldi_frames(
 //   n_fft, F, n_mels as usual.
 //   power_exp     : 1.0 → magnitude spectrogram, 2.0 → power.
 //   log_floor     : > 0 → log(max(x, floor)), <= 0 → no log.
+//   mag_eps       : added to the power spectrum before the magnitude sqrt
+//                   (matcha / HiFiGAN compute sqrt(|spec|^2 + 1e-9)); only
+//                   meaningful when power_exp == 1.0.
 //
 // Returns [T, n_mels] row-major.
 static std::vector<float> mel_graph_run(
     const std::vector<float> & frames_TC,
     const std::vector<float> & mel_fb,
     int T, int n_fft, int F, int n_mels,
-    float power_exp, float log_floor)
+    float power_exp, float log_floor, float mag_eps = 0.0f)
 {
     const std::vector<float> * frames = &frames_TC;
 
@@ -192,12 +195,14 @@ static std::vector<float> mel_graph_run(
     ggml_backend_tensor_set(t_neg_sin, neg_sin_basis.data(), 0, neg_sin_basis.size() * sizeof(float));
     ggml_backend_tensor_set(t_mel_fb,  mel_fb.data(),        0, mel_fb.size()        * sizeof(float));
 
-    // Build graph
+    // Build graph.  The metadata arena is call-local on purpose: engines bake
+    // voice conditioning concurrently (one construction per thread), and a
+    // shared static here corrupts graph metadata under that load.  It is a
+    // few tens of KB, so per-call allocation is noise next to the matmuls.
     const int max_nodes = 32;
     const size_t buf_size = ggml_tensor_overhead() * max_nodes +
                             ggml_graph_overhead_custom(max_nodes, false);
-    static std::vector<uint8_t> buf;
-    buf.resize(buf_size);
+    std::vector<uint8_t> buf(buf_size);
     ggml_init_params gp = { buf_size, buf.data(), /*no_alloc=*/ true };
     ggml_context * gctx = ggml_init(gp);
     ggml_cgraph * gf = ggml_new_graph_custom(gctx, max_nodes, false);
@@ -212,7 +217,11 @@ static std::vector<float> mel_graph_run(
 
     ggml_tensor * mag = pow_;
     if (power_exp == 1.0f) {
-        mag = ggml_sqrt(gctx, pow_);    // magnitude spectrogram
+        if (mag_eps > 0.0f) {
+            mag = ggml_sqrt(gctx, ggml_scale_bias(gctx, pow_, 1.0f, mag_eps));
+        } else {
+            mag = ggml_sqrt(gctx, pow_);    // magnitude spectrogram
+        }
     } // power_exp == 2.0f → keep pow_ as-is.
 
     // mel[t, m] = sum_f fb[m, f] * mag[f, t]
@@ -270,7 +279,8 @@ std::vector<float> mel_extract_stft_hann_ggml(
     int n_fft, int hop, int win, int n_mels,
     int center_mode,
     float power_exp,
-    float log_floor)
+    float log_floor,
+    float mag_eps)
 {
     const int F = n_fft / 2 + 1;
     if (mel_fb.size() != (size_t) n_mels * F) {
@@ -296,7 +306,7 @@ std::vector<float> mel_extract_stft_hann_ggml(
     }
 
     std::vector<float> frames = build_windowed_frames(padded, T, hop, win, n_fft, hann);
-    return mel_graph_run(frames, mel_fb, T, n_fft, F, n_mels, power_exp, log_floor);
+    return mel_graph_run(frames, mel_fb, T, n_fft, F, n_mels, power_exp, log_floor, mag_eps);
 }
 
 // Kaldi-flavoured 80-ch fbank: uses the Povey window, adds DC removal +

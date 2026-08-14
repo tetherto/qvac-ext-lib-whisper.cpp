@@ -13,6 +13,12 @@ GGUFs + tokenizer + baked voice into one folder with the expected names:
         vocab.json                  Qwen2 BPE vocab
         merges.txt                  Qwen2 BPE merges
 
+Optional voice-cloning add-on (required only when EngineOptions.reference_audio
+is used; convert-s3tokenizer-v3-to-gguf.py / convert-campplus-to-gguf.py):
+
+        cosyvoice3-s3tok-<type>.gguf    speech_tokenizer_v3 (f32/f16/q8_0)
+        cosyvoice3-campplus-f32.gguf    CAM++ speaker encoder
+
     python3 assemble-cosyvoice3-model.py \\
         --llm    cosyvoice3-llm-f32.gguf \\
         --flow   cosyvoice3-flow-f32.gguf \\
@@ -20,6 +26,8 @@ GGUFs + tokenizer + baked voice into one folder with the expected names:
         --voice  voice.gguf \\
         --vocab  CosyVoice-BlankEN/vocab.json \\
         --merges CosyVoice-BlankEN/merges.txt \\
+        [--s3tok cosyvoice3-s3tok-f16.gguf] \\
+        [--campplus cosyvoice3-campplus-f32.gguf] \\
         --out    models/cosyvoice3-0.5b
 """
 import argparse
@@ -35,6 +43,10 @@ def main():
     ap.add_argument("--voice", required=True)
     ap.add_argument("--vocab", required=True)
     ap.add_argument("--merges", required=True)
+    ap.add_argument("--s3tok", default=None,
+                    help="speech_tokenizer_v3 GGUF (voice-cloning add-on)")
+    ap.add_argument("--campplus", default=None,
+                    help="CAM++ GGUF (voice-cloning add-on)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--symlink", action="store_true",
                     help="symlink instead of copy (saves ~3.4 GB of duplication)")
@@ -49,10 +61,31 @@ def main():
         args.vocab: "vocab.json",
         args.merges: "merges.txt",
     }
+    # The engine discovers these under model_dir by prefix
+    # (resolve_component: cosyvoice3-s3tok*.gguf / cosyvoice3-campplus*.gguf),
+    # so an arbitrary converter output name would assemble fine but never be
+    # found at load time.  Reject early instead.
+    for opt, path, prefix in (("--s3tok", args.s3tok, "cosyvoice3-s3tok"),
+                              ("--campplus", args.campplus, "cosyvoice3-campplus")):
+        if path is None:
+            continue
+        name = os.path.basename(path)
+        if not (name.startswith(prefix) and name.endswith(".gguf")):
+            raise SystemExit(
+                f"{opt}: {name} does not match {prefix}*.gguf; the engine "
+                f"resolves cloning models by that prefix under model_dir - "
+                f"rename the file (converter defaults already conform)")
+        targets[path] = name
     for src, name in targets.items():
         if not os.path.isfile(src):
             raise SystemExit(f"missing input: {src}")
         dst = os.path.join(args.out, name)
+        # An input already living in --out under its final name would be
+        # deleted by the replace below (or turned into a self-referencing
+        # symlink); leave it untouched instead.
+        if os.path.exists(dst) and os.path.samefile(src, dst):
+            print(f"keep  {name:28s} (already in place)")
+            continue
         if os.path.lexists(dst):
             os.remove(dst)
         if args.symlink:

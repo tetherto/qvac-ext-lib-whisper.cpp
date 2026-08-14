@@ -514,6 +514,7 @@ bool load_lm(const std::string & path, int n_gpu_layers, lm_model & model,
         if (error) *error = "audio8: failed to init a compute backend";
         return false;
     }
+    model.precise_outputs = ::tts_cpp::detail::backend_is_metal(model.backend);
     if (!load_weights(file, model.backend, &model.ctx_w, &model.buffer_w, error)) {
         return false;
     }
@@ -616,6 +617,7 @@ bool load_codec(const std::string & path, int n_gpu_layers, codec_model & model,
         if (error) *error = "audio8: failed to init a compute backend";
         return false;
     }
+    model.precise_outputs = ::tts_cpp::detail::backend_is_metal(model.backend);
     if (!load_weights(file, model.backend, &model.ctx_w, &model.buffer_w, error)) {
         return false;
     }

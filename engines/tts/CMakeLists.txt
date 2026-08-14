@@ -288,6 +288,7 @@ set(TTS_CPP_LIB_SOURCES
     # also used by the cosyvoice-{llm,flow,hift} parity CLIs below.
     src/cosyvoice_pipeline.cpp
     src/cosyvoice_instruct.cpp
+    src/cosyvoice_frontend.cpp
     src/cosyvoice_engine.cpp
     src/mtl_tokenizer.cpp
     src/text_preprocess.cpp
@@ -675,8 +676,11 @@ if (TTS_CPP_BUILD_TESTS)
     set(_tcb_audio8_lm          "${TTS_CPP_TEST_MODEL_DIR}/audio8-lm-f32.gguf")
     set(_tcb_audio8_decoder     "${TTS_CPP_TEST_MODEL_DIR}/audio8-codec-decoder-f32.gguf")
     set(_tcb_audio8_encoder     "${TTS_CPP_TEST_MODEL_DIR}/audio8-codec-encoder-f32.gguf")
+    set(_tcb_audio8_lm_q8       "${TTS_CPP_TEST_MODEL_DIR}/audio8-lm-q8_0.gguf")
+    set(_tcb_audio8_decoder_q8  "${TTS_CPP_TEST_MODEL_DIR}/audio8-codec-decoder-q8_0.gguf")
     set(_tcb_audio8_ref         "${TTS_CPP_TEST_REF_DIR}/audio8-ref")
     set(_tcb_audio8_ref_clone   "${TTS_CPP_TEST_REF_DIR}/audio8-ref-clone")
+    set(_tcb_audio8_gpu_layers  99)
     # The recording the cloning fixtures were enrolled from, which the engine
     # test hands to the codec encoder instead of pre-computed codes.
     set(_tcb_audio8_ref_wav     "${TTS_CPP_TEST_AUDIO_DIR}/audio8-reference-en.wav")
@@ -762,6 +766,199 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "--hift-gguf" "${_tcb_cosy_hift_gguf}" "--in-dir" "${_tcb_cosy_ref}"
             REQUIRES "${_tcb_cosy_hift_gguf}" "${_tcb_cosy_ref}/hift_wav.npy")
         set_property(TEST test-cosyvoice-hift-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+    endif()
+
+    # ---- speech_tokenizer_v3 (CosyVoice3 zero-shot cloning front-end) -----
+    # Fixtures come from scripts/dump-s3tokenizer-v3-reference.py; the GGUFs
+    # from scripts/convert-s3tokenizer-v3-to-gguf.py.  Asserting harness (the
+    # chatterbox test-s3tokenizer only reports): exact token count, minimum
+    # exact-match ratio, elementwise log-mel bound.  The f16/q8_0 variants
+    # exercise the type-adopting weight loader; q8_0's looser bound is the
+    # measured FSQ near-boundary flip rate with margin.
+    set(_tcb_cosy_s3tok_f32  "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-s3tok-f32.gguf")
+    set(_tcb_cosy_s3tok_ref  "${TTS_CPP_TEST_REF_DIR}/s3tok-v3-ref")
+
+    add_executable(test-s3tokenizer-v3
+        test/test_s3tokenizer_v3.cpp
+        src/s3tokenizer.cpp
+        src/backend_selection.cpp)
+    target_link_libraries(test-s3tokenizer-v3 PRIVATE ggml)
+    target_include_directories(test-s3tokenizer-v3 PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-s3tokenizer-v3)
+    tts_cpp_register_test(test-s3tokenizer-v3
+        LABEL    "fixture"
+        ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--in-dir" "${_tcb_cosy_s3tok_ref}"
+        REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
+    foreach(_tcb_s3tok_quant f16 q8_0)
+        set(_tcb_cosy_s3tok_quant_gguf "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-s3tok-${_tcb_s3tok_quant}.gguf")
+        if (_tcb_s3tok_quant STREQUAL "q8_0")
+            set(_tcb_s3tok_match "--min-token-match" "0.93")
+        else()
+            set(_tcb_s3tok_match "")
+        endif()
+        tts_cpp_register_test(test-s3tokenizer-v3-${_tcb_s3tok_quant}
+            EXE      test-s3tokenizer-v3
+            LABEL    "fixture"
+            ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_quant_gguf}" "--in-dir" "${_tcb_cosy_s3tok_ref}" ${_tcb_s3tok_match}
+            REQUIRES "${_tcb_cosy_s3tok_quant_gguf}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
+    endforeach()
+    if (TTS_CPP_COSYVOICE_GPU)
+        tts_cpp_register_test(test-s3tokenizer-v3-gpu
+            EXE      test-s3tokenizer-v3
+            LABEL    "gpu"
+            ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--in-dir" "${_tcb_cosy_s3tok_ref}"
+            REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
+        set_property(TEST test-s3tokenizer-v3-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        set(_tcb_cosy_s3tok_q8_gguf "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-s3tok-q8_0.gguf")
+        tts_cpp_register_test(test-s3tokenizer-v3-gpu-q8_0
+            EXE      test-s3tokenizer-v3
+            LABEL    "gpu"
+            ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_q8_gguf}" "--in-dir" "${_tcb_cosy_s3tok_ref}" "--min-token-match" "0.93"
+            REQUIRES "${_tcb_cosy_s3tok_q8_gguf}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
+        set_property(TEST test-s3tokenizer-v3-gpu-q8_0 APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+    endif()
+
+    # ---- CosyVoice3 cloning front-end round-trip -------------------------
+    # Runs the native reference-audio front-end on the exact wav the baked
+    # voice.gguf was enrolled from and asserts it reproduces the upstream
+    # frontend_zero_shot tensors in cosyvoice3-ref (tokens / prompt mel /
+    # CAM++ embedding + the 2:1 alignment invariant).  The guards variant is
+    # fixture-free and pins the fail-closed paths (duration bounds, missing
+    # GGUF/wav) on every checkout.
+    set(_tcb_cosy_campplus_gguf "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-campplus-f32.gguf")
+    set(_tcb_cosy_prompt_wav    "${_tcb_cosy_ref}/zero_shot_prompt.wav")
+
+    add_executable(test-cosyvoice-frontend
+        test/test_cosyvoice_frontend.cpp
+        src/cosyvoice_frontend.cpp
+        src/s3tokenizer.cpp
+        src/campplus.cpp
+        src/voice_features.cpp
+        src/mel_extract_stft.cpp
+        src/backend_selection.cpp)
+    target_link_libraries(test-cosyvoice-frontend PRIVATE ggml)
+    target_include_directories(test-cosyvoice-frontend PRIVATE ggml/include src)
+    if (OpenMP_CXX_FOUND)
+        target_link_libraries(test-cosyvoice-frontend PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    tts_cpp_apply_ccache(test-cosyvoice-frontend)
+    tts_cpp_register_test(test-cosyvoice-frontend-guards
+        EXE   test-cosyvoice-frontend
+        LABEL "unit"
+        ARGS  "--guards-only")
+    tts_cpp_register_test(test-cosyvoice-frontend
+        LABEL    "fixture"
+        ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--campplus-gguf" "${_tcb_cosy_campplus_gguf}"
+                 "--wav" "${_tcb_cosy_prompt_wav}" "--in-dir" "${_tcb_cosy_ref}"
+        REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                 "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/prompt_stok.npy")
+    if (TTS_CPP_COSYVOICE_GPU)
+        tts_cpp_register_test(test-cosyvoice-frontend-gpu
+            EXE      test-cosyvoice-frontend
+            LABEL    "gpu"
+            ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--campplus-gguf" "${_tcb_cosy_campplus_gguf}"
+                     "--wav" "${_tcb_cosy_prompt_wav}" "--in-dir" "${_tcb_cosy_ref}"
+            REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                     "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/prompt_stok.npy")
+        set_property(TEST test-cosyvoice-frontend-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+    endif()
+
+    # Thread-safety guard for the shared mel/fbank extraction (concurrent
+    # engine constructions bake voice conditioning in parallel).  Synthetic
+    # inputs; no fixtures.
+    add_executable(test-mel-thread-safety
+        test/test_mel_thread_safety.cpp
+        src/voice_features.cpp
+        src/mel_extract_stft.cpp
+        src/backend_selection.cpp)
+    target_link_libraries(test-mel-thread-safety PRIVATE ggml)
+    target_include_directories(test-mel-thread-safety PRIVATE ggml/include src)
+    if (OpenMP_CXX_FOUND)
+        target_link_libraries(test-mel-thread-safety PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    tts_cpp_apply_ccache(test-mel-thread-safety)
+    tts_cpp_register_test(test-mel-thread-safety LABEL "unit")
+
+    # Branch coverage for assemble-cosyvoice3-model.py (add-on name
+    # validation, inputs already at their destination, copy + symlink modes).
+    # Registered only when a Python interpreter is available.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME test-assemble-cosyvoice3-model
+                 COMMAND "${Python3_EXECUTABLE}"
+                         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_assemble_cosyvoice3_model.py")
+        set_property(TEST test-assemble-cosyvoice3-model PROPERTY LABELS "unit")
+    endif()
+
+    # CLI-level coverage for the cloning flags: the engine harnesses bypass
+    # argument parsing, so a mapping regression would not fail them.  The
+    # synthesis legs are fixture-gated like the other cosyvoice tests and pin
+    # the engine's mode log; FAIL_REGULAR_EXPRESSION keeps a failed synthesis
+    # from passing on the log line alone.  The missing-value leg is
+    # always-on: PASS_REGEX requires the usage text.
+    if (TARGET cosyvoice-cli)
+        tts_cpp_register_test(test-cosyvoice-cli-clone-zero-shot
+            EXE        cosyvoice-cli
+            LABEL      "fixture"
+            PASS_REGEX "zero-shot mode"
+            ARGS       "--model-dir" "${TTS_CPP_TEST_MODEL_DIR}"
+                       "--reference-audio" "${_tcb_cosy_prompt_wav}"
+                       "--prompt-text" "reference transcript" "--text" "Hi." "--greedy"
+                       "--out" "cosyvoice-cli-clone-zs.wav"
+            REQUIRES   "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-f32.gguf"
+                       "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                       "${_tcb_cosy_prompt_wav}")
+        set_property(TEST test-cosyvoice-cli-clone-zero-shot PROPERTY
+            FAIL_REGULAR_EXPRESSION "cosyvoice-cli: error")
+        tts_cpp_register_test(test-cosyvoice-cli-clone-cross-lingual
+            EXE        cosyvoice-cli
+            LABEL      "fixture"
+            PASS_REGEX "cross-lingual mode"
+            ARGS       "--model-dir" "${TTS_CPP_TEST_MODEL_DIR}"
+                       "--reference-audio" "${_tcb_cosy_prompt_wav}"
+                       "--text" "Hi." "--greedy"
+                       "--out" "cosyvoice-cli-clone-xl.wav"
+            REQUIRES   "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-f32.gguf"
+                       "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                       "${_tcb_cosy_prompt_wav}")
+        set_property(TEST test-cosyvoice-cli-clone-cross-lingual PROPERTY
+            FAIL_REGULAR_EXPRESSION "cosyvoice-cli: error")
+        tts_cpp_register_test(test-cosyvoice-cli-clone-missing-value
+            EXE        cosyvoice-cli
+            LABEL      "unit"
+            PASS_REGEX "usage:"
+            ARGS       "--reference-audio")
+    endif()
+
+    # ---- CosyVoice3 engine-level cloning ---------------------------------
+    # Full-engine legs with the LM trajectory pinned: cloned-vs-baked
+    # waveform equivalence (voice.gguf was enrolled from the same wav),
+    # cross-lingual-vs-zero-shot bit-equality (the mode may only change the
+    # LM prompt), and the fail-closed constructor paths.  Needs the full
+    # model dir (llm/flow/hift/voice + s3tok/campplus).
+    add_executable(test-cosyvoice-clone test/test_cosyvoice_clone.cpp)
+    target_link_libraries(test-cosyvoice-clone PRIVATE tts-cpp ggml)
+    target_include_directories(test-cosyvoice-clone PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-cosyvoice-clone)
+    tts_cpp_register_test(test-cosyvoice-clone
+        LABEL    "fixture"
+        ARGS     "--model-dir" "${TTS_CPP_TEST_MODEL_DIR}" "--wav" "${_tcb_cosy_prompt_wav}"
+                 "--tokens-npy" "${_tcb_cosy_ref}/gen_tokens.npy" "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--campplus-gguf" "${_tcb_cosy_campplus_gguf}"
+        REQUIRES "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-f32.gguf"
+                 "${TTS_CPP_TEST_MODEL_DIR}/voice.gguf"
+                 "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                 "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/gen_tokens.npy")
+    if (TTS_CPP_COSYVOICE_GPU)
+        tts_cpp_register_test(test-cosyvoice-clone-gpu
+            EXE      test-cosyvoice-clone
+            LABEL    "gpu"
+            ARGS     "--model-dir" "${TTS_CPP_TEST_MODEL_DIR}" "--wav" "${_tcb_cosy_prompt_wav}"
+                     "--tokens-npy" "${_tcb_cosy_ref}/gen_tokens.npy" "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--campplus-gguf" "${_tcb_cosy_campplus_gguf}"
+            REQUIRES "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-f32.gguf"
+                     "${TTS_CPP_TEST_MODEL_DIR}/voice.gguf"
+                     "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                     "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/gen_tokens.npy")
+        set_property(TEST test-cosyvoice-clone-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
     endif()
 
     # Deviceless policy test for GpuBackendRequirement filtering (the per-device
@@ -933,6 +1130,19 @@ if (TTS_CPP_BUILD_TESTS)
     # GpuBackendRequirement::VulkanOrMetal).
     if (TTS_CPP_GGML_VULKAN)
         tts_cpp_register_audio8_gpu_tests(vulkan)
+        if (TARGET audio8-cli)
+            tts_cpp_register_test(test-audio8-cli-vulkan-q8_0
+                EXE        audio8-cli
+                LABEL      "gpu"
+                ARGS       "--lm" "${_tcb_audio8_lm_q8}"
+                           "--codec-decoder" "${_tcb_audio8_decoder_q8}"
+                           "--text" "Audio8 Vulkan q8 regression."
+                           "--greedy" "--max-frames" "2"
+                           "--n-gpu-layers" "${_tcb_audio8_gpu_layers}"
+                           "--out" "${CMAKE_CURRENT_BINARY_DIR}/audio8-vulkan-q8_0.wav"
+                PASS_REGEX "on Vulkan"
+                REQUIRES   "${_tcb_audio8_lm_q8}" "${_tcb_audio8_decoder_q8}")
+        endif()
     endif()
     if (TTS_CPP_GGML_METAL)
         tts_cpp_register_audio8_gpu_tests(metal)

@@ -142,6 +142,7 @@ struct lm_model {
     ggml_gallocr_t frame_allocr = nullptr;
     // Whether this backend can pick codes itself, decided once at load time.
     bool picks_codes = false;
+    bool precise_outputs = false;
 
     TokenizerData tokenizer;
 };
@@ -252,6 +253,7 @@ struct codec_model {
     ggml_context * ctx_w = nullptr;
     ggml_backend_buffer_t buffer_w = nullptr;
     ::tts_cpp::detail::sched_fallback sched;
+    bool precise_outputs = false;
     // Both directions run in two graphs: one over the whole sequence at one
     // column per frame, and one over blocks of the sample-rate stack. They get
     // an arena each, because alternating them through one would resize it on
