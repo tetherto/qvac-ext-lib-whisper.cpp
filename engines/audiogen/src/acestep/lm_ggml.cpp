@@ -76,28 +76,7 @@ static Qwen3Config to_q3(const LMConfig & c) {
 }
 
 static bool lm_backend_supports_flash_attn(ggml_backend_t backend, const Qwen3Config & c) {
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    if (!dev || (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU &&
-                 ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
-        return false;
-    }
-
-    ggml_init_params ip{ ggml_tensor_overhead() * 8, nullptr, true };
-    ggml_context * ctx = ggml_init(ip);
-    if (!ctx) return false;
-    ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.head_dim, 16, c.n_heads);
-    ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, c.head_dim, 256, c.n_kv_heads);
-    ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, c.head_dim, 256, c.n_kv_heads);
-    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, 16);
-    ggml_tensor * op = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f / sqrtf((float) c.head_dim), 0.0f, 0.0f);
-    if (!op) {
-        ggml_free(ctx);
-        return false;
-    }
-    ggml_flash_attn_ext_set_prec(op, GGML_PREC_F32);
-    const bool supported = ggml_backend_supports_op(backend, op);
-    ggml_free(ctx);
-    return supported;
+  return q3_backend_supports_flash_attention(backend, c);
 }
 
 static void lm_partial_head_clear(LMModel * m) {

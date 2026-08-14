@@ -302,11 +302,45 @@ static ggml_tensor * attn_f32(ggml_context * ctx, ggml_tensor * q, ggml_tensor *
     return ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
 }
 
-static bool backend_supports_flash_attention(ggml_backend_t backend) {
-    const ggml_backend_dev_t device = ggml_backend_get_device(backend);
-    if (!device) return false;
-    const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
-    return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+static bool backend_supports_flash_attention(ggml_backend_t backend,
+                                             const DitConfig &config) {
+  if (!backend || config.head_dim <= 0 || config.n_heads <= 0 ||
+      config.n_kv_heads <= 0)
+    return false;
+  const ggml_backend_dev_t device = ggml_backend_get_device(backend);
+  if (!device)
+    return false;
+  const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
+  if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+      type != GGML_BACKEND_DEVICE_TYPE_IGPU)
+    return false;
+
+  constexpr int sequence = 16;
+  constexpr int batch = 2;
+  ggml_init_params init{ggml_tensor_overhead() * 8, nullptr, true};
+  ggml_context *context = ggml_init(init);
+  if (!context)
+    return false;
+  ggml_tensor *query = ggml_new_tensor_4d(
+      context, GGML_TYPE_F32, config.head_dim, sequence, config.n_heads, batch);
+  ggml_tensor *key = ggml_new_tensor_4d(context, GGML_TYPE_F16, config.head_dim,
+                                        sequence, config.n_kv_heads, batch);
+  ggml_tensor *value =
+      ggml_new_tensor_4d(context, GGML_TYPE_F16, config.head_dim, sequence,
+                         config.n_kv_heads, batch);
+  ggml_tensor *mask =
+      ggml_new_tensor_4d(context, GGML_TYPE_F16, sequence, sequence, 1, batch);
+  ggml_tensor *operation =
+      ggml_flash_attn_ext(context, query, key, value, mask,
+                          1.0f / sqrtf((float)config.head_dim), 0.0f, 0.0f);
+  if (!operation) {
+    ggml_free(context);
+    return false;
+  }
+  ggml_flash_attn_ext_set_prec(operation, GGML_PREC_F32);
+  const bool supported = ggml_backend_supports_op(backend, operation);
+  ggml_free(context);
+  return supported;
 }
 
 static constexpr float DIT_FLASH_ATTENTION_MAX_BIAS = 0.0f;
@@ -455,13 +489,13 @@ DitModel * dit_model_load(const std::string & path, ggml_backend_t backend, bool
     if (!dit_gguf_open(g, path)) return nullptr;
 
     DitModel * m = new DitModel();
-    m->backend   = backend;
-    m->use_flash_attn = backend_supports_flash_attention(backend);
+    m->backend = backend;
     if (!dit_gguf_read_config(g, m->cfg)) {
         dit_gguf_close(g);
         delete m;
         return nullptr;
     }
+    m->use_flash_attn = backend_supports_flash_attention(backend, m->cfg);
     const DitConfig & c = m->cfg;
     const int         H = c.hidden_size;
 
@@ -952,7 +986,7 @@ struct FlowEditState {
     std::vector<float> velocity_delta_sum;
     int min_step;
     int max_step;
-    uint64_t draw_index = 0;
+    int64_t rng_subsequence = 0;
 
     FlowEditState(DitModel * model_value, const DitFlowEditParams & params_value)
         : model(model_value),
@@ -1074,8 +1108,10 @@ static void integrate_flow_target(std::vector<float> & target,
 }
 
 static void draw_flow_edit_noise(FlowEditState & state) {
-    philox_randn(state.params.seed + state.draw_index++, state.noise.data(),
-                 (int) state.count, FLOW_EDIT_ROUND_NOISE_TO_BF16);
+  const int samples = (int)state.count;
+  philox_randn_from((int64_t)state.params.seed, state.rng_subsequence,
+                    state.noise.data(), samples, FLOW_EDIT_ROUND_NOISE_TO_BF16);
+  state.rng_subsequence += samples;
 }
 
 static bool run_flow_edit_forward_pair(FlowEditState & state, float timestep) {

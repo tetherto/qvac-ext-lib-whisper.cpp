@@ -109,10 +109,11 @@ CondModel * cond_model_load(const std::string & path, ggml_backend_t backend, bo
     }
 
     CondModel * m   = new CondModel();
-    m->backend      = backend;
-    m->use_flash_attn = q3_backend_supports_flash_attention(backend);
+    m->backend = backend;
     m->lyric_cfg    = lyric_config();
     m->timbre_cfg   = timbre_config();
+    m->use_flash_attn =
+        q3_backend_supports_flash_attention(backend, m->lyric_cfg);
     // acestep.cpp gates the CLS prepend on acestep.encoder_hidden_size > 0 (XL
     // models), not merely on the special_token tensor being present (the
     // converter may still emit it). Match that rule to keep the timbre token

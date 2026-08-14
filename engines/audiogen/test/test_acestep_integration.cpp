@@ -60,14 +60,27 @@ void check(bool condition, const char * expression) {
 
 struct StageLog {
     std::vector<std::string> names;
+    struct Event {
+      std::string name;
+      int step;
+      int total;
+    };
+    std::vector<Event> events;
 
-    bool record(const std::string & stage, int, int) {
-        names.push_back(stage);
-        return true;
+    bool record(const std::string &stage, int step, int total) {
+      names.push_back(stage);
+      events.push_back({stage, step, total});
+      return true;
     }
 
     bool contains(const char * stage) const {
         return std::find(names.begin(), names.end(), stage) != names.end();
+    }
+
+    bool contains_detailed_progress(const char *stage) const {
+      return std::any_of(events.begin(), events.end(), [&](const Event &event) {
+        return event.name == stage && event.total > 1 && event.step > 0;
+      });
     }
 };
 
@@ -310,6 +323,7 @@ void run_repaint_scenario(tts_cpp::acestep::Engine & engine, const fs::path & du
     CHECK(!result.pcm.empty());
     CHECK(stages.contains(AUDIO_EDIT_REPAINT_STAGE));
     CHECK(!stages.contains(TEST_LM_STAGE));
+    CHECK(stages.contains_detailed_progress("vae"));
     CHECK(result.metadata.vocal_language == TEST_UNKNOWN_LANGUAGE);
     verify_repaint_silence_context(dump_dir);
     verify_repaint_preservation(result, fixture.params);
@@ -372,10 +386,26 @@ void run_flow_scenario(tts_cpp::acestep::Engine & engine, const fs::path & dump_
     }
 }
 
+void run_edit_vae_cancel_scenario(tts_cpp::acestep::Engine &engine,
+                                  const EditFixture &fixture) {
+  bool cancelled_during_vae = false;
+  const tts_cpp::acestep::GenerateResult result = engine.generate(
+      fixture.params, [&](const std::string &stage, int step, int total) {
+        if (stage == "vae" && total > 1 && step > 0) {
+          cancelled_during_vae = true;
+          return false;
+        }
+        return true;
+      });
+  CHECK(cancelled_during_vae);
+  CHECK(result.pcm.empty());
+}
+
 void run_edit_scenarios(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir) {
     EditFixture fixture = make_edit_fixture();
     run_repaint_scenario(engine, dump_dir, fixture);
     run_flow_scenario(engine, dump_dir, fixture);
+    run_edit_vae_cancel_scenario(engine, fixture);
 }
 
 int run_integration(const char * models_dir) {

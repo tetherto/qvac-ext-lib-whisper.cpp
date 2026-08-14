@@ -64,9 +64,9 @@ TextEncModel * textenc_model_load(const std::string & path, ggml_backend_t backe
     }
 
     TextEncModel * m = new TextEncModel();
-    m->backend       = backend;
-    m->use_flash_attn = q3_backend_supports_flash_attention(backend);
+    m->backend = backend;
     m->q3            = to_q3(m->cfg);
+    m->use_flash_attn = q3_backend_supports_flash_attention(backend, m->q3);
     const Qwen3Config & c = m->q3;
 
     // CPU backend: map the quantised weights straight off the mmap (no dirty RAM).

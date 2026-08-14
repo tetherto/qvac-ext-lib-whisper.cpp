@@ -109,6 +109,7 @@ void test_haar_dcw() {
 // 3. philox_randn ------------------------------------------------------------
 void test_philox() {
     using tts_cpp::acestep::philox_randn;
+    using tts_cpp::acestep::philox_randn_from;
 
     // Golden vector for seed 42 (bf16-rounded, the mode the engine uses for
     // the DiT initial noise). These values were validated corr=1.0 against
@@ -124,6 +125,16 @@ void test_philox() {
     philox_randn(1234, a, 16, true);
     philox_randn(1234, b, 16, true);
     for (int i = 0; i < 16; ++i) CHECK(a[i] == b[i]);
+
+    // Repeated draws from one generator continue at the next subsequence,
+    // matching one torch.Generator whose state advances across randn calls.
+    float first[7], second[9];
+    philox_randn_from(1234, 0, first, 7, true);
+    philox_randn_from(1234, 7, second, 9, true);
+    for (int i = 0; i < 7; ++i)
+      CHECK(first[i] == a[i]);
+    for (int i = 0; i < 9; ++i)
+      CHECK(second[i] == a[i + 7]);
 
     // Different seeds -> different stream (extremely unlikely to collide).
     float c[16];

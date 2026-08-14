@@ -13,6 +13,7 @@
 
 #include "dit_gguf.h"  // DitGGUF, dit_gmeta, dit_gdata
 
+#include "ggml-backend.h"
 #include "ggml.h"
 
 #include <cmath>
@@ -212,11 +213,46 @@ static inline ggml_tensor * q3_attn(ggml_context * ctx, ggml_tensor * q, ggml_te
     return ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
 }
 
-static inline bool q3_backend_supports_flash_attention(ggml_backend_t backend) {
-    const ggml_backend_dev_t device = ggml_backend_get_device(backend);
-    if (!device) return false;
-    const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
-    return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+static inline bool
+q3_backend_supports_flash_attention(ggml_backend_t backend,
+                                    const Qwen3Config &config) {
+  if (!backend || config.head_dim <= 0 || config.n_heads <= 0 ||
+      config.n_kv_heads <= 0)
+    return false;
+  const ggml_backend_dev_t device = ggml_backend_get_device(backend);
+  if (!device)
+    return false;
+  const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
+  if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+      type != GGML_BACKEND_DEVICE_TYPE_IGPU)
+    return false;
+
+  constexpr int query_tokens = 16;
+  constexpr int key_value_tokens = 256;
+  ggml_init_params init{ggml_tensor_overhead() * 8, nullptr, true};
+  ggml_context *context = ggml_init(init);
+  if (!context)
+    return false;
+  ggml_tensor *query = ggml_new_tensor_3d(
+      context, GGML_TYPE_F32, config.head_dim, query_tokens, config.n_heads);
+  ggml_tensor *key = ggml_new_tensor_3d(context, GGML_TYPE_F16, config.head_dim,
+                                        key_value_tokens, config.n_kv_heads);
+  ggml_tensor *value =
+      ggml_new_tensor_3d(context, GGML_TYPE_F16, config.head_dim,
+                         key_value_tokens, config.n_kv_heads);
+  ggml_tensor *mask = ggml_new_tensor_2d(context, GGML_TYPE_F16,
+                                         key_value_tokens, query_tokens);
+  ggml_tensor *operation =
+      ggml_flash_attn_ext(context, query, key, value, mask,
+                          1.0f / sqrtf((float)config.head_dim), 0.0f, 0.0f);
+  if (!operation) {
+    ggml_free(context);
+    return false;
+  }
+  ggml_flash_attn_ext_set_prec(operation, GGML_PREC_F32);
+  const bool supported = ggml_backend_supports_op(backend, operation);
+  ggml_free(context);
+  return supported;
 }
 
 inline constexpr float Q3_FLASH_ATTENTION_MAX_BIAS = 0.0f;

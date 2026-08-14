@@ -13,6 +13,8 @@
 //             --gpu --threads N --dump-stages <existing dir>
 
 #include "audiogen-cpp/acestep/engine.h"
+#include "mini_json.h"
+#include "music_cli_edit.h"
 #include "wav_reader.h"
 
 #include <chrono>
@@ -35,314 +37,9 @@ static bool arg_flag(int argc, char ** argv, const char * key) {
     return false;
 }
 
-// --- tiny JSON field readers (flat object; good enough for a request json) ---
-static std::string read_file(const char * path) {
-    FILE * f = fopen(path, "rb");
-    if (!f) return {};
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    std::string s((size_t) n, '\0');
-    size_t rd = fread(&s[0], 1, (size_t) n, f);
-    fclose(f);
-    s.resize(rd);
-    return s;
-}
-
-// Return the raw value token after "key": . Handles "string" or bareword/number.
-static bool json_field(const std::string & j, const char * key, std::string & out) {
-    std::string needle = std::string("\"") + key + "\"";
-    size_t      p      = j.find(needle);
-    if (p == std::string::npos) return false;
-    p = j.find(':', p + needle.size());
-    if (p == std::string::npos) return false;
-    p++;
-    while (p < j.size() && (j[p] == ' ' || j[p] == '\t' || j[p] == '\n' || j[p] == '\r')) p++;
-    if (p >= j.size()) return false;
-    if (j[p] == '"') {
-        size_t e = ++p;
-        std::string v;
-        while (e < j.size() && j[e] != '"') {
-            if (j[e] == '\\' && e + 1 < j.size()) {
-                switch (j[e + 1]) {
-                    case '"':  v += '"';  break;
-                    case '\\': v += '\\'; break;
-                    case '/':  v += '/';  break;
-                    case 'b':  v += '\b'; break;
-                    case 'f':  v += '\f'; break;
-                    case 'n':  v += '\n'; break;
-                    case 'r':  v += '\r'; break;
-                    case 't':  v += '\t'; break;
-                    default:   v += j[e + 1]; break;
-                }
-                e += 2;
-                continue;
-            }
-            v += j[e++];
-        }
-        out = v;
-    } else {
-        size_t e = p;
-        while (e < j.size() && j[e] != ',' && j[e] != '}' && j[e] != '\n') e++;
-        out = j.substr(p, e - p);
-        while (!out.empty() && (out.back() == ' ' || out.back() == '\r' || out.back() == '\t')) out.pop_back();
-    }
-    return true;
-}
-
-static std::vector<std::string> json_array_objects(const std::string & json, const char * key) {
-    std::vector<std::string> objects;
-    const std::string needle = std::string("\"") + key + "\"";
-    size_t cursor = json.find(needle);
-    if (cursor == std::string::npos) return objects;
-    cursor = json.find('[', cursor + needle.size());
-    if (cursor == std::string::npos) return objects;
-
-    bool in_string = false;
-    bool escaped = false;
-    int object_depth = 0;
-    size_t object_start = std::string::npos;
-    for (++cursor; cursor < json.size(); ++cursor) {
-        const char ch = json[cursor];
-        if (in_string) {
-            if (escaped) escaped = false;
-            else if (ch == '\\') escaped = true;
-            else if (ch == '"') in_string = false;
-            continue;
-        }
-        if (ch == '"') {
-            in_string = true;
-        } else if (ch == '{') {
-            if (object_depth++ == 0) object_start = cursor;
-        } else if (ch == '}') {
-            if (--object_depth == 0 && object_start != std::string::npos) {
-                objects.push_back(json.substr(object_start, cursor - object_start + 1));
-                object_start = std::string::npos;
-            }
-        } else if (ch == ']' && object_depth == 0) {
-            break;
-        }
-    }
-    return objects;
-}
-
 static constexpr int kRequiredAudioSampleRate = 48000;
-static constexpr const char * kEditPlanOption = "--edit-plan";
-static constexpr const char * kNormalizeOption = "--normalize";
-static constexpr const char * kRepaintStartOption = "--repaint-start";
-static constexpr const char * kRepaintEndOption = "--repaint-end";
-static constexpr const char * kRepaintModeOption = "--repaint-mode";
-static constexpr const char * kRepaintStrengthOption = "--repaint-strength";
-static constexpr const char * kFlowSourceCaptionOption = "--flow-source-caption";
-static constexpr const char * kFlowSourceLyricsOption = "--flow-source-lyrics";
-static constexpr const char * kFlowMinimumOption = "--flow-n-min";
-static constexpr const char * kFlowMaximumOption = "--flow-n-max";
-static constexpr const char * kFlowAverageOption = "--flow-n-avg";
-static constexpr const char * kSourceAudioOption = "--src-audio";
-static constexpr const char * kTextToMusicTask = "text2music";
-static constexpr const char * kOperationsField = "operations";
-static constexpr const char * kTypeField = "type";
-static constexpr const char * kRepaintType = "repaint";
-static constexpr const char * kFlowEditType = "flow-edit";
-static constexpr const char * kStartField = "start";
-static constexpr const char * kEndField = "end";
-static constexpr const char * kStrengthField = "strength";
-static constexpr const char * kCaptionField = "caption";
-static constexpr const char * kLyricsField = "lyrics";
-static constexpr const char * kModeField = "mode";
-static constexpr const char * kSourceCaptionField = "source_caption";
-static constexpr const char * kSourceLyricsField = "source_lyrics";
-static constexpr const char * kTargetCaptionField = "target_caption";
-static constexpr const char * kTargetLyricsField = "target_lyrics";
-static constexpr const char * kMinimumField = "n_min";
-static constexpr const char * kMaximumField = "n_max";
-static constexpr const char * kAverageField = "n_avg";
-static constexpr const char * kConservativeMode = "conservative";
-static constexpr const char * kBalancedMode = "balanced";
-static constexpr const char * kAggressiveMode = "aggressive";
-
-static bool parse_repaint_mode(const std::string & value,
-                               tts_cpp::acestep::RepaintMode & mode) {
-    using tts_cpp::acestep::RepaintMode;
-    if (value == kConservativeMode) mode = RepaintMode::Conservative;
-    else if (value == kBalancedMode) mode = RepaintMode::Balanced;
-    else if (value == kAggressiveMode) mode = RepaintMode::Aggressive;
-    else return false;
-    return true;
-}
-
-static bool parse_repaint_operation(
-        const std::string & operation,
-        std::vector<tts_cpp::acestep::AudioEditParams> & plan,
-        std::string & error) {
-    using namespace tts_cpp::acestep;
-    RepaintParams repaint;
-    std::string value;
-    if (json_field(operation, kStartField, value)) repaint.start_seconds = (float) atof(value.c_str());
-    if (json_field(operation, kEndField, value)) repaint.end_seconds = (float) atof(value.c_str());
-    if (json_field(operation, kStrengthField, value)) repaint.strength = (float) atof(value.c_str());
-    if (json_field(operation, kCaptionField, value)) repaint.caption = value;
-    if (json_field(operation, kLyricsField, value)) repaint.lyrics = value;
-    if (json_field(operation, kModeField, value) &&
-        !parse_repaint_mode(value, repaint.mode)) {
-        error = "repaint mode must be conservative|balanced|aggressive";
-        return false;
-    }
-    plan.emplace_back(std::move(repaint));
-    return true;
-}
-
-static void parse_flow_edit_operation(
-        const std::string & operation,
-        std::vector<tts_cpp::acestep::AudioEditParams> & plan) {
-    using namespace tts_cpp::acestep;
-    FlowEditParams flow;
-    std::string value;
-    if (json_field(operation, kSourceCaptionField, value)) flow.source_caption = value;
-    if (json_field(operation, kSourceLyricsField, value)) flow.source_lyrics = value;
-    if (json_field(operation, kTargetCaptionField, value)) flow.target_caption = value;
-    if (json_field(operation, kTargetLyricsField, value)) flow.target_lyrics = value;
-    if (json_field(operation, kMinimumField, value)) flow.n_min = (float) atof(value.c_str());
-    if (json_field(operation, kMaximumField, value)) flow.n_max = (float) atof(value.c_str());
-    if (json_field(operation, kAverageField, value)) flow.n_avg = atoi(value.c_str());
-    plan.emplace_back(std::move(flow));
-}
-
-static bool parse_edit_operation(
-        const std::string & operation,
-        std::vector<tts_cpp::acestep::AudioEditParams> & plan,
-        std::string & error) {
-    std::string type;
-    if (!json_field(operation, kTypeField, type)) {
-        error = "edit plan operation is missing type";
-        return false;
-    }
-    if (type == kRepaintType) return parse_repaint_operation(operation, plan, error);
-    if (type == kFlowEditType) {
-        parse_flow_edit_operation(operation, plan);
-        return true;
-    }
-    error = "unsupported edit plan operation type '" + type + "'";
-    return false;
-}
-
-static bool parse_edit_operations(
-        const std::vector<std::string> & operations,
-        std::vector<tts_cpp::acestep::AudioEditParams> & plan,
-        std::string & error) {
-    if (operations.empty()) {
-        error = "edit plan requires a non-empty operations array";
-        return false;
-    }
-    for (const std::string & operation : operations) {
-        if (!parse_edit_operation(operation, plan, error)) return false;
-    }
-    return true;
-}
-
-static bool load_edit_plan(const char * path,
-                           std::vector<tts_cpp::acestep::AudioEditParams> & plan,
-                           std::string & error) {
-    const std::string json = read_file(path);
-    if (json.empty()) {
-        error = "cannot read edit plan";
-        return false;
-    }
-    return parse_edit_operations(json_array_objects(json, kOperationsField), plan, error);
-}
-
-static bool has_standalone_repaint_flags(int argc, char ** argv) {
-    return arg_val(argc, argv, kRepaintStartOption) ||
-           arg_val(argc, argv, kRepaintEndOption) ||
-           arg_val(argc, argv, kRepaintModeOption) ||
-           arg_val(argc, argv, kRepaintStrengthOption);
-}
-
-static bool has_standalone_flow_flags(int argc, char ** argv) {
-    return arg_val(argc, argv, kFlowSourceCaptionOption) != nullptr;
-}
-
-static bool parse_standalone_repaint(
-        int argc, char ** argv,
-        std::vector<tts_cpp::acestep::AudioEditParams> & plan) {
-    using namespace tts_cpp::acestep;
-    if (!has_standalone_repaint_flags(argc, argv)) return true;
-    RepaintParams repaint;
-    if (const char * value = arg_val(argc, argv, kRepaintStartOption))
-        repaint.start_seconds = (float) atof(value);
-    if (const char * value = arg_val(argc, argv, kRepaintEndOption))
-        repaint.end_seconds = (float) atof(value);
-    if (const char * value = arg_val(argc, argv, kRepaintStrengthOption))
-        repaint.strength = (float) atof(value);
-    if (const char * value = arg_val(argc, argv, kRepaintModeOption)) {
-        if (!parse_repaint_mode(value, repaint.mode)) {
-            fprintf(stderr, "[music-cli] --repaint-mode must be conservative|balanced|aggressive\n");
-            return false;
-        }
-    }
-    plan.emplace_back(std::move(repaint));
-    return true;
-}
-
-static void parse_standalone_flow(
-        int argc, char ** argv,
-        const tts_cpp::acestep::GenerateParams & params,
-        std::vector<tts_cpp::acestep::AudioEditParams> & plan) {
-    using namespace tts_cpp::acestep;
-    const char * source_caption = arg_val(argc, argv, kFlowSourceCaptionOption);
-    if (!source_caption) return;
-    FlowEditParams flow;
-    flow.source_caption = source_caption;
-    if (const char * value = arg_val(argc, argv, kFlowSourceLyricsOption))
-        flow.source_lyrics = value;
-    flow.target_caption = params.caption;
-    flow.target_lyrics = params.lyrics;
-    if (const char * value = arg_val(argc, argv, kFlowMinimumOption))
-        flow.n_min = (float) atof(value);
-    if (const char * value = arg_val(argc, argv, kFlowMaximumOption))
-        flow.n_max = (float) atof(value);
-    if (const char * value = arg_val(argc, argv, kFlowAverageOption))
-        flow.n_avg = atoi(value);
-    plan.emplace_back(std::move(flow));
-}
-
-static bool parse_edit_flags(int argc, char ** argv,
-                             tts_cpp::acestep::GenerateParams & params) {
-    const bool standalone_repaint = has_standalone_repaint_flags(argc, argv);
-    const bool standalone_flow = has_standalone_flow_flags(argc, argv);
-    if (const char * edit_plan_path = arg_val(argc, argv, kEditPlanOption)) {
-        if (standalone_repaint || standalone_flow) {
-            fprintf(stderr, "[music-cli] --edit-plan cannot be combined with standalone edit flags\n");
-            return false;
-        }
-        std::string error;
-        if (!load_edit_plan(edit_plan_path, params.edit_plan, error)) {
-            fprintf(stderr, "[music-cli] edit plan failed: %s\n", error.c_str());
-            return false;
-        }
-        return true;
-    }
-    if (!parse_standalone_repaint(argc, argv, params.edit_plan)) return false;
-    parse_standalone_flow(argc, argv, params, params.edit_plan);
-    return true;
-}
-
-static bool validate_edit_configuration(
-        const tts_cpp::acestep::GenerateParams & params) {
-    if (params.edit_plan.empty()) return true;
-    if (params.source_audio.empty()) {
-        fprintf(stderr, "[music-cli] editing requires --src-audio <48-kHz PCM16 WAV>\n");
-        return false;
-    }
-    if (params.task_type != kTextToMusicTask) {
-        fprintf(stderr, "[music-cli] editing cannot be combined with --task %s\n",
-                params.task_type.c_str());
-        return false;
-    }
-    fprintf(stderr, "[music-cli] edit plan: %zu ordered operation(s)\n",
-            params.edit_plan.size());
-    return true;
-}
+static constexpr const char *kNormalizeOption = "--normalize";
+static constexpr const char *kSourceAudioOption = "--src-audio";
 
 static std::vector<float> wav_read(const char * path, int * frames, int * rate) {
     tts_cpp::acestep::WavReadResult result = tts_cpp::acestep::load_pcm16_wav(path);
@@ -407,6 +104,8 @@ static void wav_write(const char * path, const std::vector<float> & pcm,
 
 int main(int argc, char ** argv) {
     using namespace tts_cpp::acestep;
+    using music_cli::json_field;
+    using music_cli::read_text_file;
 
     EngineOptions o;
     o.verbose = true;
@@ -481,8 +180,11 @@ int main(int argc, char ** argv) {
     // --req <json>: load caption/lyrics/metas and (if present) audio_codes to
     // bypass our LM — used for parity against acestep.cpp's ace-lm output.
     if (arg_val(argc, argv, "--req")) {
-        std::string j = read_file(arg_val(argc, argv, "--req"));
-        if (j.empty()) { fprintf(stderr, "[music-cli] cannot read --req json\n"); return 1; }
+      std::string j = read_text_file(arg_val(argc, argv, "--req"));
+      if (j.empty()) {
+        fprintf(stderr, "[music-cli] cannot read --req json\n");
+        return 1;
+      }
         std::string v;
         if (json_field(j, "caption", v)) p.caption = v;
         if (json_field(j, "lyrics", v)) p.lyrics = v;
@@ -535,8 +237,16 @@ int main(int argc, char ** argv) {
     if (arg_val(argc, argv, "--cover-noise"))
         p.cover_noise_strength = (float) atof(arg_val(argc, argv, "--cover-noise"));
 
-    if (!parse_edit_flags(argc, argv, p)) return 1;
-    if (!validate_edit_configuration(p)) return 1;
+    std::string edit_error;
+    if (!music_cli::parse_edit_flags(argc, argv, p, edit_error) ||
+        !music_cli::validate_edit_configuration(p, edit_error)) {
+      fprintf(stderr, "[music-cli] %s\n", edit_error.c_str());
+      return 1;
+    }
+    if (!p.edit_plan.empty()) {
+      fprintf(stderr, "[music-cli] edit plan: %zu ordered operation(s)\n",
+              p.edit_plan.size());
+    }
 
     const char * out_path = arg_val(argc, argv, "--out") ? arg_val(argc, argv, "--out") : "music_out.wav";
 

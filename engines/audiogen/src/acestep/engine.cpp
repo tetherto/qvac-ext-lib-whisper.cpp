@@ -1600,7 +1600,14 @@ static GenerateResult decode_edit_plan_result(
     GenerateResult result;
     result.sample_rate = AUDIO_SAMPLE_RATE;
     result.channels = AUDIO_CHANNELS;
-    result.pcm = engine.vae->decode(artifact.latent, artifact.latent_frames);
+    bool completed = true;
+    result.pcm = engine.vae->decode(
+        artifact.latent, artifact.latent_frames, [&](int done, int total) {
+          completed = report(EDIT_STAGE_VAE, done, total);
+          return completed;
+        });
+    if (!completed)
+      return {};
     if (result.pcm.empty()) {
         throw std::runtime_error(EDIT_ERROR_FINAL_DECODE);
     }
