@@ -81,6 +81,7 @@ endif()
 
 # ---- library --------------------------------------------------------------
 set(AUDIOGEN_LIB_SOURCES
+    src/acestep/audio_edit.cpp
     src/acestep/vae_gguf.cpp
     src/acestep/vae_ggml.cpp
     src/acestep/vae_encode_windows.cpp

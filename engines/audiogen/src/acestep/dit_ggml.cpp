@@ -1,6 +1,8 @@
 #include "dit_ggml.h"
 
+#include "audio_edit.h"
 #include "dit_gguf.h"
+#include "philox.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -95,7 +97,7 @@ struct DitModel {
 
     ggml_tensor * scalar_one = nullptr;  // [1] = 1.0f
 
-    bool use_flash_attn = false;  // CPU target: F32 soft_max path
+    bool use_flash_attn = false;
 };
 
 // ------------------------------------------------------------------ loaders
@@ -300,6 +302,34 @@ static ggml_tensor * attn_f32(ggml_context * ctx, ggml_tensor * q, ggml_tensor *
     return ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
 }
 
+static bool backend_supports_flash_attention(ggml_backend_t backend) {
+    const ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    if (!device) return false;
+    const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
+    return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+}
+
+static constexpr float DIT_FLASH_ATTENTION_MAX_BIAS = 0.0f;
+static constexpr float DIT_FLASH_ATTENTION_LOGIT_SOFTCAP = 0.0f;
+
+static ggml_tensor * flash_attention(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k,
+                                     ggml_tensor * v, ggml_tensor * mask, float scale) {
+    if (k->type == GGML_TYPE_F32) k = ggml_cast(ctx, k, GGML_TYPE_F16);
+    if (v->type == GGML_TYPE_F32) v = ggml_cast(ctx, v, GGML_TYPE_F16);
+    ggml_tensor * attention =
+        ggml_flash_attn_ext(ctx, q, k, v, mask, scale,
+                            DIT_FLASH_ATTENTION_MAX_BIAS, DIT_FLASH_ATTENTION_LOGIT_SOFTCAP);
+    ggml_flash_attn_ext_set_prec(attention, GGML_PREC_F32);
+    return attention;
+}
+
+static ggml_tensor * select_attention(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k,
+                                      ggml_tensor * v, ggml_tensor * mask, float scale,
+                                      bool use_flash_attention) {
+    if (use_flash_attention) return flash_attention(ctx, q, k, v, mask, scale);
+    return attn_f32(ctx, q, k, v, mask, scale);
+}
+
 static ggml_tensor * build_temb(ggml_context * ctx, DitTemb * w, ggml_tensor * t_scalar, ggml_tensor ** out_tproj) {
     ggml_tensor * t_scaled   = ggml_scale(ctx, t_scalar, 1000.0f);
     ggml_tensor * sinusoidal = ggml_timestep_embedding(ctx, t_scaled, 256, 10000);
@@ -340,8 +370,8 @@ static ggml_tensor * build_self_attn(ggml_context * ctx, DitModel * m, DitLayer 
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
-    float         scale = 1.0f / sqrtf((float) D);
-    ggml_tensor * attn  = attn_f32(ctx, q, k, v, mask, scale);
+    const float scale = 1.0f / sqrtf((float) D);
+    ggml_tensor * attn = select_attention(ctx, q, k, v, mask, scale, m->use_flash_attn);
     attn                = ggml_reshape_3d(ctx, attn, (int64_t) Nh * D, S, N);
     return linear(ctx, ly->sa_o_proj, attn);
 }
@@ -367,8 +397,8 @@ static ggml_tensor * build_cross_attn(ggml_context * ctx, DitModel * m, DitLayer
     q = ggml_mul(ctx, ggml_rms_norm(ctx, q, c.rms_norm_eps), as_f32(ctx, ly->ca_q_norm));
     k = ggml_mul(ctx, ggml_rms_norm(ctx, k, c.rms_norm_eps), as_f32(ctx, ly->ca_k_norm));
 
-    float         scale = 1.0f / sqrtf((float) D);
-    ggml_tensor * attn  = attn_f32(ctx, q, k, v, mask, scale);
+    const float scale = 1.0f / sqrtf((float) D);
+    ggml_tensor * attn = select_attention(ctx, q, k, v, mask, scale, m->use_flash_attn);
     attn                = ggml_reshape_3d(ctx, attn, (int64_t) Nh * D, S, N);
     return linear(ctx, ly->ca_o_proj, attn);
 }
@@ -426,6 +456,7 @@ DitModel * dit_model_load(const std::string & path, ggml_backend_t backend, bool
 
     DitModel * m = new DitModel();
     m->backend   = backend;
+    m->use_flash_attn = backend_supports_flash_attention(backend);
     if (!dit_gguf_read_config(g, m->cfg)) {
         dit_gguf_close(g);
         delete m;
@@ -738,6 +769,34 @@ void dit_apply_haar_dcw(std::vector<float> &       x_next,
     }
 }
 
+static constexpr float DIT_FINAL_TIMESTEP = 0.0f;
+
+static float next_schedule_timestep(const float * schedule, int step, int num_steps) {
+    return step == num_steps - 1 ? DIT_FINAL_TIMESTEP : schedule[step + 1];
+}
+
+static void inject_repaint_source(const DitSampleParams & params, int step, size_t latent_count,
+                                  int channels, std::vector<float> & current) {
+    const int injection_cutoff =
+        audio_edit_round_ties_to_even(params.repaint_injection_ratio * params.num_steps);
+    if (!params.repaint_mask || !params.clean_source_latents || step >= injection_cutoff) return;
+    const float timestep = next_schedule_timestep(params.schedule, step, params.num_steps);
+    const std::vector<float> clean(params.clean_source_latents,
+                                   params.clean_source_latents + latent_count);
+    const std::vector<float> noise(params.noise, params.noise + latent_count);
+    const std::vector<float> mask(params.repaint_mask, params.repaint_mask + params.T);
+    repaint_inject_source(current, clean, noise, mask, timestep, channels);
+}
+
+static void preserve_repaint_latent(const DitSampleParams & params, size_t latent_count,
+                                    int channels, std::vector<float> & current) {
+    if (!params.repaint_mask || !params.clean_source_latents || !params.repaint_preserve_latent) return;
+    const std::vector<float> clean(params.clean_source_latents,
+                                   params.clean_source_latents + latent_count);
+    const std::vector<float> mask(params.repaint_mask, params.repaint_mask + params.T);
+    repaint_blend_latent(current, clean, mask, params.repaint_crossfade_frames, channels);
+}
+
 bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & latent_out) {
     const DitConfig & c      = m->cfg;
     const int         Oc     = c.out_channels;                 // 64 (noisy latent channels)
@@ -860,9 +919,248 @@ bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & la
                                t_curr * p.dcw_scaler,
                                (1.0f - t_curr) * p.dcw_high_scaler);
         }
+
+        inject_repaint_source(p, step, n_per * N, Oc, xt);
     }
 
+    preserve_repaint_latent(p, n_per * N, Oc, xt);
+
     latent_out.swap(xt);
+    return true;
+}
+
+static constexpr int FLOW_EDIT_BATCH_SIZE = 1;
+static constexpr float ATTENTION_VISIBLE_VALUE = 0.0f;
+static constexpr bool FLOW_EDIT_ROUND_NOISE_TO_BF16 = true;
+static constexpr char FLOW_EDIT_PAIRED_FORWARD_ERROR[] =
+    "[acestep-dit] flow-edit paired forward failed at step %d\n";
+static constexpr char FLOW_EDIT_TARGET_FORWARD_ERROR[] =
+    "[acestep-dit] flow-edit target forward failed at step %d\n";
+
+struct FlowEditState {
+    DitModel * model;
+    const DitFlowEditParams & params;
+    size_t count;
+    std::vector<float> source;
+    std::vector<float> edit;
+    std::vector<float> target_running;
+    std::vector<float> noise;
+    std::vector<float> noisy_source;
+    std::vector<float> noisy_target;
+    std::vector<float> source_velocity;
+    std::vector<float> target_velocity;
+    std::vector<float> velocity_delta_sum;
+    int min_step;
+    int max_step;
+    uint64_t draw_index = 0;
+
+    FlowEditState(DitModel * model_value, const DitFlowEditParams & params_value)
+        : model(model_value),
+          params(params_value),
+          count((size_t) params.T * model->cfg.out_channels),
+          source(params.source_latents, params.source_latents + count),
+          edit(source),
+          noise(count),
+          velocity_delta_sum(count),
+          min_step((int) (params.num_steps * params.n_min)),
+          max_step((int) (params.num_steps * params.n_max)) {}
+};
+
+static void fill_flow_edit_input(std::vector<float> & input, const std::vector<float> & latent,
+                                 const float * context, int frames, int input_channels,
+                                 int context_channels, int latent_channels) {
+    for (int frame = 0; frame < frames; ++frame) {
+        float * destination = input.data() + (size_t) frame * input_channels;
+        memcpy(destination, context + (size_t) frame * context_channels,
+               (size_t) context_channels * sizeof(float));
+        memcpy(destination + context_channels, latent.data() + (size_t) frame * latent_channels,
+               (size_t) latent_channels * sizeof(float));
+    }
+}
+
+static void fill_flow_self_attention_mask(std::vector<uint16_t> & mask, int sequence,
+                                          int sliding_window) {
+    for (int query = 0; query < sequence; ++query) {
+        for (int key = 0; key < sequence; ++key) {
+            const int distance = query > key ? query - key : key - query;
+            const bool visible = sliding_window <= 0 || sequence <= sliding_window ||
+                                 distance <= sliding_window;
+            mask[(size_t) query * sequence + key] =
+                ggml_fp32_to_fp16(visible ? ATTENTION_VISIBLE_VALUE : -INFINITY);
+        }
+    }
+}
+
+static void fill_flow_cross_attention_mask(std::vector<uint16_t> & mask, int sequence,
+                                           int encoded_sequence, int real_encoded_sequence) {
+    for (int query = 0; query < sequence; ++query) {
+        for (int key = 0; key < encoded_sequence; ++key) {
+            mask[(size_t) query * encoded_sequence + key] =
+                ggml_fp32_to_fp16(key < real_encoded_sequence ? ATTENTION_VISIBLE_VALUE : -INFINITY);
+        }
+    }
+}
+
+static DitForwardInputs make_flow_forward_inputs(const std::vector<float> & input,
+                                                 const DitFlowEditCondition & condition,
+                                                 const std::vector<uint16_t> & self_mask,
+                                                 const std::vector<uint16_t> & cross_mask,
+                                                 int frames, float timestep) {
+    DitForwardInputs forward;
+    forward.input_latents = input.data();
+    forward.T = frames;
+    forward.N = FLOW_EDIT_BATCH_SIZE;
+    forward.enc_hidden = condition.enc_hidden;
+    forward.enc_S = condition.enc_S;
+    forward.H_enc = condition.H_enc;
+    forward.t = timestep;
+    forward.t_r = timestep;
+    forward.sa_mask_sw = self_mask.data();
+    forward.ca_mask = cross_mask.data();
+    return forward;
+}
+
+static bool flow_edit_condition_is_valid(const DitFlowEditCondition & condition) {
+    return condition.context_latents && condition.enc_hidden &&
+           condition.enc_S > 0 && condition.H_enc > 0;
+}
+
+static bool flow_edit_forward(DitModel * model, const std::vector<float> & latent,
+                              const DitFlowEditCondition & condition, int frames,
+                              float timestep, std::vector<float> & velocity) {
+    const DitConfig & config = model->cfg;
+    const int latent_channels = config.out_channels;
+    if (!flow_edit_condition_is_valid(condition) ||
+        latent.size() != (size_t) frames * latent_channels) {
+        return false;
+    }
+    const int context_channels = config.in_channels - latent_channels;
+    const int sequence = frames / config.patch_size;
+    std::vector<float> input((size_t) frames * config.in_channels);
+    fill_flow_edit_input(input, latent, condition.context_latents, frames,
+                         config.in_channels, context_channels, latent_channels);
+    std::vector<uint16_t> self_mask((size_t) sequence * sequence);
+    fill_flow_self_attention_mask(self_mask, sequence, config.sliding_window);
+    const int real_encoded_sequence = condition.real_enc_S > 0
+                                          ? std::min(condition.real_enc_S, condition.enc_S)
+                                          : condition.enc_S;
+    std::vector<uint16_t> cross_mask((size_t) condition.enc_S * sequence);
+    fill_flow_cross_attention_mask(cross_mask, sequence, condition.enc_S, real_encoded_sequence);
+    const DitForwardInputs forward =
+        make_flow_forward_inputs(input, condition, self_mask, cross_mask, frames, timestep);
+    return dit_model_forward(model, forward, velocity);
+}
+
+static void add_average_velocity_delta(std::vector<float> & delta,
+                                       const std::vector<float> & target_velocity,
+                                       const std::vector<float> & source_velocity, int averages) {
+    for (size_t index = 0; index < delta.size(); ++index) {
+        delta[index] += (target_velocity[index] - source_velocity[index]) / averages;
+    }
+}
+
+static void integrate_flow_edit_delta(std::vector<float> & edit,
+                                      const std::vector<float> & velocity_delta, float dt) {
+    for (size_t index = 0; index < edit.size(); ++index) {
+        edit[index] += dt * velocity_delta[index];
+    }
+}
+
+static void integrate_flow_target(std::vector<float> & target,
+                                  const std::vector<float> & velocity, float dt) {
+    for (size_t index = 0; index < target.size(); ++index) {
+        target[index] += dt * velocity[index];
+    }
+}
+
+static void draw_flow_edit_noise(FlowEditState & state) {
+    philox_randn(state.params.seed + state.draw_index++, state.noise.data(),
+                 (int) state.count, FLOW_EDIT_ROUND_NOISE_TO_BF16);
+}
+
+static bool run_flow_edit_forward_pair(FlowEditState & state, float timestep) {
+    if (flow_edit_forward(state.model, state.noisy_source, state.params.source,
+                          state.params.T, timestep, state.source_velocity) &&
+        flow_edit_forward(state.model, state.noisy_target, state.params.target,
+                          state.params.T, timestep, state.target_velocity)) {
+        return true;
+    }
+    return false;
+}
+
+static bool accumulate_flow_edit_averages(FlowEditState & state, int step, float timestep) {
+    for (int average = 0; average < state.params.n_avg; ++average) {
+        draw_flow_edit_noise(state);
+        flow_edit_make_source(state.source, state.noise, timestep, state.noisy_source);
+        flow_edit_make_target(state.edit, state.noisy_source, state.source, state.noisy_target);
+        if (!run_flow_edit_forward_pair(state, timestep)) {
+            fprintf(stderr, FLOW_EDIT_PAIRED_FORWARD_ERROR, step);
+            return false;
+        }
+        add_average_velocity_delta(state.velocity_delta_sum, state.target_velocity,
+                                   state.source_velocity, state.params.n_avg);
+    }
+    return true;
+}
+
+static bool run_flow_edit_delta_step(FlowEditState & state, int step, float timestep, float dt) {
+    std::fill(state.velocity_delta_sum.begin(), state.velocity_delta_sum.end(),
+              DIT_FLOW_EDIT_MIN_RATIO);
+    if (!accumulate_flow_edit_averages(state, step, timestep)) return false;
+    integrate_flow_edit_delta(state.edit, state.velocity_delta_sum, dt);
+    return true;
+}
+
+static void initialize_flow_target(FlowEditState & state, float timestep) {
+    draw_flow_edit_noise(state);
+    flow_edit_make_source(state.source, state.noise, timestep, state.noisy_source);
+    flow_edit_make_target(state.edit, state.noisy_source, state.source, state.target_running);
+}
+
+static bool run_flow_edit_target_step(FlowEditState & state, int step, float timestep, float dt) {
+    if (state.target_running.empty()) initialize_flow_target(state, timestep);
+    if (!flow_edit_forward(state.model, state.target_running, state.params.target,
+                           state.params.T, timestep, state.target_velocity)) {
+        fprintf(stderr, FLOW_EDIT_TARGET_FORWARD_ERROR, step);
+        return false;
+    }
+    integrate_flow_target(state.target_running, state.target_velocity, dt);
+    return true;
+}
+
+static bool run_flow_edit_step(FlowEditState & state, int step) {
+    if (state.params.on_step && !state.params.on_step(step, state.params.num_steps)) return false;
+    if (step < state.min_step) return true;
+    const float timestep = state.params.schedule[step];
+    const float next_timestep =
+        next_schedule_timestep(state.params.schedule, step, state.params.num_steps);
+    const float dt = next_timestep - timestep;
+    if (step < state.max_step) return run_flow_edit_delta_step(state, step, timestep, dt);
+    return run_flow_edit_target_step(state, step, timestep, dt);
+}
+
+static bool run_flow_edit_steps(FlowEditState & state) {
+    for (int step = 0; step < state.params.num_steps; ++step) {
+        if (!run_flow_edit_step(state, step)) return false;
+    }
+    return true;
+}
+
+static bool flow_edit_params_are_valid(DitModel * model, const DitFlowEditParams & params) {
+    return model && params.source_latents && params.schedule && params.T > 0 &&
+           params.num_steps > 0 && params.n_avg >= DIT_FLOW_EDIT_DEFAULT_AVERAGES &&
+           params.n_min >= DIT_FLOW_EDIT_MIN_RATIO && params.n_min <= params.n_max &&
+           params.n_max <= DIT_FLOW_EDIT_MAX_RATIO &&
+           params.T % model->cfg.patch_size == 0;
+}
+
+bool dit_flow_edit(DitModel * model, const DitFlowEditParams & params,
+                   std::vector<float> & latent_out) {
+    if (!flow_edit_params_are_valid(model, params)) return false;
+    FlowEditState state(model, params);
+    if (!run_flow_edit_steps(state)) return false;
+    if (params.on_step && !params.on_step(params.num_steps, params.num_steps)) return false;
+    latent_out = state.target_running.empty() ? std::move(state.edit) : std::move(state.target_running);
     return true;
 }
 

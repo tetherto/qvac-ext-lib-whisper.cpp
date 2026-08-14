@@ -27,6 +27,11 @@ VAE (AutoencoderOobleck)           -> 48 kHz stereo PCM
 
 The VAE upsamples by 1920, so `T_audio = T_latent * 1920`. Latents are time-major, `latent[t * 64 + c]`.
 
+When `GenerateParams::edit_plan` is non-empty, the engine takes the editing
+path instead: it VAE-encodes `source_audio`, skips the LM and FSQ
+detokenizer, executes each `RepaintParams` or `FlowEditParams` operation in
+order, and VAE-decodes the final latent.
+
 ## Model stages
 
 Four GGUF files provide six runtime weight sets. The DiT GGUF contains the
@@ -230,6 +235,82 @@ int main() {
 }
 ```
 
+## Audio editing
+
+Repaint and FlowEdit are separate operations. Repaint regenerates a time
+range while preserving the surrounding audio; FlowEdit morphs source
+caption/lyrics conditioning toward target caption/lyrics conditioning. Both
+can run independently, can be repeated, and can be composed in any order.
+Because each operation consumes the previous operation's result,
+`FlowEdit -> Repaint` is intentionally different from
+`Repaint -> FlowEdit`.
+
+Editing requires `GenerateParams::source_audio` as normalized, interleaved,
+stereo PCM at 48 kHz. The engine derives duration from this buffer and bypasses
+the LM and FSQ detokenizer. Repaint ranges must remain inside the source;
+outpainting is not supported.
+
+```cpp
+tts_cpp::acestep::GenerateParams params;
+params.source_audio = source_pcm_48khz_stereo;
+params.seed = 22883;
+
+tts_cpp::acestep::FlowEditParams flow;
+flow.source_caption = "bright late-1990s pop";
+flow.source_lyrics = original_lyrics;
+flow.target_caption = "dark analog synthwave";
+flow.target_lyrics = "[Instrumental]";
+flow.n_min = 0.0f;
+flow.n_max = 1.0f;
+flow.n_avg = 1;
+params.edit_plan.emplace_back(std::move(flow));
+
+tts_cpp::acestep::RepaintParams repaint;
+repaint.start_seconds = 10.0f;
+repaint.end_seconds = 20.0f;
+repaint.mode = tts_cpp::acestep::RepaintMode::Balanced;
+repaint.strength = 0.5f;
+repaint.caption = "expressive analog synthesizer solo";
+repaint.lyrics = "[Instrumental]";
+params.edit_plan.emplace_back(std::move(repaint));
+
+auto result = engine->generate(params);
+```
+
+`GenerateParams::seed` seeds the first operation. Operation at index `i` uses
+`seed + i`, so changing plan order also changes its deterministic noise.
+
+### Repaint options
+
+| Field | Default | Meaning |
+|---|---|---|
+| `start_seconds` | `0` | inclusive start of the repaint region |
+| `end_seconds` | `-1` | end of the region; `-1` means source end |
+| `mode` | `Balanced` | `Conservative`, `Balanced`, or `Aggressive` source preservation |
+| `strength` | `0.5` | balanced-mode regeneration strength in `[0, 1]`; `0` preserves more and `1` regenerates more |
+| `caption` | `GenerateParams::caption` | target description for this operation |
+| `lyrics` | `GenerateParams::lyrics` | target lyrics for this operation |
+
+`Conservative` maximizes source injection, boundary blending, and
+post-decode waveform preservation. `Aggressive` disables those preservation
+steps. `strength` controls the interpolation only in `Balanced` mode.
+
+### FlowEdit options
+
+| Field | Default | Meaning |
+|---|---|---|
+| `source_caption` | required | description of the current audio |
+| `source_lyrics` | `[Instrumental]` | current lyrics |
+| `target_caption` | required | desired description |
+| `target_lyrics` | `[Instrumental]` | desired lyrics |
+| `n_min` | `0` | beginning of the active diffusion window, in `[0, 1]` |
+| `n_max` | `1` | end of the active diffusion window, in `[0, 1]` |
+| `n_avg` | `1` | forward-noise samples averaged per active step; must be at least `1` |
+
+FlowEdit v1 is the validated Turbo, Euler, no-CFG path. It requires
+`diffusion_guidance_scale == 1`, with DCW, ADG, and Heun disabled; unsupported
+combinations are rejected rather than silently ignored.
+
 ## Command line tools
 
 | Binary | Purpose |
@@ -254,6 +335,25 @@ int main() {
 ./build/music-cli --models models/acestep --ref-audio reference-48k.wav \
                   --caption "warm Latin pop with a male lead vocal" \
                   --lyrics "[Verse]\nA brand new lyric" --gpu --out referenced.wav
+
+# repaint 10s..20s while preserving the rest of the source
+./build/audiogen/music-cli --models models/acestep --src-audio source-48k.wav \
+                  --caption "expressive analog synthesizer solo" \
+                  --lyrics "[Instrumental]" --repaint-start 10 --repaint-end 20 \
+                  --repaint-mode balanced --repaint-strength 0.5 \
+                  --seed 22883 --gpu --out repainted.wav
+
+# FlowEdit uses --caption/--lyrics as the target
+./build/audiogen/music-cli --models models/acestep --src-audio source-48k.wav \
+                  --flow-source-caption "bright late-1990s pop" \
+                  --flow-source-lyrics "[Instrumental]" \
+                  --caption "dark analog synthwave" --lyrics "[Instrumental]" \
+                  --flow-n-min 0 --flow-n-max 1 --flow-n-avg 1 \
+                  --seed 22883 --gpu --out flow-edited.wav
+
+# ordered, repeated, composable operations
+./build/audiogen/music-cli --models models/acestep --src-audio source-48k.wav \
+                  --edit-plan edit-plan.json --seed 22883 --gpu --out edited.wav
 ```
 
 | Flag | Default | Meaning |
@@ -271,6 +371,16 @@ int main() {
 | `--no-phase1` | off | skip the LM metadata auto-fill pass |
 | `--req FILE` | | request JSON; pre-supplied `audio_codes` skip the LM stage |
 | `--ref-audio FILE` | | 48 kHz PCM16 WAV used by ACE-Step's timbre-conditioning path |
+| `--src-audio FILE` | | 48 kHz PCM16 source WAV; required for editing |
+| `--repaint-start SEC`, `--repaint-end SEC` | `0`, source end | standalone repaint range |
+| `--repaint-mode MODE` | `balanced` | `conservative`, `balanced`, or `aggressive` |
+| `--repaint-strength F` | `0.5` | balanced-mode strength in `[0, 1]` |
+| `--flow-source-caption TEXT` | | enables standalone FlowEdit and describes the current source |
+| `--flow-source-lyrics TEXT` | `[Instrumental]` | current source lyrics |
+| `--flow-n-min F`, `--flow-n-max F` | `0`, `1` | active FlowEdit diffusion window |
+| `--flow-n-avg N` | `1` | forward-noise samples averaged per active step |
+| `--edit-plan FILE` | | ordered JSON edit plan; cannot be combined with standalone edit flags |
+| `--normalize` | off for edit plans | peak-normalize edited CLI output; avoid for partial repaint when outside-region PCM must remain exact |
 | `--gpu`, `--threads N` | CPU, hardware concurrency | compute placement |
 | `--backends-dir DIR` | | directory containing staged dynamic ggml backend modules; required by Android and Linux arm64 dynamic-backend builds |
 | `--dump-stages DIR` | | write one `.bin` per stage into an existing directory |
@@ -289,6 +399,35 @@ values after CLI parsing:
 
 `audio_codes` is currently not parsed as a JSON numeric array. A non-empty
 value bypasses the LM and feeds the codes directly to the FSQ detokenizer.
+
+`--edit-plan` accepts an object with an `operations` array. Operations execute
+in array order and may repeat:
+
+```json
+{
+  "operations": [
+    {
+      "type": "flow-edit",
+      "source_caption": "bright late-1990s pop",
+      "source_lyrics": "[Instrumental]",
+      "target_caption": "dark analog synthwave",
+      "target_lyrics": "[Instrumental]",
+      "n_min": 0,
+      "n_max": 1,
+      "n_avg": 1
+    },
+    {
+      "type": "repaint",
+      "start": 10,
+      "end": 20,
+      "mode": "balanced",
+      "strength": 0.5,
+      "caption": "expressive analog synthesizer solo",
+      "lyrics": "[Instrumental]"
+    }
+  ]
+}
+```
 
 The sampler enables ACE-Step's single-level Haar DCW `double` mode by default.
 At timestep `t`, the low band uses `t * 0.05` and the high band uses

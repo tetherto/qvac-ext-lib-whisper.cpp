@@ -212,8 +212,37 @@ static inline ggml_tensor * q3_attn(ggml_context * ctx, ggml_tensor * q, ggml_te
     return ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
 }
 
+static inline bool q3_backend_supports_flash_attention(ggml_backend_t backend) {
+    const ggml_backend_dev_t device = ggml_backend_get_device(backend);
+    if (!device) return false;
+    const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
+    return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+}
+
+inline constexpr float Q3_FLASH_ATTENTION_MAX_BIAS = 0.0f;
+inline constexpr float Q3_FLASH_ATTENTION_LOGIT_SOFTCAP = 0.0f;
+
+static inline ggml_tensor * q3_flash_attn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k,
+                                          ggml_tensor * v, ggml_tensor * mask, float scale) {
+    if (k->type == GGML_TYPE_F32) k = ggml_cast(ctx, k, GGML_TYPE_F16);
+    if (v->type == GGML_TYPE_F32) v = ggml_cast(ctx, v, GGML_TYPE_F16);
+    ggml_tensor * attention =
+        ggml_flash_attn_ext(ctx, q, k, v, mask, scale,
+                            Q3_FLASH_ATTENTION_MAX_BIAS, Q3_FLASH_ATTENTION_LOGIT_SOFTCAP);
+    ggml_flash_attn_ext_set_prec(attention, GGML_PREC_F32);
+    return attention;
+}
+
+static inline ggml_tensor * q3_select_attn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k,
+                                           ggml_tensor * v, ggml_tensor * mask, float scale,
+                                           ggml_prec precision, bool use_flash_attn) {
+    if (use_flash_attn) return q3_flash_attn(ctx, q, k, v, mask, scale);
+    return q3_attn(ctx, ggml_cont(ctx, q), ggml_cont(ctx, k), ggml_cont(ctx, v), mask, scale, precision);
+}
+
 static inline ggml_tensor * q3_build_self_attn(ggml_context * ctx, const Qwen3Config & c, Qwen3Layer * ly,
-                                               ggml_tensor * x, ggml_tensor * positions, ggml_tensor * mask, int S) {
+                                               ggml_tensor * x, ggml_tensor * positions, ggml_tensor * mask, int S,
+                                               bool use_flash_attn = false) {
     const int D   = c.head_dim;
     const int Nh  = c.n_heads;
     const int Nkv = c.n_kv_heads;
@@ -232,12 +261,12 @@ static inline ggml_tensor * q3_build_self_attn(ggml_context * ctx, const Qwen3Co
     q = ggml_rope_ext(ctx, q, positions, nullptr, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     k = ggml_rope_ext(ctx, k, positions, nullptr, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
-    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
-    v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+    q = ggml_permute(ctx, q, 0, 2, 1, 3);
+    k = ggml_permute(ctx, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
-    const float   scale = 1.0f / sqrtf((float) D);
-    ggml_tensor * attn  = q3_attn(ctx, q, k, v, mask, scale, c.prec);
+    const float scale = 1.0f / sqrtf((float) D);
+    ggml_tensor * attn = q3_select_attn(ctx, q, k, v, mask, scale, c.prec, use_flash_attn);
     attn                = ggml_reshape_2d(ctx, attn, (int64_t) Nh * D, S);
     return q3_linear(ctx, ly->o_proj, attn, c.prec);
 }
@@ -252,9 +281,10 @@ static inline ggml_tensor * q3_build_mlp(ggml_context * ctx, Qwen3Layer * ly, gg
 
 // One layer: hidden [H, S] -> [H, S]. mask nullptr = full attention.
 static inline ggml_tensor * q3_build_layer(ggml_context * ctx, const Qwen3Config & c, Qwen3Layer * ly,
-                                           ggml_tensor * hidden, ggml_tensor * positions, ggml_tensor * mask, int S) {
+                                           ggml_tensor * hidden, ggml_tensor * positions, ggml_tensor * mask, int S,
+                                           bool use_flash_attn = false) {
     ggml_tensor * norm = q3_rms_norm_w(ctx, hidden, ly->input_norm, c.rms_norm_eps);
-    ggml_tensor * attn = q3_build_self_attn(ctx, c, ly, norm, positions, mask, S);
+    ggml_tensor * attn = q3_build_self_attn(ctx, c, ly, norm, positions, mask, S, use_flash_attn);
     hidden             = ggml_add(ctx, hidden, attn);
 
     norm              = q3_rms_norm_w(ctx, hidden, ly->post_norm, c.rms_norm_eps);

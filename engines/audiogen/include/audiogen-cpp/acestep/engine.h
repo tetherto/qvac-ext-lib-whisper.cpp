@@ -42,6 +42,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace tts_cpp::acestep {
@@ -81,9 +82,50 @@ struct EngineOptions {
     // VAE encode remains a full-graph operation.
 };
 
+inline constexpr char AUDIO_EDIT_DEFAULT_LYRICS[] = "[Instrumental]";
+inline constexpr char AUDIO_EDIT_REPAINT_STAGE[] = "repaint";
+inline constexpr char AUDIO_EDIT_FLOW_STAGE[] = "flow-edit";
+inline constexpr float AUDIO_EDIT_MIN_RATIO = 0.0f;
+inline constexpr float AUDIO_EDIT_MAX_RATIO = 1.0f;
+inline constexpr float REPAINT_SOURCE_END_SECONDS = -1.0f;
+inline constexpr float REPAINT_DEFAULT_STRENGTH = 0.5f;
+inline constexpr int FLOW_EDIT_DEFAULT_AVERAGES = 1;
+inline constexpr float FLOW_EDIT_NO_CFG_SCALE = 1.0f;
+
+enum class RepaintMode {
+    Conservative,
+    Balanced,
+    Aggressive,
+};
+
+struct RepaintParams {
+    float       start_seconds = AUDIO_EDIT_MIN_RATIO;
+    float       end_seconds   = REPAINT_SOURCE_END_SECONDS;
+    RepaintMode mode          = RepaintMode::Balanced;
+    float       strength      = REPAINT_DEFAULT_STRENGTH;
+    std::string caption;
+    std::string lyrics;
+};
+
+struct FlowEditParams {
+    std::string source_caption;
+    std::string source_lyrics = AUDIO_EDIT_DEFAULT_LYRICS;
+    std::string target_caption;
+    std::string target_lyrics = AUDIO_EDIT_DEFAULT_LYRICS;
+    float       n_min         = AUDIO_EDIT_MIN_RATIO;
+    float       n_max         = AUDIO_EDIT_MAX_RATIO;
+    int         n_avg         = FLOW_EDIT_DEFAULT_AVERAGES;
+    float diffusion_guidance_scale = FLOW_EDIT_NO_CFG_SCALE;
+    bool  dcw_enabled              = false;
+    bool  use_adg                  = false;
+    bool  use_heun                 = false;
+};
+
+using AudioEditParams = std::variant<RepaintParams, FlowEditParams>;
+
 struct GenerateParams {
     std::string caption;                 // required text prompt
-    std::string lyrics = "[Instrumental]";
+    std::string lyrics = AUDIO_EDIT_DEFAULT_LYRICS;
     float       duration = 20.0f;        // target seconds (drives LM code count)
     int         inference_steps = 0;     // 0 = auto (turbo: 8, base/sft: 50)
     float       shift = 0.0f;            // 0 = auto (turbo: 3.0, base/sft: 1.0)
@@ -133,6 +175,8 @@ struct GenerateParams {
     // skipped and these codes are used directly (parity / caching / editing).
     // Ignored for cover / cover-nofsq (those skip the LM entirely).
     std::vector<int> audio_codes;
+
+    std::vector<AudioEditParams> edit_plan;
 };
 
 // LM-enriched metadata surfaced alongside the audio (the same fields
