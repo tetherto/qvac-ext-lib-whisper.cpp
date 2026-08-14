@@ -7,10 +7,20 @@
 //   cosyvoice-cli --model-dir models/cosyvoice3-0.5b \
 //       --text "Hello from a fully on-device C++ pipeline." --out out.wav
 //
-// Pass --n-gpu-layers > 0 to select the GPU path (Metal on Apple, OpenCL on
-// Adreno; every other GPU is declined and falls back to CPU).  Uses the baked
-// default voice;
-// zero-shot from arbitrary reference audio awaits the native S3/CAM++ port.
+// Pass --n-gpu-layers > 0 to select the GPU path (Metal on Apple, Vulkan on
+// desktop Linux / Windows, OpenCL on Adreno; every other GPU is declined and
+// falls back to CPU).
+//
+// Voice cloning (needs cosyvoice3-s3tok*.gguf + cosyvoice3-campplus*.gguf in
+// the model dir, or --s3tok-gguf / --campplus-gguf):
+//
+//   zero-shot (same language as the reference; best fidelity):
+//     cosyvoice-cli --model-dir ... --reference-audio me.wav \
+//         --prompt-text "verbatim transcript of me.wav" --text "..."
+//   cross-lingual (no transcript; timbre only, target language differs):
+//     cosyvoice-cli --model-dir ... --reference-audio me.wav --text "..."
+//
+// Without --reference-audio the baked default voice (voice.gguf) is used.
 
 #include "tts-cpp/cosyvoice/engine.h"
 #include "tts-cpp/voice_controls.h"
@@ -59,6 +69,7 @@ int main(int argc, char ** argv) {
     constexpr ctl::EngineId kEngine = ctl::EngineId::CosyVoice;
 
     std::string out = "cosyvoice_out.wav", prompt_text, voice_gguf;
+    std::string reference_audio, s3tok_gguf, campplus_gguf;
     std::string backends_dir, opencl_cache_dir;
     VoiceControls controls;
     int seed = 42, n_gpu_layers = 0, n_threads = 0, vulkan_device = 0;
@@ -69,6 +80,9 @@ int main(int argc, char ** argv) {
         else if (a == "--text" && i + 1 < argc) text = argv[++i];
         else if (a == "--out" && i + 1 < argc) out = argv[++i];
         else if (a == "--prompt-text" && i + 1 < argc) prompt_text = argv[++i];
+        else if (a == "--reference-audio" && i + 1 < argc) reference_audio = argv[++i];
+        else if (a == "--s3tok-gguf" && i + 1 < argc) s3tok_gguf = argv[++i];
+        else if (a == "--campplus-gguf" && i + 1 < argc) campplus_gguf = argv[++i];
         else if (a == "--instruct" && i + 1 < argc) controls.instruct_text = argv[++i];
         else if (a == "--emotion" && i + 1 < argc) controls.emotion = argv[++i];
         else if (a == "--pace" && i + 1 < argc) controls.pace = argv[++i];
@@ -91,10 +105,16 @@ int main(int argc, char ** argv) {
         else {
             fprintf(stderr,
                 "usage: %s --model-dir DIR [--text ...] [--voice-gguf voice.gguf]\n"
+                "          [--reference-audio REF.wav [--prompt-text \"its transcript\"]]\n"
+                "          [--s3tok-gguf S3TOK.gguf] [--campplus-gguf CAMPPLUS.gguf]\n"
                 "          [--emotion NAME] [--pace slow|moderate|fast] [--instruct \"...\"]\n"
                 "          [--list-emotions] [--list-paces]\n"
                 "          [--out out.wav] [--seed N] [--greedy] [--n-gpu-layers N] [--threads N]\n"
                 "          [--vulkan-device N] [--backends-dir DIR] [--opencl-cache-dir DIR]\n"
+                "\n"
+                "Voice cloning: --reference-audio with --prompt-text (the reference's verbatim\n"
+                "transcript) = zero-shot; without --prompt-text = cross-lingual (timbre only).\n"
+                "Requires the s3tok + campplus GGUFs (auto-resolved from --model-dir).\n"
                 "\n"
                 "CosyVoice3 is trained on one instruction per synthesis: set at most one of\n"
                 "--emotion / --pace / --instruct (pace=moderate counts as unset).\n"
@@ -113,6 +133,9 @@ int main(int argc, char ** argv) {
     opts.n_threads = n_threads;
     opts.default_controls = controls;
     if (!prompt_text.empty()) opts.prompt_text = prompt_text;
+    if (!reference_audio.empty()) opts.reference_audio = reference_audio;
+    if (!s3tok_gguf.empty()) opts.s3tok_gguf_path = s3tok_gguf;
+    if (!campplus_gguf.empty()) opts.campplus_gguf_path = campplus_gguf;
     if (!voice_gguf.empty()) opts.voice_gguf_path = voice_gguf;
     if (!backends_dir.empty()) opts.backends_dir = backends_dir;
     if (!opencl_cache_dir.empty()) opts.opencl_cache_dir = opencl_cache_dir;

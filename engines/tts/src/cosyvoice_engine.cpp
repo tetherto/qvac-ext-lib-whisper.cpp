@@ -6,19 +6,24 @@
 // placeholder audio.
 //
 // Model directory layout (resolve_component discovers these under model_dir):
-//   cosyvoice3-llm*.gguf    Qwen2.5-0.5B speech LM
-//   cosyvoice3-flow*.gguf   DiT conditional-flow-matching estimator
-//   cosyvoice3-hift*.gguf   CausalHiFT vocoder
-//   voice.gguf              baked default voice (prompt tensors)
-//   vocab.json / merges.txt Qwen2 byte-level BPE frontend
+//   cosyvoice3-llm*.gguf      Qwen2.5-0.5B speech LM
+//   cosyvoice3-flow*.gguf     DiT conditional-flow-matching estimator
+//   cosyvoice3-hift*.gguf     CausalHiFT vocoder
+//   voice.gguf                baked default voice (prompt tensors)
+//   vocab.json / merges.txt   Qwen2 byte-level BPE frontend
+//   cosyvoice3-s3tok*.gguf    speech_tokenizer_v3 (only with reference_audio)
+//   cosyvoice3-campplus*.gguf CAM++ speaker encoder (only with reference_audio)
 //
-// Zero-shot cloning from arbitrary reference audio still needs the native S3
-// tokenizer + CAM++ port (stage 6); until then the baked default voice is used.
+// Zero-shot / cross-lingual cloning: with reference_audio set, the native
+// front-end (cosyvoice_frontend.cpp) bakes the four prompt tensors from the
+// recording at construction, replacing voice.gguf's; prompt_text selects the
+// mode (transcript given = zero-shot, empty = cross-lingual).
 
 #include "tts-cpp/cosyvoice/engine.h"
 
 #include "backend_selection.h"
 #include "backend_util.h"
+#include "cosyvoice_frontend.h"
 #include "cosyvoice_instruct.h"
 #include "cosyvoice_pipeline.h"
 #include "qwen_tokenizer.h"
@@ -127,6 +132,12 @@ struct Engine::Impl {
     int                voice_mel_len1 = 0;
     std::vector<float> voice_embedding;     // 192-d CAM++ embedding
     std::string        voice_prompt_text;   // baked reference transcript (voice.gguf)
+    // True when the voice_* tensors were baked from opts.reference_audio at
+    // construction instead of loaded from voice.gguf.  Gates the zero-shot /
+    // cross-lingual branch in run(): a cloned voice must never fall back to
+    // the baked transcript or kDefaultTranscript, which describe the baked
+    // clip rather than the reference recording.
+    bool               cloned = false;
 
     std::atomic_bool cancel_flag{false};
 
@@ -156,11 +167,6 @@ struct Engine::Impl {
         require(vocab_path, "vocab.json");
         require(merges_path, "merges.txt");
 
-        if (!opts.reference_audio.empty()) {
-            fprintf(stderr, "cosyvoice: reference_audio is set but native S3/CAM++ "
-                            "is not yet ported; using the baked default voice.\n");
-        }
-
         // ---- backend selection -------------------------------------------
         namespace det = ::tts_cpp::detail;
         if (!opts.backends_dir.empty())     det::set_backends_directory(opts.backends_dir);
@@ -178,6 +184,18 @@ struct Engine::Impl {
                                         cosyvoice_gpu_requirement());
         if (!backend) backend = det::init_cpu_backend();
         if (!backend) throw std::runtime_error("cosyvoice: failed to init a compute backend");
+
+        // ~Impl does not run when the constructor throws, so every throw
+        // below this point (tokenizer/voice.gguf load, cloning validation)
+        // would leak the backend without this guard; it is disarmed once
+        // construction succeeds.
+        struct BackendGuard {
+            ggml_backend_t & b;
+            bool armed = true;
+            ~BackendGuard() {
+                if (armed && b) { ggml_backend_free(b); b = nullptr; }
+            }
+        } backend_guard{backend};
 
         llm_path_  = llm_path;
         flow_path_ = flow_path;
@@ -200,6 +218,44 @@ struct Engine::Impl {
         }
         voice_mel_len1     = (int)(voice_prompt_feat.size() / 80);
         voice_prompt_text  = cosyvoice_gguf_meta_str(voice_path, "voice.prompt_text", "");
+
+        // ---- zero-shot voice cloning bake (optional) ---------------------
+        // Runs the native front-end once and overwrites the baked-voice
+        // tensors above.  Every failure throws: silently keeping the baked
+        // voice would synthesise with the wrong speaker, which the caller has
+        // no way to detect.
+        if (!opts.reference_audio.empty()) {
+            const std::string s3tok_path = resolve_component(
+                opts.s3tok_gguf_path, opts.model_dir, "cosyvoice3-s3tok", false);
+            const std::string campplus_path = resolve_component(
+                opts.campplus_gguf_path, opts.model_dir, "cosyvoice3-campplus", false);
+            require(s3tok_path,
+                    "speech tokenizer gguf (cosyvoice3-s3tok*.gguf; required when reference_audio is set)");
+            require(campplus_path,
+                    "CAM++ gguf (cosyvoice3-campplus*.gguf; required when reference_audio is set)");
+
+            cosyvoice_prompt ref;
+            std::string err;
+            if (!cosyvoice_frontend_run(opts.reference_audio, s3tok_path, campplus_path,
+                                        backend, opts.n_threads, ref, err)) {
+                throw std::runtime_error("cosyvoice: voice cloning failed: " + err);
+            }
+            voice_prompt_stok.assign(ref.prompt_stok.begin(), ref.prompt_stok.end());
+            voice_prompt_token = voice_prompt_stok;
+            voice_prompt_feat  = std::move(ref.prompt_feat);
+            voice_mel_len1     = ref.mel_len1;
+            voice_embedding    = std::move(ref.embedding);
+            // The baked transcript describes the baked clip, not this
+            // reference; without opts.prompt_text run() goes cross-lingual.
+            voice_prompt_text.clear();
+            cloned = true;
+            fprintf(stderr, "cosyvoice: cloned voice from %s (%zu prompt tokens, %s)\n",
+                    opts.reference_audio.c_str(), voice_prompt_stok.size(),
+                    opts.prompt_text.empty() ? "no transcript: cross-lingual mode"
+                                             : "transcript given: zero-shot mode");
+        }
+
+        backend_guard.armed = false;
     }
 
     ~Impl() {
@@ -221,6 +277,7 @@ struct Engine::Impl {
                            std::vector<int> * out_tokens = nullptr) {
         std::string prompt_text;
         std::vector<int> lm_prompt_stok;
+        bool cross_lingual = false;
         if (!instruct.empty()) {
             // Instruct mode (dialects / accents / emotion / pace / volume):
             // the natural-language instruction sits in the LM prompt *before*
@@ -231,8 +288,22 @@ struct Engine::Impl {
             // dialect/style.
             prompt_text = detail::build_lm_prompt_instruct(instruct);
             lm_prompt_stok = {};  // dropped in instruct mode
+        } else if (cloned && opts.prompt_text.empty()) {
+            // Cross-lingual cloning: no transcript for the reference, so the
+            // LM gets the bare template (which still carries the
+            // <|endofprompt|> marker the CosyVoice3 LM requires) and NO
+            // prompt speech tokens — upstream frontend_cross_lingual ==
+            // frontend_zero_shot minus prompt_text minus
+            // llm_prompt_speech_token.  The flow tensors keep the cloned
+            // timbre; the LM is free to speak the target language natively
+            // instead of continuing the reference clip's language.
+            prompt_text = detail::build_lm_prompt_zero_shot("");
+            lm_prompt_stok = {};
+            cross_lingual = true;
         } else {
             // Zero-shot: transcript precedence explicit > baked voice > fallback.
+            // (`cloned` implies opts.prompt_text is non-empty here, so a cloned
+            // voice never picks up the baked metadata or kDefaultTranscript.)
             const std::string transcript =
                 !opts.prompt_text.empty()    ? opts.prompt_text
                 : !voice_prompt_text.empty() ? voice_prompt_text
@@ -245,9 +316,21 @@ struct Engine::Impl {
         std::vector<int> text_ids = tokenizer.encode(prompt_text);
         text_ids.insert(text_ids.end(), tts_ids.begin(), tts_ids.end());
 
-        const int min_len   = 2 * (int)tts_ids.size();     // min_token_text_ratio
-        const int max_steps = 50 * ((int)tts_ids.size() + 1); // generous cap
+        // Length-guard basis mirrors upstream, which scales min/max on the
+        // tokens that are NOT LM prompt text.  Upstream cross-lingual deletes
+        // prompt_text and carries the <|endofprompt|> template inside
+        // tts_text, so the template tokens count toward its basis; our port
+        // keeps the template in prompt_text, so add them back explicitly or
+        // short cross-lingual text could reach EOS earlier than upstream.
+        const int lm_basis  = cross_lingual ? (int)text_ids.size() : (int)tts_ids.size();
+        const int min_len   = 2 * lm_basis;       // min_token_text_ratio
+        const int max_steps = 50 * (lm_basis + 1); // generous cap
         const bool greedy   = opts.greedy;
+
+        if (tmg) {
+            tmg->n_text_ids             = (int) text_ids.size();
+            tmg->n_prompt_speech_tokens = (int) lm_prompt_stok.size();
+        }
 
         // Stage 1 — LM: text ids -> speech tokens (freed at scope end). A pinned
         // trajectory skips the LM entirely -- sampling is chaotic in the logits,
@@ -348,6 +431,8 @@ SynthesisResult Engine::synthesize(const std::string & text,
     result.timings.n_speech_tokens  = tmg.n_speech_tokens;
     result.timings.tm               = tmg.tm;
     result.timings.mel_len          = tmg.mel_len;
+    result.timings.n_text_ids       = tmg.n_text_ids;
+    result.timings.n_prompt_speech_tokens = tmg.n_prompt_speech_tokens;
 
     const bool streaming = pimpl_->opts.stream_chunk_tokens > 0 && static_cast<bool>(on_chunk);
     if (!streaming) {

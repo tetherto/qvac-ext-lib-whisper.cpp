@@ -50,7 +50,7 @@ engine, not every backend ggml can compile.
 | Supertonic 2 | `en`, `ko`, `es`, `pt`, `fr` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Supertonic 3 | 31 languages plus `na` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Parler-TTS mini/large/Indic | English or 21 Indic languages | natural-language description | 44.1 kHz | yes | yes | yes | yes | no |
-| Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice; instruct controls | 24 kHz | yes | yes | yes | yes | no |
+| Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice or zero-shot/cross-lingual reference WAV; instruct controls | 24 kHz | yes | yes | yes | yes | no |
 | Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | yes | yes | no | no |
 | LavaSR denoiser | language agnostic | input PCM | rate preserving | yes | yes | yes | yes | yes |
 | LavaSR enhancer | language agnostic | input PCM | 48 kHz | yes | yes | yes | yes | yes |
@@ -569,6 +569,42 @@ the callback shape but does not reduce first-audio latency.
 ./build/cosyvoice-cli --model-dir models/cosyvoice3-0.5b \
   --text "Hello from CosyVoice3." --out out.wav
 ```
+
+### Voice cloning
+
+With no reference audio the engine speaks with the baked default voice
+(`voice.gguf`). Zero-shot / cross-lingual cloning runs fully natively — the
+reference wav is tokenized by a ggml port of `speech_tokenizer_v3` (12-block
+FSMN encoder + FSQ, converted by `scripts/convert-s3tokenizer-v3-to-gguf.py`),
+the 192-d speaker embedding comes from the CAM++ port
+(`scripts/convert-campplus-to-gguf.py`; the same 3D-Speaker checkpoint
+CosyVoice ships as `campplus.onnx`), and the prompt mel from the shared
+matcha-compatible mel extractor. Both GGUFs are required whenever
+`reference_audio` is set (`cosyvoice3-s3tok*.gguf`,
+`cosyvoice3-campplus*.gguf`, auto-resolved from the model dir); a missing
+model, an unreadable wav, or an out-of-range duration (0.5-30 s hard limits,
+5-15 s recommended) fails construction rather than silently keeping the baked
+voice.
+
+The reference transcript selects the mode, mirroring the upstream frontends:
+
+```bash
+# zero-shot: transcript given, LM prompted with the reference speech tokens
+# (best fidelity when synthesizing the reference's own language)
+./build/cosyvoice-cli --model-dir models/cosyvoice3-0.5b \
+  --reference-audio me.wav --prompt-text "verbatim transcript of me.wav" \
+  --text "Same language as the reference." --out out.wav
+
+# cross-lingual: no transcript, timbre-only conditioning through the flow
+./build/cosyvoice-cli --model-dir models/cosyvoice3-0.5b \
+  --reference-audio me.wav --text "Any other language." --out out.wav
+```
+
+The bake runs once at engine construction (roughly a second of CPU for the
+tokenizer + CAM++ + mel on a short clip; the tokenizer graph rides the
+engine's GPU backend when one is selected). Instruct mode composes with a
+cloned voice: the instruction drives dialect/style while the cloned tensors
+supply the timbre.
 
 ## Audio8
 
