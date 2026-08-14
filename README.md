@@ -165,17 +165,21 @@ cmake --build build -j
 
 GPU backends come from the ggml build: `-DGGML_VULKAN=ON`, `-DGGML_OPENCL=ON`, `-DGGML_CUDA=ON`; Metal is on by default on Apple. Core ML is gated per engine and defaults to off on both, so add `-DWHISPER_COREML=ON -DPARAKEET_COREML=ON` on Apple for the Whisper encoder and Parakeet offline TDT encoder sidecars. For tests, configure with `-DSPEECH_BUILD_TESTS=ON`, then run the non-GPU suite with `ctest --test-dir build -LE 'gpu|perf'`.
 
-Each engine also configures standalone (`cmake -S engines/parakeet`, and so on), which is what the per-engine vcpkg ports and CI lanes use.
+Each engine also configures standalone (`cmake -S engines/parakeet`, and so on), which is what the CI lanes use.
 
 ### Consumable packages
 
-| vcpkg port | `find_package` | Imported target |
+One vcpkg port, [`speech-cpp`](https://github.com/tetherto/qvac-registry-vcpkg/tree/main/ports/speech-cpp), builds this repo through the umbrella `CMakeLists.txt` above: engine features select what gets built, and every enabled engine links the single `ggml-speech` ggml. Consumers depend on the engines they need, for example `speech-cpp[whisper,parakeet,vulkan]`, and the backend features (`metal`, `vulkan`, `opencl`) fan out to the matching `ggml-speech` features so the whole stack resolves one ggml.
+
+| Feature | `find_package` | Imported target |
 |---|---|---|
-| `ggml-speech` | `ggml` | `ggml::ggml` |
-| `whisper-cpp` | `whisper` | `whisper::whisper` |
-| `parakeet-cpp` | `qvac-parakeet` | `qvac::parakeet` |
-| `tts-cpp` | `tts-cpp` | `tts-cpp::tts-cpp` |
-| `audiogen-cpp` | `audiogen-cpp` | `audiogen-cpp::audiogen-cpp` |
+| (always) | `ggml` | `ggml::ggml` |
+| `speech-cpp[whisper]` | `whisper` | `whisper::whisper` |
+| `speech-cpp[parakeet]` | `qvac-parakeet` | `qvac::parakeet` |
+| `speech-cpp[tts]` | `tts-cpp` | `tts-cpp::tts-cpp` |
+| `speech-cpp[audiogen]` | `audiogen-cpp` | `audiogen-cpp::audiogen-cpp` |
+
+The per-engine `whisper-cpp`, `parakeet-cpp`, `tts-cpp` and `audiogen-cpp` ports that predate `speech-cpp` are superseded: they pinned this repo at four different commits, and `speech-cpp` replaces them with one pin for the whole stack.
 
 ## Command line tools
 
@@ -338,14 +342,14 @@ On-device Android and iOS performance is tracked by the benchmark lanes in [QVAC
 
 ## Use in QVAC
 
-These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons, which consume the vcpkg ports built from this repo. The CLIs here are development and validation entry points: for anything beyond them, such as the JavaScript and TypeScript APIs on the Bare runtime, model download and registry, and desktop plus mobile app integration, see QVAC.
+These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons, which consume the `speech-cpp` vcpkg port built from this repo. The CLIs here are development and validation entry points: for anything beyond them, such as the JavaScript and TypeScript APIs on the Bare runtime, model download and registry, and desktop plus mobile app integration, see QVAC.
 
-| QVAC addon | Wraps | vcpkg ports consumed |
+| QVAC addon | Wraps | `speech-cpp` features consumed |
 |---|---|---|
-| `@qvac/asr-ggml` | speech-to-text, diarization, end-of-utterance | `whisper-cpp`, `parakeet-cpp` |
-| `@qvac/tts-ggml` | text-to-speech, voice cloning, speech enhancement | `tts-cpp` |
-| `@qvac/audiogen-ggml` | music generation | `audiogen-cpp` |
-| `@qvac/bci-whispercpp` | brain-computer interface transcription | `whisper-cpp` |
+| `@qvac/asr-ggml` | speech-to-text, diarization, end-of-utterance | `whisper`, `parakeet` |
+| `@qvac/tts-ggml` | text-to-speech, voice cloning, speech enhancement | `tts` |
+| `@qvac/audiogen-ggml` | music generation | `audiogen` |
+| `@qvac/bci-whispercpp` | brain-computer interface transcription | `whisper` |
 
 ## Licenses
 
