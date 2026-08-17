@@ -45,10 +45,12 @@ constexpr int kCosyvoiceNativeSampleRate = 24000;
 // backend no reference run covers. TTS_CPP_COSYVOICE_GPU in
 // CMakeLists.txt mirrors this condition for gpu test registration.
 inline ::tts_cpp::detail::GpuBackendRequirement cosyvoice_gpu_requirement() {
+    using ::tts_cpp::detail::GpuBackendRequirement;
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
-    return ::tts_cpp::detail::GpuBackendRequirement::MetalOrOpenCLOrVulkan;
+    return GpuBackendRequirement::Metal | GpuBackendRequirement::OpenCL |
+           GpuBackendRequirement::Vulkan;
 #else
-    return ::tts_cpp::detail::GpuBackendRequirement::MetalOrOpenCL;
+    return GpuBackendRequirement::Metal | GpuBackendRequirement::OpenCL;
 #endif
 }
 

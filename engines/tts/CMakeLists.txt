@@ -1126,8 +1126,8 @@ if (TTS_CPP_BUILD_TESTS)
                      PROPERTY ENVIRONMENT "AUDIO8_TEST_GPU=${suffix}")
     endfunction()
 
-    # Audio8 allowlist: Vulkan / Metal (audio8/gguf.cpp
-    # GpuBackendRequirement::VulkanOrMetal).
+    # Audio8 allowlist: Vulkan / Metal / OpenCL (audio8/gguf.cpp
+    # GpuBackendRequirement::Vulkan | Metal | OpenCL).
     if (TTS_CPP_GGML_VULKAN)
         tts_cpp_register_audio8_gpu_tests(vulkan)
         if (TARGET audio8-cli)
@@ -1146,6 +1146,9 @@ if (TTS_CPP_BUILD_TESTS)
     endif()
     if (TTS_CPP_GGML_METAL)
         tts_cpp_register_audio8_gpu_tests(metal)
+    endif()
+    if (TTS_CPP_GGML_OPENCL)
+        tts_cpp_register_audio8_gpu_tests(opencl)
     endif()
 
     # The per-stage breakdown the Metal work is ranked by.  Needs the models but

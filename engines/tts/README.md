@@ -51,7 +51,7 @@ engine, not every backend ggml can compile.
 | Supertonic 3 | 31 languages plus `na` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Parler-TTS mini/large/Indic | English or 21 Indic languages | natural-language description | 44.1 kHz | yes | yes | yes | yes | no |
 | Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice or zero-shot/cross-lingual reference WAV; instruct controls | 24 kHz | yes | yes | yes | yes | no |
-| Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | yes | yes | no | no |
+| Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | yes | yes | yes | no |
 | LavaSR denoiser | language agnostic | input PCM | rate preserving | yes | yes | yes | yes | yes |
 | LavaSR enhancer | language agnostic | input PCM | 48 kHz | yes | yes | yes | yes | yes |
 
@@ -617,15 +617,41 @@ frame.  Cloning needs no speaker encoder: the codec *encoder* turns a reference
 wav into codes, and those codes plus the reference transcript are prepended to
 the prompt.
 
-**Status — CPU, Metal, and desktop Vulkan, validated against the reference.**
-Text-to-speech and voice cloning both run in-process on macOS and iOS Metal and
-on Linux and Windows Vulkan.  Pass `--n-gpu-layers 99` to offload every stage;
-omit it for CPU.  On Metal that is **4.2x** CPU at q4_0 and **3.2x** at q8_0 on
-an iPhone 17, measured on device with both arms in one launch.  At F32 the GPU
-reproduces the CPU code trajectory exactly, frame for frame, which is the
-strongest available statement that the graphs compute the same function;
-quantised tiers fork their trajectories under either backend and are judged by
-WER instead.
+**Status — CPU, Metal, OpenCL, and desktop Vulkan, validated against the
+reference.**  Text-to-speech and voice cloning both run in-process on macOS and
+iOS Metal, on Android/Adreno OpenCL, and on Linux and Windows Vulkan.  Pass
+`--n-gpu-layers 99` to offload every stage; omit it for CPU.  On Metal that is
+**4.2x** CPU at q4_0 and **3.2x** at q8_0 on an iPhone 17, measured on device
+with both arms in one launch.  At F32 the GPU reproduces the CPU code trajectory
+exactly, frame for frame, which is the strongest available statement that the
+graphs compute the same function; quantised tiers fork their trajectories under
+either backend and are judged by WER instead.
+
+On OpenCL the two halves of the model behave differently and are reported
+separately, because a single overall number is not reproducible on that device.
+**Codec synthesis is 3.5-4.7x faster than CPU** and is stable run to run.  The
+autoregressive loop is not GPU-bound at all: it is bound by the host issuing
+roughly one dispatch every 24 us, so its wall time follows which CPU core the
+issuing thread is scheduled onto.  Pinning that thread to the big cluster took a
+q4_0 utterance from 30952/22011 ms across two runs to 17197/17201 ms — a 41%
+spread collapsing to 0.02% — while codec synthesis did not move.
+
+| backend | device | tier | codec synth | overall, same cores | overall, unpinned |
+|---|---|---|---:|---:|---:|
+| Metal | iPhone 17 | q8_0 | — | 3.2x | — |
+| Metal | iPhone 17 | q4_0 | — | 4.2x | — |
+| OpenCL | Adreno 740 | q8_0 | 4.7x | 1.9x | 1.1x |
+| OpenCL | Adreno 740 | q4_0 | 5.1x | 2.3x | 1.3x |
+
+Read the two overall columns as a range, not as one number with a caveat.  "Same
+cores" pins both arms to the big cluster, which makes the GPU arm reproducible
+(2.9% spread) but costs the CPU arm, whose five threads then contend for four
+cores.  "Unpinned" is the median of every interleaved, thermally gated run, and
+is what an application that does not set affinity should expect; its GPU arm
+ranged 126-245 ms/frame at q8_0 for the same binary.  Both were measured on a
+cold device with a 50 °C gate between arms.  Real-time factors are quoted
+elsewhere in this file as wall-clock seconds per second of audio, so **lower is
+faster** and a value above 1 means slower than real time.
 
 ### Convert
 
@@ -900,10 +926,10 @@ ctest -R audio8 --output-on-failure
 no models; every other target needs the dumps.
 
 On a build with a GPU backend compiled in, the `lm`, `codec` and `engine`
-suites are registered a second time per backend as `test-audio8-<suite>-metal`
-and `-vulkan`. Each arm names its backend in `AUDIO8_TEST_GPU` and asserts it
-before reading a number, so an arm that fell back to CPU, or that was handed the
-other arm's GPU, fails rather than passing on someone else's result.
+suites are registered a second time per backend as `test-audio8-<suite>-metal`,
+`-vulkan` and `-opencl`. Each arm names its backend in `AUDIO8_TEST_GPU` and
+asserts it before reading a number, so an arm that fell back to CPU, or that was
+handed the other arm's GPU, fails rather than passing on someone else's result.
 
 The engine test hands the cloning path a wav rather than pre-computed codes, so
 it exercises the codec encoder the way a caller would.
