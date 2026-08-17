@@ -49,6 +49,12 @@ bool summarize(const char * name,
                const std::vector<float> & cpu,
                const std::vector<float> & vk,
                double rel_tol = 5e-2) {
+    if (cpu.size() != vk.size()) {
+        std::fprintf(stderr,
+                     "FAIL stage %-25s size mismatch: cpu=%zu vk=%zu\n",
+                     name, cpu.size(), vk.size());
+        return false;
+    }
     double max_abs = 0.0, rel = 0.0;
     compute_parity(vk, cpu, max_abs, rel);
     const bool nan_cpu = any_nan_or_inf(cpu);
@@ -97,6 +103,13 @@ int main(int argc, char ** argv) {
     if (int rc = load_from_gguf(gguf_path, m_vk, 0, /*n_gpu_layers=*/1, false); rc != 0) {
         std::fprintf(stderr, "error: Vulkan load_from_gguf rc=%d\n", rc);
         return 11;
+    }
+    if (!model_has_gpu_backend(m_vk)) {
+        std::fprintf(stderr,
+                     "error: no GPU backend selected (got '%s'); a CPU-vs-CPU "
+                     "run would pass parity without testing anything\n",
+                     model_active_backend_name(m_vk).c_str());
+        return 12;
     }
 
     // ---- read wav and compute mel on CPU (once) ----

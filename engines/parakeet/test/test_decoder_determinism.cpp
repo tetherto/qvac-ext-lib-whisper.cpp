@@ -2,8 +2,8 @@
 //
 // Usage:
 //   test-decoder-determinism --model <gguf> --wav <wav> [--runs N] [--threads N]
-//       [--n-gpu-layers N] [--language ID] [--cache-hit-ratio R] [--prewarm]
-//       [--prewarm-audio-seconds F] [--cold-overhead-max R] [--verbose]
+//       [--n-gpu-layers N] [--language ID] [--require-gpu] [--cache-hit-ratio R]
+//       [--prewarm] [--prewarm-audio-seconds F] [--cold-overhead-max R] [--verbose]
 //
 // Exit 0 on success; non-zero on failure or invalid arguments.
 
@@ -27,6 +27,7 @@ struct Opts {
     int  n_gpu_layers = 0;
     int  n_threads = 0;
     std::string language;
+    bool require_gpu = false;
     bool verbose = false;
     // Cache-hit gate compares median(warm runs 1..N-1) to run 0
     // (cold). Median (not max) is the right statistic — a real
@@ -85,6 +86,9 @@ void usage(const char * argv0) {
         "  --threads N          CPU threads (0 = HW concurrency)\n"
         "  --language ID        pass-through to Engine (required for multilingual\n"
         "                       CTC GGUFs that carry language masks, e.g. 'hi')\n"
+        "  --require-gpu        fail unless the engine actually selected a GPU\n"
+        "                       backend; guards against silent CPU fallback\n"
+        "                       turning a GPU determinism run into CPU-vs-CPU\n"
         "  --cache-hit-ratio F  fail if median(warm enc_ms) exceeds cold\n"
         "                       enc_ms * F. Default 1.10. A real cache MISS\n"
         "                       (graph rebuilt each call) makes EVERY warm\n"
@@ -109,7 +113,7 @@ void usage(const char * argv0) {
         "  --cold-overhead-max F  with --prewarm, fail if run0_enc_ms exceeds\n"
         "                       median(warm) * F. Default 1.30. The 1.30 leaves\n"
         "                       headroom for CPU thermal jitter on a noisy desktop\n"
-        "                       (single-run spikes can lift run0 ~25 % even when\n"
+        "                       (single-run spikes can lift run0 ~25%% even when\n"
         "                       the cache hits). Tighten on a thermally-controlled\n"
         "                       CI box. A real prewarm regression goes 1.5-2.5x.\n"
         "  --verbose            print per-run summary\n",
@@ -125,6 +129,7 @@ int parse_args(int argc, char ** argv, Opts & o) {
         else if (a == "--n-gpu-layers" && i + 1 < argc) o.n_gpu_layers = std::atoi(argv[++i]);
         else if (a == "--threads"      && i + 1 < argc) o.n_threads = std::atoi(argv[++i]);
         else if (a == "--language"     && i + 1 < argc) o.language = argv[++i];
+        else if (a == "--require-gpu")                  o.require_gpu = true;
         else if (a == "--cache-hit-ratio" && i + 1 < argc) o.cache_hit_ratio_max = std::atof(argv[++i]);
         else if (a == "--prewarm")                         o.prewarm = true;
         else if (a == "--prewarm-audio-seconds" && i + 1 < argc) o.prewarm_audio_seconds = (float) std::atof(argv[++i]);
@@ -194,6 +199,13 @@ int run_transcribe_path(const Opts & o,
     parakeet::Engine eng(eopts);
     const double ctor_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                                std::chrono::steady_clock::now() - t_ctor).count() / 1000.0;
+    if (o.require_gpu && eng.backend_device() != parakeet::BackendDevice::GPU) {
+        std::fprintf(stderr,
+            "[determinism] FAIL: --require-gpu but the engine selected backend "
+            "'%s'; a silent CPU fallback would make this run CPU-vs-CPU\n",
+            eng.backend_name().c_str());
+        return 1;
+    }
     std::fprintf(stderr,
         "[determinism] transcribe path: model=%s backend=%s threads=%d gpu_layers=%d runs=%d prewarm=%s ctor=%.2fms\n",
         model_type_str.c_str(),
@@ -343,6 +355,13 @@ int run_diarize_path(const Opts & o,
     parakeet::Engine eng(eopts);
     const double ctor_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                                std::chrono::steady_clock::now() - t_ctor).count() / 1000.0;
+    if (o.require_gpu && eng.backend_device() != parakeet::BackendDevice::GPU) {
+        std::fprintf(stderr,
+            "[determinism] FAIL: --require-gpu but the engine selected backend "
+            "'%s'; a silent CPU fallback would make this run CPU-vs-CPU\n",
+            eng.backend_name().c_str());
+        return 1;
+    }
     std::fprintf(stderr,
         "[determinism] diarize path: model=%s backend=%s threads=%d gpu_layers=%d runs=%d prewarm=%s ctor=%.2fms\n",
         model_type_str.c_str(),

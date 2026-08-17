@@ -3527,7 +3527,13 @@ masked CTC decode is ~0.2 ms.
   `test-vk-vs-cpu-indic` (per-stage encoder parity).
 - `test/test_decoder_determinism.cpp` — `--language` pass-through to
   `EngineOptions::language` so the harness can drive multilingual CTC
-  GGUFs that require a language id.
+  GGUFs that require a language id, and `--require-gpu` so GPU
+  registrations fail loudly instead of silently passing CPU-vs-CPU when
+  backend init falls back to CPU (used by the indic-gpu and
+  rnnt-vulkan determinism registrations).
+- `test/test_vk_vs_cpu.cpp` — refuses to run when the second load did
+  not actually select a GPU backend, and per-stage parity now fails on
+  output size mismatch instead of comparing the shared prefix.
 - `test/samples/hi-16k.wav` — 7.3 s synthesized Hindi fixture
   (16 kHz mono PCM16, canonical 44-byte RIFF header for the test's
   minimal reader).

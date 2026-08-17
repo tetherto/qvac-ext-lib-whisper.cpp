@@ -1081,7 +1081,7 @@ if (PARAKEET_BUILD_TESTS)
             LABEL    "gpu"
             EXE      test-decoder-determinism
             ARGS     "--model" "${_qvp_indic_q8_gguf}" "--wav" "${_qvp_hi_wav}"
-                     "--language" "hi" "--n-gpu-layers" "1"
+                     "--language" "hi" "--n-gpu-layers" "1" "--require-gpu"
             REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}")
     endif()
 
@@ -1096,7 +1096,7 @@ if (PARAKEET_BUILD_TESTS)
             LABEL    "gpu"
             EXE      test-decoder-determinism
             ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
-                     "--threads" "4" "--n-gpu-layers" "1"
+                     "--threads" "4" "--n-gpu-layers" "1" "--require-gpu"
             REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
     endif()
 endif()
