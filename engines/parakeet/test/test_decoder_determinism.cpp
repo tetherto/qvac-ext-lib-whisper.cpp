@@ -2,7 +2,7 @@
 //
 // Usage:
 //   test-decoder-determinism --model <gguf> --wav <wav> [--runs N] [--threads N]
-//       [--n-gpu-layers N] [--cache-hit-ratio R] [--prewarm]
+//       [--n-gpu-layers N] [--language ID] [--cache-hit-ratio R] [--prewarm]
 //       [--prewarm-audio-seconds F] [--cold-overhead-max R] [--verbose]
 //
 // Exit 0 on success; non-zero on failure or invalid arguments.
@@ -26,6 +26,7 @@ struct Opts {
     int  n_runs = 5;
     int  n_gpu_layers = 0;
     int  n_threads = 0;
+    std::string language;
     bool verbose = false;
     // Cache-hit gate compares median(warm runs 1..N-1) to run 0
     // (cold). Median (not max) is the right statistic — a real
@@ -82,6 +83,8 @@ void usage(const char * argv0) {
         "  --runs N             number of repeated calls (default 5; min 2)\n"
         "  --n-gpu-layers N     pass-through to Engine (default 0)\n"
         "  --threads N          CPU threads (0 = HW concurrency)\n"
+        "  --language ID        pass-through to Engine (required for multilingual\n"
+        "                       CTC GGUFs that carry language masks, e.g. 'hi')\n"
         "  --cache-hit-ratio F  fail if median(warm enc_ms) exceeds cold\n"
         "                       enc_ms * F. Default 1.10. A real cache MISS\n"
         "                       (graph rebuilt each call) makes EVERY warm\n"
@@ -121,6 +124,7 @@ int parse_args(int argc, char ** argv, Opts & o) {
         else if (a == "--runs"         && i + 1 < argc) o.n_runs = std::atoi(argv[++i]);
         else if (a == "--n-gpu-layers" && i + 1 < argc) o.n_gpu_layers = std::atoi(argv[++i]);
         else if (a == "--threads"      && i + 1 < argc) o.n_threads = std::atoi(argv[++i]);
+        else if (a == "--language"     && i + 1 < argc) o.language = argv[++i];
         else if (a == "--cache-hit-ratio" && i + 1 < argc) o.cache_hit_ratio_max = std::atof(argv[++i]);
         else if (a == "--prewarm")                         o.prewarm = true;
         else if (a == "--prewarm-audio-seconds" && i + 1 < argc) o.prewarm_audio_seconds = (float) std::atof(argv[++i]);
@@ -182,6 +186,7 @@ int run_transcribe_path(const Opts & o,
     eopts.model_gguf_path        = o.model_path;
     eopts.n_threads              = o.n_threads;
     eopts.n_gpu_layers           = o.n_gpu_layers;
+    eopts.language               = o.language;
     eopts.verbose                = false;
     eopts.prewarm                = o.prewarm;
     eopts.prewarm_audio_seconds  = o.prewarm_audio_seconds;
@@ -330,6 +335,7 @@ int run_diarize_path(const Opts & o,
     eopts.model_gguf_path        = o.model_path;
     eopts.n_threads              = o.n_threads;
     eopts.n_gpu_layers           = o.n_gpu_layers;
+    eopts.language               = o.language;
     eopts.verbose                = false;
     eopts.prewarm                = o.prewarm;
     eopts.prewarm_audio_seconds  = o.prewarm_audio_seconds;

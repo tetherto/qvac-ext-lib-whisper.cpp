@@ -557,9 +557,11 @@ if (PARAKEET_BUILD_TESTS)
     set(_qvp_sf_f16_gguf   "${PARAKEET_TEST_MODEL_DIR}/diar_sortformer_4spk-v1.f16.gguf")
     set(_qvp_sfs_q8_gguf   "${PARAKEET_TEST_MODEL_DIR}/diar_streaming_sortformer_4spk-v2.q8_0.gguf")
     set(_qvp_sfsv21_q8_gguf "${PARAKEET_TEST_MODEL_DIR}/diar_streaming_sortformer_4spk-v2.1.q8_0.gguf")
+    set(_qvp_indic_q8_gguf "${PARAKEET_TEST_MODEL_DIR}/indic-conformer-600m-multilingual.q8_0.gguf")
     set(_qvp_jfk_wav       "${PARAKEET_TEST_AUDIO_DIR}/jfk.wav")
     set(_qvp_diar_wav      "${PARAKEET_TEST_AUDIO_DIR}/diarization-sample-16k.wav")
     set(_qvp_fr_multipiece_wav "${PARAKEET_TEST_AUDIO_DIR}/fr-multipiece-16k.wav")
+    set(_qvp_hi_wav        "${PARAKEET_TEST_AUDIO_DIR}/hi-16k.wav")
     set(_qvp_abcba_wav     "${PARAKEET_TEST_AUDIO_DIR}/abcba.wav")
     set(_qvp_abcba_rttm    "${PARAKEET_TEST_AUDIO_DIR}/abcba.rttm")
     set(_qvp_abcdba_wav    "${PARAKEET_TEST_AUDIO_DIR}/abcdba.wav")
@@ -1023,6 +1025,12 @@ if (PARAKEET_BUILD_TESTS)
         EXE      test-decoder-determinism
         ARGS     "--model" "${_qvp_sf_q8_gguf}" "--wav" "${_qvp_diar_wav}"
         REQUIRES "${_qvp_sf_q8_gguf}" "${_qvp_diar_wav}")
+    parakeet_register_test(test-decoder-determinism-indic
+        LABEL    "fixture"
+        EXE      test-decoder-determinism
+        ARGS     "--model" "${_qvp_indic_q8_gguf}" "--wav" "${_qvp_hi_wav}"
+                 "--language" "hi"
+        REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}")
 
     # Long-form encoder windowing. The model-free unit test (planner + resolver
     # + seam trim/append) runs on every checkout; the parity test is
@@ -1046,7 +1054,11 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
 
-    if (GGML_VULKAN)
+    # test-vk-vs-cpu is the generic GPU-vs-CPU encoder bisect: it loads the
+    # model twice (CPU baseline + whichever GPU backend the build enables)
+    # and reports per-stage parity. Despite the historical name it applies
+    # to Metal builds too.
+    if (GGML_VULKAN OR GGML_METAL)
         add_executable(test-vk-vs-cpu
             test/test_vk_vs_cpu.cpp
             src/parakeet_ctc.cpp
@@ -1060,6 +1072,20 @@ if (PARAKEET_BUILD_TESTS)
             LABEL    "gpu"
             ARGS     "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}"
             REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
+        parakeet_register_test(test-vk-vs-cpu-indic
+            LABEL    "gpu"
+            EXE      test-vk-vs-cpu
+            ARGS     "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}"
+            REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}")
+        parakeet_register_test(test-decoder-determinism-indic-gpu
+            LABEL    "gpu"
+            EXE      test-decoder-determinism
+            ARGS     "--model" "${_qvp_indic_q8_gguf}" "--wav" "${_qvp_hi_wav}"
+                     "--language" "hi" "--n-gpu-layers" "1"
+            REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}")
+    endif()
+
+    if (GGML_VULKAN)
         parakeet_register_test(test-streaming-rnnt-vulkan
             LABEL    "gpu"
             EXE      test-parakeet-streaming
