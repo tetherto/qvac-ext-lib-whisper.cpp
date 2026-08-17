@@ -549,9 +549,47 @@ static long long resolve_seed(long long seed) {
     return (long long) random();
 }
 
+static const char * tempo_label(int bpm) {
+    if (bpm < 80) return "slow";
+    if (bpm < 120) return "moderate";
+    if (bpm < 160) return "fast";
+    return "very fast";
+}
+
+static std::string build_conditioning_caption(const std::string & caption, int bpm,
+                                              const std::string & timesignature,
+                                              const std::string & keyscale) {
+    std::string result = caption;
+    if (bpm > 0 && result.find("Target tempo:") == std::string::npos) {
+        if (!result.empty() && result.back() != '.' && result.back() != '!' && result.back() != '?') {
+            result += '.';
+        }
+        result += "\nTarget tempo: " + std::to_string(bpm) + " BPM (" + tempo_label(bpm) + ").";
+        if (bpm < 80) {
+            result += " Use a clearly perceptible slow, spacious pulse.";
+        } else if (bpm < 120) {
+            result += " Use a clearly perceptible steady mid-tempo pulse.";
+        } else if (bpm < 160) {
+            result += " Use a clearly perceptible fast, energetic pulse.";
+        } else {
+            result += " Use a clearly perceptible very-fast full-time pulse; avoid half-time interpretation.";
+        }
+    }
+    if (!timesignature.empty() && result.find("Target time signature:") == std::string::npos) {
+        result += "\nTarget time signature: " + timesignature + ".";
+    }
+    if (!keyscale.empty() && result.find("Target key:") == std::string::npos) {
+        result += "\nTarget key: " + keyscale + ".";
+    }
+    return result;
+}
+
 static AcePrompt make_prompt(const GenerateParams & params, const std::string & language) {
     AcePrompt prompt;
-    prompt.caption        = params.caption;
+    prompt.caption        = params.augment_caption_with_metadata
+                                ? build_conditioning_caption(
+                                      params.caption, params.bpm, params.timesignature, params.keyscale)
+                                : params.caption;
     prompt.lyrics         = params.lyrics.empty() ? INSTRUMENTAL_LYRICS : params.lyrics;
     prompt.duration       = params.duration;
     prompt.bpm            = params.bpm;
@@ -624,6 +662,7 @@ struct GenerationState {
     GenerationPlan plan;
     long long seed = 0;
     std::string language;
+    std::string original_caption;
     AcePrompt prompt;
     GenerationConditioning conditioning;
     std::vector<float> context_latents;
@@ -666,6 +705,7 @@ static GenerationState make_generation_state(const GenerateParams & params, bool
                          ? (params.edit_plan.empty() ? DEFAULT_VOCAL_LANGUAGE
                                                      : EDIT_VOCAL_LANGUAGE)
                          : params.vocal_language;
+    state.original_caption = params.caption;
     state.prompt = make_prompt(params, state.language);
     state.low_memory = !keep_stages;
     return state;
@@ -1047,7 +1087,12 @@ static AcePrompt make_edit_prompt(const GenerateParams & params, const std::stri
                                   const std::string & lyrics, float duration,
                                   const std::string & language) {
     AcePrompt prompt = make_prompt(params, language);
-    prompt.caption = caption.empty() ? params.caption : caption;
+    if (!caption.empty() && params.augment_caption_with_metadata) {
+        prompt.caption =
+            build_conditioning_caption(caption, prompt.bpm, prompt.timesignature, prompt.keyscale);
+    } else if (!caption.empty()) {
+        prompt.caption = caption;
+    }
     prompt.lyrics = lyrics.empty() ? params.lyrics : lyrics;
     if (prompt.lyrics.empty()) prompt.lyrics = INSTRUMENTAL_LYRICS;
     prompt.duration = duration;
@@ -1661,7 +1706,8 @@ static GenerateResult run_audio_edit_plan(EngineImpl & engine,
 }
 
 static void populate_metadata(const GenerationState & state, GenerateResult & result) {
-    result.metadata.caption = state.prompt.caption;
+    result.metadata.caption =
+        state.original_caption.empty() ? state.prompt.caption : state.original_caption;
     result.metadata.lyrics = state.prompt.lyrics;
     result.metadata.keyscale = state.prompt.keyscale;
     result.metadata.vocal_language = state.prompt.vocal_language;
