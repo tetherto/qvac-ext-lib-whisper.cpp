@@ -158,9 +158,11 @@ constexpr int PROBE_NODES = 2;
 // validated against, stage by stage, against the F32 reference. Anything else
 // falls back to CPU rather than running unverified kernels.
 ggml_backend_t init_backend(int n_gpu_layers) {
+    using ::tts_cpp::detail::GpuBackendRequirement;
     ggml_backend_t backend = ::tts_cpp::detail::init_gpu_backend(
         n_gpu_layers, true, "audio8", 0, false, nullptr,
-        ::tts_cpp::detail::GpuBackendRequirement::VulkanOrMetal);
+        GpuBackendRequirement::Vulkan | GpuBackendRequirement::Metal |
+            GpuBackendRequirement::OpenCL);
     return backend ? backend : ::tts_cpp::detail::init_cpu_backend();
 }
 
