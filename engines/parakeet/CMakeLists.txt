@@ -562,6 +562,7 @@ if (PARAKEET_BUILD_TESTS)
     set(_qvp_diar_wav      "${PARAKEET_TEST_AUDIO_DIR}/diarization-sample-16k.wav")
     set(_qvp_fr_multipiece_wav "${PARAKEET_TEST_AUDIO_DIR}/fr-multipiece-16k.wav")
     set(_qvp_hi_wav        "${PARAKEET_TEST_AUDIO_DIR}/hi-16k.wav")
+    set(_qvp_hi_expected   "${PARAKEET_TEST_AUDIO_DIR}/hi-16k.expected.txt")
     set(_qvp_abcba_wav     "${PARAKEET_TEST_AUDIO_DIR}/abcba.wav")
     set(_qvp_abcba_rttm    "${PARAKEET_TEST_AUDIO_DIR}/abcba.rttm")
     set(_qvp_abcdba_wav    "${PARAKEET_TEST_AUDIO_DIR}/abcdba.wav")
@@ -1029,8 +1030,8 @@ if (PARAKEET_BUILD_TESTS)
         LABEL    "fixture"
         EXE      test-decoder-determinism
         ARGS     "--model" "${_qvp_indic_q8_gguf}" "--wav" "${_qvp_hi_wav}"
-                 "--language" "hi"
-        REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}")
+                 "--language" "hi" "--expect-text-file" "${_qvp_hi_expected}"
+        REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}" "${_qvp_hi_expected}")
 
     # Long-form encoder windowing. The model-free unit test (planner + resolver
     # + seam trim/append) runs on every checkout; the parity test is
@@ -1054,28 +1055,24 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
 
-    # test-vk-vs-cpu is the generic GPU-vs-CPU encoder bisect: it loads the
-    # model twice (CPU baseline + whichever GPU backend the build enables)
-    # and reports per-stage parity. Despite the historical name it applies
-    # to Metal builds too.
     if (GGML_VULKAN OR GGML_METAL)
-        add_executable(test-vk-vs-cpu
-            test/test_vk_vs_cpu.cpp
+        add_executable(test-gpu-vs-cpu
+            test/test_gpu_vs_cpu.cpp
             src/parakeet_ctc.cpp
             src/parakeet_log.cpp
             src/mel_preprocess.cpp
             src/sentencepiece_bpe.cpp)
-        target_link_libraries(test-vk-vs-cpu PRIVATE ggml parakeet-backend-defs)
-        target_include_directories(test-vk-vs-cpu PRIVATE ggml/include src include)
-        parakeet_apply_backend_defs(test-vk-vs-cpu)
-        parakeet_register_test(test-vk-vs-cpu
+        target_link_libraries(test-gpu-vs-cpu PRIVATE ggml parakeet-backend-defs)
+        target_include_directories(test-gpu-vs-cpu PRIVATE ggml/include src include)
+        parakeet_apply_backend_defs(test-gpu-vs-cpu)
+        parakeet_register_test(test-gpu-vs-cpu
             LABEL    "gpu"
             ARGS     "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}"
             REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
-        parakeet_register_test(test-vk-vs-cpu-indic
+        parakeet_register_test(test-gpu-vs-cpu-indic
             LABEL    "gpu"
-            EXE      test-vk-vs-cpu
-            ARGS     "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}"
+            EXE      test-gpu-vs-cpu
+            ARGS     "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}" "hi"
             REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}")
         parakeet_register_test(test-decoder-determinism-indic-gpu
             LABEL    "gpu"

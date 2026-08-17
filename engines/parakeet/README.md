@@ -436,8 +436,9 @@ ctest --test-dir build-parakeet -L cpu --output-on-failure
 ```
 
 Fixture roots are configurable with `PARAKEET_TEST_MODEL_DIR`,
-`PARAKEET_TEST_AUDIO_DIR`, and `PARAKEET_TEST_REF_DIR`. `test-vk-vs-cpu`
-is available when Vulkan is configured. `verify-gguf-roundtrip.py`,
+`PARAKEET_TEST_AUDIO_DIR`, and `PARAKEET_TEST_REF_DIR`. `test-gpu-vs-cpu`
+(formerly `test-vk-vs-cpu`) is available when Vulkan or Metal is configured.
+`verify-gguf-roundtrip.py`,
 `ref-encoder-from-gguf.py`, and `streaming-reference.py` support converter and
 parity investigation.
 

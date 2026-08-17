@@ -3492,7 +3492,7 @@ backend-independent by construction.
   knife-edge greedy-argmax jitter at ambiguous frames from ordinary
   backend numeric drift, not the deferred-LSTM class of bug fixed in
   Phase 15 (CTC has no recurrent decoder state).
-- Per-stage encoder bisect (`test-vk-vs-cpu`, q8_0, 7.3 s hi clip):
+- Per-stage encoder bisect (`test-gpu-vs-cpu`, q8_0, 7.3 s hi clip):
   all stages within the 5e-2 gate; `encoder_out` rel L2 = 2.9e-2,
   `logits` rel L2 = 1.6e-2.
 - FLEURS test-split spot check (32 clips, 8 each of hi/ta/gu/kn,
@@ -3517,23 +3517,35 @@ masked CTC decode is ~0.2 ms.
 
 ### 18.3 — changes
 
-- `CMakeLists.txt` — `test-vk-vs-cpu` (GPU-vs-CPU encoder bisect) now
-  builds under `GGML_VULKAN OR GGML_METAL` instead of Vulkan only; the
+- `CMakeLists.txt` — the Phase-16 `test-vk-vs-cpu` harness is renamed
+  `test-gpu-vs-cpu` (it was never Vulkan-specific) and now builds under
+  `GGML_VULKAN OR GGML_METAL` instead of Vulkan only; the
   Vulkan-specific RNNT registrations stay Vulkan-gated. New fixture
-  shorthands `_qvp_indic_q8_gguf` / `_qvp_hi_wav` and three
-  registrations, all auto-disabled when the fixtures are missing:
-  `test-decoder-determinism-indic` (CPU, `--language hi`),
+  shorthands `_qvp_indic_q8_gguf` / `_qvp_hi_wav` / `_qvp_hi_expected`
+  and three registrations, all auto-disabled when the fixtures are
+  missing: `test-decoder-determinism-indic` (CPU, `--language hi`,
+  anchored to the expected transcript),
   `test-decoder-determinism-indic-gpu` (`--n-gpu-layers 1`),
-  `test-vk-vs-cpu-indic` (per-stage encoder parity).
+  `test-gpu-vs-cpu-indic` (per-stage encoder parity + hi-masked greedy
+  decode equality).
 - `test/test_decoder_determinism.cpp` — `--language` pass-through to
   `EngineOptions::language` so the harness can drive multilingual CTC
-  GGUFs that require a language id, and `--require-gpu` so GPU
+  GGUFs that require a language id; `--require-gpu` so GPU
   registrations fail loudly instead of silently passing CPU-vs-CPU when
   backend init falls back to CPU (used by the indic-gpu and
-  rnnt-vulkan determinism registrations).
-- `test/test_vk_vs_cpu.cpp` — refuses to run when the second load did
-  not actually select a GPU backend, and per-stage parity now fails on
-  output size mismatch instead of comparing the shared prefix.
+  rnnt-vulkan determinism registrations); and `--expect-text-file` so
+  repeatability runs can anchor run 0 to a known-good transcript —
+  determinism alone would also pass deterministic-but-wrong output,
+  e.g. a GGUF that lost its language ranges silently decoding the full
+  aggregate vocab.
+- `test/test_gpu_vs_cpu.cpp` — refuses to run when the second load did
+  not actually select a GPU backend; per-stage parity fails on output
+  size mismatch instead of comparing the shared prefix; and both logit
+  sets must greedy-decode (with the language mask applied when the
+  GGUF carries ranges) to the exact same token sequence, since rel-L2
+  gates cannot catch a consistent argmax flip.
+- `test/samples/hi-16k.expected.txt` — known-good CPU q8_0 transcript
+  of the hi fixture, consumed by `--expect-text-file`.
 - `test/samples/hi-16k.wav` — 7.3 s synthesized Hindi fixture
   (16 kHz mono PCM16, canonical 44-byte RIFF header for the test's
   minimal reader).

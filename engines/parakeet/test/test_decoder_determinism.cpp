@@ -2,8 +2,9 @@
 //
 // Usage:
 //   test-decoder-determinism --model <gguf> --wav <wav> [--runs N] [--threads N]
-//       [--n-gpu-layers N] [--language ID] [--require-gpu] [--cache-hit-ratio R]
-//       [--prewarm] [--prewarm-audio-seconds F] [--cold-overhead-max R] [--verbose]
+//       [--n-gpu-layers N] [--language ID] [--require-gpu]
+//       [--expect-text-file PATH] [--cache-hit-ratio R] [--prewarm]
+//       [--prewarm-audio-seconds F] [--cold-overhead-max R] [--verbose]
 //
 // Exit 0 on success; non-zero on failure or invalid arguments.
 
@@ -27,6 +28,7 @@ struct Opts {
     int  n_gpu_layers = 0;
     int  n_threads = 0;
     std::string language;
+    std::string expect_text_file;
     bool require_gpu = false;
     bool verbose = false;
     // Cache-hit gate compares median(warm runs 1..N-1) to run 0
@@ -89,6 +91,11 @@ void usage(const char * argv0) {
         "  --require-gpu        fail unless the engine actually selected a GPU\n"
         "                       backend; guards against silent CPU fallback\n"
         "                       turning a GPU determinism run into CPU-vs-CPU\n"
+        "  --expect-text-file PATH  fail unless run 0's transcript equals the\n"
+        "                       file's contents (trailing whitespace ignored).\n"
+        "                       Guards against deterministic-but-wrong output,\n"
+        "                       e.g. a multilingual GGUF that lost its language\n"
+        "                       ranges and silently decodes the full vocab\n"
         "  --cache-hit-ratio F  fail if median(warm enc_ms) exceeds cold\n"
         "                       enc_ms * F. Default 1.10. A real cache MISS\n"
         "                       (graph rebuilt each call) makes EVERY warm\n"
@@ -130,6 +137,7 @@ int parse_args(int argc, char ** argv, Opts & o) {
         else if (a == "--threads"      && i + 1 < argc) o.n_threads = std::atoi(argv[++i]);
         else if (a == "--language"     && i + 1 < argc) o.language = argv[++i];
         else if (a == "--require-gpu")                  o.require_gpu = true;
+        else if (a == "--expect-text-file" && i + 1 < argc) o.expect_text_file = argv[++i];
         else if (a == "--cache-hit-ratio" && i + 1 < argc) o.cache_hit_ratio_max = std::atof(argv[++i]);
         else if (a == "--prewarm")                         o.prewarm = true;
         else if (a == "--prewarm-audio-seconds" && i + 1 < argc) o.prewarm_audio_seconds = (float) std::atof(argv[++i]);
@@ -180,6 +188,23 @@ bool load_wav_pcm(const std::string & path, std::vector<float> & out, int & sr) 
 double median(std::vector<double> v) {
     std::sort(v.begin(), v.end());
     return v.empty() ? 0.0 : v[v.size() / 2];
+}
+
+bool read_text_file(const std::string & path, std::string & out) {
+    FILE * f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    out.resize(n > 0 ? static_cast<size_t>(n) : 0);
+    const size_t got = out.empty() ? 0 : std::fread(&out[0], 1, out.size(), f);
+    std::fclose(f);
+    if (got != out.size()) return false;
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' ||
+                            out.back() == ' '  || out.back() == '\t')) {
+        out.pop_back();
+    }
+    return true;
 }
 
 // ---------- Determinism for CTC / TDT / EOU (transcribe path) ----------
@@ -260,6 +285,27 @@ int run_transcribe_path(const Opts & o,
                 "[determinism] FAIL: run %d transcript differs from run 0\n"
                 "  run 0: '%s'\n  run %d: '%s'\n",
                 k, text_per_run[0].c_str(), k, text_per_run[k].c_str());
+            ok = false;
+        }
+    }
+
+    // Expected-transcript gate: repeatability alone would also pass
+    // deterministic-but-wrong output (e.g. a multilingual GGUF whose
+    // language ranges were dropped decodes the full aggregate vocab
+    // deterministically). Anchor run 0 to a known-good transcript.
+    if (!o.expect_text_file.empty()) {
+        std::string expected;
+        if (!read_text_file(o.expect_text_file, expected)) {
+            std::fprintf(stderr,
+                "[determinism] FAIL: cannot read --expect-text-file %s\n",
+                o.expect_text_file.c_str());
+            ok = false;
+        } else if (text_per_run[0] != expected) {
+            std::fprintf(stderr,
+                "[determinism] FAIL: transcript does not match %s\n"
+                "  expected: '%s'\n  actual  : '%s'\n",
+                o.expect_text_file.c_str(),
+                expected.c_str(), text_per_run[0].c_str());
             ok = false;
         }
     }
