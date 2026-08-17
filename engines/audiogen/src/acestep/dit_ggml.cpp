@@ -815,20 +815,19 @@ static void inject_repaint_source(const DitSampleParams & params, int step, size
         audio_edit_round_ties_to_even(params.repaint_injection_ratio * params.num_steps);
     if (!params.repaint_mask || !params.clean_source_latents || step >= injection_cutoff) return;
     const float timestep = next_schedule_timestep(params.schedule, step, params.num_steps);
-    const std::vector<float> clean(params.clean_source_latents,
-                                   params.clean_source_latents + latent_count);
-    const std::vector<float> noise(params.noise, params.noise + latent_count);
-    const std::vector<float> mask(params.repaint_mask, params.repaint_mask + params.T);
-    repaint_inject_source(current, clean, noise, mask, timestep, channels);
+    GGML_ASSERT(latent_count == (size_t) params.T * channels * params.N);
+    repaint_inject_source(
+        current, params.clean_source_latents, params.noise, params.repaint_mask,
+        (size_t) params.T, timestep, channels);
 }
 
 static void preserve_repaint_latent(const DitSampleParams & params, size_t latent_count,
                                     int channels, std::vector<float> & current) {
     if (!params.repaint_mask || !params.clean_source_latents || !params.repaint_preserve_latent) return;
-    const std::vector<float> clean(params.clean_source_latents,
-                                   params.clean_source_latents + latent_count);
-    const std::vector<float> mask(params.repaint_mask, params.repaint_mask + params.T);
-    repaint_blend_latent(current, clean, mask, params.repaint_crossfade_frames, channels);
+    GGML_ASSERT(latent_count == (size_t) params.T * channels * params.N);
+    repaint_blend_latent(
+        current, params.clean_source_latents, params.repaint_mask,
+        (size_t) params.T, params.repaint_crossfade_frames, channels);
 }
 
 bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & latent_out) {

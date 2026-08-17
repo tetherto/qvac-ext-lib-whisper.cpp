@@ -528,6 +528,8 @@ static constexpr const char * EDIT_ERROR_REPAINT_CONTEXT =
     "acestep engine: repaint expects 64 latent + 64 mask context channels";
 static constexpr const char * EDIT_ERROR_REPAINT_SILENCE =
     "acestep engine: repaint silence latent is unavailable";
+static constexpr const char * EDIT_ERROR_FLOW_SILENCE =
+    "acestep engine: flow-edit silence latent is unavailable";
 static constexpr const char * EDIT_ERROR_REPAINT_SAMPLE =
     "acestep engine: repaint DiT sample failed";
 static constexpr const char * EDIT_ERROR_FLOW_TURBO =
@@ -1247,10 +1249,16 @@ static bool encode_edit_plan_inputs(EngineImpl & engine, const GenerateParams & 
 
 template <typename EngineImpl>
 static void materialize_repaint_source(EngineImpl & engine, const EditPlanState & state,
-                                       AudioEditArtifact & artifact) {
-    engine.ensure_vae();
-    std::vector<float> materialized =
-        engine.vae->decode(artifact.latent, artifact.latent_frames);
+                                       AudioEditArtifact & artifact,
+                                       const StageReporter & report) {
+    engine.ensure_vae(true);
+    bool completed = true;
+    std::vector<float> materialized = engine.vae->decode(
+        artifact.latent, artifact.latent_frames, [&](int done, int total) {
+            completed = report(EDIT_STAGE_VAE, done, total);
+            return completed;
+        });
+    if (!completed) return;
     if (materialized.empty()) {
         throw std::runtime_error(EDIT_ERROR_INTERMEDIATE_DECODE);
     }
@@ -1264,10 +1272,13 @@ static void materialize_repaint_source(EngineImpl & engine, const EditPlanState 
     artifact.pcm = std::move(materialized);
     artifact.pcm_is_current = true;
     artifact.pending_waveform_splice = false;
-    engine.ensure_vae(true);
     artifact.latent = engine.vae->encode(
         artifact.pcm, (int) artifact.pcm.size() / AUDIO_CHANNELS,
-        &artifact.latent_frames);
+        &artifact.latent_frames, [&](int done, int total) {
+            completed = report(EDIT_STAGE_VAE, done, total);
+            return completed;
+        });
+    if (!completed) return;
     if (artifact.latent.empty() || artifact.latent_frames <= 0) {
         throw std::runtime_error(EDIT_ERROR_INTERMEDIATE_ENCODE);
     }
@@ -1276,9 +1287,10 @@ static void materialize_repaint_source(EngineImpl & engine, const EditPlanState 
 
 static RepaintRange resolve_repaint_operation_range(const RepaintParams & edit,
                                                     const AudioEditArtifact & artifact) {
-    if (!std::isfinite(edit.strength) ||
-        edit.strength < REPAINT_MIN_STRENGTH ||
-        edit.strength > REPAINT_MAX_STRENGTH) {
+    if (edit.mode == RepaintMode::Balanced &&
+        (!std::isfinite(edit.strength) ||
+         edit.strength < REPAINT_MIN_STRENGTH ||
+         edit.strength > REPAINT_MAX_STRENGTH)) {
         throw std::invalid_argument(EDIT_ERROR_REPAINT_STRENGTH);
     }
     RepaintRange range;
@@ -1458,6 +1470,9 @@ static FlowOperationState prepare_flow_operation(
         round_edit_frames(artifact.latent_frames, engine.dit_cfg.patch_size);
     engine.ensure_cond();
     const std::vector<float> & silence = cond_model_silence_latent(engine.cond);
+    if (silence.empty()) {
+        throw std::runtime_error(EDIT_ERROR_FLOW_SILENCE);
+    }
     operation.source = pad_edit_source(
         artifact.latent, artifact.latent_frames, operation.frames, silence);
     std::vector<float> silence_source =
@@ -1557,9 +1572,10 @@ static AudioEditCapabilities make_edit_capabilities(
     capabilities.cancelled = [engine_ptr] {
         return engine_ptr->cancel_flag.load();
     };
-    capabilities.prepare_repaint_source = [engine_ptr, state_ptr](
+    capabilities.prepare_repaint_source = [engine_ptr, state_ptr, report_ptr](
                                                 AudioEditArtifact & artifact) {
-        materialize_repaint_source(*engine_ptr, *state_ptr, artifact);
+        materialize_repaint_source(
+            *engine_ptr, *state_ptr, artifact, *report_ptr);
     };
     capabilities.repaint = [engine_ptr, params_ptr, state_ptr, report_ptr,
                             dump_ptr, timing_ptr](
@@ -1593,21 +1609,20 @@ static GenerateResult decode_edit_plan_result(
     EngineImpl & engine, const EditPlanState & state,
     const AudioEditArtifact & artifact, const StageReporter & report,
     StageDump & dump) {
+    GenerateResult result;
+    result.sample_rate = engine.sr;
+    result.channels = AUDIO_CHANNELS;
     engine.ensure_vae();
     if (!report(EDIT_STAGE_VAE, EDIT_PROGRESS_START, EDIT_PROGRESS_TOTAL)) {
-        return {};
+        return result;
     }
-    GenerateResult result;
-    result.sample_rate = AUDIO_SAMPLE_RATE;
-    result.channels = AUDIO_CHANNELS;
     bool completed = true;
     result.pcm = engine.vae->decode(
         artifact.latent, artifact.latent_frames, [&](int done, int total) {
           completed = report(EDIT_STAGE_VAE, done, total);
           return completed;
         });
-    if (!completed)
-      return {};
+    if (!completed) return result;
     if (result.pcm.empty()) {
         throw std::runtime_error(EDIT_ERROR_FINAL_DECODE);
     }
@@ -1627,18 +1642,21 @@ static GenerateResult run_audio_edit_plan(EngineImpl & engine,
                                           const GenerateParams & params,
                                           const StageReporter & report,
                                           StageDump & dump, StageTimes & timing) {
+    GenerateResult result;
+    result.sample_rate = engine.sr;
+    result.channels = AUDIO_CHANNELS;
     validate_edit_plan_request(params);
     EditPlanState state = make_edit_plan_state(params, engine.keep_stages);
     AudioEditArtifact artifact;
     if (!encode_edit_plan_inputs(
             engine, params, state, report, dump, timing, artifact)) {
-        return {};
+        return result;
     }
     const AudioEditPipeline pipeline = make_audio_edit_pipeline(params.edit_plan);
     const AudioEditCapabilities capabilities = make_edit_capabilities(
         engine, params, state, report, dump, timing);
     pipeline.execute(artifact, capabilities);
-    if (engine.cancel_flag.load()) return {};
+    if (engine.cancel_flag.load()) return result;
     return decode_edit_plan_result(engine, state, artifact, report, dump);
 }
 

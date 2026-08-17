@@ -272,7 +272,12 @@ static inline ggml_tensor * q3_flash_attn(ggml_context * ctx, ggml_tensor * q, g
 static inline ggml_tensor * q3_select_attn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k,
                                            ggml_tensor * v, ggml_tensor * mask, float scale,
                                            ggml_prec precision, bool use_flash_attn) {
-    if (use_flash_attn) return q3_flash_attn(ctx, q, k, v, mask, scale);
+    // The flash helper stages K/V as F16. Callers requesting F32 precision do so
+    // because their activations can exceed the finite F16 range, so keep those
+    // models on the non-flash path rather than silently narrowing V.
+    if (use_flash_attn && precision != GGML_PREC_F32) {
+        return q3_flash_attn(ctx, q, k, v, mask, scale);
+    }
     return q3_attn(ctx, ggml_cont(ctx, q), ggml_cont(ctx, k), ggml_cont(ctx, v), mask, scale, precision);
 }
 

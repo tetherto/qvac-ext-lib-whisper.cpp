@@ -38,10 +38,10 @@ constexpr char FLOW_CAPABILITY_ERROR[] = "flow-edit capability is unavailable";
 constexpr char EDIT_OPERATION_NULL_ERROR[] = "audio edit operation cannot be null";
 constexpr char REPAINT_MATERIALIZATION_ERROR[] = "repaint materialization capability is unavailable";
 
-void inject_unmasked_frames(std::vector<float> & current, const std::vector<float> & clean_source,
-                            const std::vector<float> & original_noise, const std::vector<float> & mask,
-                            float t_next, int channels) {
-    for (size_t frame = 0; frame < mask.size(); ++frame) {
+void inject_unmasked_frames(std::vector<float> & current, const float * clean_source,
+                            const float * original_noise, const float * mask,
+                            size_t frames, float t_next, int channels) {
+    for (size_t frame = 0; frame < frames; ++frame) {
         if (mask[frame] != AUDIO_EDIT_MIN_RATIO) continue;
         for (int channel = 0; channel < channels; ++channel) {
             const size_t index = frame * (size_t) channels + channel;
@@ -67,7 +67,7 @@ void fill_right_fade(std::vector<float> & mask, int edit_end, int fade_end) {
     }
 }
 
-void blend_latent_frames(std::vector<float> & generated, const std::vector<float> & clean_source,
+void blend_latent_frames(std::vector<float> & generated, const float * clean_source,
                          const std::vector<float> & mask, int channels) {
     for (size_t frame = 0; frame < mask.size(); ++frame) {
         const float generated_weight = mask[frame];
@@ -202,32 +202,33 @@ std::vector<float> make_repaint_mask(int latent_frames, int start_frame, int end
     return mask;
 }
 
-void repaint_inject_source(std::vector<float> & current, const std::vector<float> & clean_source,
-                           const std::vector<float> & original_noise, const std::vector<float> & mask,
+void repaint_inject_source(std::vector<float> & current, const float * clean_source,
+                           const float * original_noise, const float * mask, size_t frames,
                            float t_next, int channels) {
-    if (channels <= 0 || current.size() != clean_source.size() ||
-        current.size() != original_noise.size() ||
-        current.size() != mask.size() * (size_t) channels) {
+    if (channels <= 0 || !clean_source || !original_noise || !mask ||
+        current.size() != frames * (size_t) channels) {
         throw std::invalid_argument(REPAINT_INJECTION_SHAPE_ERROR);
     }
-    inject_unmasked_frames(current, clean_source, original_noise, mask, t_next, channels);
+    inject_unmasked_frames(
+        current, clean_source, original_noise, mask, frames, t_next, channels);
 }
 
-void repaint_blend_latent(std::vector<float> & generated, const std::vector<float> & clean_source,
-                          const std::vector<float> & mask, int crossfade_frames, int channels) {
-    if (channels <= 0 || generated.size() != clean_source.size() ||
-        generated.size() != mask.size() * (size_t) channels) {
+void repaint_blend_latent(std::vector<float> & generated, const float * clean_source,
+                          const float * mask, size_t frames, int crossfade_frames,
+                          int channels) {
+    if (channels <= 0 || !clean_source || !mask ||
+        generated.size() != frames * (size_t) channels) {
         throw std::invalid_argument(REPAINT_BLEND_SHAPE_ERROR);
     }
-    std::vector<float> soft = mask;
+    std::vector<float> soft(mask, mask + frames);
     if (crossfade_frames > 0) {
-        const auto first = std::find(mask.begin(), mask.end(), AUDIO_EDIT_MAX_RATIO);
-        const auto last = std::find(mask.rbegin(), mask.rend(), AUDIO_EDIT_MAX_RATIO);
-        if (first != mask.end() && last != mask.rend()) {
-            const int left = (int) std::distance(mask.begin(), first);
-            const int right = (int) mask.size() - (int) std::distance(mask.rbegin(), last);
+        const auto first = std::find(soft.begin(), soft.end(), AUDIO_EDIT_MAX_RATIO);
+        const auto last = std::find(soft.rbegin(), soft.rend(), AUDIO_EDIT_MAX_RATIO);
+        if (first != soft.end() && last != soft.rend()) {
+            const int left = (int) std::distance(soft.begin(), first);
+            const int right = (int) soft.size() - (int) std::distance(soft.rbegin(), last);
             const int fade_start = std::max(0, left - crossfade_frames);
-            const int fade_end = std::min((int) mask.size(), right + crossfade_frames);
+            const int fade_end = std::min((int) soft.size(), right + crossfade_frames);
             fill_left_fade(soft, fade_start, left);
             fill_right_fade(soft, right, fade_end);
         }

@@ -113,6 +113,7 @@ CondModel * cond_model_load(const std::string & path, ggml_backend_t backend, bo
     m->lyric_cfg    = lyric_config();
     m->timbre_cfg   = timbre_config();
     m->use_flash_attn =
+        m->lyric_cfg.prec != GGML_PREC_F32 &&
         q3_backend_supports_flash_attention(backend, m->lyric_cfg);
     // acestep.cpp gates the CLS prepend on acestep.encoder_hidden_size > 0 (XL
     // models), not merely on the special_token tensor being present (the

@@ -2,6 +2,7 @@
 
 #include "audiogen-cpp/acestep/engine.h"
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -45,11 +46,12 @@ std::string resolve_repaint_range(float start_seconds, float end_seconds, int so
                                   RepaintRange & range);
 std::vector<float> make_repaint_mask(int latent_frames, int start_frame, int end_frame);
 
-void repaint_inject_source(std::vector<float> & current, const std::vector<float> & clean_source,
-                           const std::vector<float> & original_noise, const std::vector<float> & mask, float t_next,
-                           int channels);
-void repaint_blend_latent(std::vector<float> & generated, const std::vector<float> & clean_source,
-                          const std::vector<float> & mask, int crossfade_frames, int channels);
+void repaint_inject_source(std::vector<float> & current, const float * clean_source,
+                           const float * original_noise, const float * mask, size_t frames,
+                           float t_next, int channels);
+void repaint_blend_latent(std::vector<float> & generated, const float * clean_source,
+                          const float * mask, size_t frames, int crossfade_frames,
+                          int channels);
 void repaint_splice_waveform(std::vector<float> & generated, const std::vector<float> & source, int start_sample,
                              int end_sample, int crossfade_samples, int channels = AUDIO_EDIT_CHANNELS);
 

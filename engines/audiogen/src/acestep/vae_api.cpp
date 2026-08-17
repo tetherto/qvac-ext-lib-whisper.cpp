@@ -80,9 +80,26 @@ std::vector<float> Vae::decode(const std::vector<float> & latent, int T_latent,
     return pcm;
 }
 
-std::vector<float> Vae::encode(const std::vector<float> & pcm_interleaved, int frames, int * T_latent_out) const {
-    const VaeWindowEncoder encode = [this](const float * pcm, int window_frames, std::vector<float> & latent) {
-        return vae_model_encode(impl_->model, pcm, window_frames, latent);
+std::vector<float> Vae::encode(const std::vector<float> & pcm_interleaved, int frames,
+                               int * T_latent_out,
+                               const ProgressCb & on_progress) const {
+    const int window_count = vae_encode_window_count(frames);
+    int window_index = 0;
+    const VaeWindowEncoder encode = [this, &on_progress, &window_index, window_count](
+                                        const float * pcm, int window_frames,
+                                        std::vector<float> & latent) {
+        ProgressCb window_progress;
+        if (on_progress) {
+            window_progress = [&on_progress, &window_index, window_count](
+                                  int done, int total) {
+                return on_progress(window_index * total + done,
+                                   window_count * total);
+            };
+        }
+        const int encoded = vae_model_encode(
+            impl_->model, pcm, window_frames, latent, window_progress);
+        ++window_index;
+        return encoded;
     };
     return encode_vae_pcm_bounded(pcm_interleaved, frames, encode, T_latent_out);
 }

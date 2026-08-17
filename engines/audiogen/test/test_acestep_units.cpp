@@ -828,21 +828,24 @@ void test_repaint_mask_injection_blend_and_splice() {
     std::vector<float> current(10, 10.0f);
     const std::vector<float> clean = { 2, 4, 2, 4, 2, 4, 2, 4, 2, 4 };
     const std::vector<float> noise(10, 8.0f);
-    repaint_inject_source(current, clean, noise, mask, 0.25f, 2);
+    repaint_inject_source(
+        current, clean.data(), noise.data(), mask.data(), mask.size(), 0.25f, 2);
     CHECK(approx(current[0], 3.5f));
     CHECK(approx(current[1], 5.0f));
     CHECK(approx(current[2], 10.0f));
     CHECK(approx(current[8], 3.5f));
 
     std::vector<float> generated(10, 10.0f);
-    repaint_blend_latent(generated, clean, mask, 0, 2);
+    repaint_blend_latent(
+        generated, clean.data(), mask.data(), mask.size(), 0, 2);
     CHECK(approx(generated[0], 2.0f));
     CHECK(approx(generated[1], 4.0f));
     CHECK(approx(generated[2], 10.0f));
     CHECK(approx(generated[8], 2.0f));
 
     generated.assign(10, 10.0f);
-    repaint_blend_latent(generated, clean, mask, 1, 2);
+    repaint_blend_latent(
+        generated, clean.data(), mask.data(), mask.size(), 1, 2);
     CHECK(generated[0] > clean[0] && generated[0] < 10.0f);
     CHECK(generated[8] > clean[8] && generated[8] < 10.0f);
 
