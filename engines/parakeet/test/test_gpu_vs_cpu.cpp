@@ -71,6 +71,54 @@ bool summarize(const char * name,
     return pass;
 }
 
+enum class DecodeParity { Match, Mismatch, ConfigError };
+
+DecodeParity compare_greedy_decode(const parakeet::ParakeetCtcModel & m_cpu,
+                                   const parakeet::ParakeetCtcModel & m_gpu,
+                                   const parakeet::EncoderOutputs   & out_cpu,
+                                   const parakeet::EncoderOutputs   & out_gpu,
+                                   const std::string                & language) {
+    if (m_cpu.vocab_size <= 0 || m_cpu.vocab_size != m_gpu.vocab_size) {
+        std::fprintf(stderr,
+                     "FAIL greedy decode: no usable CTC head (cpu vocab=%d gpu vocab=%d)\n",
+                     m_cpu.vocab_size, m_gpu.vocab_size);
+        return DecodeParity::Mismatch;
+    }
+    if (out_cpu.logits.size() != out_gpu.logits.size()) {
+        std::fprintf(stderr,
+                     "FAIL greedy decode: logits size mismatch cpu=%zu gpu=%zu\n",
+                     out_cpu.logits.size(), out_gpu.logits.size());
+        return DecodeParity::Mismatch;
+    }
+    if (out_cpu.logits.empty()) {
+        std::fprintf(stderr, "FAIL greedy decode: encoder produced no logits\n");
+        return DecodeParity::Mismatch;
+    }
+
+    parakeet::CtcDecodeOptions dopts;
+    try {
+        dopts = parakeet::resolve_ctc_decode_options(m_cpu, language);
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return DecodeParity::ConfigError;
+    }
+
+    const int n_frames = static_cast<int>(out_cpu.logits.size() / m_cpu.vocab_size);
+    const std::vector<int32_t> ids_cpu = parakeet::ctc_greedy_decode(
+        out_cpu.logits.data(), n_frames, m_cpu.vocab_size, m_cpu.blank_id, &dopts);
+    const std::vector<int32_t> ids_gpu = parakeet::ctc_greedy_decode(
+        out_gpu.logits.data(), n_frames, m_gpu.vocab_size, m_gpu.blank_id, &dopts);
+
+    if (ids_cpu != ids_gpu) {
+        std::fprintf(stderr,
+                     "FAIL greedy decode: token ids differ (cpu=%zu gpu=%zu tokens)\n",
+                     ids_cpu.size(), ids_gpu.size());
+        return DecodeParity::Mismatch;
+    }
+    std::fprintf(stderr, "PASS greedy decode: %zu tokens identical\n", ids_cpu.size());
+    return DecodeParity::Match;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -164,40 +212,10 @@ int main(int argc, char ** argv) {
     if (!summarize("encoder_out",       out_cpu.encoder_out,       out_gpu.encoder_out))       ++n_fail;
     if (!summarize("logits",            out_cpu.logits,            out_gpu.logits))             ++n_fail;
 
-    // Greedy decode parity, masked when the GGUF carries language ranges.
-    // The rel-L2 gates above cannot catch a consistent argmax flip that
-    // changes the emitted tokens, so both logit sets must decode to the
-    // exact same token sequence.
-    if (out_cpu.logits.size() == out_gpu.logits.size() && m_cpu.vocab_size > 0) {
-        CtcDecodeOptions dopts;
-        try {
-            dopts = resolve_ctc_decode_options(m_cpu, language);
-        } catch (const std::exception & e) {
-            std::fprintf(stderr, "error: %s\n", e.what());
-            return 40;
-        }
-        const int n_dec_frames =
-            static_cast<int>(out_cpu.logits.size() / m_cpu.vocab_size);
-        const std::vector<int32_t> ids_cpu = ctc_greedy_decode(
-            out_cpu.logits.data(), n_dec_frames, m_cpu.vocab_size,
-            m_cpu.blank_id, &dopts);
-        const std::vector<int32_t> ids_gpu = ctc_greedy_decode(
-            out_gpu.logits.data(), n_dec_frames, m_gpu.vocab_size,
-            m_gpu.blank_id, &dopts);
-        if (ids_cpu != ids_gpu) {
-            std::fprintf(stderr,
-                         "FAIL greedy decode: token ids differ (cpu=%zu gpu=%zu tokens)\n",
-                         ids_cpu.size(), ids_gpu.size());
-            ++n_fail;
-        } else {
-            std::fprintf(stderr,
-                         "PASS greedy decode: %zu tokens identical\n",
-                         ids_cpu.size());
-        }
-    } else {
-        std::fprintf(stderr,
-                     "FAIL greedy decode: skipped (logits size mismatch or no CTC head)\n");
-        ++n_fail;
+    switch (compare_greedy_decode(m_cpu, m_gpu, out_cpu, out_gpu, language)) {
+        case DecodeParity::ConfigError: return 40;
+        case DecodeParity::Mismatch:    ++n_fail; break;
+        case DecodeParity::Match:       break;
     }
 
     if (n_fail > 0) {

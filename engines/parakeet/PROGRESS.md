@@ -3523,9 +3523,10 @@ masked CTC decode is ~0.2 ms.
   Vulkan-specific RNNT registrations stay Vulkan-gated. New fixture
   shorthands `_qvp_indic_q8_gguf` / `_qvp_hi_wav` / `_qvp_hi_expected`
   and three registrations, all auto-disabled when the fixtures are
-  missing: `test-decoder-determinism-indic` (CPU, `--language hi`,
-  anchored to the expected transcript),
-  `test-decoder-determinism-indic-gpu` (`--n-gpu-layers 1`),
+  missing: `test-decoder-determinism-indic` (CPU, `--language hi`),
+  `test-decoder-determinism-indic-gpu` (`--n-gpu-layers 1`,
+  `--require-gpu`) — both anchored to the expected transcript so the
+  `gpu` label alone cannot pass on a shared wrong output — and
   `test-gpu-vs-cpu-indic` (per-stage encoder parity + hi-masked greedy
   decode equality).
 - `test/test_decoder_determinism.cpp` — `--language` pass-through to
@@ -3540,10 +3541,11 @@ masked CTC decode is ~0.2 ms.
   aggregate vocab.
 - `test/test_gpu_vs_cpu.cpp` — refuses to run when the second load did
   not actually select a GPU backend; per-stage parity fails on output
-  size mismatch instead of comparing the shared prefix; and both logit
-  sets must greedy-decode (with the language mask applied when the
-  GGUF carries ranges) to the exact same token sequence, since rel-L2
-  gates cannot catch a consistent argmax flip.
+  size mismatch instead of comparing the shared prefix; and
+  `compare_greedy_decode()` requires both logit sets to decode (with
+  the language mask applied when the GGUF carries ranges) to the exact
+  same token sequence, since rel-L2 gates cannot catch a consistent
+  argmax flip.
 - `test/samples/hi-16k.expected.txt` — known-good CPU q8_0 transcript
   of the hi fixture, consumed by `--expect-text-file`.
 - `test/samples/hi-16k.wav` — 7.3 s synthesized Hindi fixture

@@ -1079,7 +1079,8 @@ if (PARAKEET_BUILD_TESTS)
             EXE      test-decoder-determinism
             ARGS     "--model" "${_qvp_indic_q8_gguf}" "--wav" "${_qvp_hi_wav}"
                      "--language" "hi" "--n-gpu-layers" "1" "--require-gpu"
-            REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}")
+                     "--expect-text-file" "${_qvp_hi_expected}"
+            REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}" "${_qvp_hi_expected}")
     endif()
 
     if (GGML_VULKAN)
