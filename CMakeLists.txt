@@ -20,18 +20,6 @@ option(SPEECH_BUILD_TESTS       "speech: build the engines' test harnesses"     
 option(SPEECH_BUILD_WHISPER_TESTS "speech: build whisper's test harnesses too (fixture-only tests run model-free; the transcription tests additionally need downloaded whisper models — filter by label)" OFF)
 option(SPEECH_BUILD_EXECUTABLES "speech: build the engines' CLI executables"                 ON)
 
-# Whisper's CMake (cmake_minimum_required(3.5), CMP0077 OLD) defaults
-# BUILD_SHARED_LIBS ON for standalone builds and writes that into the
-# global cache. AudioGen CLIs call hidden, non-AUDIOGEN_API helpers that
-# only resolve against a static archive, so a default umbrella configure
-# then fails at link. Pin OFF unless the caller already set it
-# (-DBUILD_SHARED_LIBS=ON remains an override). Stage-1 ggml can still be
-# shared; this flag is the engine libraries in this tree.
-if (NOT DEFINED BUILD_SHARED_LIBS)
-    set(BUILD_SHARED_LIBS OFF CACHE BOOL
-        "speech: static engine libs; ggml from CMAKE_PREFIX_PATH may still be shared")
-endif()
-
 if (SPEECH_BUILD_TESTS)
     enable_testing()
 endif()

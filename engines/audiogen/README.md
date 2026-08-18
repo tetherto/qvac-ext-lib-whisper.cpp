@@ -173,9 +173,9 @@ cmake --build build/audiogen -j
 ./build/audiogen/music-cli --help
 ```
 
-The umbrella build uses `SPEECH_BUILD_AUDIOGEN=ON` (the default). It pins
-`BUILD_SHARED_LIBS=OFF` so `music-cli` can link hidden internals; see the
-[top-level README](../../README.md#build) for a shared-`audiogen-cpp` library-only configure.
+The umbrella build uses `SPEECH_BUILD_AUDIOGEN=ON` (the default). In-tree CLIs
+and tests link an object library, so they work when `BUILD_SHARED_LIBS=ON`
+(whisper's umbrella default) and `audiogen-cpp` is a hidden shared library.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
