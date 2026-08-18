@@ -133,6 +133,7 @@ struct GenerateParams {
     int         bpm = 0;                 // optional; 0 => N/A (LM/DiT infer)
     std::string keyscale;                // optional, e.g. "C major"
     std::string timesignature;           // optional, e.g. "4/4"
+    bool        augment_caption_with_metadata = false;
     long long   seed = -1;               // <0 = random (uint32 range: torch/philox parity)
     // LM sampling (Phase-2 audio codes). Defaults mirror acestep.cpp.
     float       lm_temperature = 0.85f;
