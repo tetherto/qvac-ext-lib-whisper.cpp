@@ -151,6 +151,14 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$PWD/ggml-ins
 cmake --build build -j
 ```
 
+Stage 1 installs a **shared** ggml. Stage 2 defaults engine libraries to **static**
+(`BUILD_SHARED_LIBS=OFF`) so the in-tree CLIs link. Whisper's standalone CMake
+would otherwise cache `BUILD_SHARED_LIBS=ON` and AudioGen's tools fail to
+resolve hidden internals. Override with `-DBUILD_SHARED_LIBS=ON` only for a
+library-only tree (`-DSPEECH_BUILD_EXECUTABLES=OFF`), or configure AudioGen
+standalone with `-DAUDIOGEN_BUILD_EXECUTABLES=OFF`. `SPEECH_BUILD_AUDIOGEN`
+stays on; static `audiogen-cpp` is still the same imported target.
+
 ### CMake options
 
 | Option | Default | Effect |
@@ -162,6 +170,7 @@ cmake --build build -j
 | `SPEECH_BUILD_EXECUTABLES` | `ON` | build the CLIs; set `OFF` for library-only builds |
 | `SPEECH_BUILD_TESTS` | `OFF` | build the engine test harnesses |
 | `SPEECH_BUILD_WHISPER_TESTS` | `OFF` | also build whisper's tests (transcription tests need downloaded models) |
+| `BUILD_SHARED_LIBS` | `OFF` (umbrella) | engine linkage; ggml shared/static is the stage-1 install. `ON` is unsupported with the AudioGen CLIs |
 
 GPU backends come from the ggml build: `-DGGML_VULKAN=ON`, `-DGGML_OPENCL=ON`, `-DGGML_CUDA=ON`; Metal is on by default on Apple. Core ML is gated per engine and defaults to off on both, so add `-DWHISPER_COREML=ON -DPARAKEET_COREML=ON` on Apple for the Whisper encoder and Parakeet offline TDT encoder sidecars. For tests, configure with `-DSPEECH_BUILD_TESTS=ON`, then run the non-GPU suite with `ctest --test-dir build -LE 'gpu|perf'`.
 
