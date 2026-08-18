@@ -711,8 +711,22 @@ if (PARAKEET_BUILD_TESTS)
     parakeet_apply_backend_defs(test-mel-fft-parity)
     parakeet_register_test(test-mel-fft-parity LABEL "unit")
 
-    add_executable(test-rnnt test/test_rnnt.cpp)
-    target_link_libraries(test-rnnt PRIVATE qvac-parakeet)
+    # test_rnnt.cpp exercises internal decoder entry points
+    # (rnnt_decode_window, build_transducer_argmax_outputs) that are not
+    # exported from the shared library (CXX_VISIBILITY_PRESET hidden), so
+    # compile the sources in directly like test-tdt-decoder-parity.
+    add_executable(test-rnnt
+        test/test_rnnt.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-rnnt PRIVATE ggml parakeet-backend-defs)
     target_include_directories(test-rnnt PRIVATE src include ggml/include)
     parakeet_apply_backend_defs(test-rnnt)
     parakeet_register_test(test-rnnt LABEL "unit")
@@ -1091,6 +1105,24 @@ if (PARAKEET_BUILD_TESTS)
                      "--threads" "4" "--n-gpu-layers" "1"
             REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
         parakeet_register_test(test-decoder-determinism-rnnt-vulkan
+            LABEL    "gpu"
+            EXE      test-decoder-determinism
+            ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+                     "--threads" "4" "--n-gpu-layers" "1" "--require-gpu"
+            REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
+    endif()
+
+    # Metal GPU-path instances of the Unified RNN-T fixtures (mirrors the
+    # GGML_VULKAN block above; --n-gpu-layers 1 moves the encoder + graph
+    # decoder to the registered GPU, which is Metal on Apple builds).
+    if (GGML_METAL)
+        parakeet_register_test(test-streaming-rnnt-metal
+            LABEL    "gpu"
+            EXE      test-parakeet-streaming
+            ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+                     "--threads" "4" "--n-gpu-layers" "1"
+            REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
+        parakeet_register_test(test-decoder-determinism-rnnt-metal
             LABEL    "gpu"
             EXE      test-decoder-determinism
             ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
