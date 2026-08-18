@@ -118,22 +118,39 @@ if (AUDIOGEN_BUILD_MINIMAX)
 endif()
 
 if (AUDIOGEN_BUILD_LIBRARY)
+    # Compile once. The installed/exported library follows BUILD_SHARED_LIBS
+    # (shared under the umbrella, because whisper caches ON). In-tree CLIs and
+    # tests include src/ headers and call non-AUDIOGEN_API helpers; those
+    # symbols are hidden in the DSO, so the tools link this object library
+    # instead of libaudiogen-cpp.
+    add_library(audiogen-cpp-objects OBJECT ${AUDIOGEN_LIB_SOURCES})
+    audiogen_apply_ccache(audiogen-cpp-objects)
+    target_include_directories(audiogen-cpp-objects
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/acestep
+            $<$<BOOL:${AUDIOGEN_BUILD_MINIMAX}>:${CMAKE_CURRENT_SOURCE_DIR}/src/minimax>
+    )
+    target_link_libraries(audiogen-cpp-objects PUBLIC ggml)
+    set_target_properties(audiogen-cpp-objects PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET     hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+
     if (DEFINED BUILD_SHARED_LIBS)
-        add_library(audiogen-cpp ${AUDIOGEN_LIB_SOURCES})
+        add_library(audiogen-cpp $<TARGET_OBJECTS:audiogen-cpp-objects>)
     else()
-        add_library(audiogen-cpp STATIC ${AUDIOGEN_LIB_SOURCES})
+        add_library(audiogen-cpp STATIC $<TARGET_OBJECTS:audiogen-cpp-objects>)
     endif()
     add_library(audiogen-cpp::audiogen-cpp ALIAS audiogen-cpp)
-    audiogen_apply_ccache(audiogen-cpp)
 
     target_include_directories(audiogen-cpp
         PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/acestep
-            $<$<BOOL:${AUDIOGEN_BUILD_MINIMAX}>:${CMAKE_CURRENT_SOURCE_DIR}/src/minimax>
     )
     target_link_libraries(audiogen-cpp PUBLIC ggml)
 
@@ -146,22 +163,34 @@ if (AUDIOGEN_BUILD_LIBRARY)
         SOVERSION 0
     )
 
-    # Symbol-export contract for shared builds (see include/audiogen-cpp/export.h).
-    # No-op for the default STATIC build, where consumers (and the in-tree smoke
-    # tools / unit tests) see the whole symbol table.
     get_target_property(_audiogen_type audiogen-cpp TYPE)
     if (_audiogen_type STREQUAL "SHARED_LIBRARY")
-        target_compile_definitions(audiogen-cpp PUBLIC  AUDIOGEN_SHARED)
-        target_compile_definitions(audiogen-cpp PRIVATE AUDIOGEN_BUILD)
+        # PRIVATE on the objects: library TUs dllexport. PUBLIC on audiogen-cpp:
+        # find_package consumers dllimport. Tools that link the objects do not
+        # inherit AUDIOGEN_SHARED, so they do not dllimport symbols they
+        # statically pull in.
+        target_compile_definitions(audiogen-cpp-objects PRIVATE AUDIOGEN_SHARED AUDIOGEN_BUILD)
+        target_compile_definitions(audiogen-cpp PUBLIC AUDIOGEN_SHARED)
     endif()
 
     if (CMAKE_BUILD_TYPE STREQUAL "Release" OR NOT CMAKE_BUILD_TYPE)
-        target_compile_options(audiogen-cpp PRIVATE
+        target_compile_options(audiogen-cpp-objects PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-O3>
             $<$<COMPILE_LANGUAGE:C>:-O3>
         )
     endif()
 endif()
+
+function(audiogen_link_in_tree_binary target)
+    target_link_libraries(${target} PRIVATE audiogen-cpp-objects)
+    target_include_directories(${target} PRIVATE
+        include
+        src
+        src/acestep
+        $<$<BOOL:${AUDIOGEN_BUILD_MINIMAX}>:${CMAKE_CURRENT_SOURCE_DIR}/src/minimax>
+    )
+    audiogen_apply_ccache(${target})
+endfunction()
 
 # ---- executables (CLI + per-stage smoke harnesses) ------------------------
 if (AUDIOGEN_BUILD_EXECUTABLES)
@@ -169,9 +198,8 @@ if (AUDIOGEN_BUILD_EXECUTABLES)
         message(FATAL_ERROR "AUDIOGEN_BUILD_EXECUTABLES requires AUDIOGEN_BUILD_LIBRARY=ON")
     endif()
 
-    # Each harness is a thin driver over the audiogen-cpp library; they reach
-    # internal (non-AUDIOGEN_API) helpers, which resolve against the default
-    # STATIC archive. Include src/ so they can pull the internal stage headers.
+    # Thin drivers over engine internals (non-AUDIOGEN_API). Link the object
+    # library, not the hidden shared audiogen-cpp.
     foreach (_tool
              acestep_cli:acestep-cli
              dit_smoke:dit-smoke
@@ -186,9 +214,7 @@ if (AUDIOGEN_BUILD_EXECUTABLES)
         list(GET _pair 0 _src)
         list(GET _pair 1 _exe)
         add_executable(${_exe} src/acestep/${_src}.cpp)
-        target_link_libraries(${_exe} PRIVATE audiogen-cpp)
-        target_include_directories(${_exe} PRIVATE include src src/acestep)
-        audiogen_apply_ccache(${_exe})
+        audiogen_link_in_tree_binary(${_exe})
     endforeach()
     target_sources(music-cli PRIVATE
         src/acestep/mini_json.cpp
@@ -213,9 +239,7 @@ if (AUDIOGEN_BUILD_TESTS)
     # CPU-only, weight-free unit tests for the pipeline's pure logic
     # (dit schedule, philox golden vector, FSQ decode, top-k/p sampler).
     add_executable(test-acestep-units test/test_acestep_units.cpp)
-    target_link_libraries(test-acestep-units PRIVATE audiogen-cpp)
-    target_include_directories(test-acestep-units PRIVATE include src src/acestep)
-    audiogen_apply_ccache(test-acestep-units)
+    audiogen_link_in_tree_binary(test-acestep-units)
     audiogen_register_test(test-acestep-units LABEL "unit")
 
     add_executable(test-music-cli-edit
@@ -223,29 +247,21 @@ if (AUDIOGEN_BUILD_TESTS)
         src/acestep/mini_json.cpp
         src/acestep/music_cli_edit.cpp
     )
-    target_link_libraries(test-music-cli-edit PRIVATE audiogen-cpp)
-    target_include_directories(test-music-cli-edit PRIVATE include src src/acestep)
-    audiogen_apply_ccache(test-music-cli-edit)
+    audiogen_link_in_tree_binary(test-music-cli-edit)
     audiogen_register_test(test-music-cli-edit LABEL "unit")
 
     add_executable(test-acestep-integration test/test_acestep_integration.cpp)
-    target_link_libraries(test-acestep-integration PRIVATE audiogen-cpp)
-    target_include_directories(test-acestep-integration PRIVATE include src src/acestep)
-    audiogen_apply_ccache(test-acestep-integration)
+    audiogen_link_in_tree_binary(test-acestep-integration)
     audiogen_register_test(test-acestep-integration LABEL "integration")
     set_property(TEST test-acestep-integration PROPERTY SKIP_RETURN_CODE 77)
 
     if (AUDIOGEN_BUILD_MINIMAX)
         add_executable(test-minimax-units test/test_minimax_units.cpp)
-        target_link_libraries(test-minimax-units PRIVATE audiogen-cpp)
-        target_include_directories(test-minimax-units PRIVATE include src src/minimax)
-        audiogen_apply_ccache(test-minimax-units)
+        audiogen_link_in_tree_binary(test-minimax-units)
         audiogen_register_test(test-minimax-units LABEL "unit")
 
         add_executable(test-minimax-loading-safety test/test_minimax_loading_safety.cpp)
-        target_link_libraries(test-minimax-loading-safety PRIVATE audiogen-cpp)
-        target_include_directories(test-minimax-loading-safety PRIVATE include src src/minimax)
-        audiogen_apply_ccache(test-minimax-loading-safety)
+        audiogen_link_in_tree_binary(test-minimax-loading-safety)
         audiogen_register_test(test-minimax-loading-safety LABEL "unit")
 
         add_executable(test-minimax-integration test/test_minimax_integration.cpp)

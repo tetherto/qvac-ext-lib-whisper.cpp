@@ -154,6 +154,11 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$PWD/ggml-ins
 cmake --build build -j
 ```
 
+Stage 1 installs a **shared** ggml. Stage 2 follows `BUILD_SHARED_LIBS` (whisper
+defaults it `ON` for the umbrella). `audiogen-cpp` can be shared; its CLIs and
+tests link an object library so they still see hidden internals. Consumers keep
+`audiogen-cpp::audiogen-cpp`.
+
 ### CMake options
 
 | Option | Default | Effect |
