@@ -16,11 +16,18 @@
 
 #include "ggml-backend.h"
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
 
 namespace tts_cpp::acestep {
+
+inline constexpr float DIT_REPAINT_DISABLED_RATIO = 0.0f;
+inline constexpr int DIT_REPAINT_DISABLED_CROSSFADE = 0;
+inline constexpr float DIT_FLOW_EDIT_MIN_RATIO = 0.0f;
+inline constexpr float DIT_FLOW_EDIT_MAX_RATIO = 1.0f;
+inline constexpr int DIT_FLOW_EDIT_DEFAULT_AVERAGES = 1;
 
 // Populated from GGUF metadata (acestep-dit.* / acestep.*).
 struct DitConfig {
@@ -103,6 +110,12 @@ struct DitSampleParams {
     float         dcw_scaler      = 0.05f;    // low band: t_curr * scaler
     float         dcw_high_scaler = 0.02f;    // high band: (1-t_curr) * scaler
 
+    const float * repaint_mask          = nullptr;
+    const float * clean_source_latents  = nullptr;
+    float         repaint_injection_ratio = DIT_REPAINT_DISABLED_RATIO;
+    int           repaint_crossfade_frames = DIT_REPAINT_DISABLED_CROSSFADE;
+    bool          repaint_preserve_latent = false;
+
     // Optional per-step progress hook, fired at the start of each Euler step
     // with (step, num_steps). Return false to request cancellation (the sampler
     // then aborts and dit_sample returns false). The diffusion loop is the bulk
@@ -113,5 +126,30 @@ struct DitSampleParams {
 // Writes the denoised latent [out_channels, T, N] to `latent_out`. Rebuilds the
 // DiT graph per step (bring-up simplicity); correctness first, fusion later.
 bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & latent_out);
+
+struct DitFlowEditCondition {
+    const float * context_latents = nullptr;
+    const float * enc_hidden      = nullptr;
+    int           enc_S           = 0;
+    int           H_enc           = 0;
+    int           real_enc_S      = 0;
+};
+
+struct DitFlowEditParams {
+    const float * source_latents = nullptr;
+    int           T              = 0;
+    const float * schedule       = nullptr;
+    int           num_steps      = 0;
+    float         n_min          = DIT_FLOW_EDIT_MIN_RATIO;
+    float         n_max          = DIT_FLOW_EDIT_MAX_RATIO;
+    int           n_avg          = DIT_FLOW_EDIT_DEFAULT_AVERAGES;
+    uint64_t      seed           = 0;
+    DitFlowEditCondition source;
+    DitFlowEditCondition target;
+    std::function<bool(int step, int total)> on_step;
+};
+
+bool dit_flow_edit(DitModel * m, const DitFlowEditParams & p,
+                   std::vector<float> & latent_out);
 
 } // namespace tts_cpp::acestep

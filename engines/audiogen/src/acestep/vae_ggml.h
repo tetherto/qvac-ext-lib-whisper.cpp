@@ -37,8 +37,11 @@ int vae_model_decode(VaeModel * m, const float * latent, int T_latent, std::vect
                      const std::function<bool(int done, int total)> & on_node = {});
 
 // Encode interleaved stereo PCM (frames*2 samples, 48 kHz) into the 64-ch mean
-// latent (time-major, out[t*64 + c]). Returns T_latent or -1 on failure.
-int vae_model_encode(VaeModel * m, const float * pcm, int frames, std::vector<float> & latent_out);
+// latent (time-major, out[t*64 + c]). Returns T_latent or -1 on failure or
+// cancellation through `on_node`.
+int vae_model_encode(VaeModel * m, const float * pcm, int frames,
+                     std::vector<float> & latent_out,
+                     const std::function<bool(int done, int total)> & on_node = {});
 
 // Decode-progress percentage from the per-node eval callback. `total` is
 // ggml_graph_n_nodes(gf), but a GPU+CPU scheduler can insert extra copy/split

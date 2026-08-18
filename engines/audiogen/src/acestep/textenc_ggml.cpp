@@ -17,6 +17,11 @@
 
 namespace tts_cpp::acestep {
 
+static constexpr char TEXTENC_LOAD_FORMAT[] =
+    "[acestep-txt] loaded %s: %.1f MB, %d layers H=%d Nh=%d/%d D=%d, FA=%s\n";
+static constexpr char FLASH_ATTENTION_ENABLED[] = "on";
+static constexpr char FLASH_ATTENTION_DISABLED[] = "off";
+
 struct TextEncModel {
     ggml_backend_t        backend    = nullptr;  // borrowed
     ggml_context *        weight_ctx = nullptr;
@@ -33,6 +38,7 @@ struct TextEncModel {
     DitGGUF               gguf;
     ggml_backend_buffer_t map_buf = nullptr;
     bool                  mapped  = false;
+    bool                  use_flash_attn = false;
     size_t                mapped_bytes = 0;  // sum of mmapped weight nbytes
 };
 
@@ -58,8 +64,9 @@ TextEncModel * textenc_model_load(const std::string & path, ggml_backend_t backe
     }
 
     TextEncModel * m = new TextEncModel();
-    m->backend       = backend;
+    m->backend = backend;
     m->q3            = to_q3(m->cfg);
+    m->use_flash_attn = q3_backend_supports_flash_attention(backend, m->q3);
     const Qwen3Config & c = m->q3;
 
     // CPU backend: map the quantised weights straight off the mmap (no dirty RAM).
@@ -96,9 +103,9 @@ TextEncModel * textenc_model_load(const std::string & path, ggml_backend_t backe
     m->mapped_bytes = mapped ? dit_gguf_mapped_bytes(ctx, g) : 0;
 
     if (verbose) {
-        fprintf(stderr, "[acestep-txt] loaded %s: %.1f MB, %d layers H=%d Nh=%d/%d D=%d\n", path.c_str(),
+        fprintf(stderr, TEXTENC_LOAD_FORMAT, path.c_str(),
                 textenc_model_weight_bytes(m) / 1048576.0, c.n_layers, c.hidden_size, c.n_heads, c.n_kv_heads,
-                c.head_dim);
+                c.head_dim, m->use_flash_attn ? FLASH_ATTENTION_ENABLED : FLASH_ATTENTION_DISABLED);
     }
 
     if (mapped) {
@@ -148,7 +155,7 @@ bool textenc_model_forward(TextEncModel * m, const int32_t * token_ids, int S, s
 
     ggml_tensor * hidden = ggml_get_rows(ctx, m->embed_tokens, t_ids);  // [H, S]
     for (int i = 0; i < c.n_layers; i++) {
-        hidden = q3_build_layer(ctx, c, &m->layers[i], hidden, positions, mask, S);
+        hidden = q3_build_layer(ctx, c, &m->layers[i], hidden, positions, mask, S, m->use_flash_attn);
     }
     ggml_tensor * out = q3_rms_norm_w(ctx, hidden, m->final_norm, c.rms_norm_eps);
     ggml_set_output(out);

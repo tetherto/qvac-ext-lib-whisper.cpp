@@ -81,6 +81,7 @@ endif()
 
 # ---- library --------------------------------------------------------------
 set(AUDIOGEN_LIB_SOURCES
+    src/acestep/audio_edit.cpp
     src/acestep/vae_gguf.cpp
     src/acestep/vae_ggml.cpp
     src/acestep/vae_encode_windows.cpp
@@ -169,6 +170,10 @@ if (AUDIOGEN_BUILD_EXECUTABLES)
         target_include_directories(${_exe} PRIVATE include src src/acestep)
         audiogen_apply_ccache(${_exe})
     endforeach()
+    target_sources(music-cli PRIVATE
+        src/acestep/mini_json.cpp
+        src/acestep/music_cli_edit.cpp
+    )
 endif()
 
 # ---- tests ----------------------------------------------------------------
@@ -192,6 +197,16 @@ if (AUDIOGEN_BUILD_TESTS)
     target_include_directories(test-acestep-units PRIVATE include src src/acestep)
     audiogen_apply_ccache(test-acestep-units)
     audiogen_register_test(test-acestep-units LABEL "unit")
+
+    add_executable(test-music-cli-edit
+        test/test_music_cli_edit.cpp
+        src/acestep/mini_json.cpp
+        src/acestep/music_cli_edit.cpp
+    )
+    target_link_libraries(test-music-cli-edit PRIVATE audiogen-cpp)
+    target_include_directories(test-music-cli-edit PRIVATE include src src/acestep)
+    audiogen_apply_ccache(test-music-cli-edit)
+    audiogen_register_test(test-music-cli-edit LABEL "unit")
 
     add_executable(test-acestep-integration test/test_acestep_integration.cpp)
     target_link_libraries(test-acestep-integration PRIVATE audiogen-cpp)
