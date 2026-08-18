@@ -3566,3 +3566,107 @@ python scripts/convert-nemo-to-gguf.py \
 build-metal/parakeet --model models/indic-conformer-600m-multilingual.q8_0.gguf \
   --wav test/samples/hi-16k.wav --language hi --n-gpu-layers 99
 ```
+
+## Phase 19 — IndicConformer multilingual CTC on Vulkan  _(done)_
+
+Phase 18 validated `ai4bharat/indic-conformer-600m-multilingual` on Metal and
+left Vulkan/OpenCL/CUDA marked "share the CTC path but remain unvalidated".
+This phase validates and enables Vulkan. As with Metal, no engine code changes
+were required: Phase 16 already brought the CTC encoder to correctness on
+Vulkan, and the per-language masked greedy argmax runs on the host from
+copied-back logits, so it is backend-independent by construction.
+
+### 19.1 — validation (NVIDIA RTX 3090, Ubuntu x86-64, Vulkan 1.4, KHR_coopmat)
+
+- Transcript parity, CPU vs Vulkan, across f16 / q8_0 / q4_0 × hi / kn / te / bn
+  (12 combinations): 11 byte-identical. The one difference (q8_0 te) is a
+  single subword where Vulkan emits `డైఆక్సైడ్` and CPU emits `డైయాక్సైడ్`;
+  Vulkan matches what both backends produce at f16, so the CPU q8_0 result is
+  the outlier. Same knife-edge greedy-argmax class as Phase 18, not a decode
+  bug — CTC carries no recurrent decoder state.
+- Per-stage encoder bisect (`test-gpu-vs-cpu`, 7.3 s hi clip): f16 and q8_0
+  pass every stage inside the 5e-2 gate (q8_0 `encoder_out` rel L2 2.7e-2,
+  `logits` 1.4e-2); greedy decode is token-identical at all three quants.
+- FLEURS test-split spot check (32 clips, 8 each of hi/ta/gu/kn): f16 differs
+  on 1 of 32 clips by one subword, aggregate WER identical at 19.73% both
+  backends. q8_0 differs on 2 of 32, and on both Vulkan produces the correct
+  word where CPU does not, so Vulkan scores slightly better in aggregate:
+  19.57% vs 19.73%. The hi hypotheses reproduce the Phase 18 transcripts.
+- All fixture-present `-L gpu` registrations pass on this host.
+
+### 19.2 — q4_0 and the cooperative-matrix matmul path
+
+q4_0 is the quantization the mobile packages ship for this model, and it is the
+one case where the per-stage gate is informative about Vulkan specifically:
+
+| matmul path | q8_0 `encoder_out` rel L2 | q4_0 `encoder_out` rel L2 |
+|---|---:|---:|
+| KHR_coopmat (default on this host) | 2.70e-2 | 6.49e-2 |
+| `GGML_VK_DISABLE_COOPMAT2=1`       | 2.70e-2 | 6.49e-2 |
+| `GGML_VK_DISABLE_COOPMAT=1` (scalar) | 2.31e-2 | 2.54e-2 |
+
+ggml-vulkan accumulates in f16 for quantized weights on cooperative-matrix
+hardware, which is what lifts q4_0 above the harness's 5e-2 gate; the scalar
+path more than halves it. Greedy decode is token-identical in every row, and
+the fixture transcript is byte-identical to CPU at all three quants, so the
+extra encoder noise does not reach the output. `ggml_mul_mat_set_prec` /
+`GGML_PREC_F32` would close the numeric gap the way the CosyVoice LM does, but
+that fix exists there because greedy speech-token decode turns one argmax flip
+into a divergent trajectory; frame-wise CTC argmax has no such amplification,
+so paying f32 accumulation throughput here buys nothing measurable.
+
+Consequently q4_0 GPU coverage is registered on the transcript assertion rather
+than on the rel-L2 harness — see 19.3.
+
+Note for mobile: the Android defaults block in `CMakeLists.txt` sets
+`GGML_VULKAN_DISABLE_COOPMAT` / `GGML_VULKAN_DISABLE_COOPMAT2`, but the pinned
+`qvac-ext-ggml@speech` exposes no such CMake options — it gates cooperative
+matrix at runtime through `GGML_VK_DISABLE_COOPMAT` / `..._COOPMAT2`. Those two
+cache entries are therefore inert today. Left as-is here because the fix
+affects every engine and model on Android, not just this one.
+
+### 19.3 — changes
+
+- `CMakeLists.txt` — new `_qvp_indic_q4_gguf` fixture shorthand and two
+  registrations for the mobile quantization, both auto-disabled when the GGUF
+  is absent: `test-decoder-determinism-indic-q4` (CPU) and
+  `test-decoder-determinism-indic-q4-gpu` (`--n-gpu-layers 1`,
+  `--require-gpu`). Both anchor to the existing
+  `test/samples/hi-16k.expected.txt`, which q4_0 reproduces byte-for-byte on
+  CPU and on GPU, so no new fixture and no relaxed tolerance were needed.
+- `README.md` (root) — Indic support-matrix row moves from `CPU, Metal` to
+  `CPU, Metal, Vulkan`; the caveat narrows to OpenCL/CUDA.
+- `engines/parakeet/README.md` — recorded RTF for the Indic row gains the
+  measured Vulkan figure.
+
+No engine sources changed, and every `CMakeLists.txt` hunk is inside
+`if (PARAKEET_BUILD_TESTS)`, so the installed artifact is unaffected.
+
+### 19.4 — throughput (46 s Hindi input, 1 warmup + 3 timed runs, median)
+
+| quant | Vulkan RTF | vs real-time | CPU RTF | Vulkan speedup |
+|---|---:|---:|---:|---:|
+| f16  | 0.0019 | 533x | 0.050 | 26.5x |
+| q8_0 | 0.0019 | 515x | 0.045 | 23.2x |
+| q4_0 | 0.0019 | 516x | 0.033 | 16.7x |
+
+Encoder dominates: 66-69 ms of the 86-89 ms inference, against 1460-2239 ms on
+the host CPU (AMD Ryzen 9 5900, 12 cores / 24 threads, ggml default thread
+count). Host-side masked CTC decode is ~0.15 ms and does not vary by backend. RTF is flat across quantizations because the encoder
+is launch- and bandwidth-bound at this sequence length rather than
+weight-decode-bound.
+
+### 19.5 — reproduction
+
+```bash
+engines/parakeet/scripts/setup-ggml.sh
+cmake -S engines/parakeet -B build-vk -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+cmake --build build-vk -j
+ctest --test-dir build-vk -R indic --output-on-failure
+build-vk/parakeet --model models/indic-conformer-600m-multilingual.q8_0.gguf \
+  --wav engines/parakeet/test/samples/hi-16k.wav --language hi --n-gpu-layers 99
+```
+
+GGUF conversion is unchanged from 18.4. To reproduce the 19.2 table, re-run
+`build-vk/test-gpu-vs-cpu` under `GGML_VK_DISABLE_COOPMAT=1` and
+`GGML_VK_DISABLE_COOPMAT2=1`.

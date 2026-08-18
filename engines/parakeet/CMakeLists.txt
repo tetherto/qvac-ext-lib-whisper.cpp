@@ -558,6 +558,7 @@ if (PARAKEET_BUILD_TESTS)
     set(_qvp_sfs_q8_gguf   "${PARAKEET_TEST_MODEL_DIR}/diar_streaming_sortformer_4spk-v2.q8_0.gguf")
     set(_qvp_sfsv21_q8_gguf "${PARAKEET_TEST_MODEL_DIR}/diar_streaming_sortformer_4spk-v2.1.q8_0.gguf")
     set(_qvp_indic_q8_gguf "${PARAKEET_TEST_MODEL_DIR}/indic-conformer-600m-multilingual.q8_0.gguf")
+    set(_qvp_indic_q4_gguf "${PARAKEET_TEST_MODEL_DIR}/indic-conformer-600m-multilingual.q4_0.gguf")
     set(_qvp_jfk_wav       "${PARAKEET_TEST_AUDIO_DIR}/jfk.wav")
     set(_qvp_diar_wav      "${PARAKEET_TEST_AUDIO_DIR}/diarization-sample-16k.wav")
     set(_qvp_fr_multipiece_wav "${PARAKEET_TEST_AUDIO_DIR}/fr-multipiece-16k.wav")
@@ -1046,6 +1047,15 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "--model" "${_qvp_indic_q8_gguf}" "--wav" "${_qvp_hi_wav}"
                  "--language" "hi" "--expect-text-file" "${_qvp_hi_expected}"
         REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}" "${_qvp_hi_expected}")
+    # q4_0 is the quantization the mobile packages ship for this model, and it
+    # decodes the fixture to the same transcript as q8_0 and f16, so it anchors
+    # against the same expected text.
+    parakeet_register_test(test-decoder-determinism-indic-q4
+        LABEL    "fixture"
+        EXE      test-decoder-determinism
+        ARGS     "--model" "${_qvp_indic_q4_gguf}" "--wav" "${_qvp_hi_wav}"
+                 "--language" "hi" "--expect-text-file" "${_qvp_hi_expected}"
+        REQUIRES "${_qvp_indic_q4_gguf}" "${_qvp_hi_wav}" "${_qvp_hi_expected}")
 
     # Long-form encoder windowing. The model-free unit test (planner + resolver
     # + seam trim/append) runs on every checkout; the parity test is
@@ -1095,6 +1105,19 @@ if (PARAKEET_BUILD_TESTS)
                      "--language" "hi" "--n-gpu-layers" "1" "--require-gpu"
                      "--expect-text-file" "${_qvp_hi_expected}"
             REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}" "${_qvp_hi_expected}")
+        # The mobile quantization on GPU. Anchored to the expected transcript
+        # rather than registered on test-gpu-vs-cpu: q4_0 weights push encoder
+        # rel L2 past that harness's 5e-2 gate on Vulkan cooperative-matrix
+        # hardware (measured 6.5e-2, and 2.5e-2 with coopmat off) while the
+        # decoded tokens stay identical, so the transcript is the assertion
+        # that holds across matmul paths.
+        parakeet_register_test(test-decoder-determinism-indic-q4-gpu
+            LABEL    "gpu"
+            EXE      test-decoder-determinism
+            ARGS     "--model" "${_qvp_indic_q4_gguf}" "--wav" "${_qvp_hi_wav}"
+                     "--language" "hi" "--n-gpu-layers" "1" "--require-gpu"
+                     "--expect-text-file" "${_qvp_hi_expected}"
+            REQUIRES "${_qvp_indic_q4_gguf}" "${_qvp_hi_wav}" "${_qvp_hi_expected}")
     endif()
 
     if (GGML_VULKAN)
