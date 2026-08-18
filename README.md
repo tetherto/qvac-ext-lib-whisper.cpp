@@ -49,6 +49,8 @@ tts       text -> LM (T3 / Llama / Qwen2.5) -> acoustic tokens -> CFM or flow ->
 audiogen  caption + lyrics -> ACE-Step LM -> FSQ detokenizer -> text encoder
                            -> condition encoder -> DiT flow matching
                            -> Oobleck VAE -> 48 kHz stereo
+          caption + lyrics -> MiniMax Qwen3 LM -> RVQ depth decoder
+                           -> condition encoder -> flow DiT -> vocoder -> stereo
 ```
 
 ## Repo layout
@@ -61,7 +63,7 @@ third_party/whisper.cpp/    upstream whisper.cpp, vendored as a git subtree,
 engines/
   parakeet/                 ASR + diarization + end-of-utterance (NVIDIA Parakeet family)
   tts/                      text-to-speech, voice cloning, speech enhancement
-  audiogen/                 music generation (ACE-Step)
+  audiogen/                 music generation (ACE-Step, MiniMax-Music3)
 docs/UPSTREAM-SYNC.md       how to sync the whisper subtree
 ```
 
@@ -87,7 +89,7 @@ engine-specific guides qualify model-level validation.
 | `silero-v6.2.0` | whisper | language agnostic | 2 M | `f16` | CPU | voice activity detection |
 | `nvidia/parakeet-ctc-0.6b` | parakeet | English | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA | offline + streaming + long-form |
 | `nvidia/parakeet-ctc-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | offline + streaming + long-form |
-| `ai4bharat/indic-conformer-600m-multilingual` | parakeet | 22 Indic (CTC-only export) | 600 M | `f16`, `q8_0`, `q4_0` | CPU | GPU backends share the CTC path but remain unvalidated; requires `--language` / `EngineOptions::language` |
+| `ai4bharat/indic-conformer-600m-multilingual` | parakeet | 22 Indic (CTC-only export) | 600 M | `f16`, `q8_0`, `q4_0` | CPU, Metal | Vulkan/OpenCL/CUDA share the CTC path but remain unvalidated; requires `--language` / `EngineOptions::language` |
 | `nvidia/parakeet-tdt-0.6b-v3` | parakeet | ~25 + punctuation and capitalization | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA; Core ML offline encoder | graph decoder on Metal/Vulkan/CUDA; scalar on CPU/OpenCL |
 | `nvidia/parakeet-tdt-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA; Core ML offline encoder | no punctuation; graph decoder on Metal/Vulkan/CUDA |
 
@@ -133,6 +135,7 @@ Pair any CTC, TDT, or EOU GGUF with a Sortformer GGUF via `--diarization-model` 
 |---|---|---|---|---|---|---|
 | ACE-Step v15 turbo | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0`, `q4_k_m` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 8 diffusion steps by default |
 | ACE-Step v15 sft | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 50 diffusion steps by default |
+| MiniMax-Music3 | audiogen | text-to-music | 44.1 kHz stereo | `f16`, `q8_0` | CPU desktop | 25 fps, 30 flow steps, two GGUF files |
 
 ## Build
 
@@ -159,6 +162,7 @@ cmake --build build -j
 | `SPEECH_BUILD_PARAKEET` | `ON` | build `engines/parakeet` |
 | `SPEECH_BUILD_TTS` | `ON` | build `engines/tts` |
 | `SPEECH_BUILD_AUDIOGEN` | `ON` | build `engines/audiogen` |
+| `AUDIOGEN_BUILD_MINIMAX` | desktop `ON`, mobile `OFF` | build the desktop CPU MiniMax-Music3 engine |
 | `SPEECH_BUILD_EXECUTABLES` | `ON` | build the CLIs; set `OFF` for library-only builds |
 | `SPEECH_BUILD_TESTS` | `OFF` | build the engine test harnesses |
 | `SPEECH_BUILD_WHISPER_TESTS` | `OFF` | also build whisper's tests (transcription tests need downloaded models) |
@@ -358,7 +362,7 @@ These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons
 | `third_party/whisper.cpp` | MIT | MIT (OpenAI Whisper), Silero VAD models under their own terms |
 | `engines/parakeet` | Apache-2.0 | CC-BY-4.0, except `parakeet_realtime_eou_120m-v1` under the NVIDIA Open Model License |
 | `engines/tts` | MIT | Chatterbox MIT; Parler, CosyVoice3, Audio8, and LavaSR Apache-2.0; Supertonic OpenRAIL-M |
-| `engines/audiogen` | MIT | ACE-Step 1.5 MIT, Qwen3-Embedding Apache-2.0 |
+| `engines/audiogen` | MIT | ACE-Step 1.5 MIT, Qwen3-Embedding Apache-2.0, MiniMax-Music3 Community License |
 
 Per-engine `NOTICE` files list every third-party dependency and its license.
 
