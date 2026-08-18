@@ -494,6 +494,9 @@ static constexpr float EDIT_EMPTY_LATENT    = 0.0f;
 static constexpr float REPAINT_MIN_STRENGTH = 0.0f;
 static constexpr float REPAINT_MAX_STRENGTH = 1.0f;
 static constexpr float REPAINT_MASKED_FRAME = 1.0f;
+static constexpr int TEMPO_SLOW_BPM_MAX     = 80;
+static constexpr int TEMPO_MODERATE_BPM_MAX = 120;
+static constexpr int TEMPO_FAST_BPM_MAX     = 160;
 
 static constexpr const char * DEFAULT_VOCAL_LANGUAGE = "en";
 static constexpr const char * EDIT_VOCAL_LANGUAGE    = "unknown";
@@ -550,9 +553,9 @@ static long long resolve_seed(long long seed) {
 }
 
 static const char * tempo_label(int bpm) {
-    if (bpm < 80) return "slow";
-    if (bpm < 120) return "moderate";
-    if (bpm < 160) return "fast";
+    if (bpm < TEMPO_SLOW_BPM_MAX) return "slow";
+    if (bpm < TEMPO_MODERATE_BPM_MAX) return "moderate";
+    if (bpm < TEMPO_FAST_BPM_MAX) return "fast";
     return "very fast";
 }
 
@@ -565,11 +568,11 @@ static std::string build_conditioning_caption(const std::string & caption, int b
             result += '.';
         }
         result += "\nTarget tempo: " + std::to_string(bpm) + " BPM (" + tempo_label(bpm) + ").";
-        if (bpm < 80) {
+        if (bpm < TEMPO_SLOW_BPM_MAX) {
             result += " Use a clearly perceptible slow, spacious pulse.";
-        } else if (bpm < 120) {
+        } else if (bpm < TEMPO_MODERATE_BPM_MAX) {
             result += " Use a clearly perceptible steady mid-tempo pulse.";
-        } else if (bpm < 160) {
+        } else if (bpm < TEMPO_FAST_BPM_MAX) {
             result += " Use a clearly perceptible fast, energetic pulse.";
         } else {
             result += " Use a clearly perceptible very-fast full-time pulse; avoid half-time interpretation.";
@@ -705,7 +708,9 @@ static GenerationState make_generation_state(const GenerateParams & params, bool
                          ? (params.edit_plan.empty() ? DEFAULT_VOCAL_LANGUAGE
                                                      : EDIT_VOCAL_LANGUAGE)
                          : params.vocal_language;
-    state.original_caption = params.caption;
+    if (params.augment_caption_with_metadata) {
+        state.original_caption = params.caption;
+    }
     state.prompt = make_prompt(params, state.language);
     state.low_memory = !keep_stages;
     return state;
