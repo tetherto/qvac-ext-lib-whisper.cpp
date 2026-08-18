@@ -3627,13 +3627,20 @@ affects every engine and model on Android, not just this one.
 
 ### 19.3 — changes
 
-- `CMakeLists.txt` — new `_qvp_indic_q4_gguf` fixture shorthand and two
-  registrations for the mobile quantization, both auto-disabled when the GGUF
-  is absent: `test-decoder-determinism-indic-q4` (CPU) and
-  `test-decoder-determinism-indic-q4-gpu` (`--n-gpu-layers 1`,
-  `--require-gpu`). Both anchor to the existing
-  `test/samples/hi-16k.expected.txt`, which q4_0 reproduces byte-for-byte on
-  CPU and on GPU, so no new fixture and no relaxed tolerance were needed.
+- `CMakeLists.txt` — new `_qvp_indic_q4_gguf` and `_qvp_indic_f16_gguf` fixture
+  shorthands, so that every quantization the support matrix advertises has GPU
+  regression coverage rather than q8_0 alone. All five new registrations
+  auto-disable when their GGUF is absent:
+  - `test-decoder-determinism-indic-q4` / `-f16` (CPU) and
+    `test-decoder-determinism-indic-q4-gpu` / `-f16-gpu` (`--n-gpu-layers 1`,
+    `--require-gpu`). All four anchor to the existing
+    `test/samples/hi-16k.expected.txt`, which both quantizations reproduce
+    byte-for-byte on CPU and on GPU, so no new fixture was needed.
+  - `test-gpu-vs-cpu-indic-f16`, per-stage encoder parity on the f16 weights.
+    This follows the convention recorded above for the other parity harnesses:
+    f16 keeps quantization noise out of the comparison, so the rel-L2 gates
+    stay sensitive to real operator bugs. q4_0 deliberately gets no
+    `test-gpu-vs-cpu` registration — see 19.2.
 - `README.md` (root) — Indic support-matrix row moves from `CPU, Metal` to
   `CPU, Metal, Vulkan`; the caveat narrows to OpenCL/CUDA.
 - `engines/parakeet/README.md` — recorded RTF for the Indic row gains the
@@ -3658,15 +3665,31 @@ weight-decode-bound.
 
 ### 19.5 — reproduction
 
+Conversion is unchanged from 18.4, but it has to happen *before* configuring:
+`REQUIRES` is evaluated at configure time, so a GGUF that appears afterwards
+leaves its registrations `DISABLED` until cmake runs again. All paths below are
+relative to the repository root.
+
 ```bash
 engines/parakeet/scripts/setup-ggml.sh
+
+curl -LO https://objectstore.e2enetworks.net/indicconformer/models/indicconformer_stt_multi_hybrid_rnnt_600m.nemo
+for q in f16 q8_0 q4_0; do
+  python engines/parakeet/scripts/convert-nemo-to-gguf.py \
+    --ckpt indicconformer_stt_multi_hybrid_rnnt_600m.nemo \
+    --out "engines/parakeet/models/indic-conformer-600m-multilingual.$q.gguf" \
+    --quant "$q"
+done
+
 cmake -S engines/parakeet -B build-vk -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
 cmake --build build-vk -j
 ctest --test-dir build-vk -R indic --output-on-failure
-build-vk/parakeet --model models/indic-conformer-600m-multilingual.q8_0.gguf \
+
+build-vk/parakeet \
+  --model engines/parakeet/models/indic-conformer-600m-multilingual.q8_0.gguf \
   --wav engines/parakeet/test/samples/hi-16k.wav --language hi --n-gpu-layers 99
 ```
 
-GGUF conversion is unchanged from 18.4. To reproduce the 19.2 table, re-run
+The converter needs python >= 3.10. To reproduce the 19.2 table, re-run
 `build-vk/test-gpu-vs-cpu` under `GGML_VK_DISABLE_COOPMAT=1` and
 `GGML_VK_DISABLE_COOPMAT2=1`.
