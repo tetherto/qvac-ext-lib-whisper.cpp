@@ -38,6 +38,18 @@ option(AUDIOGEN_INSTALL           "audiogen-cpp: generate install rules"        
 option(AUDIOGEN_USE_SYSTEM_GGML   "audiogen-cpp: use system-installed GGML (find_package(ggml)) instead of a vendored ggml. Defaults ON: the QVAC speech-stack vcpkg port `ggml-speech` (qvac-ext-ggml/speech branch) is the canonical, pre-patched ggml with the custom snake / col2im_1d ops this engine needs." ON)
 option(AUDIOGEN_CCACHE            "audiogen-cpp: use ccache as compiler launcher if available"      ON)
 
+if (ANDROID OR IOS OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(AUDIOGEN_MOBILE ON)
+    set(AUDIOGEN_MINIMAX_DEFAULT OFF)
+else()
+    set(AUDIOGEN_MOBILE OFF)
+    set(AUDIOGEN_MINIMAX_DEFAULT ON)
+endif()
+option(AUDIOGEN_BUILD_MINIMAX "audiogen-cpp: build the desktop CPU MiniMax-Music3 engine" ${AUDIOGEN_MINIMAX_DEFAULT})
+if (AUDIOGEN_MOBILE)
+    set(AUDIOGEN_BUILD_MINIMAX OFF CACHE BOOL "audiogen-cpp: MiniMax-Music3 is unavailable on mobile" FORCE)
+endif()
+
 # ccache shaves iterative rebuild time on developer machines. Scoped to
 # audiogen's own targets; ggml has its own GGML_CCACHE option we leave alone.
 if (AUDIOGEN_CCACHE)
@@ -98,6 +110,13 @@ set(AUDIOGEN_LIB_SOURCES
     src/acestep/engine.cpp
 )
 
+if (AUDIOGEN_BUILD_MINIMAX)
+    list(APPEND AUDIOGEN_LIB_SOURCES
+        src/minimax/logic.cpp
+        src/minimax/engine.cpp
+    )
+endif()
+
 if (AUDIOGEN_BUILD_LIBRARY)
     # Compile once. The installed/exported library follows BUILD_SHARED_LIBS
     # (shared under the umbrella, because whisper caches ON). In-tree CLIs and
@@ -112,6 +131,7 @@ if (AUDIOGEN_BUILD_LIBRARY)
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/src/acestep
+            $<$<BOOL:${AUDIOGEN_BUILD_MINIMAX}>:${CMAKE_CURRENT_SOURCE_DIR}/src/minimax>
     )
     target_link_libraries(audiogen-cpp-objects PUBLIC ggml)
     set_target_properties(audiogen-cpp-objects PROPERTIES
@@ -163,7 +183,12 @@ endif()
 
 function(audiogen_link_in_tree_binary target)
     target_link_libraries(${target} PRIVATE audiogen-cpp-objects)
-    target_include_directories(${target} PRIVATE include src src/acestep)
+    target_include_directories(${target} PRIVATE
+        include
+        src
+        src/acestep
+        $<$<BOOL:${AUDIOGEN_BUILD_MINIMAX}>:${CMAKE_CURRENT_SOURCE_DIR}/src/minimax>
+    )
     audiogen_apply_ccache(${target})
 endfunction()
 
@@ -229,6 +254,32 @@ if (AUDIOGEN_BUILD_TESTS)
     audiogen_link_in_tree_binary(test-acestep-integration)
     audiogen_register_test(test-acestep-integration LABEL "integration")
     set_property(TEST test-acestep-integration PROPERTY SKIP_RETURN_CODE 77)
+
+    if (AUDIOGEN_BUILD_MINIMAX)
+        add_executable(test-minimax-units test/test_minimax_units.cpp)
+        audiogen_link_in_tree_binary(test-minimax-units)
+        audiogen_register_test(test-minimax-units LABEL "unit")
+
+        add_executable(test-minimax-loading-safety test/test_minimax_loading_safety.cpp)
+        audiogen_link_in_tree_binary(test-minimax-loading-safety)
+        audiogen_register_test(test-minimax-loading-safety LABEL "unit")
+
+        add_executable(test-minimax-integration test/test_minimax_integration.cpp)
+        target_link_libraries(test-minimax-integration PRIVATE audiogen-cpp)
+        target_include_directories(test-minimax-integration PRIVATE include)
+        audiogen_apply_ccache(test-minimax-integration)
+        audiogen_register_test(test-minimax-integration LABEL "integration")
+        set_property(TEST test-minimax-integration PROPERTY SKIP_RETURN_CODE 77)
+
+        find_package(Python3 COMPONENTS Interpreter)
+        if (Python3_Interpreter_FOUND)
+            add_test(NAME test-minimax-converter
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_convert_minimax.py
+            )
+            set_property(TEST test-minimax-converter PROPERTY LABELS "unit")
+            set_property(TEST test-minimax-converter PROPERTY ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+        endif()
+    endif()
 endif()
 
 # ---- install / export -----------------------------------------------------
@@ -243,7 +294,20 @@ if (AUDIOGEN_INSTALL AND AUDIOGEN_BUILD_LIBRARY)
     install(DIRECTORY include/audiogen-cpp
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
         FILES_MATCHING PATTERN "*.h"
+        PATTERN "minimax" EXCLUDE
     )
+    install(FILES LICENSE NOTICE
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/audiogen-cpp
+    )
+    if (AUDIOGEN_BUILD_MINIMAX)
+        install(DIRECTORY include/audiogen-cpp/minimax
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/audiogen-cpp
+            FILES_MATCHING PATTERN "*.h"
+        )
+        install(FILES scripts/convert-minimax-music3-to-gguf.py
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/audiogen-cpp/scripts
+        )
+    endif()
     install(EXPORT audiogen-cppTargets
         FILE audiogen-cppTargets.cmake
         NAMESPACE audiogen-cpp::

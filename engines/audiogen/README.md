@@ -1,12 +1,12 @@
 # audiogen-cpp
 
-Native [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) text-to-music in pure C++ on [ggml](https://github.com/tetherto/qvac-ext-ggml): caption and lyrics in, 48 kHz stereo audio out, no Python or PyTorch at inference time.
+Native [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) and MiniMax-Music3 text-to-music in pure C++ on [ggml](https://github.com/tetherto/qvac-ext-ggml): caption and lyrics in, stereo audio out, no Python or PyTorch at inference time.
 
 | Property | Value |
 |---|---|
 | CMake project | `audiogen-cpp` v0.1.0 |
-| Public API | `tts_cpp::acestep::Engine` (`include/audiogen-cpp/acestep/engine.h`) |
-| Output | interleaved stereo PCM, 48 kHz, `pcm[t * 2 + ch]` |
+| Public API | `tts_cpp::acestep::Engine`, `tts_cpp::minimax::Engine` |
+| Output | interleaved stereo PCM, model-defined sample rate, `pcm[t * 2 + ch]` |
 | Backends | CPU, Vulkan (including Android Mali iGPUs), Metal, OpenCL (validated on Adreno 700+) |
 | ggml | requires the `ggml-speech` port for the custom `ggml_snake` and `ggml_col2im_1d` ops |
 | Consumed by | the `@qvac/audiogen-ggml` addon in [QVAC](https://github.com/tetherto/qvac) |
@@ -26,6 +26,39 @@ VAE (AutoencoderOobleck)           -> 48 kHz stereo PCM
 ```
 
 The VAE upsamples by 1920, so `T_audio = T_latent * 1920`. Latents are time-major, `latent[t * 64 + c]`.
+
+### MiniMax-Music3
+
+```
+caption + lyrics -> byte-exact Qwen prompt -> Qwen3 LM
+                 -> RVQ depth decoder -> condition encoder
+                 -> windowed flow DiT -> DAC vocoder -> 44.1 kHz stereo PCM
+```
+
+MiniMax uses two GGUF files: `mm3-lm-<quant>.gguf` for the Qwen3 global LM and
+`mm3-synth-<quant>.gguf` for the RVQ depth decoder, condition encoder, flow DiT,
+and vocoder. Set `EngineOptions::model_dir`, or provide `lm_model_path` and
+`synth_model_path` explicitly. Directory discovery matches quantized pairs
+case-insensitively, prefers `q8_0`, then `f16`, then `bf16`, and rejects
+duplicate candidates. The engine is CPU-only and desktop-only. One MiniMax
+engine instance may be active at a time because its compute graphs are shared.
+
+The frame rate, maximum frame count, flow defaults, and output sample rate come
+from GGUF metadata. Current converted files specify 25 frames per second, at
+most 9000 frames, 30 flow steps, CFG 1.7, and 44100 Hz output.
+
+Convert local upstream checkpoints without downloading weights:
+
+```sh
+python scripts/convert-minimax-music3-to-gguf.py \
+  --src /path/to/MiniMax-Music3 --out /path/to/output --quant f16
+```
+
+The converter emits the two-file contract and writes the
+MiniMax-Music3 Community License identifier into both files. Ship the upstream
+model license with converted weights.
+
+### ACE-Step audio editing
 
 When `GenerateParams::edit_plan` is non-empty, the engine takes the editing
 path instead: it VAE-encodes `source_audio`, skips the LM and FSQ
@@ -193,6 +226,7 @@ directory such as `Release/` beneath the executable directory. See the
 | `AUDIOGEN_BUILD_LIBRARY` | `ON` | build the library; linkage follows `BUILD_SHARED_LIBS` |
 | `AUDIOGEN_BUILD_EXECUTABLES` | `ON` standalone, `OFF` as a subdirectory | CLIs and per-stage smoke harnesses |
 | `AUDIOGEN_BUILD_TESTS` | `ON` standalone, `OFF` as a subdirectory | CPU-only unit tests |
+| `AUDIOGEN_BUILD_MINIMAX` | `ON` on desktop, unavailable on Android and iOS | MiniMax-Music3 CPU engine |
 | `AUDIOGEN_INSTALL` | `ON` | generate install rules |
 | `AUDIOGEN_USE_SYSTEM_GGML` | `ON` | `find_package(ggml)`; required, there is no supported vendored ggml in this tree |
 | `AUDIOGEN_CCACHE` | `ON` | use ccache when available |
@@ -459,7 +493,16 @@ cmake --build build/audiogen -j
 ctest --test-dir build/audiogen
 ```
 
-`test-acestep-units` covers the weight-free CPU logic and needs no GGUFs. That includes the stage-placement policy above: the backend allowlist (both the `MTL` and `Metal` registry names), the CPU fallback for every unmeasured backend, and the environment override precedence.
+`test-acestep-units`, `test-minimax-units`, and `test-minimax-converter` cover
+weight-free CPU logic and need no GGUFs. MiniMax coverage includes metadata
+compatibility, model-pair selection, Unicode token classes, frame validation,
+prompt assembly, unconditional masking, deterministic noise, flow scheduling,
+condition length, window stitching, sampler edge cases, and converter output
+transactions. Set `AUDIOGEN_TEST_MINIMAX_MODELS_DIR` to a directory containing
+the MiniMax GGUF pair to run `test-minimax-integration`, which covers model
+loading, generation output, progress, and cancellation.
+`test-acestep-integration` exercises the ACE-Step public API when model paths
+are supplied and otherwise reports a skipped test.
 
 Stage dumps are the tool for localising a backend divergence. Run the same prompt twice with `--dump-stages`, then compare:
 

@@ -3470,3 +3470,99 @@ doesn't flake the test.
   binary. Surfacing it through downstream addon wrappers
   (e.g. `transcription-parakeet`'s `runStreaming()` JS API) requires
   separate plumbing work on those wrappers — not in this phase.
+
+## Phase 18 — IndicConformer multilingual CTC on Metal  _(done)_
+
+The `ai4bharat/indic-conformer-600m-multilingual` CTC-only hybrid export
+(Phase-13-era CTC path + per-language token masks) previously shipped with
+CPU smoke validation only. This phase validates and enables it on the Metal
+backend. No engine code changes were required: the encoder + CTC head run
+as ggml graphs on the GPU, and the language-masked greedy argmax already
+executes on the host from copied-back logits, so the masking path is
+backend-independent by construction.
+
+### 18.1 — validation (Apple M5, macOS arm64)
+
+- Transcript parity, CPU vs Metal, on 16 kHz synthesized speech across
+  f16 / q8_0 / q4_0 × hi / kn / te / bn (12 combinations): byte-identical
+  transcripts in all 12.
+- Long-form 46 s Hindi input: transcripts differ by 1-2 subwords in
+  ~150 words, with flips in BOTH directions across quants (f16 keeps a
+  nasalized form on CPU that Metal drops; q8_0 the reverse). This is
+  knife-edge greedy-argmax jitter at ambiguous frames from ordinary
+  backend numeric drift, not the deferred-LSTM class of bug fixed in
+  Phase 15 (CTC has no recurrent decoder state).
+- Per-stage encoder bisect (`test-gpu-vs-cpu`, q8_0, 7.3 s hi clip):
+  all stages within the 5e-2 gate; `encoder_out` rel L2 = 2.9e-2,
+  `logits` rel L2 = 1.6e-2.
+- FLEURS test-split spot check (32 clips, 8 each of hi/ta/gu/kn,
+  references from the dataset): f16 CPU vs Metal transcripts are
+  byte-identical on all 32 clips (WER 19.73% both). q8_0 differs on
+  3 of 32 clips by one subword each with flips in both directions
+  (on one, Metal emits the correct word where CPU misspells);
+  aggregate WER is identical to the word: 19.57% both backends.
+  The hi transcripts also reproduce the CPU hypotheses recorded in
+  the original multilingual-CTC bring-up, character for character.
+
+### 18.2 — throughput (46 s input, 3 timed runs, median)
+
+| quant | Metal RTF | CPU RTF | Metal speedup |
+|---|---:|---:|---:|
+| f16  | 0.008 (133x realtime) | 0.057 | 8.2x |
+| q8_0 | 0.008 (120x realtime) | 0.036 | 4.3x |
+| q4_0 | 0.008 (119x realtime) | 0.066 | 7.9x |
+
+Encoder dominates (~370 ms of ~385 ms inference at q8_0); host-side
+masked CTC decode is ~0.2 ms.
+
+### 18.3 — changes
+
+- `CMakeLists.txt` — the Phase-16 `test-vk-vs-cpu` harness is renamed
+  `test-gpu-vs-cpu` (it was never Vulkan-specific) and now builds under
+  `GGML_VULKAN OR GGML_METAL` instead of Vulkan only; the
+  Vulkan-specific RNNT registrations stay Vulkan-gated. New fixture
+  shorthands `_qvp_indic_q8_gguf` / `_qvp_hi_wav` / `_qvp_hi_expected`
+  and three registrations, all auto-disabled when the fixtures are
+  missing: `test-decoder-determinism-indic` (CPU, `--language hi`),
+  `test-decoder-determinism-indic-gpu` (`--n-gpu-layers 1`,
+  `--require-gpu`) — both anchored to the expected transcript so the
+  `gpu` label alone cannot pass on a shared wrong output — and
+  `test-gpu-vs-cpu-indic` (per-stage encoder parity + hi-masked greedy
+  decode equality).
+- `test/test_decoder_determinism.cpp` — `--language` pass-through to
+  `EngineOptions::language` so the harness can drive multilingual CTC
+  GGUFs that require a language id; `--require-gpu` so GPU
+  registrations fail loudly instead of silently passing CPU-vs-CPU when
+  backend init falls back to CPU (used by the indic-gpu and
+  rnnt-vulkan determinism registrations); and `--expect-text-file` so
+  repeatability runs can anchor run 0 to a known-good transcript —
+  determinism alone would also pass deterministic-but-wrong output,
+  e.g. a GGUF that lost its language ranges silently decoding the full
+  aggregate vocab.
+- `test/test_gpu_vs_cpu.cpp` — refuses to run when the second load did
+  not actually select a GPU backend; per-stage parity fails on output
+  size mismatch instead of comparing the shared prefix; and
+  `compare_greedy_decode()` requires both logit sets to decode (with
+  the language mask applied when the GGUF carries ranges) to the exact
+  same token sequence, since rel-L2 gates cannot catch a consistent
+  argmax flip.
+- `test/samples/hi-16k.expected.txt` — known-good CPU q8_0 transcript
+  of the hi fixture, consumed by `--expect-text-file`.
+- `test/samples/hi-16k.wav` — 7.3 s synthesized Hindi fixture
+  (16 kHz mono PCM16, canonical 44-byte RIFF header for the test's
+  minimal reader).
+- `README.md` — support-matrix row updated from "CPU smoke only" to the
+  measured Metal RTF.
+
+### 18.4 — reproduction
+
+The GGUF is converted locally (no registry hosting yet):
+
+```bash
+curl -LO https://objectstore.e2enetworks.net/indicconformer/models/indicconformer_stt_multi_hybrid_rnnt_600m.nemo
+python scripts/convert-nemo-to-gguf.py \
+  --ckpt indicconformer_stt_multi_hybrid_rnnt_600m.nemo \
+  --out models/indic-conformer-600m-multilingual.q8_0.gguf --quant q8_0
+build-metal/parakeet --model models/indic-conformer-600m-multilingual.q8_0.gguf \
+  --wav test/samples/hi-16k.wav --language hi --n-gpu-layers 99
+```
