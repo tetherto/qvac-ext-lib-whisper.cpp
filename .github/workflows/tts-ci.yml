@@ -136,14 +136,16 @@ jobs:
       - uses: actions/checkout@v4
       # GGML_VULKAN=ON is the backend the -L gpu suites primarily target
       # (test_vk_vs_cpu et al); Metal is on by default on Apple hosts.
-      # Revisit the flag set (OpenCL? CUDA?) when the GPU runner fleet is
-      # provisioned — a CPU-only ggml here would skip or falsely pass the
-      # GPU suites.
+      # GGML_CUDA=ON builds the NVIDIA path alongside it so the per-backend
+      # arms have both to choose between; each arm pins the one it covers via
+      # TTS_CPP_GPU_BACKEND, since selection otherwise prefers CUDA here.
+      # A CPU-only ggml would skip or falsely pass the GPU suites.
       - name: Build ggml + engine (native backends) and run GPU suites
         run: |
           git clone --depth 1 --branch "$GGML_BRANCH" "$GGML_REPO" ggml-src
           cmake -S ggml-src -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
             -DGGML_VULKAN=ON \
+            -DGGML_CUDA=ON \
             -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
           cmake --build ggml-src/build -j && cmake --install ggml-src/build
           cmake -S engines/tts -B build -DCMAKE_BUILD_TYPE=Release \

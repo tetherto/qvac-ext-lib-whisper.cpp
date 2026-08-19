@@ -56,6 +56,44 @@ const char * dev_reg_name(ggml_backend_dev_t dev) {
     return reg ? ggml_backend_reg_name(reg) : "";
 }
 
+// Names a single registry that selection must use, from
+// TTS_CPP_GPU_BACKEND ("cuda", "vulkan", "metal", "opencl"); empty when
+// unset. Selection otherwise picks on its own preference order, so a
+// per-backend test arm cannot ask for the backend it is meant to cover on a
+// host where several are compiled in. Not a production knob: an engine names
+// the backends it accepts through GpuBackendRequirement.
+std::string forced_gpu_backend() {
+    const char * v = std::getenv("TTS_CPP_GPU_BACKEND");
+    if (!v || !*v) return "";
+    std::string out = v;
+    for (char & c : out) {
+        c = (char) std::tolower((unsigned char) c);
+    }
+    return out;
+}
+
+bool reg_name_is_forced(const char * reg_name, const std::string & forced) {
+    if (forced.empty())     return true;
+    if (forced == "cuda")   return reg_name_is_cuda(reg_name);
+    if (forced == "vulkan") return reg_name_is_vulkan(reg_name);
+    if (forced == "metal")  return reg_name_is_metal(reg_name);
+    if (forced == "opencl") return reg_name_is_opencl(reg_name);
+    // Unreachable: validate_forced_gpu_backend rejects anything else, so a
+    // misspelt name cannot quietly match nothing and leave a GPU arm passing
+    // on the CPU.
+    return false;
+}
+
+void validate_forced_gpu_backend(const std::string & forced) {
+    if (forced.empty() || forced == "cuda" || forced == "vulkan" ||
+        forced == "metal" || forced == "opencl") {
+        return;
+    }
+    throw std::runtime_error(
+        "TTS_CPP_GPU_BACKEND='" + forced +
+        "' is not one of cuda, vulkan, metal, opencl");
+}
+
 // Vulkan multi-adapter pick. Pure logic on the two
 // per-device vectors so the policy stays unit-testable (a richer
 // copy lives in `tts_cpp::supertonic::detail::resolve_vulkan_device_index`
@@ -133,7 +171,8 @@ bool gpu_backend_satisfies_requirement(const char * backend_name,
     };
     return (allows(GpuBackendRequirement::Vulkan) && reg_name_is_vulkan(backend_name)) ||
            (allows(GpuBackendRequirement::Metal)  && reg_name_is_metal(backend_name))  ||
-           (allows(GpuBackendRequirement::OpenCL) && reg_name_is_opencl(backend_name));
+           (allows(GpuBackendRequirement::OpenCL) && reg_name_is_opencl(backend_name)) ||
+           (allows(GpuBackendRequirement::CUDA)   && reg_name_is_cuda(backend_name));
 }
 
 void set_backends_directory(const std::string & dir) {
@@ -390,7 +429,8 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
         const char *       reg_name;
     };
     std::vector<Cand> opencl_adreno_700plus;
-    std::vector<Cand> other_gpu;    // Vulkan / Metal / CUDA / Mali / Intel / ...
+    std::vector<Cand> cuda_gpu;     // CUDA, preferred over Vulkan on the same NVIDIA card
+    std::vector<Cand> other_gpu;    // Vulkan / Metal / Mali / Intel / ...
     std::vector<Cand> opencl_other; // Non-Adreno OpenCL (e.g. desktop)
     int max_adreno_version = -1;
 
@@ -405,6 +445,9 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
     // or Adreno 6xx) so the caller accepts CPU fallback; NOT set when a validated GPU's init failed.
     bool gpu_present_but_unvalidated = false;
     bool requirement_skipped_gpu = false;
+
+    const std::string forced_backend = forced_gpu_backend();
+    validate_forced_gpu_backend(forced_backend);
 
     const size_t n_dev = ggml_backend_dev_count();
     for (size_t i = 0; i < n_dev; ++i) {
@@ -421,6 +464,15 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
         const bool   is_opencl = reg_name && std::strcmp(reg_name, "OpenCL") == 0;
         const bool   is_vulkan =
             reg_name && std::strcmp(reg_name, VULKAN_BACKEND_NAME) == 0;
+        if (!reg_name_is_forced(reg_name, forced_backend)) {
+            if (verbose) {
+                fprintf(stderr,
+                    "%s: TTS_CPP_GPU_BACKEND=%s set; skipping %s device '%s'\n",
+                    log_prefix, forced_backend.c_str(),
+                    reg_name && *reg_name ? reg_name : "?", name ? name : "?");
+            }
+            continue;
+        }
         if (!gpu_backend_satisfies_requirement(reg_name, requirement)) {
             // Recorded, not flagged: this only becomes a policy CPU fallback
             // if no requirement-matching device exists at all. Flagging here
@@ -516,6 +568,8 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
             } else {
                 opencl_other.push_back({dev, name, desc, reg_name});
             }
+        } else if (reg_name_is_cuda(reg_name)) {
+            cuda_gpu.push_back({dev, name, desc, reg_name});
         } else {
             other_gpu.push_back({dev, name, desc, reg_name});
         }
@@ -524,11 +578,13 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
     // Tier policy:
     //   1. Adreno 700+: prefer OpenCL (validated, faster than Vulkan
     //      on Snapdragon 8 Gen 2/3/4 etc.).
-    //   2. Anything else with a non-OpenCL GPU: prefer that
+    //   2. CUDA: the vendor-native path on NVIDIA, and measurably faster
+    //      than that card's Vulkan adapter, so it outranks Vulkan when a
+    //      build carries both.
+    //   3. Anything else with a non-OpenCL GPU: prefer that
     //      (Adreno Vulkan on Android — non-Adreno is filtered out
-    //      above; Metal on Apple; CUDA / Vulkan on Linux/Windows
-    //      desktop).
-    //   3. Last resort: any other OpenCL device (e.g. desktop OpenCL,
+    //      above; Metal on Apple; Vulkan on Linux/Windows desktop).
+    //   4. Last resort: any other OpenCL device (e.g. desktop OpenCL,
     //      or Adreno OpenCL whose version string lacked a model number).
     auto try_init = [&](const std::vector<Cand> & bucket) -> ggml_backend_t {
         for (const Cand & c : bucket) {
@@ -634,6 +690,7 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
     if (!opencl_adreno_700plus.empty()) {
         if (ggml_backend_t b = try_init(opencl_adreno_700plus)) return b;
     }
+    if (ggml_backend_t b = try_init(cuda_gpu)) return b;
     if (!vulkan_override_wins_tier_policy) {
         if (ggml_backend_t b = try_init(other_gpu)) return b;
     }

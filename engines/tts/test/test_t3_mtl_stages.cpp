@@ -332,6 +332,15 @@ bool stage_logits(stage_run & r, const chatterbox_model & model,
 
 } // namespace
 
+// The stage names below are lower case; callers spell them either way.
+static std::string ascii_lower(const std::string & s) {
+    std::string out = s;
+    for (char & c : out) {
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    }
+    return out;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 4) {
         fprintf(stderr,
@@ -342,7 +351,7 @@ int main(int argc, char ** argv) {
     }
     const std::string model_path = argv[1];
     const std::string ref_dir    = argv[2];
-    const std::string stage      = argv[3];
+    const std::string stage      = ascii_lower(argv[3]);
     int n_threads = (int) std::thread::hardware_concurrency();
     int n_gpu_layers = 99;
     for (int i = 4; i < argc; ++i) {

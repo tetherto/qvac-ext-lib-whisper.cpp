@@ -1,6 +1,9 @@
 #include "backend_selection.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -13,6 +16,24 @@ void check(bool condition, const char * message) {
     if (condition) return;
     std::fprintf(stderr, "FAIL: %s\n", message);
     ++failures;
+}
+
+// A GPU arm names its backend here, so an unusable value has to be rejected
+// rather than skipping every device and leaving the arm to pass on the CPU.
+bool selection_rejects(const char * forced) {
+    if (forced) {
+        setenv("TTS_CPP_GPU_BACKEND", forced, 1);
+    } else {
+        unsetenv("TTS_CPP_GPU_BACKEND");
+    }
+    try {
+        tts_cpp::detail::init_gpu_backend(/*n_gpu_layers=*/1, /*verbose=*/false, "test");
+    } catch (const std::exception &) {
+        unsetenv("TTS_CPP_GPU_BACKEND");
+        return true;
+    }
+    unsetenv("TTS_CPP_GPU_BACKEND");
+    return false;
 }
 
 }
@@ -39,5 +60,12 @@ int main() {
           "Metal|OpenCL|Vulkan selection must accept Vulkan");
     check(!gpu_backend_satisfies_requirement(CUDA_BACKEND, vkmtlcl),
           "Metal|OpenCL|Vulkan selection must reject CUDA");
+
+    check(selection_rejects("bogus"),
+          "an unknown TTS_CPP_GPU_BACKEND must be rejected, not silently ignored");
+    check(!selection_rejects("cuda"),
+          "a known TTS_CPP_GPU_BACKEND must be accepted whether or not that device exists");
+    check(!selection_rejects(nullptr),
+          "an unset TTS_CPP_GPU_BACKEND must leave selection alone");
     return failures == 0 ? 0 : 1;
 }

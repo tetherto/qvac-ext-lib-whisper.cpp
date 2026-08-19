@@ -13,11 +13,14 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+#include "backend_selection.h"
+
 #include "npy.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -38,7 +41,22 @@ struct model_ctx {
 };
 } // namespace
 
-static model_ctx load_s3gen_gguf(const std::string & path) {
+static ggml_backend_t init_backend(int n_gpu_layers) {
+    if (n_gpu_layers > 0) {
+        ggml_backend_t gpu = ::tts_cpp::detail::init_gpu_backend(
+            n_gpu_layers, /*verbose=*/true, "s3gen");
+        if (!gpu) {
+            // A GPU arm that quietly runs on the CPU reports a pass for a
+            // backend it never touched.
+            throw std::runtime_error(
+                "--n-gpu-layers > 0 but no GPU backend was selected");
+        }
+        return gpu;
+    }
+    return ggml_backend_cpu_init();
+}
+
+static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers) {
     model_ctx m;
 
     ggml_context * tmp_ctx = nullptr;
@@ -46,7 +64,7 @@ static model_ctx load_s3gen_gguf(const std::string & path) {
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) throw std::runtime_error("gguf_init_from_file failed: " + path);
 
-    m.backend = ggml_backend_cpu_init();
+    m.backend = init_backend(n_gpu_layers);
     int64_t n_tensors = gguf_get_n_tensors(g);
 
     ggml_init_params p = { ggml_tensor_overhead() * (size_t)n_tensors, nullptr, true };
@@ -2013,7 +2031,6 @@ static ggml_tensor * reflect_pad_1d(ggml_context * ctx, ggml_tensor * x, int p_l
 //   Input: source signal (65280,)
 //   Output: spec (18, 16321) = concat(real(9, T_stft), imag(9, T_stft))
 static void stage_H4(const model_ctx & m, const std::string & ref_dir) {
-    (void)m;
     fprintf(stderr, "\n=== Stage H4: STFT ===\n");
     npy_array src_npy = npy_load(ref_dir + "/hift_msource_tup0.npy");
     npy_array exp_npy = npy_load(ref_dir + "/hift_s_stft.npy");
@@ -2045,14 +2062,13 @@ static void stage_H4(const model_ctx & m, const std::string & ref_dir) {
     ggml_set_name(spec, "spec"); ggml_set_output(spec);
     ggml_build_forward_expand(gf, spec);
 
-    ggml_backend_t cpu = ggml_backend_cpu_init();
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "src"), npy_as_f32(src_npy), 0, src_npy.data.size());
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "kernel"), kernel_data.data(), 0, kernel_data.size() * sizeof(float));
-    ggml_backend_graph_compute(cpu, gf);
+    ggml_backend_graph_compute(m.backend, gf);
 
     std::vector<float> out_data(ggml_nelements(spec));
     ggml_backend_tensor_get(spec, out_data.data(), 0, ggml_nbytes(spec));
@@ -2065,7 +2081,6 @@ static void stage_H4(const model_ctx & m, const std::string & ref_dir) {
     print_compare("stft", s);
 
     ggml_gallocr_free(allocr);
-    ggml_backend_free(cpu);
     ggml_free(ctx);
 }
 
@@ -2111,7 +2126,6 @@ static std::vector<float> build_window_sum(int T_stft, int n_fft, int hop, const
 
 // Stage H5: ISTFT of conv_post output -> waveform
 static void stage_H5(const model_ctx & m, const std::string & ref_dir) {
-    (void)m;
     fprintf(stderr, "\n=== Stage H5: ISTFT (conv_post -> waveform) ===\n");
     npy_array cp_npy  = npy_load(ref_dir + "/hift_conv_post.npy");  // (18, 16321)
     npy_array wav_npy = npy_load(ref_dir + "/waveform.npy");         // (65280,)
@@ -2203,8 +2217,7 @@ static void stage_H5(const model_ctx & m, const std::string & ref_dir) {
     ggml_set_name(y_trim, "wav"); ggml_set_output(y_trim);
     ggml_build_forward_expand(gf, y_trim);
 
-    ggml_backend_t cpu = ggml_backend_cpu_init();
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
 
@@ -2212,7 +2225,7 @@ static void stage_H5(const model_ctx & m, const std::string & ref_dir) {
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "kernel"), istft_kernel.data(),       0, istft_kernel.size() * sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "w_sum"),  w_sum.data(),              0, w_sum.size() * sizeof(float));
 
-    ggml_backend_graph_compute(cpu, gf);
+    ggml_backend_graph_compute(m.backend, gf);
 
     std::vector<float> out_data(ggml_nelements(y_trim));
     ggml_backend_tensor_get(y_trim, out_data.data(), 0, ggml_nbytes(y_trim));
@@ -2224,21 +2237,28 @@ static void stage_H5(const model_ctx & m, const std::string & ref_dir) {
     print_compare("waveform", s);
 
     ggml_gallocr_free(allocr);
-    ggml_backend_free(cpu);
     ggml_free(ctx);
 }
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s S3GEN_GGUF REFERENCE_DIR [stage=A|B|C|D|E|E0|F|G1|G2|G3|G4|H1|H3|H4|H5|ALL]\n", argv[0]);
+        fprintf(stderr, "usage: %s S3GEN_GGUF REFERENCE_DIR "
+                        "[stage=A|B|C|D|E|E0|F|G1|G2|G3|G4|H1|H3|H4|H5|ALL] "
+                        "[--n-gpu-layers N]\n", argv[0]);
         return 1;
     }
     const std::string gguf_path = argv[1];
     const std::string ref_dir   = argv[2];
-    const std::string stage     = argc > 3 ? argv[3] : "ALL";
+    std::string stage = "ALL";
+    int n_gpu_layers  = 0;
+    for (int i = 3; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--n-gpu-layers" && i + 1 < argc) n_gpu_layers = atoi(argv[++i]);
+        else                                       stage        = a;
+    }
 
-    fprintf(stderr, "Loading %s\n", gguf_path.c_str());
-    model_ctx m = load_s3gen_gguf(gguf_path);
+    fprintf(stderr, "Loading %s (gpu_layers=%d)\n", gguf_path.c_str(), n_gpu_layers);
+    model_ctx m = load_s3gen_gguf(gguf_path, n_gpu_layers);
     fprintf(stderr, "  %zu tensors loaded, backend=%s\n", m.tensors.size(),
             ggml_backend_name(m.backend));
 

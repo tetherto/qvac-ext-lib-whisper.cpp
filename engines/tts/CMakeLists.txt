@@ -667,7 +667,9 @@ if (TTS_CPP_BUILD_TESTS)
     set(_tcb_super_ref          "${TTS_CPP_TEST_REF_DIR}/supertonic-ref-quick")
     set(_tcb_super_ref_noise    "${_tcb_super_ref}/noise.npy")
     set(_tcb_s3gen_ref          "${TTS_CPP_TEST_REF_DIR}/s3gen-ref")
-    set(_tcb_s3gen_ref_logits   "${_tcb_s3gen_ref}/logits.npy")
+    # Written last by dump-s3gen-reference.py, so it gates on a dump that ran
+    # to completion rather than one that died partway through.
+    set(_tcb_s3gen_ref_sentinel "${_tcb_s3gen_ref}/waveform.npy")
     set(_tcb_t3_mtl_ref         "${TTS_CPP_TEST_REF_DIR}/t3-mtl-ref")
     set(_tcb_streaming_ref      "${TTS_CPP_TEST_REF_DIR}/streaming-ref")
     set(_tcb_jfk_wav            "${TTS_CPP_TEST_AUDIO_DIR}/jfk.wav")
@@ -1418,14 +1420,37 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_parler_indic_gguf}"
         REQUIRES "${_tcb_parler_indic_gguf}")
 
-    add_executable(test-s3gen test/test_s3gen.cpp)
+    add_executable(test-s3gen test/test_s3gen.cpp src/backend_selection.cpp)
     target_link_libraries(test-s3gen PRIVATE ggml)
     target_include_directories(test-s3gen PRIVATE ggml/include src)
     tts_cpp_apply_ccache(test-s3gen)
     tts_cpp_register_test(test-s3gen
         LABEL    "fixture"
         ARGS     "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}" "ALL"
-        REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref_logits}")
+        REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref_sentinel}")
+
+    # Per-backend S3Gen parity arms. Both run the same binary and selection
+    # picks on its own preference order, so each arm pins the backend it
+    # covers through TTS_CPP_GPU_BACKEND; the harness fails rather than
+    # falling back to CPU when that backend is unavailable. Registered only
+    # for backends whose S3Gen/HiFT graphs have been checked against the
+    # reference dump -- Metal is absent because it has not been.
+    function(tts_cpp_register_s3gen_gpu_arm suffix)
+        tts_cpp_register_test(test-s3gen-${suffix}
+            EXE      test-s3gen
+            LABEL    "gpu"
+            ARGS     "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}" "ALL" "--n-gpu-layers" "99"
+            REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref_sentinel}")
+        set_property(TEST test-s3gen-${suffix} APPEND
+                     PROPERTY ENVIRONMENT "TTS_CPP_GPU_BACKEND=${suffix}")
+    endfunction()
+
+    if (TTS_CPP_GGML_CUDA)
+        tts_cpp_register_s3gen_gpu_arm(cuda)
+    endif()
+    if (TTS_CPP_GGML_VULKAN)
+        tts_cpp_register_s3gen_gpu_arm(vulkan)
+    endif()
 
     add_executable(test-voice-features
         test/test_voice_features.cpp

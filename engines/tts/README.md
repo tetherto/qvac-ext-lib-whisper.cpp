@@ -55,6 +55,33 @@ engine, not every backend ggml can compile.
 | LavaSR denoiser | language agnostic | input PCM | rate preserving | yes | yes | yes | yes | yes |
 | LavaSR enhancer | language agnostic | input PCM | 48 kHz | yes | yes | yes | yes | yes |
 
+Chatterbox on CUDA depends on two ggml-cuda fixes carried by
+[`qvac-ext-ggml@speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech).
+Without the first (`im2col` / `pad` striding the grid Y and Z axes, which are
+capped at 65535) a chunk past roughly ten seconds aborts the launch; Chatterbox
+splits on sentences but readily emits a thirty-second chunk from ordinary
+prose, so long-form input reaches it. Without the second (`conv_transpose_1d`
+bounded to the kernel taps that reach each output) the HiFT vocoder is slower
+on CUDA than on CPU and dominates the pipeline. With both, Chatterbox Turbo
+runs at RTF 0.05 against 0.72 on CPU, and Multilingual at 0.08 against 3.23 --
+CPU cannot keep up with real time on Multilingual and CUDA is comfortably
+ahead of it.
+
+What that row is based on: `test-s3gen` compares every S3Gen and HiFT stage to
+the Python reference dump and is registered per backend (`test-s3gen-cuda`,
+`test-s3gen-vulkan`), each arm pinning its backend through
+`TTS_CPP_GPU_BACKEND` and failing rather than falling back to the CPU. T3
+carries a weaker claim: its `t3-mtl-ref` fixture cannot be regenerated -- the
+dump script pins no conditioning, so a fresh dump disagrees with the C++ by
+about 4e-2 on CPU and CUDA alike -- so T3 on CUDA is covered by agreement with
+the CPU (identical token counts end to end), not by reference parity.
+
+Where a build carries both CUDA and Vulkan, selection prefers CUDA on NVIDIA:
+measured on one binary on an RTX 3090, Chatterbox Turbo is 8.6x faster on CUDA
+than on that card's Vulkan adapter. Set `TTS_CPP_GPU_BACKEND` to `cuda`,
+`vulkan`, `metal` or `opencl` to pin one for a test arm or a comparison; an
+unrecognised value is rejected rather than silently dropping to the CPU.
+
 Chatterbox Multilingual's native tokenizer covers `en, es, fr, de, it, pt, nl,
 pl, tr, sv, da, fi, no, el, ms, sw, ar, ko`; `ja`, `he`, `ru`, `zh`, and `hi`
 use external preprocessing. Japanese requires MeCab/IPAdic and Chinese requires
