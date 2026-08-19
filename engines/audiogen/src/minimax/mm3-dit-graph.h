@@ -417,8 +417,7 @@ static bool mm3_dit_run(const MM3Model & m, MM3DitGraph * g, const float * laten
             ggml_backend_tensor_get(g->output, destination, 0, bytes);
             return true;
         };
-    return mm3_read_dit_output(out, output_count, m.synth_cfg.dit.output_negated,
-                               readback, err);
+    return mm3_read_dit_output(out, output_count, readback, err);
 }
 
 static bool mm3_dit_forward(const MM3Model & m, const float * latents, const float * cond, int64_t L, float t,

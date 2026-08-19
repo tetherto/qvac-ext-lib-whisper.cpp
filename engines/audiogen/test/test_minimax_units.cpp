@@ -141,7 +141,7 @@ void test_flow_schedule() {
     CHECK(throws_invalid_argument([&] { flow_schedule(0, sigmas, timesteps); }));
 }
 
-void test_production_dit_readback_polarity() {
+void test_production_dit_readback_preserves_velocity() {
     const std::vector<float> raw = {1.0f, -2.0f, 0.5f};
     size_t requested_bytes = 0;
     const MM3DitReadback readback =
@@ -150,17 +150,12 @@ void test_production_dit_readback_polarity() {
             std::copy(raw.begin(), raw.end(), output);
             return true;
         };
-    std::vector<float> negated(raw.size());
+    std::vector<float> output(raw.size());
     std::string error;
-    CHECK(mm3_read_dit_output(negated.data(), negated.size(), true, readback, &error));
+    CHECK(mm3_read_dit_output(output.data(), output.size(), readback, &error));
     CHECK(error.empty());
     CHECK(requested_bytes == raw.size() * sizeof(float));
-    CHECK(negated == std::vector<float>({-1.0f, 2.0f, -0.5f}));
-
-    std::vector<float> unchanged(raw.size());
-    CHECK(mm3_read_dit_output(unchanged.data(), unchanged.size(), false, readback,
-                              &error));
-    CHECK(unchanged == raw);
+    CHECK(output == raw);
 }
 
 void test_production_cfg_euler_step() {
@@ -804,7 +799,7 @@ int main() {
     test_unconditional_mask();
     test_noise();
     test_flow_schedule();
-    test_production_dit_readback_polarity();
+    test_production_dit_readback_preserves_velocity();
     test_production_cfg_euler_step();
     test_malformed_synthesis_metadata();
     test_vocoder_output_shape();
