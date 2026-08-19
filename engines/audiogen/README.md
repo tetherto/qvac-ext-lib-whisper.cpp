@@ -527,6 +527,10 @@ verbose engine output and prints per-stage wall clock to stderr (`[music-cli]`,
 `[acestep-timing]`). Direct library use prints `[acestep-timing]` only when
 `EngineOptions::verbose` is enabled; it defaults to `false`.
 
+For a reproducible engine-to-engine measurement against upstream
+`acestep.cpp` (`ace-lm` + `ace-synth`, no addon), see
+[`benchmarks/comparison/README.md`](benchmarks/comparison/README.md).
+
 ## License
 
 `audiogen-cpp` is MIT licensed; see [LICENSE](LICENSE). Model weights and upstream model code carry their own terms, listed in [NOTICE](NOTICE).
