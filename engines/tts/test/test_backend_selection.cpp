@@ -1,9 +1,9 @@
 #include "backend_selection.h"
 
+#include "test_env_portable.h"
+
 #include <cstdio>
-#include <cstdlib>
 #include <stdexcept>
-#include <string>
 
 namespace {
 
