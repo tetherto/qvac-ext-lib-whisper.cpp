@@ -197,25 +197,26 @@ foreach(_tts_ggml_backend metal vulkan cuda opencl)
         set(TTS_CPP_GGML_${_tts_ggml_backend_uc} TRUE)
     endif()
 endforeach()
-# Parler allowlist: Metal / Vulkan / OpenCL (parler/gguf.cpp).
+# Parler allowlist: Metal / Vulkan / OpenCL / CUDA (parler/gguf.cpp).
 set(TTS_CPP_PARLER_GPU FALSE)
-if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_VULKAN OR TTS_CPP_GGML_OPENCL)
+if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_VULKAN OR TTS_CPP_GGML_OPENCL OR
+    TTS_CPP_GGML_CUDA)
     set(TTS_CPP_PARLER_GPU TRUE)
 endif()
-# CosyVoice3 allowlist: Metal / OpenCL everywhere, Vulkan on Windows and
-# non-Android Linux only (cosyvoice_gpu_requirement() in
+# CosyVoice3 allowlist: Metal / OpenCL everywhere, Vulkan and CUDA on
+# Windows and non-Android Linux only (cosyvoice_gpu_requirement() in
 # cosyvoice_pipeline.h -- keep the two conditions in lockstep). The
 # platform guard mirrors the runtime split: a build whose only GPU
 # backend the runtime requirement would refuse (Android or Apple
 # Vulkan-only) must not register gpu test variants that would hard-fail
 # instead of skipping.
 set(TTS_CPP_COSYVOICE_GPU FALSE)
-set(_tts_cosy_vulkan_platform FALSE)
+set(_tts_cosy_desktop_platform FALSE)
 if (WIN32 OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
-    set(_tts_cosy_vulkan_platform TRUE)
+    set(_tts_cosy_desktop_platform TRUE)
 endif()
 if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_OPENCL OR
-    (TTS_CPP_GGML_VULKAN AND _tts_cosy_vulkan_platform))
+    ((TTS_CPP_GGML_VULKAN OR TTS_CPP_GGML_CUDA) AND _tts_cosy_desktop_platform))
     set(TTS_CPP_COSYVOICE_GPU TRUE)
 endif()
 
@@ -1126,8 +1127,9 @@ if (TTS_CPP_BUILD_TESTS)
                      PROPERTY ENVIRONMENT "AUDIO8_TEST_GPU=${suffix}")
     endfunction()
 
-    # Audio8 allowlist: Vulkan / Metal / OpenCL (audio8/gguf.cpp
-    # GpuBackendRequirement::Vulkan | Metal | OpenCL).
+    # Audio8 allowlist: Vulkan / Metal / OpenCL / CUDA (audio8/gguf.cpp
+    # GpuBackendRequirement::Vulkan | Metal | OpenCL | CUDA). Arms register
+    # only for the backends whose graphs match the reference.
     if (TTS_CPP_GGML_VULKAN)
         tts_cpp_register_audio8_gpu_tests(vulkan)
         if (TARGET audio8-cli)
@@ -1150,6 +1152,9 @@ if (TTS_CPP_BUILD_TESTS)
     if (TTS_CPP_GGML_OPENCL)
         tts_cpp_register_audio8_gpu_tests(opencl)
     endif()
+    # No CUDA arm: the backend is selectable but its graphs do not yet
+    # reproduce the reference (see the Audio8 CUDA notes in README.md), so a
+    # registered arm would be a standing failure rather than a gate.
 
     # The per-stage breakdown the Metal work is ranked by.  Needs the models but
     # none of the reference dumps: it checks the accounting, not the numbers.

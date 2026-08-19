@@ -133,7 +133,8 @@ bool gpu_backend_satisfies_requirement(const char * backend_name,
     };
     return (allows(GpuBackendRequirement::Vulkan) && reg_name_is_vulkan(backend_name)) ||
            (allows(GpuBackendRequirement::Metal)  && reg_name_is_metal(backend_name))  ||
-           (allows(GpuBackendRequirement::OpenCL) && reg_name_is_opencl(backend_name));
+           (allows(GpuBackendRequirement::OpenCL) && reg_name_is_opencl(backend_name)) ||
+           (allows(GpuBackendRequirement::CUDA)   && reg_name_is_cuda(backend_name));
 }
 
 void set_backends_directory(const std::string & dir) {

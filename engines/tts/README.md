@@ -49,11 +49,38 @@ engine, not every backend ggml can compile.
 | Supertonic 1 | English | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Supertonic 2 | `en`, `ko`, `es`, `pt`, `fr` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Supertonic 3 | 31 languages plus `na` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
-| Parler-TTS mini/large/Indic | English or 21 Indic languages | natural-language description | 44.1 kHz | yes | yes | yes | yes | no |
-| Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice or zero-shot/cross-lingual reference WAV; instruct controls | 24 kHz | yes | yes | yes | yes | no |
-| Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | yes | yes | yes | no |
+| Parler-TTS mini/large/Indic | English or 21 Indic languages | natural-language description | 44.1 kHz | yes | yes | yes | yes | yes |
+| Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice or zero-shot/cross-lingual reference WAV; instruct controls | 24 kHz | yes | yes | yes | yes | yes |
+| Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | yes | yes | yes | selectable, unvalidated |
 | LavaSR denoiser | language agnostic | input PCM | rate preserving | yes | yes | yes | yes | yes |
 | LavaSR enhancer | language agnostic | input PCM | 48 kHz | yes | yes | yes | yes | yes |
+
+CUDA support for the convolutional stages depends on a ggml-cuda fix: the
+`im2col` and `pad` kernels mapped an output axis one-to-one onto the CUDA grid
+Y dimension, which is capped at 65535, so a long audio time axis aborted the
+launch. Against a ggml without that fix, CosyVoice3 aborts on any utterance past
+roughly one short sentence and Parler's streaming path aborts as well. The rows
+above assume a ggml carrying the strided-Y kernels.
+
+With that ggml, CUDA is validated for CosyVoice3 (every per-stage parity
+harness, a bit-identical CPU-vs-CUDA greedy LM trace at f32 and q8_0, and
+long-form synthesis) and for Parler (DAC decode at 76.9 dB SNR against the torch
+reference, and stream-vs-batch agreement to 2.1e-4). Three qualifications:
+
+- Parler's Indic checkpoint is gated on its model hub, so the Indic arm carries
+  the mini/large result rather than one measured on the Indic weights.
+- `test-parler-dac-gpu` fails a chunked-decode bit-identity check on CUDA. It
+  fails identically on Vulkan, including on an unmodified tree, so it is a
+  pre-existing property of the GPU decode path rather than a CUDA regression.
+- Audio8 selects CUDA but does not yet reproduce the reference on it, which is
+  why its cell above says selectable rather than yes and why no CUDA test arm is
+  registered. Two numeric defects remain once the kernel fix removes the
+  aborts, both absent on Vulkan with the same fixtures and models: the LM
+  diverges from the first step (step-0 hidden state off by 9.6 absolute,
+  relative 0.32, against 3e-3 on Vulkan and 2e-5 on CPU), and the codec's latent
+  stage is off by 4.1e-3 relative against a 6e-3 bound on max, which carries
+  into the waveform. The stages feeding it agree to between 1e-7 and 4e-5.
+  Prefer Vulkan on NVIDIA hardware for Audio8 until both are fixed.
 
 Chatterbox Multilingual's native tokenizer covers `en, es, fr, de, it, pt, nl,
 pl, tr, sv, da, fi, no, el, ms, sw, ar, ko`; `ja`, `he`, `ru`, `zh`, and `hi`

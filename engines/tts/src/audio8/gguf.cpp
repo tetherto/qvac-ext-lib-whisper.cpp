@@ -162,7 +162,7 @@ ggml_backend_t init_backend(int n_gpu_layers) {
     ggml_backend_t backend = ::tts_cpp::detail::init_gpu_backend(
         n_gpu_layers, true, "audio8", 0, false, nullptr,
         GpuBackendRequirement::Vulkan | GpuBackendRequirement::Metal |
-            GpuBackendRequirement::OpenCL);
+            GpuBackendRequirement::OpenCL | GpuBackendRequirement::CUDA);
     return backend ? backend : ::tts_cpp::detail::init_cpu_backend();
 }
 

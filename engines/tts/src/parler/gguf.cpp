@@ -216,7 +216,8 @@ bool parler_load_gguf(const std::string & path, parler_model & model,
     const bool backend_validated = model.backend &&
         (::tts_cpp::detail::backend_is_metal(model.backend) ||
          ::tts_cpp::detail::backend_is_vulkan(model.backend) ||
-         ::tts_cpp::detail::backend_is_opencl(model.backend));
+         ::tts_cpp::detail::backend_is_opencl(model.backend) ||
+         ::tts_cpp::detail::backend_is_cuda(model.backend));
     if (model.backend && !backend_validated) {
         ggml_backend_free(model.backend);
         model.backend = nullptr;

@@ -30,12 +30,14 @@ int main() {
     const auto any     = GpuBackendRequirement::Any;
     const auto vulkan  = GpuBackendRequirement::Vulkan;
     const auto opencl  = GpuBackendRequirement::OpenCL;
+    const auto cuda    = GpuBackendRequirement::CUDA;
     const auto vkmtl   = GpuBackendRequirement::Vulkan | GpuBackendRequirement::Metal;
     const auto mtlcl   = GpuBackendRequirement::Metal  | GpuBackendRequirement::OpenCL;
-    // Every backend either engine has validated: Audio8 asks for this set on
-    // every platform, CosyVoice3 on desktop (cosyvoice_gpu_requirement()).
     const auto vkmtlcl = GpuBackendRequirement::Vulkan | GpuBackendRequirement::Metal |
                          GpuBackendRequirement::OpenCL;
+    // The set both engines admit: Audio8 asks for it on every platform,
+    // CosyVoice3 on desktop (cosyvoice_gpu_requirement()).
+    const auto vkmtlclcu = vkmtlcl | GpuBackendRequirement::CUDA;
 
     expect(gpu_backend_satisfies_requirement("Metal", any), "Any accepts Metal");
     expect(gpu_backend_satisfies_requirement("Vulkan", any), "Any accepts Vulkan");
@@ -73,6 +75,23 @@ int main() {
     expect(gpu_backend_satisfies_requirement("OpenCL", vkmtlcl), "Vulkan|Metal|OpenCL accepts OpenCL");
     expect(!gpu_backend_satisfies_requirement("CUDA", vkmtlcl), "Vulkan|Metal|OpenCL rejects CUDA");
     expect(!gpu_backend_satisfies_requirement(nullptr, vkmtlcl), "Vulkan|Metal|OpenCL rejects unnamed");
+
+    expect(gpu_backend_satisfies_requirement("CUDA", cuda), "CUDA accepts CUDA");
+    expect(!gpu_backend_satisfies_requirement("Vulkan", cuda), "CUDA rejects Vulkan");
+    expect(!gpu_backend_satisfies_requirement("MTL", cuda), "CUDA rejects MTL");
+    expect(!gpu_backend_satisfies_requirement("OpenCL", cuda), "CUDA rejects OpenCL");
+    expect(!gpu_backend_satisfies_requirement(nullptr, cuda), "CUDA rejects unnamed");
+
+    // The set both engines request once CUDA is admitted: it names four
+    // backends and must still reject an unnamed device, so adding the CUDA
+    // flag did not collapse the set into Any.
+    expect(gpu_backend_satisfies_requirement("Vulkan", vkmtlclcu), "Vulkan|Metal|OpenCL|CUDA accepts Vulkan");
+    expect(gpu_backend_satisfies_requirement("MTL", vkmtlclcu), "Vulkan|Metal|OpenCL|CUDA accepts MTL");
+    expect(gpu_backend_satisfies_requirement("Metal", vkmtlclcu), "Vulkan|Metal|OpenCL|CUDA accepts Metal under its former name");
+    expect(gpu_backend_satisfies_requirement("OpenCL", vkmtlclcu), "Vulkan|Metal|OpenCL|CUDA accepts OpenCL");
+    expect(gpu_backend_satisfies_requirement("CUDA", vkmtlclcu), "Vulkan|Metal|OpenCL|CUDA accepts CUDA");
+    expect(!gpu_backend_satisfies_requirement("SomeFutureGPU", vkmtlclcu), "Vulkan|Metal|OpenCL|CUDA rejects an unnamed backend");
+    expect(!gpu_backend_satisfies_requirement(nullptr, vkmtlclcu), "Vulkan|Metal|OpenCL|CUDA rejects unnamed");
 
     if (g_failures) {
         fprintf(stderr, "%d requirement checks failed\n", g_failures);
