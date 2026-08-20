@@ -5,6 +5,11 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <string>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #ifdef _MSC_VER
 inline int setenv(const char * name, const char * value, int overwrite) {
     // POSIX: with overwrite=0 an existing variable must be left untouched
@@ -22,6 +27,16 @@ inline int unsetenv(const char * name) {
 // Writable scratch directory for tests that emit temp fixtures. POSIX
 // runners set TMPDIR; Windows sets TEMP/TMP and has no /tmp, so fall
 // through the whole chain before defaulting.
+// Distinguishes temp files written by tests that run concurrently under
+// `ctest -j`: same-named files across arms clobber each other's fixtures.
+inline std::string test_process_tag() {
+#ifdef _WIN32
+    return std::to_string(_getpid());
+#else
+    return std::to_string(getpid());
+#endif
+}
+
 inline std::string test_tmpdir() {
     for (const char * var : { "TMPDIR", "TEMP", "TMP" }) {
         if (const char * v = std::getenv(var); v && *v) return v;

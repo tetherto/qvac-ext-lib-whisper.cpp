@@ -126,13 +126,27 @@ bool compare_waveforms(const std::vector<float> & cpu_pcm, const std::vector<flo
     return true;
 }
 
+// dump_mel_path also writes per-stage sidecars, named from the path with its
+// .npy extension stripped.
+void remove_mel_dumps(const std::string & mel_path) {
+    std::remove(mel_path.c_str());
+    std::string base = mel_path;
+    if (base.size() > 4 && base.substr(base.size() - 4) == ".npy") {
+        base.resize(base.size() - 4);
+    }
+    for (const char * sidecar : { "_cond.npy", "_mu.npy", "_spks.npy", "_step0_dxdt.npy" }) {
+        std::remove((base + sidecar).c_str());
+    }
+}
+
 bool compare_case(const std::string & gguf, int token_count, const char * label,
                   double mel_tolerance, double max_rms_ratio) {
     std::fprintf(stderr, "\n== %s: %d tokens ==\n", label, token_count);
 
-    const std::string tmp      = test_tmpdir();
-    const std::string cpu_mel  = tmp + "/s3gen_agree_cpu_" + label + ".npy";
-    const std::string gpu_mel  = tmp + "/s3gen_agree_gpu_" + label + ".npy";
+    const std::string tmp     = test_tmpdir();
+    const std::string tag     = test_process_tag();
+    const std::string cpu_mel = tmp + "/s3gen_agree_" + tag + "_cpu_" + label + ".npy";
+    const std::string gpu_mel = tmp + "/s3gen_agree_" + tag + "_gpu_" + label + ".npy";
 
     std::vector<float> cpu_pcm;
     if (!synthesize(gguf, 0, token_count, cpu_pcm, cpu_mel, "cpu")) {
@@ -145,8 +159,8 @@ bool compare_case(const std::string & gguf, int token_count, const char * label,
 
     const bool mel_ok = compare_mels(cpu_mel, gpu_mel, mel_tolerance);
     const bool wav_ok = compare_waveforms(cpu_pcm, gpu_pcm, max_rms_ratio);
-    std::remove(cpu_mel.c_str());
-    std::remove(gpu_mel.c_str());
+    remove_mel_dumps(cpu_mel);
+    remove_mel_dumps(gpu_mel);
     return mel_ok && wav_ok;
 }
 
