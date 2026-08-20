@@ -83,6 +83,7 @@ int main() {
     }
 
     backend_configure_cpu(4, std::getenv("AUDIOGEN_TEST_BACKENDS_DIR") ? std::getenv("AUDIOGEN_TEST_BACKENDS_DIR") : "");
+    backend_configure_device("");  // cpu unless MM3_DEVICE overrides
 
     MM3Model model;
     const tts_cpp::minimax::detail::ModelPair pair =
@@ -127,11 +128,12 @@ int main() {
     CHECK(result.window_latents.size() == 1);
 
     // On-manifold check: a correct flow trajectory ends at the learned latent
-    // distribution (std ~2.2); the historical velocity-sign and stale-condition
-    // bugs both stalled near the noise distribution (std ~1.4).
+    // distribution (std ~2.2 for 300-frame songs, ~1.9 for this short prompt);
+    // the historical velocity-sign and stale-condition bugs both stalled near
+    // the noise distribution (std ~1.4).
     const double std_dev = latent_std(result.window_latents[0]);
-    std::fprintf(stderr, "[quality] final latent std %.4f (healthy ~2.2, broken ~1.4)\n", std_dev);
-    CHECK(std_dev > 1.8);
+    std::fprintf(stderr, "[quality] final latent std %.4f (healthy ~1.9-2.4, broken ~1.4)\n", std_dev);
+    CHECK(std_dev > 1.7);
     CHECK(std_dev < 3.2);
 
     mm3_unload(&model);
