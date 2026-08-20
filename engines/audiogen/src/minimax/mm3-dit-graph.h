@@ -44,8 +44,6 @@ struct MM3DitGraph {
     int64_t        graph_L = 0;
     size_t         compute_bytes = 0;
     int            n_nodes       = 0;
-
-    bool           cond_uploaded = false;
 };
 
 struct MM3FlowStats {
@@ -96,7 +94,6 @@ static void mm3_dit_free_graph(MM3DitGraph * g) {
     g->in_pos        = nullptr;
     g->output        = nullptr;
     g->graph_L       = 0;
-    g->cond_uploaded = false;
 }
 
 static void mm3_dit_free(MM3DitGraph * g) {
@@ -359,7 +356,6 @@ static bool mm3_dit_ensure_graph(const MM3Model & m, MM3DitGraph * g, int64_t L,
 
     g->gctx          = ctx;
     g->graph_L       = L;
-    g->cond_uploaded = false;
     g->n_nodes       = ggml_graph_n_nodes(g->graph);
     g->compute_bytes = ggml_backend_sched_get_buffer_size(g->sched, g->backend);
 
@@ -392,17 +388,17 @@ static bool mm3_dit_run(const MM3Model & m, MM3DitGraph * g, const float * laten
     }
     ggml_backend_tensor_set(g->in_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
 
-    ggml_backend_tensor_set(g->in_gate, &gate, 0, sizeof(float));
-    ggml_backend_tensor_set(g->in_lat, latents, 0, ggml_nbytes(g->in_lat));
-    if (cond) {
-        ggml_backend_tensor_set(g->in_cond, cond, 0, ggml_nbytes(g->in_cond));
-        g->cond_uploaded = true;
-    } else if (!g->cond_uploaded) {
+    if (!cond) {
         if (err) {
-            *err = "no condition uploaded yet (internal: mm3_dit_run called with cond=nullptr first)";
+            *err = "mm3_dit_run needs the window condition on every call: the graph "
+                   "allocator recycles input blocks between computes, so uploads do "
+                   "not survive a forward";
         }
         return false;
     }
+    ggml_backend_tensor_set(g->in_gate, &gate, 0, sizeof(float));
+    ggml_backend_tensor_set(g->in_lat, latents, 0, ggml_nbytes(g->in_lat));
+    ggml_backend_tensor_set(g->in_cond, cond, 0, ggml_nbytes(g->in_cond));
 
     if (ggml_backend_sched_graph_compute(g->sched, g->graph) != GGML_STATUS_SUCCESS) {
         if (err) {
@@ -475,11 +471,12 @@ static bool mm3_flow_sample(const MM3Model & m, const float * noise, const float
         const float t = timesteps[(size_t) i];
         const auto  t0 = std::chrono::steady_clock::now();
 
-        if (!mm3_dit_run(m, &g_mm3_dit, out_latents.data(), i == 0 ? cond : nullptr, 1.0f, t, L, pred_c.data(), err)) {
+        // Re-upload the condition every forward — see mm3_flow_sample_chunk.
+        if (!mm3_dit_run(m, &g_mm3_dit, out_latents.data(), cond, 1.0f, t, L, pred_c.data(), err)) {
             return false;
         }
 
-        if (!mm3_dit_run(m, &g_mm3_dit, out_latents.data(), nullptr, 0.0f, t, L, pred_u.data(), err)) {
+        if (!mm3_dit_run(m, &g_mm3_dit, out_latents.data(), cond, 0.0f, t, L, pred_u.data(), err)) {
             return false;
         }
 

@@ -760,7 +760,6 @@ def build_dit(src, b):
     b.meta("add_uint32", "mm3.dit.fourier_dim", DIT_FOURIER_DIM)
     b.meta("add_float32", "mm3.dit.layer_norm_eps", DIT_LN_EPS)
     b.meta("add_string", "mm3.dit.glu_order", "value_gate")
-    b.meta("add_bool", "mm3.dit.output_negated", True)
     b.meta("add_bool", "mm3.dit.timestep_token_prepended", True)
     b.meta("add_bool", "mm3.dit.pre_post_conv_residual", True)
     b.meta("add_bool", "mm3.dit.attn_bias", False)
