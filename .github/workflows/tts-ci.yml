@@ -130,10 +130,21 @@ jobs:
   # macOS.
   gpu:
     if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
-    runs-on: [self-hosted, gpu]
+    # qvac-ubuntu2204-x64-gpu is the NVIDIA Linux runner the qvac monorepo's
+    # benchmark and e2e lanes use (it exposes nvidia-smi there). The generic
+    # [self-hosted, gpu] label resolved to an Apple Silicon host with no CUDA
+    # toolkit, which cannot run the CUDA arms this lane exists for.
+    runs-on: qvac-ubuntu2204-x64-gpu
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: Show what this runner has
+        run: |
+          uname -a
+          nvidia-smi || echo "no NVIDIA driver"
+          command -v nvcc && nvcc --version || echo "no CUDA toolkit on PATH"
+          ls /usr/local/cuda*/bin/nvcc 2>/dev/null || echo "no /usr/local/cuda*"
+          command -v vulkaninfo && vulkaninfo --summary 2>/dev/null | head -20 || echo "no vulkaninfo"
       # GGML_VULKAN=ON is the backend the -L gpu suites primarily target
       # (test_vk_vs_cpu et al); Metal is on by default on Apple hosts.
       # CUDA is added only where a toolkit exists: this label currently
