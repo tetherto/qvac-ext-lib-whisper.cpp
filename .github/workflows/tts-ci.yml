@@ -228,5 +228,7 @@ jobs:
           CHECK
 
       - name: Run the GPU suites
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
         run: |
           ctest --test-dir build -L gpu --output-on-failure --timeout 1200
