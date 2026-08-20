@@ -220,6 +220,11 @@ if (AUDIOGEN_BUILD_EXECUTABLES)
         src/acestep/mini_json.cpp
         src/acestep/music_cli_edit.cpp
     )
+
+    if (AUDIOGEN_BUILD_MINIMAX)
+        add_executable(mm3-replay src/minimax/mm3_replay_cli.cpp)
+        audiogen_link_in_tree_binary(mm3-replay)
+    endif()
 endif()
 
 # ---- tests ----------------------------------------------------------------
@@ -270,6 +275,14 @@ if (AUDIOGEN_BUILD_TESTS)
         audiogen_apply_ccache(test-minimax-integration)
         audiogen_register_test(test-minimax-integration LABEL "integration")
         set_property(TEST test-minimax-integration PROPERTY SKIP_RETURN_CODE 77)
+
+        # Model-backed quality regression over engine internals: DiT
+        # determinism across computes and the on-manifold final-latent check
+        # that rejects the historical "valid WAV but noise" failure.
+        add_executable(test-minimax-quality test/test_minimax_quality.cpp)
+        audiogen_link_in_tree_binary(test-minimax-quality)
+        audiogen_register_test(test-minimax-quality LABEL "integration")
+        set_property(TEST test-minimax-quality PROPERTY SKIP_RETURN_CODE 77)
 
         find_package(Python3 COMPONENTS Interpreter)
         if (Python3_Interpreter_FOUND)
