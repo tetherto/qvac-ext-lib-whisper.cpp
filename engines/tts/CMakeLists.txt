@@ -1429,6 +1429,11 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}" "ALL"
         REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref_sentinel}")
 
+    add_executable(test-chatterbox-backend-parity test/test_chatterbox_backend_parity.cpp)
+    target_link_libraries(test-chatterbox-backend-parity PRIVATE tts-cpp ggml tts-cpp-backend-defs)
+    target_include_directories(test-chatterbox-backend-parity PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-chatterbox-backend-parity)
+
     # Per-backend S3Gen parity arms. Both run the same binary and selection
     # picks on its own preference order, so each arm pins the backend it
     # covers through TTS_CPP_GPU_BACKEND; the harness fails rather than
@@ -1442,6 +1447,17 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}" "ALL" "--n-gpu-layers" "99"
             REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref_sentinel}")
         set_property(TEST test-s3gen-${suffix} APPEND
+                     PROPERTY ENVIRONMENT "TTS_CPP_GPU_BACKEND=${suffix}")
+
+        # Backs the CPU-vs-GPU claim for the T3 half, which has no usable
+        # reference dump: same seed, greedy sampling, token and sample counts
+        # compared against the CPU on the same build.
+        tts_cpp_register_test(test-chatterbox-parity-mtl-${suffix}
+            EXE      test-chatterbox-backend-parity
+            LABEL    "gpu"
+            ARGS     "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}" "en"
+            REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}")
+        set_property(TEST test-chatterbox-parity-mtl-${suffix} APPEND
                      PROPERTY ENVIRONMENT "TTS_CPP_GPU_BACKEND=${suffix}")
     endfunction()
 

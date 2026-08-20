@@ -68,13 +68,22 @@ CPU cannot keep up with real time on Multilingual and CUDA is comfortably
 ahead of it.
 
 What that row is based on: `test-s3gen` compares every S3Gen and HiFT stage to
-the Python reference dump and is registered per backend (`test-s3gen-cuda`,
+the Python reference dump under an explicit per-stage tolerance and returns
+non-zero when one is exceeded. It is registered per backend (`test-s3gen-cuda`,
 `test-s3gen-vulkan`), each arm pinning its backend through
-`TTS_CPP_GPU_BACKEND` and failing rather than falling back to the CPU. T3
-carries a weaker claim: its `t3-mtl-ref` fixture cannot be regenerated -- the
-dump script pins no conditioning, so a fresh dump disagrees with the C++ by
-about 4e-2 on CPU and CUDA alike -- so T3 on CUDA is covered by agreement with
-the CPU (identical token counts end to end), not by reference parity.
+`TTS_CPP_GPU_BACKEND` and failing rather than falling back to the CPU.
+
+T3 carries a weaker claim, and the shape of it matters. Its `t3-mtl-ref`
+fixture cannot be regenerated -- the dump script pins no conditioning, so a
+fresh dump disagrees with the C++ by about 4e-2 on CPU and CUDA alike -- so
+there is no reference parity for T3 on any backend. Nor do CPU and GPU agree
+token for token: T3 decodes autoregressively, so a single differing argmax
+re-rolls the remainder and the two emit different counts for the same input
+(55 against 56, 64 against 68, 63 against 69 on the three phrases the arm
+uses). `test-chatterbox-parity-mtl-{cuda,vulkan}` therefore asserts what does
+hold -- both backends produce audio, and within 1.35x of each other's duration,
+which truncation, runaway generation and silent failure all break. T3 on CUDA
+is gated at that strength and no more.
 
 Where a build carries both CUDA and Vulkan, selection prefers CUDA on NVIDIA:
 measured on one binary on an RTX 3090, Chatterbox Turbo is 8.6x faster on CUDA
