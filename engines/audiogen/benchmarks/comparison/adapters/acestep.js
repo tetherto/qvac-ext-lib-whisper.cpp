@@ -9,10 +9,6 @@ const { runTimedProcess, writeJson } = require('../lib/process')
 const { parseAcestepTimings } = require('../lib/timing')
 const { rtf } = require('../lib/aggregate')
 
-function stripGguf (filename) {
-  return String(filename).replace(/\.gguf$/i, '')
-}
-
 function buildRequest (config, prompt) {
   const p = config.parameters
   return {
@@ -25,6 +21,7 @@ function buildRequest (config, prompt) {
     vocal_language: prompt.vocal_language,
     seed: prompt.seed,
     lm_seed: prompt.seed,
+    lm_mode: 'generate',
     lm_temperature: p.lm_temperature,
     lm_cfg_scale: p.lm_cfg_scale,
     lm_top_p: p.lm_top_p,
@@ -40,8 +37,9 @@ function buildRequest (config, prompt) {
     task_type: p.task_type,
     output_format: p.output_format,
     peak_clip: p.peak_clip,
-    lm_model: stripGguf(config.models.lm),
-    synth_model: stripGguf(config.models.dit)
+    lm_model: config.models.lm,
+    synth_model: config.models.dit,
+    vae: config.models.vae
   }
 }
 

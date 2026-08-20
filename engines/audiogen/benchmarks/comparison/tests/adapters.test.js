@@ -53,7 +53,10 @@ test('acestep request maps lm_seed and wav16', () => {
   assert.equal(request.output_format, 'wav16')
   assert.equal(request.peak_clip, 0)
   assert.equal(request.dcw_mode, 'double')
-  assert.equal(request.lm_model, 'acestep-5Hz-lm-0.6B-Q8_0')
+  assert.equal(request.lm_mode, 'generate')
+  assert.equal(request.lm_model, 'acestep-5Hz-lm-0.6B-Q8_0.gguf')
+  assert.equal(request.synth_model, 'acestep-v15-turbo-Q8_0.gguf')
+  assert.equal(request.vae, 'vae-BF16.gguf')
 })
 
 test('qvac args pass explicit metadata and do not enable GPU on cpu', () => {
