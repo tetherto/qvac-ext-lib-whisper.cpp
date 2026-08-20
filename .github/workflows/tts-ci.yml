@@ -130,24 +130,106 @@ jobs:
   # macOS.
   gpu:
     if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
-    runs-on: [self-hosted, gpu]
+    # qvac-ubuntu2204-x64-gpu is the NVIDIA Linux runner the qvac monorepo's
+    # benchmark and e2e lanes use (it exposes nvidia-smi there). The generic
+    # [self-hosted, gpu] label resolved to an Apple Silicon host with no CUDA
+    # toolkit, which cannot run the CUDA arms this lane exists for.
+    runs-on: qvac-ubuntu2204-x64-gpu
     timeout-minutes: 90
     steps:
+      # Self-hosted runners are persistent, so the previous job's tree can
+      # survive into this one (docs/ci/SELF-HOSTED-RUNNERS.md in the qvac
+      # monorepo). This job is self-hosted-only, so no hosted-runner guard.
+      - name: Manual Workspace Cleanup
+        run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
+        shell: bash
+        working-directory: .
       - uses: actions/checkout@v4
+      - name: Show what this runner has
+        run: |
+          uname -a
+          nvidia-smi || echo "no NVIDIA driver"
+          command -v nvcc && nvcc --version || echo "no CUDA toolkit on PATH"
+          ls /usr/local/cuda*/bin/nvcc 2>/dev/null || echo "no /usr/local/cuda*"
+          command -v vulkaninfo && vulkaninfo --summary 2>/dev/null | head -20 || echo "no vulkaninfo"
       # GGML_VULKAN=ON is the backend the -L gpu suites primarily target
       # (test_vk_vs_cpu et al); Metal is on by default on Apple hosts.
-      # Revisit the flag set (OpenCL? CUDA?) when the GPU runner fleet is
-      # provisioned — a CPU-only ggml here would skip or falsely pass the
-      # GPU suites.
+      # CUDA is added only where a toolkit exists: this label currently
+      # resolves to an Apple Silicon host, where requesting it fails the
+      # configure outright. The per-backend arms pin the backend they cover
+      # via TTS_CPP_GPU_BACKEND, so a host carrying several stays unambiguous.
+      # A CPU-only ggml would skip or falsely pass the GPU suites.
       - name: Build ggml + engine (native backends) and run GPU suites
         run: |
           git clone --depth 1 --branch "$GGML_BRANCH" "$GGML_REPO" ggml-src
+          CUDA_OPTION=""
+          if command -v nvcc >/dev/null 2>&1 || [ -x /usr/local/cuda/bin/nvcc ]; then
+            NVCC_PATH=$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)
+            CUDA_OPTION="-DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=$NVCC_PATH"
+            echo "CUDA toolkit found at $NVCC_PATH; building the NVIDIA backend as well"
+          else
+            echo "::notice::no CUDA toolkit on this runner; the CUDA arms cannot run here"
+          fi
           cmake -S ggml-src -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
             -DGGML_VULKAN=ON \
+            $CUDA_OPTION \
             -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
           cmake --build ggml-src/build -j && cmake --install ggml-src/build
           cmake -S engines/tts -B build -DCMAKE_BUILD_TYPE=Release \
             -DTTS_CPP_BUILD_TESTS=ON \
             -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
           cmake --build build -j
+      # A fixture-less arm registers DISABLED, so `ctest -L gpu` reports success
+      # having run none of them. Name the arms this lane exists to run and say
+      # which could not, rather than reporting a bare pass. Reported rather than
+      # enforced: no engine's fixtures are available to CI today -- Audio8's and
+      # Parler's GPU arms are equally disabled -- so hosting them is a change
+      # for the whole repo to make, not for this lane to block on.
+      - name: Report which GPU arms are runnable
+        run: |
+          python3 - <<'CHECK'
+          import json, subprocess, sys
+
+          EXPECTED = [
+              "test-s3gen-cuda",
+              "test-s3gen-vulkan",
+              "test-chatterbox-parity-mtl-cuda",
+              "test-chatterbox-parity-mtl-vulkan",
+          ]
+
+          listing = subprocess.run(
+              ["ctest", "--test-dir", "build", "-N", "--show-only=json-v1"],
+              capture_output=True, text=True, check=True).stdout
+          tests = json.loads(listing)["tests"]
+
+          disabled = {}
+          for test in tests:
+              properties = {p["name"]: p["value"] for p in test.get("properties", [])}
+              disabled[test["name"]] = bool(properties.get("DISABLED"))
+
+          absent = [name for name in EXPECTED if name not in disabled]
+          skipped = [name for name in EXPECTED if disabled.get(name)]
+          if not absent and not skipped:
+              print("all %d GPU arms are runnable" % len(EXPECTED))
+              sys.exit(0)
+
+          for name in absent:
+              print("::warning::%s is not registered (its backend was not compiled)" % name)
+          for name in skipped:
+              print("::warning::%s is disabled (its model or reference dump is missing)" % name)
+          print("")
+          print("These arms did not run. Staging the fixtures and pointing the build")
+          print("at them with -DTTS_CPP_TEST_MODEL_DIR and -DTTS_CPP_TEST_REF_DIR")
+          print("would enable them:")
+          print("  chatterbox-s3gen.gguf       ~1.0 GB   test-s3gen-*")
+          print("  chatterbox-s3gen-mtl.gguf   ~1.0 GB   test-chatterbox-parity-mtl-*")
+          print("  chatterbox-t3-mtl.gguf      ~330 MB   test-chatterbox-parity-mtl-*")
+          print("  artifacts/s3gen-ref/        ~121 MB   test-s3gen-* (dump-s3gen-reference.py)")
+          sys.exit(0)
+          CHECK
+
+      - name: Run the GPU suites
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+        run: |
           ctest --test-dir build -L gpu --output-on-failure --timeout 1200

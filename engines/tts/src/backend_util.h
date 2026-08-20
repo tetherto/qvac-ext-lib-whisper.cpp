@@ -50,6 +50,10 @@ inline bool reg_name_is_opencl(const char * n) {
     return n && std::strcmp(n, "OpenCL") == 0;
 }
 
+inline bool reg_name_is_cuda(const char * n) {
+    return n && std::strcmp(n, "CUDA") == 0;
+}
+
 inline bool backend_is_metal(ggml_backend_t b) {
     return reg_name_is_metal(backend_reg_name(b));
 }
@@ -60,6 +64,10 @@ inline bool backend_is_vulkan(ggml_backend_t b) {
 
 inline bool backend_is_opencl(ggml_backend_t b) {
     return reg_name_is_opencl(backend_reg_name(b));
+}
+
+inline bool backend_is_cuda(ggml_backend_t b) {
+    return reg_name_is_cuda(backend_reg_name(b));
 }
 
 // Null-safe ASCII case-insensitive substring match: device name capitalisation
