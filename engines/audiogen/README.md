@@ -40,8 +40,13 @@ MiniMax uses two GGUF files: `mm3-lm-<quant>.gguf` for the Qwen3 global LM and
 and vocoder. Set `EngineOptions::model_dir`, or provide `lm_model_path` and
 `synth_model_path` explicitly. Directory discovery matches quantized pairs
 case-insensitively, prefers `q8_0`, then `f16`, then `bf16`, and rejects
-duplicate candidates. The engine is CPU-only and desktop-only. One MiniMax
-engine instance may be active at a time because its compute graphs are shared.
+duplicate candidates. The engine is desktop-only. It runs on CPU by default;
+`EngineOptions::device` (or, when that is empty, the `MM3_DEVICE` environment
+variable) accepts `cpu`, `gpu`, or `auto`. With a GPU device the weights and
+graphs live on the first usable GPU backend the ggml registry offers (CUDA,
+Vulkan, Metal, ...) and a CPU backend backs any unsupported op; the full model
+pair must fit in device memory (~22 GB for the f16 pair). One MiniMax engine
+instance may be active at a time because its compute graphs are shared.
 
 The frame rate, maximum frame count, flow defaults, and output sample rate come
 from GGUF metadata. Current converted files specify 25 frames per second, at

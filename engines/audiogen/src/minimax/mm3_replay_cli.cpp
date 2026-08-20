@@ -97,12 +97,13 @@ int main(int argc, char ** argv) {
                 "  replay: --tokens <i32 file> --semantic <i32 file> --acoustic <i32 file>\n"
                 "          [--noise <f32 file>]... (per window)\n"
                 "  full:   --caption <text> [--lyrics <text>]\n"
-                "  common: [--seed N] [--steps N] [--max-frames N] [--threads N]\n");
+                "  common: [--seed N] [--steps N] [--max-frames N] [--threads N] [--device cpu|gpu|auto]\n");
         return 1;
     }
 
     const int threads = atoi(arg_value(argc, argv, "--threads", "0"));
     backend_configure_cpu(threads > 0 ? threads : (int) std::thread::hardware_concurrency(), "");
+    backend_configure_device(arg_value(argc, argv, "--device", ""));
 
     MM3Model model;
     const tts_cpp::minimax::detail::ModelPair pair =

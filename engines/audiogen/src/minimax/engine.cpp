@@ -208,6 +208,7 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & input) {
     engine->impl_->options = resolve_model_paths(input);
     engine->impl_->options.n_threads = resolve_thread_count(input.n_threads);
     backend_configure_cpu(engine->impl_->options.n_threads, input.backends_dir);
+    backend_configure_device(input.device);
     probe_model_files(engine->impl_->model, engine->impl_->options);
     std::string error;
     if (!mm3_load(&engine->impl_->model, &error)) {
@@ -286,7 +287,12 @@ int Engine::sample_rate() const {
 }
 
 std::string Engine::backend_name() const {
-    return "CPU";
+    const ggml_backend_t backend = impl_->model.backend;
+    if (!backend || backend == impl_->model.cpu_backend) {
+        return "CPU";
+    }
+    const char * name = tts_cpp::acestep::backend_reg_name(backend);
+    return name && *name ? name : "CPU";
 }
 
 }
