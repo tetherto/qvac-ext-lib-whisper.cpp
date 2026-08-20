@@ -713,8 +713,16 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
     // non-empty buckets means a matching device was tried and failed to init,
     // which must not be reported as intentional.
     if (requirement_skipped_gpu && opencl_adreno_700plus.empty() &&
-        other_gpu.empty() && opencl_other.empty()) {
+        cuda_gpu.empty() && other_gpu.empty() && opencl_other.empty()) {
         gpu_present_but_unvalidated = true;
+    }
+    // A named override that reached no usable device would otherwise hand back
+    // the CPU, and a comparison run against it would report the wrong backend's
+    // numbers as that backend's.
+    if (!forced_backend.empty()) {
+        throw std::runtime_error(
+            "TTS_CPP_GPU_BACKEND='" + forced_backend +
+            "' selected no usable device");
     }
     // Report a GPU declined by policy so the caller accepts CPU fallback as correct
     // (not a regression); not set when a validated GPU was tried and failed to init.

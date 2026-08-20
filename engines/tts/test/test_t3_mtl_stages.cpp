@@ -124,7 +124,7 @@ bool stage_cond(stage_run & r, const chatterbox_model & model, const std::string
                          got.size());
     print_compare("cond_emb", s);
     // F16-stored speech_emb contributes ~1.5e-4 rel drift in cond_prompt.
-    return s.rel_err < 5e-4;
+    return compare_within(s, 5e-4);
 }
 
 bool stage_text(stage_run & r, const chatterbox_model & model, const std::string & ref_dir) {
@@ -170,7 +170,7 @@ bool stage_text(stage_run & r, const chatterbox_model & model, const std::string
                 raw_p[0 * T_ref * C_ref + t * C_ref + c] + pos_p[t * C_ref + c];
     auto s = compare_f32(got.data(), expected.data(), got.size());
     print_compare("text_emb + pos (cond row)", s);
-    return s.rel_err < 5e-4;
+    return compare_within(s, 5e-4);
 }
 
 bool stage_inputs(stage_run & r, const chatterbox_model & model,
@@ -215,7 +215,7 @@ bool stage_inputs(stage_run & r, const chatterbox_model & model,
     const float * row = ref_p + (is_uncond ? T * C : 0);
     auto s = compare_f32(got.data(), row, got.size());
     print_compare("inputs_embeds", s);
-    return s.rel_err < 5e-4;
+    return compare_within(s, 5e-4);
 }
 
 bool stage_layers(stage_run & r, const chatterbox_model & model,
@@ -273,7 +273,7 @@ bool stage_layers(stage_run & r, const chatterbox_model & model,
     const float * layer_row = layer_p + (is_uncond ? T2 * C2 : 0);
     auto s = compare_f32(got.data(), layer_row, got.size());
     print_compare(ref_name.c_str(), s);
-    return s.rel_err < 1e-3;
+    return compare_within(s, 1e-3);
 }
 
 bool stage_logits(stage_run & r, const chatterbox_model & model,
@@ -327,7 +327,7 @@ bool stage_logits(stage_run & r, const chatterbox_model & model,
     print_compare("speech_logits (last pos)", s);
     // Accumulated drift through 30 F16 Llama layers + F16 speech_head.
     // Logit magnitudes are O(8) so 5e-3 rel is argmax-safe.
-    return s.rel_err < 5e-3;
+    return compare_within(s, 5e-3);
 }
 
 } // namespace
