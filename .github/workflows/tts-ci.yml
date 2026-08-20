@@ -164,8 +164,9 @@ jobs:
           git clone --depth 1 --branch "$GGML_BRANCH" "$GGML_REPO" ggml-src
           CUDA_OPTION=""
           if command -v nvcc >/dev/null 2>&1 || [ -x /usr/local/cuda/bin/nvcc ]; then
-            CUDA_OPTION="-DGGML_CUDA=ON"
-            echo "CUDA toolkit found; building the NVIDIA backend as well"
+            NVCC_PATH=$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)
+            CUDA_OPTION="-DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=$NVCC_PATH"
+            echo "CUDA toolkit found at $NVCC_PATH; building the NVIDIA backend as well"
           else
             echo "::notice::no CUDA toolkit on this runner; the CUDA arms cannot run here"
           fi
