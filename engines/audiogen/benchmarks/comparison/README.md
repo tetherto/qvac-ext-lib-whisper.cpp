@@ -127,7 +127,8 @@ Set `ACESTEP_CPP_LM` and `ACESTEP_CPP_SYNTH`.
 ```sh
 cd engines/audiogen/benchmarks/comparison
 node --test tests/backend.test.js tests/timing.test.js tests/aggregate.test.js \
-  tests/report.test.js tests/audio.test.js tests/adapters.test.js tests/clap.test.js
+  tests/report.test.js tests/audio.test.js tests/adapters.test.js tests/clap.test.js \
+  tests/process.test.js
 node capture-environment.js
 node run-comparison.js --dry-run --backend cpu
 ACESTEP_QVAC_CLI=... ACESTEP_CPP_LM=... ACESTEP_CPP_SYNTH=... \

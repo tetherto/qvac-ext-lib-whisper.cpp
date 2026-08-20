@@ -71,13 +71,28 @@ function writeJson (filePath, value) {
 function fileSha256 (filePath) {
   const crypto = require('crypto')
   const hash = crypto.createHash('sha256')
-  hash.update(fs.readFileSync(filePath))
+  const fd = fs.openSync(filePath, 'r')
+  try {
+    hashFileChunks(hash, fd)
+  } finally {
+    fs.closeSync(fd)
+  }
   return hash.digest('hex')
+}
+
+function hashFileChunks (hash, fd) {
+  const buffer = Buffer.alloc(1024 * 1024)
+  let bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null)
+  while (bytesRead > 0) {
+    hash.update(buffer.subarray(0, bytesRead))
+    bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null)
+  }
 }
 
 module.exports = {
   combineOutput,
   fileSha256,
+  hashFileChunks,
   runTimedProcess,
   writeJson,
   writeText
