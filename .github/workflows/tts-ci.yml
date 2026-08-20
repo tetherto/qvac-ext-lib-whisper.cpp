@@ -137,6 +137,13 @@ jobs:
     runs-on: qvac-ubuntu2204-x64-gpu
     timeout-minutes: 90
     steps:
+      # Self-hosted runners are persistent, so the previous job's tree can
+      # survive into this one (docs/ci/SELF-HOSTED-RUNNERS.md in the qvac
+      # monorepo). This job is self-hosted-only, so no hosted-runner guard.
+      - name: Manual Workspace Cleanup
+        run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
+        shell: bash
+        working-directory: .
       - uses: actions/checkout@v4
       - name: Show what this runner has
         run: |
