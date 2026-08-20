@@ -661,6 +661,7 @@ if (TTS_CPP_BUILD_TESTS)
     set(_tcb_t3_mtl_gguf        "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-t3-mtl.gguf")
     set(_tcb_t3_mtl_q4_gguf     "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-t3-mtl-q4_0.gguf")
     set(_tcb_s3gen_gguf         "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-s3gen.gguf")
+    set(_tcb_s3gen_q4_gguf      "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-s3gen-q4_0.gguf")
     set(_tcb_s3gen_mtl_gguf     "${TTS_CPP_TEST_MODEL_DIR}/chatterbox-s3gen-mtl.gguf")
     set(_tcb_super_gguf         "${TTS_CPP_TEST_MODEL_DIR}/supertonic.gguf")
     set(_tcb_super2_gguf        "${TTS_CPP_TEST_MODEL_DIR}/supertonic2.gguf")
@@ -1429,6 +1430,11 @@ if (TTS_CPP_BUILD_TESTS)
         ARGS     "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref}" "ALL"
         REQUIRES "${_tcb_s3gen_gguf}" "${_tcb_s3gen_ref_sentinel}")
 
+    add_executable(test-s3gen-backend-agreement test/test_s3gen_backend_agreement.cpp)
+    target_link_libraries(test-s3gen-backend-agreement PRIVATE tts-cpp ggml tts-cpp-backend-defs)
+    target_include_directories(test-s3gen-backend-agreement PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-s3gen-backend-agreement)
+
     add_executable(test-chatterbox-backend-parity test/test_chatterbox_backend_parity.cpp)
     target_link_libraries(test-chatterbox-backend-parity PRIVATE tts-cpp ggml tts-cpp-backend-defs)
     target_include_directories(test-chatterbox-backend-parity PRIVATE ggml/include src include)
@@ -1458,6 +1464,26 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}" "en"
             REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}")
         set_property(TEST test-chatterbox-parity-mtl-${suffix} APPEND
+                     PROPERTY ENVIRONMENT "TTS_CPP_GPU_BACKEND=${suffix}")
+
+        # Same-GGUF CPU-vs-GPU waveform agreement. Quantization cancels on
+        # identical weights, so the q4_0 arm holds to the same bar as f16 and
+        # runs on the tier the model registry serves; neither needs a
+        # reference dump. The long case crosses the 65535 CUDA grid limit,
+        # standing in for the launch abort long-form input used to hit.
+        tts_cpp_register_test(test-s3gen-agreement-${suffix}
+            EXE      test-s3gen-backend-agreement
+            LABEL    "gpu"
+            ARGS     "${_tcb_s3gen_gguf}"
+            REQUIRES "${_tcb_s3gen_gguf}")
+        set_property(TEST test-s3gen-agreement-${suffix} APPEND
+                     PROPERTY ENVIRONMENT "TTS_CPP_GPU_BACKEND=${suffix}")
+        tts_cpp_register_test(test-s3gen-agreement-${suffix}-q4_0
+            EXE      test-s3gen-backend-agreement
+            LABEL    "gpu"
+            ARGS     "${_tcb_s3gen_q4_gguf}" "--mel-tolerance" "5e-2" "--max-rms-ratio" "0.5"
+            REQUIRES "${_tcb_s3gen_q4_gguf}")
+        set_property(TEST test-s3gen-agreement-${suffix}-q4_0 APPEND
                      PROPERTY ENVIRONMENT "TTS_CPP_GPU_BACKEND=${suffix}")
     endfunction()
 
