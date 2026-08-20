@@ -24,6 +24,8 @@ engines/audiogen/benchmarks/comparison/
   run-comparison.js
   generate-report.js
   capture-environment.js
+  score-clap.js                # optional CLAP post-pass
+  quality/clap_score.py
   tests/
   reports/                    # reviewed platform reports
   models/                     # gitignored GGUFs
@@ -37,7 +39,8 @@ Install through the host package manager, then review local source before
 building:
 
 - CMake >= 3.20, a C++17 compiler, git, Node.js 20+
-- Python is optional (CLAP). Fréchet Audio Distance is not run by default
+- Python is optional. CLAP scoring needs Python 3.10+ and the pins in
+  `quality/requirements.txt`. Fréchet Audio Distance is not run by default
   because this harness does not ship a licensed reference corpus.
 
 Do not pipe remote installers into a shell.
@@ -123,8 +126,8 @@ Set `ACESTEP_CPP_LM` and `ACESTEP_CPP_SYNTH`.
 
 ```sh
 cd engines/audiogen/benchmarks/comparison
-node tests/backend.test.js tests/timing.test.js tests/aggregate.test.js \
-  tests/report.test.js tests/audio.test.js
+node --test tests/backend.test.js tests/timing.test.js tests/aggregate.test.js \
+  tests/report.test.js tests/audio.test.js tests/adapters.test.js tests/clap.test.js
 node capture-environment.js
 node run-comparison.js --dry-run --backend cpu
 ACESTEP_QVAC_CLI=... ACESTEP_CPP_LM=... ACESTEP_CPP_SYNTH=... \
@@ -140,6 +143,25 @@ Interrupted runs resume from `out/rounds/`. `--force` rebuilds every round.
 
 `node generate-report.js out/cpu.json` regenerates Markdown from JSON.
 
+## Optional CLAP post-pass
+
+Generation commands do not change. After WAVs exist, score them in a separate
+process so CLAP cannot affect RTF.
+
+Review `quality/requirements.txt`, then:
+
+```sh
+python3 -m pip install -r quality/requirements.txt
+node score-clap.js --backend cpu
+node score-clap.js --backend metal
+```
+
+First run downloads `laion/larger_clap_music_and_speech` into the Hugging Face
+cache (data, not a shell installer). Default text is the manifest **caption
+only**. Override with `ACESTEP_CLAP_TEXT_POLICY=caption+lyrics`.
+`--force` rescores. `--include-warmup` scores warm-up WAVs too.
+`clap.elapsedMs` is scorer time and is not added to generation time.
+
 Copy reviewed JSON/Markdown into `reports/mac-arm64/` and write
 `verification-report.md`. Keep large WAVs out of git; record checksums.
 
@@ -153,8 +175,9 @@ Copy reviewed JSON/Markdown into `reports/mac-arm64/` and write
 - **RTF**: generation seconds / generated audio seconds. Lower is faster.
 - **init_ms**: QVAC is lazy-load, so init is folded into the first stage of
   `generate()`. acestep.cpp load lines are summed when logged.
-- Quality metrics (silence, clipping, duration error, optional CLAP) use the
-  WAV after generation and are not part of inference time.
+- **CLAP**: cosine similarity of LAION CLAP text vs audio embeddings, from
+  `score-clap.js` after generation. Median is reported; `n/a` until the
+  post-pass runs. Higher is closer to the caption in CLAP space, not a MOS.
 
 Medians and distributions are reported, not only the fastest run.
 

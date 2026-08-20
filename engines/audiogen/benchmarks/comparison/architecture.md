@@ -31,7 +31,7 @@ acestep.cpp `convert.py`.
 | Metal on macOS | Default acestep.cpp builds enable Metal. CPU runs require `GGML_METAL=OFF` for **both** engines. GPU fallback is a hard failure |
 | Stage placement | QVAC allowlists Metal LM + detokenizer on GPU. acestep.cpp placement may differ. Logs are the source of truth |
 | Cover/lego/XL | Out of scope. QVAC has MiniMax and a subset of edit ops; acestep.cpp has lego/extract/complete, LoRA, HTTP server |
-| Quality vs speed | FAD is not computed without a licensed reference corpus. CLAP is optional and off the inference clock |
+| Quality vs speed | FAD is not computed without a licensed reference corpus. CLAP is an optional post-pass (`score-clap.js`) over saved WAVs and is never added to generation time or RTF |
 
 ## Comparison class
 

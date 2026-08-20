@@ -3,14 +3,12 @@
 
 const { spawnSync } = require('child_process')
 const fs = require('fs')
-const os = require('os')
 const path = require('path')
 const { runAcestepRound } = require('./adapters/acestep')
 const { runQvacRound } = require('./adapters/qvac')
-const { aggregateRounds, groupByPrompt } = require('./lib/aggregate')
 const { loadHarnessConfig } = require('./lib/config')
-const { fileSha256, writeJson } = require('./lib/process')
-const { renderMarkdownReport } = require('./lib/report')
+const { writeJson } = require('./lib/process')
+const { writeReports } = require('./lib/results')
 
 function sleep (ms) {
   if (!ms) return
@@ -82,15 +80,6 @@ function validateConfig (config) {
     console.log('Configuration is incomplete. Stage models and build both CLIs before running.')
   }
   return ready
-}
-
-function modelHashes (config) {
-  const hashes = {}
-  for (const [role, filename] of Object.entries(config.models)) {
-    const filePath = path.join(config.modelsDir, filename)
-    hashes[role] = fs.existsSync(filePath) ? fileSha256(filePath) : null
-  }
-  return hashes
 }
 
 function roundPath (config, engine, promptId, kind, index) {
@@ -172,39 +161,6 @@ function collectRounds (config, force) {
   return rounds
 }
 
-function writeReports (config, rounds) {
-  const timed = rounds.filter(round => round.kind === 'timed')
-  const data = {
-    meta: {
-      generatedAt: new Date().toISOString(),
-      platform: `${process.platform}-${process.arch}`,
-      hostname: os.hostname(),
-      backend: config.backend,
-      comparisonClass: config.comparisonClass,
-      threads: config.threads,
-      warmups: config.warmups,
-      runs: config.runs,
-      order: config.order,
-      cooldownMs: config.cooldownMs,
-      qvacCli: config.qvacCli,
-      aceLm: config.aceLm,
-      aceSynth: config.aceSynth,
-      models: config.models,
-      modelHashes: modelHashes(config),
-      parameters: config.parameters
-    },
-    overall: aggregateRounds(timed),
-    byPrompt: groupByPrompt(timed),
-    rounds
-  }
-  const jsonPath = path.join(config.outDir, `${config.backend}.json`)
-  const markdownPath = path.join(config.outDir, `${config.backend}.md`)
-  writeJson(jsonPath, data)
-  fs.writeFileSync(markdownPath, renderMarkdownReport(data))
-  console.log(`Wrote ${jsonPath}`)
-  console.log(`Wrote ${markdownPath}`)
-}
-
 function main () {
   const flags = parseArguments(process.argv)
   const config = loadHarnessConfig({
@@ -220,7 +176,9 @@ function main () {
   if (flags.dryRun) return
   if (!ready) throw new Error('comparison configuration is incomplete')
   fs.mkdirSync(config.outDir, { recursive: true })
-  writeReports(config, collectRounds(config, flags.force))
+  const written = writeReports(config, collectRounds(config, flags.force))
+  console.log(`Wrote ${written.jsonPath}`)
+  console.log(`Wrote ${written.markdownPath}`)
 }
 
 try {

@@ -35,5 +35,11 @@
     "lm": "acestep-5Hz-lm-0.6B-Q8_0.gguf",
     "dit": "acestep-v15-turbo-Q8_0.gguf",
     "vae": "vae-BF16.gguf"
+  },
+  "clap": {
+    "model": "laion/larger_clap_music_and_speech",
+    "revision": null,
+    "textPolicy": "caption",
+    "device": "cpu"
   }
 }

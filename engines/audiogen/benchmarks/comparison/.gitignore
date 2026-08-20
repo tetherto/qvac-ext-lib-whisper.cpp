@@ -12,3 +12,6 @@ build-*/
 reports/*/logs/
 reports/*/samples/
 reports/*/rounds/
+__pycache__/
+.venv/
+quality/checkpoints/

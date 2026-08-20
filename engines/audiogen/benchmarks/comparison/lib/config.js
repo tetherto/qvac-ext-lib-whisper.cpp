@@ -112,7 +112,29 @@ function loadHarnessConfig (overrides = {}) {
     acestepDir,
     engineDir: engineDir(),
     repositoryDir: repositoryDir(),
-    failOnGpuFallback: fileConfig.failOnGpuFallback !== false
+    failOnGpuFallback: fileConfig.failOnGpuFallback !== false,
+    clap: {
+      model: firstSet(
+        process.env.ACESTEP_CLAP_MODEL,
+        fileConfig.clap && fileConfig.clap.model,
+        'laion/larger_clap_music_and_speech'
+      ),
+      revision: firstSet(
+        process.env.ACESTEP_CLAP_REVISION,
+        fileConfig.clap && fileConfig.clap.revision
+      ) || null,
+      textPolicy: firstSet(
+        process.env.ACESTEP_CLAP_TEXT_POLICY,
+        fileConfig.clap && fileConfig.clap.textPolicy,
+        'caption'
+      ),
+      device: firstSet(
+        process.env.ACESTEP_CLAP_DEVICE,
+        fileConfig.clap && fileConfig.clap.device,
+        'cpu'
+      ),
+      python: firstSet(process.env.ACESTEP_CLAP_PYTHON, 'python3')
+    }
   }
 }
 

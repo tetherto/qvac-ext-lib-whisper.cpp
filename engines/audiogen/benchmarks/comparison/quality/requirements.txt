@@ -1,0 +1,9 @@
+# Optional CLAP post-pass. Review this file, then:
+#   python3 -m pip install -r quality/requirements.txt
+# Do not pipe a remote installer into a shell.
+numpy==2.2.6
+soundfile==0.13.1
+torch==2.6.0
+transformers==4.51.3
+safetensors==0.5.3
+huggingface_hub==0.30.2

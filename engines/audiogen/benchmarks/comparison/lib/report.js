@@ -14,11 +14,12 @@ function renderEngineTable (title, engines) {
   const lines = [
     `## ${title}`,
     '',
-    '| Engine | Success | Fail | Median gen ms | Median e2e ms | Median RTF | Peak RSS | Unique WAV hashes | Silent |',
-    '|---|---:|---:|---:|---:|---:|---:|---:|---:|'
+    '| Engine | Success | Fail | Median gen ms | Median e2e ms | Median RTF | Peak RSS | Unique WAV hashes | Silent | Median CLAP |',
+    '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|'
   ]
   for (const [name, stats] of Object.entries(engines || {})) {
-    lines.push(`| ${name} | ${stats.successCount} | ${stats.failureCount} | ${formatNumber(stats.generationMs.median, 1)} | ${formatNumber(stats.e2eMs.median, 1)} | ${formatNumber(stats.rtf.median, 3)} | ${formatBytes(stats.peakRssBytes.median)} | ${stats.uniqueWavHashes} | ${stats.silentCount} |`)
+    const clapMedian = stats.clap && stats.clap.median
+    lines.push(`| ${name} | ${stats.successCount} | ${stats.failureCount} | ${formatNumber(stats.generationMs.median, 1)} | ${formatNumber(stats.e2eMs.median, 1)} | ${formatNumber(stats.rtf.median, 3)} | ${formatBytes(stats.peakRssBytes.median)} | ${stats.uniqueWavHashes} | ${stats.silentCount} | ${formatNumber(clapMedian, 3)} |`)
   }
   lines.push('')
   return lines
@@ -39,7 +40,7 @@ function renderMarkdownReport (data) {
   for (const [promptId, engines] of Object.entries(data.byPrompt || {})) {
     lines.push(...renderEngineTable(promptId, engines))
   }
-  lines.push('Failed rounds are retained in the JSON. Quality metrics are computed from WAV files and are not included in generation time.')
+  lines.push('Failed rounds are retained in the JSON. WAV QC and optional CLAP scores are computed from files after generation and are not included in generation time or RTF.')
   lines.push('')
   return lines.join('\n')
 }

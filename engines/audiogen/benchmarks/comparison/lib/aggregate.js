@@ -82,6 +82,7 @@ function aggregateRounds (rounds) {
       clippingRatio: summarise(successful.map(round => round.audio && round.audio.clippingRatio)),
       uniqueWavHashes: uniqueCount(successful.map(round => round.wavSha256)),
       uniqueCodeHashes: uniqueCount(successful.map(round => round.codesSha256)),
+      clap: summarise(successful.map(round => round.clap && round.clap.score)),
       malformedCount: successful.filter(round => round.audio && round.audio.malformed).length,
       silentCount: successful.filter(round => round.audio && round.audio.silent).length
     }

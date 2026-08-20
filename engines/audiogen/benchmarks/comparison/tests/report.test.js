@@ -34,4 +34,5 @@ test('renderMarkdownReport includes medians not only fastest runs', () => {
   assert.match(markdown, /implementation-level/)
   assert.match(markdown, /1000.0/)
   assert.match(markdown, /Median gen ms/)
+  assert.match(markdown, /Median CLAP/)
 })
