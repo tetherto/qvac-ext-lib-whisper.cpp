@@ -190,12 +190,20 @@ struct compare_stats {
     size_t n = 0;
     double expected_abs_max = 0;
     double rel_err = 0;   // max_abs_err / max(|expected|)
+    // Every comparison below is a `>` against a running maximum, and `>` is
+    // false for NaN. Counting non-finite values is what keeps a NaN result
+    // from reading as a zero error and clearing every tolerance.
+    size_t non_finite = 0;
 };
 
 inline compare_stats compare_f32(const float * got, const float * expected, size_t n) {
     compare_stats s;
     double sum_abs = 0, sum_sq = 0;
     for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(got[i]) || !std::isfinite(expected[i])) {
+            ++s.non_finite;
+            continue;
+        }
         double d = std::fabs((double)got[i] - (double)expected[i]);
         sum_abs += d;
         sum_sq += d * d;
@@ -204,13 +212,20 @@ inline compare_stats compare_f32(const float * got, const float * expected, size
         if (e > s.expected_abs_max) s.expected_abs_max = e;
     }
     s.n = n;
-    s.mean_abs_err = sum_abs / n;
-    s.rms_err = std::sqrt(sum_sq / n);
+    const size_t finite = n - s.non_finite;
+    s.mean_abs_err = finite ? sum_abs / (double) finite : 0.0;
+    s.rms_err = finite ? std::sqrt(sum_sq / (double) finite) : 0.0;
     s.rel_err = s.expected_abs_max > 0 ? (s.max_abs_err / s.expected_abs_max) : s.max_abs_err;
     return s;
 }
 
+// Single gate for every parity check: a tolerance only means something once
+// the comparison is known to have looked at real numbers.
+inline bool compare_within(const compare_stats & s, double tolerance) {
+    return s.non_finite == 0 && s.n > 0 && s.rel_err < tolerance;
+}
+
 inline void print_compare(const char * name, const compare_stats & s) {
-    fprintf(stderr, "  [%s] n=%zu  max_abs=%.3e  mean_abs=%.3e  rms=%.3e  max|ref|=%.3e  rel=%.3e\n",
-        name, s.n, s.max_abs_err, s.mean_abs_err, s.rms_err, s.expected_abs_max, s.rel_err);
+    fprintf(stderr, "  [%s] n=%zu  max_abs=%.3e  mean_abs=%.3e  rms=%.3e  max|ref|=%.3e  rel=%.3e  non_finite=%zu\n",
+        name, s.n, s.max_abs_err, s.mean_abs_err, s.rms_err, s.expected_abs_max, s.rel_err, s.non_finite);
 }

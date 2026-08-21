@@ -122,6 +122,12 @@ Pair any CTC, TDT, or EOU GGUF with a Sortformer GGUF via `--diarization-model` 
 | Fun-CosyVoice3-0.5B | tts | model-advertised multilingual text | 24 kHz | `f32` | CPU, Metal, Vulkan, OpenCL | Qwen2.5 LM + DiT flow + CausalHiFT; zero-shot/cross-lingual cloning from a reference WAV (native speech_tokenizer_v3 + CAM++); Metal, desktop Vulkan, and OpenCL are the validated GPU paths |
 | Audio8-TTS-Preview-0.6B | tts | multilingual | 44.1 kHz | `f32`, `f16`, `q8_0`; LM also `q4_0` | CPU, Metal, Vulkan, OpenCL | DualAR + DAC codec, zero-shot cloning from reference audio and transcript |
 
+When a TTS build carries both CUDA and Vulkan, backend selection prefers CUDA
+on NVIDIA hardware; `TTS_CPP_GPU_BACKEND=cuda|vulkan|metal|opencl` pins one
+backend for a test arm or comparison and rejects a value that selects no usable
+device. The per-model validation each backend column rests on is documented in
+the [TTS capability table](engines/tts/README.md#capabilities).
+
 ### Speech enhancement
 
 | Model | Engine | Task | Rate | Quantization | Backends | Notes |

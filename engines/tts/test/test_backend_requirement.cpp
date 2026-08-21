@@ -74,6 +74,32 @@ int main() {
     expect(!gpu_backend_satisfies_requirement("CUDA", vkmtlcl), "Vulkan|Metal|OpenCL rejects CUDA");
     expect(!gpu_backend_satisfies_requirement(nullptr, vkmtlcl), "Vulkan|Metal|OpenCL rejects unnamed");
 
+    // CUDA is a named bit rather than a backend reachable only through Any, so
+    // an engine that has not validated it keeps excluding it (asserted above)
+    // while one that has can name it without widening to every other backend.
+    const auto cuda    = GpuBackendRequirement::CUDA;
+    const auto vkcuda  = GpuBackendRequirement::Vulkan | GpuBackendRequirement::CUDA;
+    const auto desktop = GpuBackendRequirement::Vulkan | GpuBackendRequirement::Metal |
+                         GpuBackendRequirement::OpenCL | GpuBackendRequirement::CUDA;
+
+    expect(gpu_backend_satisfies_requirement("CUDA", cuda), "CUDA accepts CUDA");
+    expect(!gpu_backend_satisfies_requirement("Vulkan", cuda), "CUDA rejects Vulkan");
+    expect(!gpu_backend_satisfies_requirement("MTL", cuda), "CUDA rejects MTL");
+    expect(!gpu_backend_satisfies_requirement("OpenCL", cuda), "CUDA rejects OpenCL");
+    expect(!gpu_backend_satisfies_requirement(nullptr, cuda), "CUDA rejects unnamed");
+
+    expect(gpu_backend_satisfies_requirement("CUDA", vkcuda), "Vulkan|CUDA accepts CUDA");
+    expect(gpu_backend_satisfies_requirement("Vulkan", vkcuda), "Vulkan|CUDA accepts Vulkan");
+    expect(!gpu_backend_satisfies_requirement("MTL", vkcuda), "Vulkan|CUDA rejects MTL");
+    expect(!gpu_backend_satisfies_requirement("OpenCL", vkcuda), "Vulkan|CUDA rejects OpenCL");
+
+    expect(gpu_backend_satisfies_requirement("CUDA", desktop), "four-backend set accepts CUDA");
+    expect(gpu_backend_satisfies_requirement("Vulkan", desktop), "four-backend set accepts Vulkan");
+    expect(gpu_backend_satisfies_requirement("MTL", desktop), "four-backend set accepts MTL");
+    expect(gpu_backend_satisfies_requirement("OpenCL", desktop), "four-backend set accepts OpenCL");
+    expect(!gpu_backend_satisfies_requirement(nullptr, desktop),
+           "four-backend set still rejects unnamed, so naming every backend is not Any");
+
     if (g_failures) {
         fprintf(stderr, "%d requirement checks failed\n", g_failures);
         return 1;

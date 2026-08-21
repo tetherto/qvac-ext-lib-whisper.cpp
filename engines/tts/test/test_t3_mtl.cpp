@@ -118,7 +118,7 @@ int main(int argc, char ** argv) {
     auto stats_uncond = compare_f32(logits_uncond.data(), ref_uncond_last, (size_t) V_ref);
     print_compare("uncond logits (last pos)", stats_uncond);
 
-    const bool pass = stats_cond.rel_err < 1e-3 && stats_uncond.rel_err < 1e-3;
+    const bool pass = compare_within(stats_cond, 1e-3) && compare_within(stats_uncond, 1e-3);
     fprintf(stderr, "%s\n", pass ? "RESULT: PASS (rel < 1e-3)" : "RESULT: FAIL");
     return pass ? 0 : 1;
 }
