@@ -744,7 +744,15 @@ void test_lego_generation_plan() {
 }
 
 void test_lego_model_policy() {
+    using tts_cpp::acestep::is_sft_model_name;
     using tts_cpp::acestep::lego_model_error;
+
+    CHECK(is_sft_model_name("acestep-v15-sft"));
+    CHECK(is_sft_model_name("acestep-v15-xl-sft"));
+    CHECK(!is_sft_model_name("acestep-v15-base"));
+    CHECK(!is_sft_model_name("acestep-v15-xl-base"));
+    CHECK(!is_sft_model_name("acestep-v15-turbo"));
+    CHECK(!is_sft_model_name(""));
 
     CHECK(lego_model_error(false, false).empty());
     CHECK(lego_model_error(true, false).find("requires a base DiT") != std::string::npos);

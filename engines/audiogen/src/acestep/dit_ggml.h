@@ -49,6 +49,12 @@ struct DitConfig {
     std::string model_name;          // general.name from the GGUF (checkpoint dir name)
 };
 
+// convert.py stamps general.name with the checkpoint directory name
+// (acestep-v15-base / acestep-v15-sft / acestep-v15-xl-sft / ...).
+inline bool is_sft_model_name(const std::string & model_name) {
+    return model_name.find("sft") != std::string::npos;
+}
+
 struct DitModel;  // opaque: fused weight tensors + backend weight buffer
 
 // Load DiT weights from `path` onto `backend` (borrowed). Returns nullptr on

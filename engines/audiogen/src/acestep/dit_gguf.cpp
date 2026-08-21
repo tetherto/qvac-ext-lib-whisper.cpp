@@ -123,11 +123,8 @@ bool dit_gguf_read_config(const DitGGUF & g, DitConfig & cfg) {
         cfg.rms_norm_eps      = dit_gguf_f32(g, "acestep-dit.attention.layer_norm_rms_epsilon");
         // convert.py only writes acestep.is_turbo when true; absent => base/sft.
         cfg.is_turbo          = dit_gguf_bool(g, "acestep.is_turbo", false);
-        // convert.py stamps general.name with the checkpoint directory name
-        // (acestep-v15-base / -sft / -turbo); sft shares is_turbo=false with
-        // base but does not support the base-exclusive stem tasks.
         cfg.model_name        = dit_gguf_str(g, "general.name", "");
-        cfg.is_sft            = cfg.model_name.find("sft") != std::string::npos;
+        cfg.is_sft            = is_sft_model_name(cfg.model_name);
     } catch (const std::exception & e) {
         fprintf(stderr, "[acestep-dit] %s\n", e.what());
         return false;
