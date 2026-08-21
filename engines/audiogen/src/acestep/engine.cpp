@@ -94,6 +94,19 @@ static const char * DIT_INSTR_TEXT2MUSIC = "Fill the audio semantic mask based o
 static const char * DIT_INSTR_COVER      = "Generate audio semantic tokens based on the given conditions:";
 static const char * DIT_INSTR_REPAINT    = "Repaint the mask area based on the given conditions:";
 
+static std::string uppercase_track_name(const std::string & track) {
+    std::string upper = track;
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+                   [](unsigned char ch) { return (char) std::toupper(ch); });
+    return upper;
+}
+
+// Lego instruction, uppercase track per the reference implementation
+// (task_utils.py formats TASK_INSTRUCTIONS["lego"] with track_name.upper()).
+static std::string make_lego_instruction(const std::string & track) {
+    return "Generate the " + uppercase_track_name(track) + " track based on the audio context:";
+}
+
 namespace fs = std::filesystem;
 
 struct Engine::Impl {
@@ -484,6 +497,10 @@ static constexpr int TURBO_STEPS            = 8;
 static constexpr int STANDARD_STEPS         = 50;
 static constexpr float TURBO_SHIFT          = 3.0f;
 static constexpr float STANDARD_SHIFT       = 1.0f;
+static constexpr float TURBO_GUIDANCE       = 1.0f;
+static constexpr float STANDARD_GUIDANCE    = 7.0f;
+static constexpr const char * LEGO_ERROR_TURBO =
+    "acestep engine: task 'lego' requires a base/sft DiT (turbo does not support stem tasks)";
 static constexpr int DIT_BATCH_SIZE         = 1;
 static constexpr int EDIT_CONTEXT_PLANES    = 2;
 static constexpr int EDIT_NO_SOURCE_FRAMES  = 0;
@@ -684,6 +701,7 @@ struct PromptEncoding {
 struct EncoderConditioning {
     std::vector<float> context;
     std::vector<float> hidden;
+    std::vector<float> null_emb;
     int frames = 0;
     int context_channels = 0;
     int sequence = 0;
@@ -704,9 +722,9 @@ static GenerationState make_generation_state(const GenerateParams & params, bool
     }
     state.plan = make_generation_plan(params, state.task);
     state.seed = resolve_seed(params.seed);
+    const bool language_neutral = !params.edit_plan.empty() || is_lego_task(state.task.type);
     state.language = params.vocal_language.empty()
-                         ? (params.edit_plan.empty() ? DEFAULT_VOCAL_LANGUAGE
-                                                     : EDIT_VOCAL_LANGUAGE)
+                         ? (language_neutral ? EDIT_VOCAL_LANGUAGE : DEFAULT_VOCAL_LANGUAGE)
                          : params.vocal_language;
     if (params.augment_caption_with_metadata) {
         state.original_caption = params.caption;
@@ -941,11 +959,23 @@ static void encode_cross_attention(EngineImpl & engine, const PromptEncoding & p
     dump.write("06_enc_hidden", output.hidden, output.sequence, output.hidden_size);
 }
 
+static void validate_lego_model(const DitConfig & config, const GenerateTask & task) {
+    if (is_lego_task(task.type) && config.is_turbo) {
+        throw std::invalid_argument(LEGO_ERROR_TURBO);
+    }
+}
+
+static std::string resolve_dit_instruction(const GenerateTask & task) {
+    if (is_lego_task(task.type)) return make_lego_instruction(task.track);
+    return DIT_INSTR_COVER;
+}
+
 template <typename EngineImpl>
 static EncoderConditioning prepare_encoder_conditioning(EngineImpl & engine,
                                                          GenerationState & state,
                                                          StageDump & dump, StageTimes & timing) {
     const DitConfig & config = engine.dit_cfg;
+    validate_lego_model(config, state.task);
     const int patch = config.patch_size;
     EncoderConditioning output;
     output.frames = ((state.latent_frames + patch - 1) / patch) * patch;
@@ -955,8 +985,9 @@ static EncoderConditioning prepare_encoder_conditioning(EngineImpl & engine,
     output.context = make_dit_context(
         state.context_latents, cond_model_silence_latent(engine.cond), output.frames,
         state.latent_frames, output.context_channels, config.out_channels);
+    output.null_emb = cond_model_null_emb(engine.cond);
     const PromptTokens tokens = tokenize_prompt(
-        engine.bpe_text, state.prompt, state.language, DIT_INSTR_COVER);
+        engine.bpe_text, state.prompt, state.language, resolve_dit_instruction(state.task).c_str());
     const PromptEncoding prompt = encode_prompt(engine, tokens, state, dump, timing);
     encode_cross_attention(engine, prompt, state, output, dump, timing);
     return output;
@@ -1013,15 +1044,21 @@ static void dump_parity_inputs(const std::vector<float> & latent, const NoiseSch
 }
 #endif
 
+static float resolve_guidance_scale(const GenerateParams & params, const DitConfig & config) {
+    if (params.guidance_scale > 0.0f) return params.guidance_scale;
+    return config.is_turbo ? TURBO_GUIDANCE : STANDARD_GUIDANCE;
+}
+
 template <typename EngineImpl>
 static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params,
                               const GenerationState & state, EncoderConditioning & conditioning,
                               NoiseSchedule & noise, const StageReporter & report,
                               StageDump & dump, StageTimes & timing, std::vector<float> & latent) {
     const DitConfig & config = engine.dit_cfg;
+    const float guidance = resolve_guidance_scale(params, config);
     if (engine.opts.verbose) {
-        fprintf(stderr, "[acestep-engine] DiT: turbo=%d steps=%d shift=%.2f T=%d task=%s\n",
-                (int) config.is_turbo, noise.steps, noise.shift,
+        fprintf(stderr, "[acestep-engine] DiT: turbo=%d steps=%d shift=%.2f guidance=%.2f T=%d task=%s\n",
+                (int) config.is_turbo, noise.steps, noise.shift, guidance,
                 conditioning.frames, state.task.type.c_str());
     }
     engine.ensure_dit();
@@ -1038,7 +1075,11 @@ static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params
     sample.schedule = noise.schedule.data();
     sample.num_steps = noise.steps;
     sample.real_enc_S = &conditioning.sequence;
-    sample.dcw_enabled = params.dcw_enabled;
+    sample.guidance_scale = guidance;
+    sample.null_cond_emb = conditioning.null_emb.empty() ? nullptr : conditioning.null_emb.data();
+    // DCW is a turbo-preset correction: the official UI disables it for
+    // base/sft models, and base-model quality is validated without it.
+    sample.dcw_enabled = params.dcw_enabled && config.is_turbo;
     sample.dcw_scaler = params.dcw_scaler;
     sample.dcw_high_scaler = params.dcw_high_scaler;
     sample.on_step = [&](int step, int total) { return report("dit", step, total); };

@@ -94,7 +94,11 @@ void dit_apply_haar_dcw(std::vector<float> &       x_next,
                         float                      low_scale,
                         float                      high_scale);
 
-// One full flow-matching denoise (Euler, no CFG — turbo runs guidance=1.0).
+// One full flow-matching denoise (Euler). guidance_scale > 1 with a
+// null-condition embedding runs classifier-free guidance via APG (Adaptive
+// Projected Guidance, official ACE-Step base/sft path): a second unconditional
+// forward per step whose encoder states are the null embedding broadcast over
+// enc_S, combined as pred_cond + (scale-1) * orthogonal(momentum(diff)).
 struct DitSampleParams {
     const float * noise           = nullptr;  // [out_channels, T, N] initial x_T
     const float * context_latents = nullptr;  // [in_channels-out_channels, T, N] conditioning
@@ -105,6 +109,8 @@ struct DitSampleParams {
     int           N               = 1;
     const float * schedule        = nullptr;  // [num_steps] descending timesteps
     int           num_steps       = 0;
+    float         guidance_scale  = 1.0f;     // <= 1 disables CFG
+    const float * null_cond_emb   = nullptr;  // [H_enc] cond-model null embedding
     const int *   real_enc_S      = nullptr;  // [N] valid encoder lengths; null = all enc_S
     bool          dcw_enabled     = true;     // official ACE-Step Haar "double" mode
     float         dcw_scaler      = 0.05f;    // low band: t_curr * scaler
@@ -126,6 +132,17 @@ struct DitSampleParams {
 // Writes the denoised latent [out_channels, T, N] to `latent_out`. Rebuilds the
 // DiT graph per step (bring-up simplicity); correctness first, fusion later.
 bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & latent_out);
+
+// APG combine for one step: velocity holds the conditional prediction on entry
+// and the guided result on exit. momentum is the caller-held running average
+// ([out_channels * T * N] doubles, zero-initialized before the first step).
+void dit_apg_guide(std::vector<float> &       velocity,
+                   const std::vector<float> & velocity_uncond,
+                   std::vector<double> &      momentum,
+                   float                      guidance_scale,
+                   int                        T,
+                   int                        Oc,
+                   int                        N);
 
 struct DitFlowEditCondition {
     const float * context_latents = nullptr;

@@ -45,6 +45,9 @@ constexpr char TEST_FLOW_TARGET_CAPTION[] = "A warm evolving synth pad";
 constexpr char TEST_UNKNOWN_LANGUAGE[] = "unknown";
 constexpr char TEST_LM_STAGE[] = "lm";
 constexpr char TEST_TURBO_ERROR[] = "turbo DiT only";
+constexpr char TEST_LEGO_BASE_ERROR[] = "requires a base/sft DiT";
+constexpr char TEST_LEGO_SKIP_FORMAT[] =
+    "[test-acestep-integration] lego skipped: fixture is a turbo DiT\n";
 constexpr char TEST_FLOW_SKIP_FORMAT[] =
     "[test-acestep-integration] flow-edit skipped: supplied model is not turbo\n";
 
@@ -408,6 +411,66 @@ void run_edit_scenarios(tts_cpp::acestep::Engine & engine, const fs::path & dump
     run_edit_vae_cancel_scenario(engine, fixture);
 }
 
+tts_cpp::acestep::GenerateParams make_lego_params() {
+    tts_cpp::acestep::GenerateParams params = make_generate_params();
+    params.task_type = tts_cpp::acestep::TASK_LEGO;
+    params.track = "guitar";
+    params.caption = "Clean electric guitar layer integration test";
+    params.reference_audio.clear();
+    params.cover_noise_strength = 0.0f;
+    return params;
+}
+
+void inspect_lego_context_frame(const TensorDump & context, const TensorDump & source, int frame,
+                                bool & matches_source, bool & mask_always_active) {
+    const float * row = context.values.data() + (size_t) frame * context.columns;
+    for (int channel = 0; channel < TEST_LATENT_CHANNELS; ++channel) {
+        if (row[TEST_LATENT_CHANNELS + channel] != TEST_CONTEXT_ACTIVE_VALUE) mask_always_active = false;
+        if (frame < source.rows &&
+            row[channel] != source.values[(size_t) frame * source.columns + channel]) {
+            matches_source = false;
+        }
+    }
+}
+
+void verify_lego_source_context(const fs::path & dump_dir) {
+    const TensorDump context = read_tensor_dump(dump_dir / TEST_CONTEXT_DUMP);
+    const TensorDump source = read_tensor_dump(dump_dir / TEST_SOURCE_DUMP);
+    CHECK(!context.values.empty());
+    CHECK(context.columns == TEST_CONTEXT_CHANNELS);
+    CHECK(!source.values.empty());
+    CHECK(source.columns == TEST_LATENT_CHANNELS);
+    if (context.values.empty() || context.columns != TEST_CONTEXT_CHANNELS ||
+        source.values.empty() || source.columns != TEST_LATENT_CHANNELS) {
+        return;
+    }
+    bool matches_source = true;
+    bool mask_always_active = true;
+    for (int frame = 0; frame < context.rows; ++frame) {
+        inspect_lego_context_frame(context, source, frame, matches_source, mask_always_active);
+    }
+    CHECK(matches_source);
+    CHECK(mask_always_active);
+}
+
+void run_lego_scenario(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir) {
+    using namespace tts_cpp::acestep;
+    GenerateParams params = make_lego_params();
+    StageLog stages;
+    try {
+        const GenerateResult result = generate_with_stage_log(engine, params, stages);
+        CHECK(!result.pcm.empty());
+        CHECK(stages.contains("source"));
+        CHECK(!stages.contains(TEST_LM_STAGE));
+        CHECK(!fs::exists(dump_dir / "01_lm_codes.bin"));
+        CHECK(result.pcm.size() >= params.source_audio.size());
+        verify_lego_source_context(dump_dir);
+    } catch (const std::invalid_argument & error) {
+        if (std::string(error.what()).find(TEST_LEGO_BASE_ERROR) == std::string::npos) throw;
+        std::fprintf(stderr, TEST_LEGO_SKIP_FORMAT);
+    }
+}
+
 int run_integration(const char * models_dir) {
     using namespace tts_cpp::acestep;
 
@@ -430,6 +493,7 @@ int run_integration(const char * models_dir) {
         CHECK(!stages.contains("lm"));
         verify_stage_dumps(dump_dir);
         run_edit_scenarios(*engine, dump_dir);
+        run_lego_scenario(*engine, dump_dir);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "FAIL integration exception: %s\n", error.what());
         ++failures;

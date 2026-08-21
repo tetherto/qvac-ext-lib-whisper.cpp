@@ -662,6 +662,121 @@ void test_generation_plans() {
     CHECK(plan.blend_cover_noise);
 }
 
+void test_lego_task_kinds() {
+    using tts_cpp::acestep::TASK_COVER_NOFSQ;
+    using tts_cpp::acestep::TASK_LEGO;
+    using tts_cpp::acestep::TASK_TEXT2MUSIC;
+    using tts_cpp::acestep::LEGO_TRACK_NAMES;
+    using tts_cpp::acestep::is_lego_task;
+    using tts_cpp::acestep::is_source_task;
+    using tts_cpp::acestep::is_valid_lego_track;
+
+    CHECK(is_lego_task(TASK_LEGO));
+    CHECK(!is_lego_task(TASK_TEXT2MUSIC));
+    CHECK(!is_lego_task(TASK_COVER_NOFSQ));
+    CHECK(is_source_task(TASK_LEGO));
+    CHECK(is_source_task(TASK_COVER_NOFSQ));
+    CHECK(!is_source_task(TASK_TEXT2MUSIC));
+
+    for (const char * name : LEGO_TRACK_NAMES) {
+        CHECK(is_valid_lego_track(name));
+    }
+    CHECK(!is_valid_lego_track(""));
+    CHECK(!is_valid_lego_track("piano"));
+    CHECK(!is_valid_lego_track("GUITAR"));
+}
+
+void test_lego_task_validation() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::TASK_LEGO;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+
+    params.task_type = TASK_LEGO;
+    CHECK(resolve_generate_task(params, task).find("requires source_audio") != std::string::npos);
+
+    params.source_audio.assign(3, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("source_audio must be interleaved stereo") != std::string::npos);
+
+    params.source_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("requires a track name") != std::string::npos);
+
+    params.track = "accordion";
+    CHECK(resolve_generate_task(params, task).find("unknown lego track") != std::string::npos);
+
+    params.track = "guitar";
+    CHECK(resolve_generate_task(params, task).empty());
+    CHECK(task.type == TASK_LEGO);
+    CHECK(task.track == "guitar");
+}
+
+void test_lego_generation_plan() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::GenerationPlan;
+    using tts_cpp::acestep::TASK_LEGO;
+    using tts_cpp::acestep::make_generation_plan;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+    params.task_type = TASK_LEGO;
+    params.track = "drums";
+    params.source_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).empty());
+
+    GenerationPlan plan = make_generation_plan(params, task);
+    CHECK(plan.encode_source);
+    CHECK(!plan.encode_reference);
+    CHECK(!plan.reuse_source_reference);
+    CHECK(!plan.run_lm);
+    CHECK(!plan.run_detokenizer);
+    CHECK(!plan.blend_cover_noise);
+
+    params.reference_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).empty());
+    plan = make_generation_plan(params, task);
+    CHECK(plan.encode_reference);
+    CHECK(!plan.reuse_source_reference);
+}
+
+// APG guide: golden values hand-derived from the reference apg_forward
+// (momentum -0.75, norm_threshold 2.5, projection per channel over T).
+void test_apg_guide() {
+    using tts_cpp::acestep::dit_apg_guide;
+
+    std::vector<double> momentum(2, 0.0);
+    std::vector<float> cond = { 3.0f, 4.0f };
+    std::vector<float> uncond = { 2.0f, 2.0f };
+    std::vector<float> velocity = cond;
+    dit_apg_guide(velocity, uncond, momentum, 7.0f, 2, 1, 1);
+    CHECK(approx(velocity[0], 1.08f, 1e-4f));
+    CHECK(approx(velocity[1], 5.44f, 1e-4f));
+
+    velocity = cond;
+    dit_apg_guide(velocity, uncond, momentum, 7.0f, 2, 1, 1);
+    CHECK(approx(velocity[0], 2.52f, 1e-4f));
+    CHECK(approx(velocity[1], 4.36f, 1e-4f));
+
+    std::vector<double> fresh_momentum(2, 0.0);
+    std::vector<float> parallel_cond = { 10.0f, 0.0f };
+    std::vector<float> parallel_uncond = { 6.0f, 0.0f };
+    velocity = parallel_cond;
+    dit_apg_guide(velocity, parallel_uncond, fresh_momentum, 7.0f, 2, 1, 1);
+    CHECK(approx(velocity[0], 10.0f, 1e-4f));
+    CHECK(approx(velocity[1], 0.0f, 1e-4f));
+
+    std::vector<double> zero_momentum(2, 0.0);
+    std::vector<float> equal = { 1.5f, -0.5f };
+    velocity = equal;
+    dit_apg_guide(velocity, equal, zero_momentum, 7.0f, 2, 1, 1);
+    CHECK(approx(velocity[0], equal[0]));
+    CHECK(approx(velocity[1], equal[1]));
+}
+
 void test_generation_conditioning() {
     using tts_cpp::acestep::AudioEncoder;
     using tts_cpp::acestep::EncodedAudio;
@@ -1099,6 +1214,10 @@ int main() {
     test_generate_task_errors();
     test_generate_task_strengths();
     test_generation_plans();
+    test_lego_task_kinds();
+    test_lego_task_validation();
+    test_lego_generation_plan();
+    test_apg_guide();
     test_generation_conditioning();
     test_cover_noise_blending();
     test_repaint_config();
