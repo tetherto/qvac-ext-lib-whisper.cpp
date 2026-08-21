@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -38,6 +39,9 @@ tts_cpp::minimax::EngineOptions make_engine_options(const char * models_dir) {
     tts_cpp::minimax::EngineOptions options;
     options.model_dir = models_dir;
     options.n_threads = 4;
+    // An explicit device wins over MM3_DEVICE, keeping the deterministic part
+    // of the suite on the CPU even when the environment requests a GPU.
+    options.device = "cpu";
     if (const char * backends_dir = std::getenv("AUDIOGEN_TEST_BACKENDS_DIR")) {
         options.backends_dir = backends_dir;
     }
@@ -121,13 +125,38 @@ void verify_cancellation(tts_cpp::minimax::Engine & engine) {
     CHECK(result.pcm.empty());
 }
 
+// When the environment requests a non-CPU device, run one generation with the
+// engine deferring to MM3_DEVICE. device=gpu on a machine without a usable GPU
+// must fail engine creation (only device=auto may fall back to the CPU).
+void verify_environment_device_request(const char * models_dir) {
+    const char * requested = std::getenv("MM3_DEVICE");
+    if (!requested || !*requested || std::strcmp(requested, "cpu") == 0) {
+        return;
+    }
+    auto options = make_engine_options(models_dir);
+    options.device.clear();
+    try {
+        std::unique_ptr<tts_cpp::minimax::Engine> engine = tts_cpp::minimax::Engine::create(options);
+        CHECK(!engine->backend_name().empty());
+        std::fprintf(stderr, "[test-minimax-integration] MM3_DEVICE=%s ran on %s\n", requested,
+                     engine->backend_name().c_str());
+        verify_result(*engine, engine->generate(make_generate_params()));
+    } catch (const std::runtime_error & error) {
+        const std::string message = error.what();
+        CHECK(message.find("no usable GPU") != std::string::npos);
+    }
+}
+
 int run_integration(const char * models_dir) {
     try {
-        std::unique_ptr<tts_cpp::minimax::Engine> engine =
-            tts_cpp::minimax::Engine::create(make_engine_options(models_dir));
-        CHECK(engine->backend_name() == "CPU");
-        verify_recursive_generation(*engine);
-        verify_cancellation(*engine);
+        {
+            std::unique_ptr<tts_cpp::minimax::Engine> engine =
+                tts_cpp::minimax::Engine::create(make_engine_options(models_dir));
+            CHECK(engine->backend_name() == "CPU");
+            verify_recursive_generation(*engine);
+            verify_cancellation(*engine);
+        }
+        verify_environment_device_request(models_dir);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "FAIL integration exception: %s\n", error.what());
         ++failures;

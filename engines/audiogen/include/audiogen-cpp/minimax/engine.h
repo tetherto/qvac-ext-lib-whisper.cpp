@@ -16,11 +16,12 @@ struct EngineOptions {
     std::string synth_model_path;
     int n_threads = 0;
     std::string backends_dir;
-    // Compute device: "cpu" (default), "gpu" (require a GPU, fall back to CPU
-    // with a warning when none is usable) or "auto" (GPU when available). An
-    // empty string defers to the MM3_DEVICE environment variable, then "cpu".
-    // GPU coverage comes from whichever ggml backends are packaged (CUDA,
-    // Vulkan, Metal, ...); the CPU backend always backs unsupported ops.
+    // Compute device: "cpu" (default), "gpu" (require a GPU; engine creation
+    // fails when none is usable) or "auto" (GPU when available, CPU fallback
+    // otherwise). An empty string defers to the MM3_DEVICE environment
+    // variable, then "cpu". GPU coverage comes from whichever ggml backends
+    // are packaged (CUDA, Vulkan, Metal, ...); the CPU backend always backs
+    // unsupported ops.
     std::string device;
 };
 

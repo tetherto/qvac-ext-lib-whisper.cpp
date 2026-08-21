@@ -1,6 +1,8 @@
 #include "minimax/logic.h"
+#include "minimax/backend.h"
 #include "minimax/bpe.h"
 #include "minimax/mm3-flow-runtime.h"
+#include "minimax/mm3-replay-io.h"
 #include "minimax/mm3-window-orchestrator.h"
 #include "minimax/progress.h"
 
@@ -34,6 +36,16 @@ bool throws_invalid_argument(Function function) {
     try {
         function();
     } catch (const std::invalid_argument &) {
+        return true;
+    }
+    return false;
+}
+
+template <typename Function>
+bool throws_runtime_error(Function function) {
+    try {
+        function();
+    } catch (const std::runtime_error &) {
         return true;
     }
     return false;
@@ -767,6 +779,91 @@ void test_backend_configuration() {
     CHECK(!backend_configuration_matches(1, 4, "first", 4, "second"));
 }
 
+void test_device_configuration() {
+    CHECK(throws_runtime_error([] { backend_configure_device("fast"); }));
+
+    setenv("MM3_DEVICE", "auto", 1);
+    backend_configure_device("cpu");
+    CHECK(g_backend_device == "cpu");
+
+    backend_configure_device("");
+    CHECK(g_backend_device == "auto");
+
+    setenv("MM3_DEVICE", "vulkan", 1);
+    CHECK(throws_runtime_error([] { backend_configure_device(""); }));
+
+    unsetenv("MM3_DEVICE");
+    backend_configure_device("");
+    CHECK(g_backend_device == "cpu");
+}
+
+void test_device_backend_init() {
+    ggml_backend_load_all();
+    ggml_backend_t probe = tts_cpp::acestep::backend_gpu_init();
+    const bool gpu_available = probe != nullptr;
+    if (probe) {
+        ggml_backend_free(probe);
+    }
+
+    backend_configure_device("cpu");
+    BackendPair cpu_pair = backend_init("test");
+    CHECK(cpu_pair.cpu_backend != nullptr);
+    CHECK(!cpu_pair.has_gpu);
+    CHECK(cpu_pair.backend == cpu_pair.cpu_backend);
+    CHECK(throws_runtime_error([] { backend_configure_device("auto"); }));
+    backend_release(cpu_pair.backend, cpu_pair.cpu_backend);
+
+    backend_configure_device("auto");
+    BackendPair auto_pair = backend_init("test");
+    CHECK(auto_pair.cpu_backend != nullptr);
+    CHECK(auto_pair.has_gpu == gpu_available);
+    backend_release(auto_pair.backend, auto_pair.cpu_backend);
+
+    backend_configure_device("gpu");
+    if (gpu_available) {
+        BackendPair gpu_pair = backend_init("test");
+        CHECK(gpu_pair.has_gpu);
+        CHECK(gpu_pair.backend != gpu_pair.cpu_backend);
+        backend_release(gpu_pair.backend, gpu_pair.cpu_backend);
+    } else {
+        CHECK(throws_runtime_error([] { backend_init("test"); }));
+    }
+    backend_configure_device("cpu");
+}
+
+void test_replay_io() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "mm3-replay-io-test";
+    fs::remove_all(dir);
+    std::string error;
+    CHECK(mm3_replay_prepare_output_dir(dir.string(), &error));
+    CHECK(mm3_replay_prepare_output_dir(dir.string(), &error));
+
+    const std::vector<float> payload = {1.0f, -2.5f, 0.25f};
+    const std::string raw_path = (dir / "data.f32").string();
+    CHECK(mm3_replay_write_raw(raw_path, payload.data(), payload.size()));
+    std::vector<float> loaded;
+    CHECK(mm3_replay_read_raw(raw_path, loaded));
+    CHECK(loaded == payload);
+
+    const std::vector<float> planar = {0.5f, -0.5f, 1.5f, -1.5f};
+    const std::string wav_path = (dir / "audio.wav").string();
+    CHECK(mm3_replay_write_wav(wav_path, planar, 2, 44100));
+    CHECK(fs::file_size(wav_path) == 44 + 2 * 2 * sizeof(int16_t));
+
+    const std::string missing = (dir / "missing-subdir" / "data.f32").string();
+    CHECK(!mm3_replay_write_raw(missing, payload.data(), payload.size()));
+    CHECK(!mm3_replay_write_wav(missing, planar, 2, 44100));
+
+    std::string not_a_dir_error;
+    CHECK(!mm3_replay_prepare_output_dir(raw_path, &not_a_dir_error));
+    CHECK(!not_a_dir_error.empty());
+
+    std::vector<float> absent;
+    CHECK(!mm3_replay_read_raw((dir / "absent.bin").string(), absent));
+    fs::remove_all(dir);
+}
+
 void test_engine_instance_limit() {
     using tts_cpp::minimax::detail::engine_instance_available;
     CHECK(engine_instance_available(0));
@@ -821,6 +918,9 @@ int main() {
     test_malformed_utf8();
     test_model_pair_resolution();
     test_backend_configuration();
+    test_device_configuration();
+    test_device_backend_init();
+    test_replay_io();
     test_engine_instance_limit();
     test_cancellation();
     test_progress_cancellation();

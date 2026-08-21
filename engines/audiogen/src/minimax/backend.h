@@ -111,7 +111,14 @@ static BackendPair backend_init(const char * tag) {
             fprintf(stderr, "[%s] Using GPU backend %s (%s); CPU handles unsupported ops\n", tag,
                     tts_cpp::acestep::backend_reg_name(gpu), ggml_backend_name(gpu));
         } else if (g_backend_device == "gpu") {
-            fprintf(stderr, "[%s] device=gpu but no usable GPU backend was found; falling back to CPU\n", tag);
+            // An explicit GPU request must not silently degrade into a run that
+            // is orders of magnitude slower; only device=auto may fall back.
+            ggml_backend_free(pair.cpu_backend);
+            throw std::runtime_error(
+                "minimax engine: device=gpu but no usable GPU backend was found; "
+                "use device=auto for CPU fallback");
+        } else {
+            fprintf(stderr, "[%s] device=auto found no usable GPU backend; using CPU\n", tag);
         }
     }
     g_backend_cache = pair;

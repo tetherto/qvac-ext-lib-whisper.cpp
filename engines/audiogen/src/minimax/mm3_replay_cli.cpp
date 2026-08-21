@@ -17,11 +17,11 @@
 #include "minimax/backend.h"
 #include "minimax/logic.h"
 #include "minimax/mm3-pipeline.h"
+#include "minimax/mm3-replay-io.h"
 #include "minimax/request-utils.h"
 
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,51 +29,13 @@
 namespace {
 
 template <typename T>
-std::vector<T> read_raw(const std::string & path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) {
+std::vector<T> read_raw_or_exit(const std::string & path) {
+    std::vector<T> data;
+    if (!mm3_replay_read_raw(path, data)) {
         fprintf(stderr, "cannot open %s\n", path.c_str());
         exit(1);
     }
-    const std::streamsize bytes = f.tellg();
-    f.seekg(0);
-    std::vector<T> data((size_t) bytes / sizeof(T));
-    f.read(reinterpret_cast<char *>(data.data()), (std::streamsize) (data.size() * sizeof(T)));
     return data;
-}
-
-template <typename T>
-void write_raw(const std::string & path, const T * data, size_t count) {
-    std::ofstream f(path, std::ios::binary);
-    f.write(reinterpret_cast<const char *>(data), (std::streamsize) (count * sizeof(T)));
-}
-
-void write_wav(const std::string & path, const std::vector<float> & planar, int64_t samples, int rate) {
-    std::vector<int16_t> pcm((size_t) samples * 2);
-    for (int64_t i = 0; i < samples; ++i) {
-        const float l = planar[(size_t) i];
-        const float r = planar[(size_t) (samples + i)];
-        pcm[(size_t) i * 2]     = (int16_t) (std::max(-1.0f, std::min(1.0f, l)) * 32767.0f);
-        pcm[(size_t) i * 2 + 1] = (int16_t) (std::max(-1.0f, std::min(1.0f, r)) * 32767.0f);
-    }
-    const uint32_t data_bytes = (uint32_t) (pcm.size() * sizeof(int16_t));
-    const uint32_t byte_rate = (uint32_t) rate * 2 * 2;
-    std::ofstream f(path, std::ios::binary);
-    uint32_t u32;
-    uint16_t u16;
-    f.write("RIFF", 4);
-    u32 = 36 + data_bytes;      f.write((char *) &u32, 4);
-    f.write("WAVEfmt ", 8);
-    u32 = 16;                   f.write((char *) &u32, 4);
-    u16 = 1;                    f.write((char *) &u16, 2);
-    u16 = 2;                    f.write((char *) &u16, 2);
-    u32 = (uint32_t) rate;      f.write((char *) &u32, 4);
-    u32 = byte_rate;            f.write((char *) &u32, 4);
-    u16 = 4;                    f.write((char *) &u16, 2);
-    u16 = 16;                   f.write((char *) &u16, 2);
-    f.write("data", 4);
-    f.write((char *) &data_bytes, 4);
-    f.write((const char *) pcm.data(), data_bytes);
 }
 
 const char * arg_value(int argc, char ** argv, const char * name, const char * fallback) {
@@ -93,11 +55,20 @@ int main(int argc, char ** argv) {
     const std::string mode    = arg_value(argc, argv, "--mode", "full");
     if (models.empty()) {
         fprintf(stderr,
-                "usage: mm3-replay --models <dir> --out <dir> --mode replay|full\n"
-                "  replay: --tokens <i32 file> --semantic <i32 file> --acoustic <i32 file>\n"
-                "          [--noise <f32 file>]... (per window)\n"
-                "  full:   --caption <text> [--lyrics <text>]\n"
-                "  common: [--seed N] [--steps N] [--max-frames N] [--threads N] [--device cpu|gpu|auto]\n");
+                "usage: mm3-replay --models <dir> --out <dir> --mode replay|full|condcheck\n"
+                "  replay:    --tokens <i32 file> --semantic <i32 file> --acoustic <i32 file>\n"
+                "             [--noise <f32 file>]... (per window)\n"
+                "  full:      --caption <text> [--lyrics <text>]\n"
+                "  condcheck: verify the DiT emits byte-identical velocities across\n"
+                "             repeated computes with interleaved CFG branches\n"
+                "  common:    [--seed N] [--steps N] [--max-frames N] [--threads N]\n"
+                "             [--device cpu|gpu|auto]\n");
+        return 1;
+    }
+
+    std::string out_error;
+    if (mode != "condcheck" && !mm3_replay_prepare_output_dir(out_dir, &out_error)) {
+        fprintf(stderr, "output error: %s\n", out_error.c_str());
         return 1;
     }
 
@@ -122,11 +93,12 @@ int main(int argc, char ** argv) {
     }
 
     if (mode == "condcheck") {
-        // Does the DiT's resident condition tensor survive repeated graph
-        // computes? Upload cond once (gate 1), interleave an uncond compute
-        // (gate 0), then recompute with gate 1 and cond=nullptr: if the
-        // scheduler's allocator recycled the input block, run 3 diverges
-        // from run 1.
+        // The DiT must emit byte-identical velocities for identical inputs
+        // across repeated graph computes: run a conditional pass, an
+        // interleaved unconditional pass (gate 0), then the conditional pass
+        // again, and require run 3 == run 1. This regressed once when the
+        // flow loop relied on a resident condition upload that the graph
+        // allocator had recycled between computes.
         const int64_t L = 128;
         const int64_t N = (int64_t) model.synth_cfg.dit.in_channels * L;
         const int64_t CN = (int64_t) model.synth_cfg.dit.condition_dim * L;
@@ -162,13 +134,13 @@ int main(int argc, char ** argv) {
     request.keep_window_latents = true;
 
     if (mode == "replay") {
-        request.ids_cond = read_raw<int32_t>(arg_value(argc, argv, "--tokens", ""));
-        request.forced_semantic = read_raw<int32_t>(arg_value(argc, argv, "--semantic", ""));
-        request.forced_acoustic = read_raw<int32_t>(arg_value(argc, argv, "--acoustic", ""));
+        request.ids_cond = read_raw_or_exit<int32_t>(arg_value(argc, argv, "--tokens", ""));
+        request.forced_semantic = read_raw_or_exit<int32_t>(arg_value(argc, argv, "--semantic", ""));
+        request.forced_acoustic = read_raw_or_exit<int32_t>(arg_value(argc, argv, "--acoustic", ""));
         request.max_frames = (int64_t) request.forced_semantic.size();
         for (int i = 1; i + 1 < argc; ++i) {
             if (strcmp(argv[i], "--noise") == 0) {
-                request.forced_noise.push_back(read_raw<float>(argv[i + 1]));
+                request.forced_noise.push_back(read_raw_or_exit<float>(argv[i + 1]));
             }
         }
         fprintf(stderr, "[replay] %zu prompt tokens, %zu frames, %zu noise windows\n",
@@ -192,15 +164,23 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    write_wav(out_dir + "/audio.wav", result.audio, result.n_samples, result.sample_rate);
-    for (size_t w = 0; w < result.window_latents.size(); ++w) {
-        write_raw(out_dir + "/window-" + std::to_string(w) + ".f32",
-                  result.window_latents[w].data(), result.window_latents[w].size());
+    bool wrote = mm3_replay_write_wav(out_dir + "/audio.wav", result.audio, result.n_samples,
+                                      result.sample_rate);
+    for (size_t w = 0; wrote && w < result.window_latents.size(); ++w) {
+        wrote = mm3_replay_write_raw(out_dir + "/window-" + std::to_string(w) + ".f32",
+                                     result.window_latents[w].data(), result.window_latents[w].size());
     }
-    write_raw(out_dir + "/frame-hiddens.f32", result.ar.frame_hiddens.data(),
-              result.ar.frame_hiddens.size());
-    write_raw(out_dir + "/semantic.i32", result.ar.semantic_all.data(), result.ar.semantic_all.size());
-    write_raw(out_dir + "/acoustic.i32", result.ar.acoustic_all.data(), result.ar.acoustic_all.size());
+    wrote = wrote &&
+            mm3_replay_write_raw(out_dir + "/frame-hiddens.f32", result.ar.frame_hiddens.data(),
+                                 result.ar.frame_hiddens.size()) &&
+            mm3_replay_write_raw(out_dir + "/semantic.i32", result.ar.semantic_all.data(),
+                                 result.ar.semantic_all.size()) &&
+            mm3_replay_write_raw(out_dir + "/acoustic.i32", result.ar.acoustic_all.data(),
+                                 result.ar.acoustic_all.size());
+    if (!wrote) {
+        fprintf(stderr, "output error: cannot write artifacts under %s\n", out_dir.c_str());
+        return 1;
+    }
 
     fprintf(stderr,
             "[done] frames=%lld windows=%lld samples=%lld peak=%.3f rms=%.4f "
