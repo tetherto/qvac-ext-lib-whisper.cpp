@@ -1322,6 +1322,24 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "${_tcb_parler_gguf}" "${_tcb_parler_ref}"
             REQUIRES "${_tcb_parler_gguf}" "${_tcb_parler_ref}/dacrand_wav.npy")
         set_property(TEST test-parler-dac-gpu APPEND PROPERTY ENVIRONMENT "PARLER_TEST_GPU=1")
+        # Per-backend pins of the same harness, so a host carrying several GPU
+        # backends covers each by name; TTS_CPP_GPU_BACKEND fails loud when
+        # the named backend is absent, so an arm cannot pass on the CPU.
+        function(tts_cpp_register_parler_dac_arm suffix)
+            tts_cpp_register_test(test-parler-dac-${suffix}
+                EXE      test-parler-dac
+                LABEL    "gpu"
+                ARGS     "${_tcb_parler_gguf}" "${_tcb_parler_ref}"
+                REQUIRES "${_tcb_parler_gguf}" "${_tcb_parler_ref}/dacrand_wav.npy")
+            set_property(TEST test-parler-dac-${suffix} APPEND PROPERTY ENVIRONMENT
+                         "PARLER_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${suffix}")
+        endfunction()
+        if (TTS_CPP_GGML_CUDA)
+            tts_cpp_register_parler_dac_arm(cuda)
+        endif()
+        if (TTS_CPP_GGML_VULKAN)
+            tts_cpp_register_parler_dac_arm(vulkan)
+        endif()
     endif()
 
     add_executable(test-parler-e2e test/parler/test_e2e.cpp

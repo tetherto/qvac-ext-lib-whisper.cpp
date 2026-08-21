@@ -207,7 +207,8 @@ bool parler_load_gguf(const std::string & path, parler_model & model,
     // Parler's GPU path (FA + fused weights + DAC phase-GEMM) is enabled only on
     // backends it has been validated against end-to-end (reference-fixture parity
     // per stage, plus greedy-token identity); anything else falls back to CPU.
-    // Metal was validated in PR #103, Vulkan and OpenCL (Adreno) since. Feature-level
+    // Metal was validated in PR #103, Vulkan and OpenCL (Adreno) since, and CUDA
+    // against the same reference fixtures on an RTX 3090. Feature-level
     // probes such as parler_probe_fa_f16() still apply on top, so a validated backend
     // that lacks an individual capability degrades rather than breaking.
     // Filtering at the walk rather than after it matters on a host carrying an
@@ -218,7 +219,7 @@ bool parler_load_gguf(const std::string & path, parler_model & model,
         n_gpu_layers, /*verbose=*/false, "parler", /*vulkan_device=*/0,
         /*allow_arm_mali=*/true, /*out_gpu_present_but_unused=*/nullptr,
         GpuBackendRequirement::Metal | GpuBackendRequirement::Vulkan |
-            GpuBackendRequirement::OpenCL);
+            GpuBackendRequirement::OpenCL | GpuBackendRequirement::CUDA);
     if (!model.backend) model.backend = ::tts_cpp::detail::init_cpu_backend();
     if (!model.backend) return fail("failed to init backend");
 

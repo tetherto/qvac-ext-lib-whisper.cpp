@@ -1,5 +1,6 @@
 #include "parler/internal.h"
 #include <cstdlib>
+#include "backend_util.h"
 #include "npy.h"
 
 #include "ggml-alloc.h"
@@ -169,6 +170,27 @@ static bool test_range_equivalence(const parler_model & model, const std::string
 
     const int W = PARLER_DAC_WINDOW_FRAMES;
     const int R = parler_dac_rf_frames(model);
+    // A ranged decode near a sequence edge builds a shorter graph than the
+    // full decode, and a GPU GEMM over a different shape reduces in a
+    // different order, so the same logical values need not match bitwise.
+    // The CPU decodes every shape in one deterministic order, so bit
+    // identity stays the bar there.
+    const bool  exact = ::tts_cpp::detail::backend_is_cpu(model.backend);
+    // Worst observed on an RTX 3090: 5.12e-4 on the first-frame range under
+    // CUDA, where a within-tolerance latent difference amplifies through the
+    // vocoder tail; Vulkan stays under 1e-5 on every range. The window and
+    // context arithmetic errors this check exists to catch are hop-scale,
+    // orders of magnitude past this bar.
+    const float RANGE_TOLERANCE = 2e-3f;
+    auto matches = [&](const float * got, const float * ref, size_t n, double & max_abs) {
+        max_abs = 0.0;
+        if (exact) return memcmp(got, ref, n * sizeof(float)) == 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double d = std::fabs((double) got[i] - (double) ref[i]);
+            if (d > max_abs) max_abs = d;
+        }
+        return max_abs <= RANGE_TOLERANCE;
+    };
     const std::vector<std::pair<int, int>> ranges = {
         {0, n_frames},                                          // whole sequence
         {0, 1},                                                 // first frame only
@@ -196,10 +218,12 @@ static bool test_range_equivalence(const parler_model & model, const std::string
             ok = false;
             continue;
         }
+        double wav_max_abs = 0.0;
         if (want != 0 &&
-            memcmp(part.data(), full.data() + (size_t) a * hop, want * sizeof(float)) != 0) {
-            fprintf(stderr, "range-equivalence: [%d, %d) NOT bit-identical to the full decode\n",
-                    a, b);
+            !matches(part.data(), full.data() + (size_t) a * hop, want, wav_max_abs)) {
+            fprintf(stderr, "range-equivalence: [%d, %d) does not match the full decode "
+                    "(max_abs=%.3e, bar=%s)\n",
+                    a, b, wav_max_abs, exact ? "bit-identical" : "2e-3");
             ok = false;
             continue;
         }
@@ -211,15 +235,17 @@ static bool test_range_equivalence(const parler_model & model, const std::string
             ok = false;
             continue;
         }
+        double lat_max_abs = 0.0;
         if (want_lat != 0 &&
-            memcmp(part_lat.data(), full_lat.data() + (size_t) a * lat,
-                   want_lat * sizeof(float)) != 0) {
-            fprintf(stderr, "range-equivalence: [%d, %d) latent NOT bit-identical\n", a, b);
+            !matches(part_lat.data(), full_lat.data() + (size_t) a * lat, want_lat, lat_max_abs)) {
+            fprintf(stderr, "range-equivalence: [%d, %d) latent does not match "
+                    "(max_abs=%.3e, bar=%s)\n",
+                    a, b, lat_max_abs, exact ? "bit-identical" : "2e-3");
             ok = false;
             continue;
         }
-        fprintf(stderr, "  [range %d, %d) bit-identical (%zu samples, %zu latent)\n",
-                a, b, want, want_lat);
+        fprintf(stderr, "  [range %d, %d) matches (%zu samples, %zu latent, wav_max_abs=%.3e)\n",
+                a, b, want, want_lat, wav_max_abs);
     }
     return ok;
 }

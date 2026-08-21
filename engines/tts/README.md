@@ -49,7 +49,7 @@ engine, not every backend ggml can compile.
 | Supertonic 1 | English | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Supertonic 2 | `en`, `ko`, `es`, `pt`, `fr` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Supertonic 3 | 31 languages plus `na` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
-| Parler-TTS mini/large/Indic | English or 21 Indic languages | natural-language description | 44.1 kHz | yes | yes | yes | yes | no |
+| Parler-TTS mini/large/Indic | English or 21 Indic languages | natural-language description | 44.1 kHz | yes | yes | yes | yes | yes |
 | Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice or zero-shot/cross-lingual reference WAV; instruct controls | 24 kHz | yes | yes | yes | yes | no |
 | Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | yes | yes | yes | no |
 | LavaSR denoiser | language agnostic | input PCM | rate preserving | yes | yes | yes | yes | yes |
@@ -84,6 +84,18 @@ uses). `test-chatterbox-parity-mtl-{cuda,vulkan}` therefore asserts what does
 hold -- both backends produce audio, and within 1.35x of each other's duration,
 which truncation, runaway generation and silent failure all break. T3 on CUDA
 is gated at that strength and no more.
+
+Parler on CUDA is covered by the same per-stage reference harnesses as the
+other GPU backends, registered per backend as `test-parler-dac-{cuda,vulkan}`
+and run with the full Parler suite pinned to each: 15/15 on CUDA and on
+Vulkan against the mini-v1 fixtures. The Indic checkpoint remains hub-gated,
+so its arm carries the mini/large result, as it always has. The DAC
+range-equivalence check now states its real contract: bit-identity on the
+CPU, and a measured tolerance on GPU backends, where a ranged decode near a
+sequence edge builds a shorter graph than the full decode and a GEMM over a
+different shape legitimately reduces in a different order (worst observed:
+5.12e-4 on CUDA, under 1e-5 on Vulkan, against a 2e-3 bar; the window
+arithmetic errors the check exists to catch are hop-scale).
 
 Supertonic on CUDA rests on a backend-capability distinction the F16-weight
 auto policy now probes: the conv-via-im2col lowerings put the weight in
