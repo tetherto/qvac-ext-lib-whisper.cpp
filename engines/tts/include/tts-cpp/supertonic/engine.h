@@ -168,7 +168,11 @@ struct EngineOptions {
     // pointwise-conv weights (vector-estimator attention W_*,
     // pwconv1/pwconv2 across every convnext block, vocoder
     // head linear, text-encoder linears, …).  Same -1/0/1 tri-state
-    // as `f16_attn`: -1 auto (on for GPU, off for CPU); 0 or 1 force.
+    // as `f16_attn`; 0 or 1 force.  -1 auto enables F16 only on a GPU
+    // backend that accepts an F16 weight in both mul_mat operand
+    // orders (the conv-via-im2col sites dispatch it as the second) --
+    // ggml-vulkan and ggml-metal qualify; CUDA, OpenCL, padded-matmul
+    // Mali and the CPU keep F32 storage.
     // Halves the GPU read bandwidth into those ops with a small
     // (≤ 2e-3 abs / 5e-3 cosine) numerical drift on the end-to-end
     // synth.  Mirrors chatterbox's CHATTERBOX_F16_CFM gate.
