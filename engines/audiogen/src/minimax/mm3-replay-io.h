@@ -1,8 +1,9 @@
 #pragma once
 
-// File I/O for the mm3-replay parity driver, separated from the CLI so the
-// success and failure paths are unit-testable without model weights. Every
-// writer reports failure instead of silently producing no artifact.
+// I/O and argument validation for the mm3-replay parity driver, separated from
+// the CLI so the success and failure paths are unit-testable without model
+// weights. Every writer reports failure instead of silently producing no
+// artifact.
 
 #include <algorithm>
 #include <cstdint>
@@ -12,6 +13,9 @@
 #include <system_error>
 #include <vector>
 
+// Rejects missing, empty, and non-element-aligned files: a truncated recording
+// must fail the replay instead of silently dropping trailing bytes, and an
+// empty forced-code file must not degrade replay mode into sampled generation.
 template <typename T>
 static bool mm3_replay_read_raw(const std::string & path, std::vector<T> & data) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -19,10 +23,13 @@ static bool mm3_replay_read_raw(const std::string & path, std::vector<T> & data)
         return false;
     }
     const std::streamsize bytes = file.tellg();
+    if (bytes <= 0 || (size_t) bytes % sizeof(T) != 0) {
+        return false;
+    }
     file.seekg(0);
     data.resize((size_t) bytes / sizeof(T));
-    file.read(reinterpret_cast<char *>(data.data()), (std::streamsize) (data.size() * sizeof(T)));
-    return file.good() || data.empty();
+    file.read(reinterpret_cast<char *>(data.data()), bytes);
+    return file.good();
 }
 
 template <typename T>
@@ -74,6 +81,10 @@ static bool mm3_replay_write_wav(const std::string & path, const std::vector<flo
     file.write((const char *) pcm.data(), data_bytes);
     file.flush();
     return file.good();
+}
+
+static bool mm3_replay_mode_is_supported(const std::string & mode) {
+    return mode == "full" || mode == "replay" || mode == "condcheck";
 }
 
 static bool mm3_replay_prepare_output_dir(const std::string & path, std::string * error) {

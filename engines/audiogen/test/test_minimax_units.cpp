@@ -876,6 +876,23 @@ void test_replay_io() {
 
     std::vector<float> absent;
     CHECK(!mm3_replay_read_raw((dir / "absent.bin").string(), absent));
+
+    const std::string empty_path = (dir / "empty.f32").string();
+    CHECK(mm3_replay_write_raw(empty_path, payload.data(), 0));
+    std::vector<float> from_empty;
+    CHECK(!mm3_replay_read_raw(empty_path, from_empty));
+
+    const std::string truncated_path = (dir / "truncated.f32").string();
+    const char truncated_bytes[5] = {1, 2, 3, 4, 5};
+    CHECK(mm3_replay_write_raw(truncated_path, truncated_bytes, sizeof(truncated_bytes)));
+    std::vector<float> from_truncated;
+    CHECK(!mm3_replay_read_raw(truncated_path, from_truncated));
+
+    CHECK(mm3_replay_mode_is_supported("full"));
+    CHECK(mm3_replay_mode_is_supported("replay"));
+    CHECK(mm3_replay_mode_is_supported("condcheck"));
+    CHECK(!mm3_replay_mode_is_supported("ful"));
+    CHECK(!mm3_replay_mode_is_supported(""));
     fs::remove_all(dir);
 }
 

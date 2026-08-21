@@ -1,26 +1,12 @@
-// Parity/replay driver for the MiniMax-Music3 engine.
-//
-// Modes:
-//   replay: force a recorded prompt (token ids), semantic/acoustic codes and
-//           per-window initial noise through the native pipeline, dumping the
-//           per-window final latents and the stitched audio. Feeding the
-//           official Diffusers run's tokens/codes/noise lets the native
-//           synthesis stack be compared 1:1 against the reference.
-//   full:   run the native pipeline end-to-end from --caption/--lyrics.
-//
-// Outputs (under --out):
-//   audio.wav            stitched stereo 16-bit WAV
-//   window-<k>.f32       per-window final latents (128 x L, channel-major)
-//   frame-hiddens.f32    AR conditioning hiddens (frames x 8 x 4096)
-//   semantic.i32 / acoustic.i32   emitted codes
-
 #include "minimax/backend.h"
 #include "minimax/logic.h"
 #include "minimax/mm3-pipeline.h"
 #include "minimax/mm3-replay-io.h"
 #include "minimax/request-utils.h"
 
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -28,15 +14,22 @@
 
 namespace {
 
-template <typename T>
-std::vector<T> read_raw_or_exit(const std::string & path) {
-    std::vector<T> data;
-    if (!mm3_replay_read_raw(path, data)) {
-        fprintf(stderr, "cannot open %s\n", path.c_str());
-        exit(1);
-    }
-    return data;
-}
+struct CliOptions {
+    std::string models;
+    std::string out_dir;
+    std::string mode;
+    std::string device;
+    std::string caption;
+    std::string lyrics;
+    std::string tokens_path;
+    std::string semantic_path;
+    std::string acoustic_path;
+    std::vector<std::string> noise_paths;
+    uint64_t seed = 0;
+    int steps = 0;
+    int64_t max_frames = 0;
+    int threads = 0;
+};
 
 const char * arg_value(int argc, char ** argv, const char * name, const char * fallback) {
     for (int i = 1; i + 1 < argc; ++i) {
@@ -47,146 +40,234 @@ const char * arg_value(int argc, char ** argv, const char * name, const char * f
     return fallback;
 }
 
-}  // namespace
-
-int main(int argc, char ** argv) {
-    const std::string models  = arg_value(argc, argv, "--models", "");
-    const std::string out_dir = arg_value(argc, argv, "--out", ".");
-    const std::string mode    = arg_value(argc, argv, "--mode", "full");
-    if (models.empty()) {
-        fprintf(stderr,
-                "usage: mm3-replay --models <dir> --out <dir> --mode replay|full|condcheck\n"
-                "  replay:    --tokens <i32 file> --semantic <i32 file> --acoustic <i32 file>\n"
-                "             [--noise <f32 file>]... (per window)\n"
-                "  full:      --caption <text> [--lyrics <text>]\n"
-                "  condcheck: verify the DiT emits byte-identical velocities across\n"
-                "             repeated computes with interleaved CFG branches\n"
-                "  common:    [--seed N] [--steps N] [--max-frames N] [--threads N]\n"
-                "             [--device cpu|gpu|auto]\n");
-        return 1;
+std::vector<std::string> collect_noise_paths(int argc, char ** argv) {
+    std::vector<std::string> paths;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (strcmp(argv[i], "--noise") == 0) {
+            paths.emplace_back(argv[i + 1]);
+        }
     }
+    return paths;
+}
 
-    std::string out_error;
-    if (mode != "condcheck" && !mm3_replay_prepare_output_dir(out_dir, &out_error)) {
-        fprintf(stderr, "output error: %s\n", out_error.c_str());
-        return 1;
+CliOptions parse_options(int argc, char ** argv) {
+    CliOptions options;
+    options.models        = arg_value(argc, argv, "--models", "");
+    options.out_dir       = arg_value(argc, argv, "--out", ".");
+    options.mode          = arg_value(argc, argv, "--mode", "full");
+    options.device        = arg_value(argc, argv, "--device", "");
+    options.caption       = arg_value(argc, argv, "--caption", "");
+    options.lyrics        = arg_value(argc, argv, "--lyrics", "");
+    options.tokens_path   = arg_value(argc, argv, "--tokens", "");
+    options.semantic_path = arg_value(argc, argv, "--semantic", "");
+    options.acoustic_path = arg_value(argc, argv, "--acoustic", "");
+    options.noise_paths   = collect_noise_paths(argc, argv);
+    options.seed          = (uint64_t) atoll(arg_value(argc, argv, "--seed", "42"));
+    options.steps         = atoi(arg_value(argc, argv, "--steps", "30"));
+    options.max_frames    = atoll(arg_value(argc, argv, "--max-frames", "300"));
+    options.threads       = atoi(arg_value(argc, argv, "--threads", "0"));
+    return options;
+}
+
+void print_usage() {
+    fprintf(stderr,
+            "usage: mm3-replay --models <dir> --out <dir> --mode replay|full|condcheck\n"
+            "  replay:    --tokens <i32 file> --semantic <i32 file> --acoustic <i32 file>\n"
+            "             [--noise <f32 file>]... (per window)\n"
+            "  full:      --caption <text> [--lyrics <text>]\n"
+            "  condcheck: verify the DiT emits byte-identical velocities across\n"
+            "             repeated computes with interleaved CFG branches\n"
+            "  common:    [--seed N] [--steps N] [--max-frames N] [--threads N]\n"
+            "             [--device cpu|gpu|auto]\n");
+}
+
+template <typename T>
+std::vector<T> read_raw_or_exit(const std::string & path) {
+    std::vector<T> data;
+    if (!mm3_replay_read_raw(path, data)) {
+        fprintf(stderr, "cannot read %s (missing, empty, or not element-aligned)\n", path.c_str());
+        exit(1);
     }
+    return data;
+}
 
-    const int threads = atoi(arg_value(argc, argv, "--threads", "0"));
-    backend_configure_cpu(threads > 0 ? threads : (int) std::thread::hardware_concurrency(), "");
-    backend_configure_device(arg_value(argc, argv, "--device", ""));
-
-    MM3Model model;
+bool load_model(const CliOptions & options, MM3Model & model, std::string * error) {
     const tts_cpp::minimax::detail::ModelPair pair =
-        tts_cpp::minimax::detail::resolve_model_pair(models, "", "");
-    model.models_dir = models;
+        tts_cpp::minimax::detail::resolve_model_pair(options.models, "", "");
+    model.models_dir = options.models;
     mm3_probe_file(pair.lm, &model.lm_file, &model.lm_cfg, nullptr, &model.meta_errors);
     mm3_probe_file(pair.synth, &model.synth_file, nullptr, &model.synth_cfg, &model.meta_errors);
     if (!model.meta_errors.empty()) {
-        fprintf(stderr, "probe error: %s\n", model.meta_errors.front().c_str());
-        return 1;
+        *error = model.meta_errors.front();
+        return false;
     }
+    return mm3_load(&model, error);
+}
+
+struct VelocityDivergence {
+    double cosine = 0.0;
+    double max_abs = 0.0;
+};
+
+VelocityDivergence velocity_divergence(const std::vector<float> & first, const std::vector<float> & repeat) {
+    double dot = 0.0, first_norm = 0.0, repeat_norm = 0.0, max_abs = 0.0;
+    for (size_t i = 0; i < first.size(); ++i) {
+        dot += (double) first[i] * repeat[i];
+        first_norm += (double) first[i] * first[i];
+        repeat_norm += (double) repeat[i] * repeat[i];
+        max_abs = std::max(max_abs, (double) std::fabs(first[i] - repeat[i]));
+    }
+    return {dot / std::sqrt(first_norm * repeat_norm), max_abs};
+}
+
+// The DiT must emit byte-identical velocities for identical inputs across
+// repeated graph computes: run a conditional pass, an interleaved
+// unconditional pass (gate 0), then the conditional pass again, and require
+// run 3 == run 1. This regressed once when the flow loop relied on a resident
+// condition upload that the graph allocator had recycled between computes.
+int run_condcheck(const MM3Model & model) {
+    const int64_t L = 128;
+    const int64_t N = (int64_t) model.synth_cfg.dit.in_channels * L;
+    const int64_t CN = (int64_t) model.synth_cfg.dit.condition_dim * L;
+    std::vector<float> latents, condition;
+    tts_cpp::minimax::detail::fill_noise(1234, 0, latents, N);
+    tts_cpp::minimax::detail::fill_noise(1234, 1, condition, CN);
+    std::vector<float> first((size_t) N), unconditional((size_t) N), repeat((size_t) N);
     std::string error;
-    if (!mm3_load(&model, &error)) {
-        fprintf(stderr, "load error: %s\n", error.c_str());
+    if (!mm3_dit_prepare(model, &g_mm3_dit, &error) ||
+        !mm3_dit_run(model, &g_mm3_dit, latents.data(), condition.data(), 1.0f, 0.5f, L, first.data(), &error) ||
+        !mm3_dit_run(model, &g_mm3_dit, latents.data(), condition.data(), 0.0f, 0.5f, L, unconditional.data(), &error) ||
+        !mm3_dit_run(model, &g_mm3_dit, latents.data(), condition.data(), 1.0f, 0.5f, L, repeat.data(), &error)) {
+        fprintf(stderr, "condcheck error: %s\n", error.c_str());
         return 1;
     }
+    const VelocityDivergence divergence = velocity_divergence(first, repeat);
+    fprintf(stderr, "[condcheck] cos(first,repeat)=%.9f max_abs_diff=%.6g\n", divergence.cosine,
+            divergence.max_abs);
+    return divergence.max_abs < 1e-4 ? 0 : 2;
+}
 
-    if (mode == "condcheck") {
-        // The DiT must emit byte-identical velocities for identical inputs
-        // across repeated graph computes: run a conditional pass, an
-        // interleaved unconditional pass (gate 0), then the conditional pass
-        // again, and require run 3 == run 1. This regressed once when the
-        // flow loop relied on a resident condition upload that the graph
-        // allocator had recycled between computes.
-        const int64_t L = 128;
-        const int64_t N = (int64_t) model.synth_cfg.dit.in_channels * L;
-        const int64_t CN = (int64_t) model.synth_cfg.dit.condition_dim * L;
-        std::vector<float> lat((size_t) N), cond((size_t) CN);
-        uint64_t state = 1234;
-        tts_cpp::minimax::detail::fill_noise(state, 0, lat, N);
-        tts_cpp::minimax::detail::fill_noise(state, 1, cond, CN);
-        std::vector<float> out1((size_t) N), out_u((size_t) N), out3((size_t) N);
-        if (!mm3_dit_prepare(model, &g_mm3_dit, &error) ||
-            !mm3_dit_run(model, &g_mm3_dit, lat.data(), cond.data(), 1.0f, 0.5f, L, out1.data(), &error) ||
-            !mm3_dit_run(model, &g_mm3_dit, lat.data(), cond.data(), 0.0f, 0.5f, L, out_u.data(), &error) ||
-            !mm3_dit_run(model, &g_mm3_dit, lat.data(), cond.data(), 1.0f, 0.5f, L, out3.data(), &error)) {
-            fprintf(stderr, "condcheck error: %s\n", error.c_str());
-            return 1;
-        }
-        double dot = 0, n1 = 0, n3 = 0, max_abs = 0;
-        for (int64_t i = 0; i < N; ++i) {
-            dot += (double) out1[(size_t) i] * out3[(size_t) i];
-            n1 += (double) out1[(size_t) i] * out1[(size_t) i];
-            n3 += (double) out3[(size_t) i] * out3[(size_t) i];
-            max_abs = std::max(max_abs, (double) std::fabs(out1[(size_t) i] - out3[(size_t) i]));
-        }
-        fprintf(stderr, "[condcheck] cos(out1,out3)=%.9f max_abs_diff=%.6g\n",
-                dot / std::sqrt(n1 * n3), max_abs);
-        return max_abs < 1e-4 ? 0 : 2;
-    }
-
+MM3GenRequest build_base_request(const CliOptions & options, const MM3Model & model) {
     MM3GenRequest request;
-    request.seed       = (uint64_t) atoll(arg_value(argc, argv, "--seed", "42"));
-    request.steps      = atoi(arg_value(argc, argv, "--steps", "30"));
-    request.max_frames = atoll(arg_value(argc, argv, "--max-frames", "300"));
-    request.cfg_flow   = model.synth_cfg.flow.cfg_scale > 0 ? model.synth_cfg.flow.cfg_scale : 1.7f;
+    request.seed = options.seed;
+    request.steps = options.steps;
+    request.max_frames = options.max_frames;
+    request.cfg_flow = model.synth_cfg.flow.cfg_scale > 0 ? model.synth_cfg.flow.cfg_scale : 1.7f;
     request.keep_window_latents = true;
+    return request;
+}
 
-    if (mode == "replay") {
-        request.ids_cond = read_raw_or_exit<int32_t>(arg_value(argc, argv, "--tokens", ""));
-        request.forced_semantic = read_raw_or_exit<int32_t>(arg_value(argc, argv, "--semantic", ""));
-        request.forced_acoustic = read_raw_or_exit<int32_t>(arg_value(argc, argv, "--acoustic", ""));
-        request.max_frames = (int64_t) request.forced_semantic.size();
-        for (int i = 1; i + 1 < argc; ++i) {
-            if (strcmp(argv[i], "--noise") == 0) {
-                request.forced_noise.push_back(read_raw_or_exit<float>(argv[i + 1]));
-            }
+void load_forced_noise(const std::vector<std::string> & paths, MM3GenRequest & request) {
+    for (const std::string & path : paths) {
+        request.forced_noise.push_back(read_raw_or_exit<float>(path));
+    }
+}
+
+MM3GenRequest build_replay_request(const CliOptions & options, const MM3Model & model) {
+    MM3GenRequest request = build_base_request(options, model);
+    request.ids_cond = read_raw_or_exit<int32_t>(options.tokens_path);
+    request.forced_semantic = read_raw_or_exit<int32_t>(options.semantic_path);
+    request.forced_acoustic = read_raw_or_exit<int32_t>(options.acoustic_path);
+    request.max_frames = (int64_t) request.forced_semantic.size();
+    load_forced_noise(options.noise_paths, request);
+    fprintf(stderr, "[replay] %zu prompt tokens, %zu frames, %zu noise windows\n",
+            request.ids_cond.size(), request.forced_semantic.size(), request.forced_noise.size());
+    return request;
+}
+
+MM3GenRequest build_full_request(const CliOptions & options, const MM3Model & model) {
+    MM3GenRequest request = build_base_request(options, model);
+    request.prompt = tts_cpp::minimax::detail::build_prompt(options.caption, options.lyrics);
+    fprintf(stderr, "[full] prompt: %s\n", request.prompt.c_str());
+    return request;
+}
+
+void log_progress(const MM3GenProgress & progress) {
+    fprintf(stderr, "[progress] %s %lld/%lld window %lld/%lld\n", progress.stage,
+            (long long) progress.step, (long long) progress.n_steps, (long long) progress.window,
+            (long long) progress.n_windows);
+}
+
+bool write_window_latents(const std::string & out_dir, const std::vector<std::vector<float>> & latents) {
+    for (size_t window = 0; window < latents.size(); ++window) {
+        if (!mm3_replay_write_raw(out_dir + "/window-" + std::to_string(window) + ".f32",
+                                  latents[window].data(), latents[window].size())) {
+            return false;
         }
-        fprintf(stderr, "[replay] %zu prompt tokens, %zu frames, %zu noise windows\n",
-                request.ids_cond.size(), request.forced_semantic.size(), request.forced_noise.size());
-    } else {
-        const std::string caption = arg_value(argc, argv, "--caption", "");
-        const std::string lyrics  = arg_value(argc, argv, "--lyrics", "");
-        request.prompt = tts_cpp::minimax::detail::build_prompt(caption, lyrics);
-        fprintf(stderr, "[full] prompt: %s\n", request.prompt.c_str());
     }
+    return true;
+}
 
-    MM3Tokenizer tokenizer;
-    MM3GenResult result;
-    const auto progress = [](const MM3GenProgress & p) {
-        fprintf(stderr, "[progress] %s %lld/%lld window %lld/%lld\n", p.stage,
-                (long long) p.step, (long long) p.n_steps, (long long) p.window,
-                (long long) p.n_windows);
-    };
-    if (!mm3_generate(model, request, &tokenizer, progress, &result, &error)) {
-        fprintf(stderr, "generate error: %s\n", error.c_str());
-        return 1;
-    }
+bool write_artifacts(const std::string & out_dir, const MM3GenResult & result) {
+    return mm3_replay_write_wav(out_dir + "/audio.wav", result.audio, result.n_samples,
+                                result.sample_rate) &&
+           write_window_latents(out_dir, result.window_latents) &&
+           mm3_replay_write_raw(out_dir + "/frame-hiddens.f32", result.ar.frame_hiddens.data(),
+                                result.ar.frame_hiddens.size()) &&
+           mm3_replay_write_raw(out_dir + "/semantic.i32", result.ar.semantic_all.data(),
+                                result.ar.semantic_all.size()) &&
+           mm3_replay_write_raw(out_dir + "/acoustic.i32", result.ar.acoustic_all.data(),
+                                result.ar.acoustic_all.size());
+}
 
-    bool wrote = mm3_replay_write_wav(out_dir + "/audio.wav", result.audio, result.n_samples,
-                                      result.sample_rate);
-    for (size_t w = 0; wrote && w < result.window_latents.size(); ++w) {
-        wrote = mm3_replay_write_raw(out_dir + "/window-" + std::to_string(w) + ".f32",
-                                     result.window_latents[w].data(), result.window_latents[w].size());
-    }
-    wrote = wrote &&
-            mm3_replay_write_raw(out_dir + "/frame-hiddens.f32", result.ar.frame_hiddens.data(),
-                                 result.ar.frame_hiddens.size()) &&
-            mm3_replay_write_raw(out_dir + "/semantic.i32", result.ar.semantic_all.data(),
-                                 result.ar.semantic_all.size()) &&
-            mm3_replay_write_raw(out_dir + "/acoustic.i32", result.ar.acoustic_all.data(),
-                                 result.ar.acoustic_all.size());
-    if (!wrote) {
-        fprintf(stderr, "output error: cannot write artifacts under %s\n", out_dir.c_str());
-        return 1;
-    }
-
+void report_done(const MM3GenResult & result) {
     fprintf(stderr,
             "[done] frames=%lld windows=%lld samples=%lld peak=%.3f rms=%.4f "
             "ar=%.0fms cond=%.0fms flow=%.0fms voc=%.0fms total=%.0fms\n",
             (long long) result.frames, (long long) result.n_windows, (long long) result.n_samples,
             result.peak, result.rms, result.ar_ms, result.cond_ms, result.flow_ms, result.voc_ms,
             result.total_ms);
+}
+
+int run_generation(const CliOptions & options, const MM3Model & model) {
+    const MM3GenRequest request = options.mode == "replay" ? build_replay_request(options, model)
+                                                           : build_full_request(options, model);
+    MM3Tokenizer tokenizer;
+    MM3GenResult result;
+    std::string error;
+    if (!mm3_generate(model, request, &tokenizer, log_progress, &result, &error)) {
+        fprintf(stderr, "generate error: %s\n", error.c_str());
+        return 1;
+    }
+    if (!write_artifacts(options.out_dir, result)) {
+        fprintf(stderr, "output error: cannot write artifacts under %s\n", options.out_dir.c_str());
+        return 1;
+    }
+    report_done(result);
     return 0;
+}
+
+}  // namespace
+
+int main(int argc, char ** argv) {
+    const CliOptions options = parse_options(argc, argv);
+    if (options.models.empty()) {
+        print_usage();
+        return 1;
+    }
+    if (!mm3_replay_mode_is_supported(options.mode)) {
+        fprintf(stderr, "unsupported mode '%s'\n", options.mode.c_str());
+        print_usage();
+        return 1;
+    }
+    std::string error;
+    if (options.mode != "condcheck" && !mm3_replay_prepare_output_dir(options.out_dir, &error)) {
+        fprintf(stderr, "output error: %s\n", error.c_str());
+        return 1;
+    }
+
+    backend_configure_cpu(options.threads > 0 ? options.threads
+                                              : (int) std::thread::hardware_concurrency(),
+                          "");
+    backend_configure_device(options.device);
+
+    MM3Model model;
+    if (!load_model(options, model, &error)) {
+        fprintf(stderr, "load error: %s\n", error.c_str());
+        return 1;
+    }
+    if (options.mode == "condcheck") {
+        return run_condcheck(model);
+    }
+    return run_generation(options, model);
 }

@@ -141,6 +141,7 @@ void verify_environment_device_request(const char * models_dir) {
         std::fprintf(stderr, "[test-minimax-integration] MM3_DEVICE=%s ran on %s\n", requested,
                      engine->backend_name().c_str());
         verify_result(*engine, engine->generate(make_generate_params()));
+        verify_cancellation(*engine);
     } catch (const std::runtime_error & error) {
         const std::string message = error.what();
         CHECK(message.find("no usable GPU") != std::string::npos);

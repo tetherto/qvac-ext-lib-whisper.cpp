@@ -147,16 +147,24 @@ bool abort_when_cancelled(void * user_data) {
 
 class AbortScope {
 public:
-    AbortScope(ggml_backend_t backend, std::atomic<bool> & cancelled) : backend_(backend) {
-        backend_set_abort_handler(backend_, abort_when_cancelled, &cancelled);
+    AbortScope(ggml_backend_t backend, ggml_backend_t cpu_backend, std::atomic<bool> & cancelled)
+        : backend_(backend), cpu_backend_(cpu_backend) {
+        backend_set_abort_handler(cpu_backend_, abort_when_cancelled, &cancelled);
+        if (backend_ != cpu_backend_) {
+            backend_set_abort_handler(backend_, abort_when_cancelled, &cancelled);
+        }
     }
 
     ~AbortScope() {
-        backend_set_abort_handler(backend_, nullptr, nullptr);
+        backend_set_abort_handler(cpu_backend_, nullptr, nullptr);
+        if (backend_ != cpu_backend_) {
+            backend_set_abort_handler(backend_, nullptr, nullptr);
+        }
     }
 
 private:
     ggml_backend_t backend_;
+    ggml_backend_t cpu_backend_;
 };
 
 class GenerationScope {
@@ -223,7 +231,7 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
     std::lock_guard<std::recursive_mutex> lock(engine_mutex());
     GenerationScope generation_scope(impl_->generating);
     impl_->cancelled.store(false);
-    AbortScope abort_scope(impl_->model.cpu_backend, impl_->cancelled);
+    AbortScope abort_scope(impl_->model.backend, impl_->model.cpu_backend, impl_->cancelled);
 
     const int model_max_frames = static_cast<int>(impl_->model.lm_cfg.max_audio_frames);
     const int64_t max_frames = detail::validate_frames(params.max_frames, model_max_frames);
