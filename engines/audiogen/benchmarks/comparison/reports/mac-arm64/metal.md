@@ -13,6 +13,58 @@ Both engines used the same GGUF files, prompt manifest, duration, seed, LM sampl
 | acestep.cpp | 30 | 0 | 5943.7 | 5943.7 | 0.628 | 3314.3 MiB | 10 | 0 | 0.283 |
 | qvac | 30 | 0 | 3931.0 | 4439.6 | 0.434 | 3394.8 MiB | 10 | 0 | 0.310 |
 
+## Visualizations
+
+```mermaid
+xychart-beta
+  title "Median generation time (lower is better)"
+  x-axis ["acestep.cpp","qvac"]
+  y-axis "Milliseconds" 0 --> 6538
+  bar [5943.7, 3931]
+```
+
+```mermaid
+xychart-beta
+  title "Median real-time factor (lower is better)"
+  x-axis ["acestep.cpp","qvac"]
+  y-axis "RTF" 0 --> 0.691
+  bar [0.628, 0.434]
+```
+
+```mermaid
+xychart-beta
+  title "Median peak memory (lower is better)"
+  x-axis ["acestep.cpp","qvac"]
+  y-axis "MiB" 0 --> 3734.3
+  bar [3314.3, 3394.8]
+```
+
+```mermaid
+xychart-beta
+  title "Median CLAP score (higher is better)"
+  x-axis ["acestep.cpp","qvac"]
+  y-axis "Cosine similarity" 0 --> 0.341
+  bar [0.283, 0.31]
+```
+
+### Median generation time by prompt
+
+```mermaid
+xychart-beta
+  title "acestep.cpp by prompt"
+  x-axis ["acoustic-chamber","adversarial-clash","dense-electronic","dense-orchestral","instrumental-folk","instrumental-house","short-drone","unusual-prepared","vocal-jazz","vocal-pop"]
+  y-axis "Milliseconds" 0 --> 9545.3
+  bar [4916.3, 4999.6, 6009.8, 8677.6, 5383.7, 6655.6, 4427.5, 5975.3, 6868.2, 5841.2]
+```
+
+```mermaid
+xychart-beta
+  title "qvac by prompt"
+  x-axis ["acoustic-chamber","adversarial-clash","dense-electronic","dense-orchestral","instrumental-folk","instrumental-house","short-drone","unusual-prepared","vocal-jazz","vocal-pop"]
+  y-axis "Milliseconds" 0 --> 6529.6
+  bar [3349, 3396, 3908, 5936, 3723, 4850, 3015, 3971, 4821, 3951]
+```
+
 ## acoustic-chamber
 
 | Engine | Success | Fail | Median gen ms | Median e2e ms | Median RTF | Peak RSS | Unique WAV hashes | Silent | Median CLAP |

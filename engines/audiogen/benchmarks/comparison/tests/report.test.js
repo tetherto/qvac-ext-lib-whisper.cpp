@@ -26,13 +26,34 @@ test('renderMarkdownReport includes medians not only fastest runs', () => {
         rtf: { median: 0.2 },
         peakRssBytes: { median: 1048576 },
         uniqueWavHashes: 3,
-        silentCount: 0
+        silentCount: 0,
+        clap: { median: 0.4 }
       }
     },
-    byPrompt: {}
+    byPrompt: {
+      'test-prompt': {
+        qvac: {
+          successCount: 1,
+          failureCount: 0,
+          generationMs: { median: 900 },
+          e2eMs: { median: 1000 },
+          rtf: { median: 0.18 },
+          peakRssBytes: { median: 1048576 },
+          uniqueWavHashes: 1,
+          silentCount: 0,
+          clap: { median: 0.4 }
+        }
+      }
+    }
   })
   assert.match(markdown, /implementation-level/)
   assert.match(markdown, /1000.0/)
   assert.match(markdown, /Median gen ms/)
   assert.match(markdown, /Median CLAP/)
+  assert.match(markdown, /## Visualizations/)
+  assert.match(markdown, /xychart-beta/)
+  assert.match(markdown, /Median generation time \(lower is better\)/)
+  assert.match(markdown, /Median CLAP score \(higher is better\)/)
+  assert.match(markdown, /qvac by prompt/)
+  assert.match(markdown, /"test-prompt"/)
 })

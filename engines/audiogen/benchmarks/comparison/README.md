@@ -142,7 +142,10 @@ Interrupted runs resume from `out/rounds/`. `--force` rebuilds every round.
 `ACESTEP_COMPARE_ORDER=random|alternate|qvac-first|acestep-first` and
 `ACESTEP_COMPARE_COOLDOWN_MS` control order and pauses.
 
-`node generate-report.js out/cpu.json` regenerates Markdown from JSON.
+`node generate-report.js out/cpu.json` regenerates Markdown from JSON. Generated
+reports include Mermaid bar charts for overall generation time, real-time
+factor, peak memory, CLAP score, and per-prompt generation time. The same
+visualizations are emitted for every platform and backend report.
 
 ## Optional CLAP post-pass
 
