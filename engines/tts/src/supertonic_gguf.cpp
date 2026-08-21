@@ -652,12 +652,6 @@ bool backend_supports_f16_mul_mat_uncached(ggml_backend_t backend) {
     return ok;
 }
 
-// The conv-via-im2col lowerings put the weight in mul_mat's SECOND operand
-// (dst = [T, C_out] without a transpose), and several backends that accept an
-// F16 weight as src0 reject it as src1 -- ggml-cuda and ggml-cpu among them,
-// with the scheduler aborting on the node no backend claims. Probed at the
-// live pointwise-conv shape so the f16-weight auto policy can refuse
-// materialisation where this orientation cannot run.
 bool backend_supports_f16_src1_mul_mat_uncached(ggml_backend_t backend) {
     if (!backend) return false;
     ggml_init_params probe_params = {
@@ -669,13 +663,17 @@ bool backend_supports_f16_src1_mul_mat_uncached(ggml_backend_t backend) {
     if (!probe_ctx) return false;
     bool ok = false;
     try {
-        constexpr int width  = 512;
-        constexpr int frames = 96;
-        constexpr int c_out  = 2048;
-        ggml_tensor * x  = ggml_new_tensor_2d(probe_ctx, GGML_TYPE_F32, width, frames);
-        ggml_tensor * w  = ggml_new_tensor_2d(probe_ctx, GGML_TYPE_F16, width, c_out);
-        ggml_tensor * op = ggml_mul_mat(probe_ctx, x, w);
-        ok = (op != nullptr) && ggml_backend_supports_op(backend, op);
+        constexpr int pointwise_width           = 512;
+        constexpr int pointwise_frame_count     = 96;
+        constexpr int pointwise_output_channels = 2048;
+        ggml_tensor * activation = ggml_new_tensor_2d(
+            probe_ctx, GGML_TYPE_F32, pointwise_width, pointwise_frame_count);
+        ggml_tensor * f16_weight = ggml_new_tensor_2d(
+            probe_ctx, GGML_TYPE_F16, pointwise_width, pointwise_output_channels);
+        ggml_tensor * weight_as_second_operand =
+            ggml_mul_mat(probe_ctx, activation, f16_weight);
+        ok = (weight_as_second_operand != nullptr) &&
+             ggml_backend_supports_op(backend, weight_as_second_operand);
     } catch (...) {
         ok = false;
     }
