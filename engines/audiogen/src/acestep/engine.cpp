@@ -689,11 +689,8 @@ struct EncoderConditioning {
     int sequence = 0;
     int hidden_size = 0;
 
-    // Cover conditioning switch (audio_cover_strength < 1): silence context and
-    // text2music-instruction encoder states the sampler swaps to mid-run. Both
-    // hidden buffers are zero-padded to the same row count when the two prompt
-    // encodings differ in length; `sequence` / `sequence_switch` keep the real
-    // lengths for the cross-attention masks.
+    // Post-switch conditioning (empty unless audio_cover_strength < 1); both
+    // hidden buffers share the padded row count, sequence_switch is the real one.
     std::vector<float> context_switch;
     std::vector<float> hidden_switch;
     int sequence_switch = 0;

@@ -67,8 +67,7 @@ inline bool needs_cover_conditioning_switch(const GenerateTask & task) {
     return is_cover_task(task.type) && task.audio_cover_strength < 1.0f;
 }
 
-// Step index where the DiT swaps the source context for silence and the cover
-// instruction for the text2music one. Mirrors the reference: floor(steps * strength).
+// Step index where the DiT drops the source conditioning; -1 disables the switch.
 inline int resolve_cover_switch_step(const GenerateTask & task, int num_steps) {
     if (!needs_cover_conditioning_switch(task)) return -1;
     return (int) ((float) num_steps * task.audio_cover_strength);
