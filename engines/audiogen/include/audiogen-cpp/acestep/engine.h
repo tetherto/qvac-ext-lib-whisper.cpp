@@ -164,8 +164,9 @@ struct GenerateParams {
     std::string task_type = "text2music";
 
     // Fraction of DiT steps that keep the source context (0..1). Default 1.0
-    // keeps source context for every step. Values < 1.0 need DiT context
-    // switching and are rejected until that path is ported.
+    // keeps source context for every step. Values < 1.0 switch the DiT to a
+    // silence context and the text2music instruction at step
+    // floor(steps * strength), so the tail of the run generates freely.
     float audio_cover_strength = 1.0f;
 
     // Blend initial DiT noise toward clean source latents (0..1). 0 = pure
