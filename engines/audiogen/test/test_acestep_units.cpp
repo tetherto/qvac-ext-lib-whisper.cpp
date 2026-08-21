@@ -743,6 +743,31 @@ void test_lego_generation_plan() {
     CHECK(!plan.reuse_source_reference);
 }
 
+void test_lego_model_policy() {
+    using tts_cpp::acestep::lego_model_error;
+
+    CHECK(lego_model_error(false, false).empty());
+    CHECK(lego_model_error(true, false).find("requires a base DiT") != std::string::npos);
+    CHECK(lego_model_error(true, false).find("turbo") != std::string::npos);
+    CHECK(lego_model_error(false, true).find("requires a base DiT") != std::string::npos);
+    CHECK(lego_model_error(false, true).find("sft") != std::string::npos);
+}
+
+void test_guidance_and_dcw_policy() {
+    using tts_cpp::acestep::resolve_dcw_enabled;
+    using tts_cpp::acestep::resolve_guidance_scale;
+
+    CHECK(approx(resolve_guidance_scale(0.0f, true), 1.0f));
+    CHECK(approx(resolve_guidance_scale(7.0f, true), 1.0f));
+    CHECK(approx(resolve_guidance_scale(0.0f, false), 7.0f));
+    CHECK(approx(resolve_guidance_scale(3.5f, false), 3.5f));
+
+    CHECK(resolve_dcw_enabled(true, true));
+    CHECK(!resolve_dcw_enabled(true, false));
+    CHECK(!resolve_dcw_enabled(false, true));
+    CHECK(!resolve_dcw_enabled(false, false));
+}
+
 // APG guide: golden values hand-derived from the reference apg_forward
 // (momentum -0.75, norm_threshold 2.5, projection per channel over T).
 void test_apg_guide() {
@@ -1217,6 +1242,8 @@ int main() {
     test_lego_task_kinds();
     test_lego_task_validation();
     test_lego_generation_plan();
+    test_lego_model_policy();
+    test_guidance_and_dcw_policy();
     test_apg_guide();
     test_generation_conditioning();
     test_cover_noise_blending();

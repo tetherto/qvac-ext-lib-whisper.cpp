@@ -48,6 +48,31 @@ inline float clamp_strength(float value) {
     return std::clamp(value, 0.0f, 1.0f);
 }
 
+inline constexpr float TURBO_GUIDANCE_SCALE    = 1.0f;
+inline constexpr float STANDARD_GUIDANCE_SCALE = 7.0f;
+
+inline std::string lego_model_error(bool is_turbo, bool is_sft) {
+    if (is_turbo) {
+        return "acestep engine: task 'lego' requires a base DiT (turbo does not support stem tasks)";
+    }
+    if (is_sft) {
+        return "acestep engine: task 'lego' requires a base DiT (sft does not support stem tasks)";
+    }
+    return {};
+}
+
+// Turbo is guidance-distilled: CFG is untrained there, so explicit overrides
+// clamp to 1.0. Base/sft default to the official 7.0 when unset.
+inline float resolve_guidance_scale(float requested, bool is_turbo) {
+    if (is_turbo) return TURBO_GUIDANCE_SCALE;
+    return requested > 0.0f ? requested : STANDARD_GUIDANCE_SCALE;
+}
+
+// Haar DCW is a turbo-preset correction; the official base/sft preset disables it.
+inline bool resolve_dcw_enabled(bool requested, bool is_turbo) {
+    return requested && is_turbo;
+}
+
 inline std::string validate_lego_track(const std::string & track) {
     if (track.empty()) {
         return "acestep engine: task 'lego' requires a track name";

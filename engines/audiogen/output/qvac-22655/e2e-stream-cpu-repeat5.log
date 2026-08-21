@@ -1,0 +1,687 @@
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 0.012 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M1 Ultra)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple7  (1007)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 55662.79 MB
+ggml_metal_init: allocating
+ggml_metal_init: found device: Apple M1 Ultra
+ggml_metal_init: picking default device: Apple M1 Ultra
+ggml_metal_init: use fusion         = true
+ggml_metal_init: use concurrency    = true
+ggml_metal_init: use graph optimize = true
+[acestep-engine] DiT/VAE on GPU backend: MTL0
+[acestep-engine] backends: enc=MTL0 lm=MTL0 detok=CPU dit/vae=MTL0
+[bpe] loaded from GGUF: 151643 vocab, 151387 merges
+[bpe] loaded from GGUF: 151643 vocab, 151387 merges
+[acestep-engine] loading text-encoder
+[acestep-txt] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/Qwen3-Embedding-0.6B-Q8_0.gguf: 742.7 MB, 28 layers H=1024 Nh=16/8 D=128
+[acestep-engine] loading LM
+[acestep-lm] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-5Hz-lm-0.6B-Q8_0.gguf: 671.9 MB weights, 28 layers H=1024 V=217204 Nh=16/8 D=128, KV 448.0 MB (2 sets), FA=on
+[acestep-engine] loading cond-encoder
+[acestep-cond] encoder_hidden_size=0 special_token=1 -> use_timbre_cls=0
+[acestep-cond] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-v15-turbo-Q8_0.gguf: 617.0 MB, lyric(8L) timbre(4L) text_proj null_emb(2048)
+[acestep-engine] loading FSQ detokenizer
+[acestep-detok] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-v15-turbo-Q8_0.gguf: 106.5 MB, FSQ(6->2048) + 2L encoder(S=5, 2048->64)
+[acestep-engine] loading DiT
+[acestep-dit] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-v15-turbo-Q8_0.gguf: 1600.7 MB alloc + 0.0 MB mmapped, 24 layers H=2048 Nh=16/8 D=128
+[acestep-engine] loading VAE
+ggml_metal_init: allocating
+ggml_metal_init: found device: Apple M1 Ultra
+ggml_metal_init: picking default device: Apple M1 Ultra
+ggml_metal_init: use fusion         = true
+ggml_metal_init: use concurrency    = true
+ggml_metal_init: use graph optimize = true
+[acestep-vae] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/vae-BF16.gguf: 161.1 MB, decoder, upsample=1920x
+[acestep-engine] ready (threads=10, stages resident)
+[music-cli] lm   0/1  (t=0ms)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_get_rows_q8_0', name = 'kernel_get_rows_q8_0'
+ggml_metal_library_compile_pipeline: loaded kernel_get_rows_q8_0                          0x103290080 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_rms_norm_mul_f32_4', name = 'kernel_rms_norm_mul_f32_4'
+ggml_metal_library_compile_pipeline: loaded kernel_rms_norm_mul_f32_4                     0x103290880 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_q8_0_f32', name = 'kernel_mul_mm_q8_0_f32_bci=0_bco=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_q8_0_f32_bci=0_bco=1            0x103291380 | th_max =  896 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_rope_neox_f32', name = 'kernel_rope_neox_f32_imrope=0'
+ggml_metal_library_compile_pipeline: loaded kernel_rope_neox_f32_imrope=0                 0x103291b80 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_cpy_f32_f32', name = 'kernel_cpy_f32_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_cpy_f32_f32                            0x103292380 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_set_rows_f16_i64', name = 'kernel_set_rows_f16_i64'
+ggml_metal_library_compile_pipeline: loaded kernel_set_rows_f16_i64                       0x103292680 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_flash_attn_ext_blk', name = 'kernel_flash_attn_ext_blk_nqptg=8_ncpsg=64'
+ggml_metal_library_compile_pipeline: loaded kernel_flash_attn_ext_blk_nqptg=8_ncpsg=64      0x103292c80 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_flash_attn_ext_f16_dk128_dv128', name = 'kernel_flash_attn_ext_f16_dk128_dv128_mask=1_sinks=0_bias=0_scap=0_kvpad=0_bcm=1_ns10=128_ns20=128_nsg=4'
+ggml_metal_library_compile_pipeline: loaded kernel_flash_attn_ext_f16_dk128_dv128_mask=1_sinks=0_bias=0_scap=0_kvpad=0_bcm=1_ns10=128_ns20=128_nsg=4      0x103293280 | th_max =  704 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32_4', name = 'kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=0_cb=0'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=0_cb=0      0x9ec1a8000 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_swiglu_f32', name = 'kernel_swiglu_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_swiglu_f32                             0x9ec1a8300 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_q8_0_f32', name = 'kernel_mul_mv_q8_0_f32_nsg=4_bias=0_res=0'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_q8_0_f32_nsg=4_bias=0_res=0      0x9ec1a8600 | th_max = 1024 | th_width =   32
+[lm-pipeline] prefill cond=211 uncond=30, max_new=250, temp=0.85 top_p=0.90 top_k=0 cfg=2.00 (batched decode)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_ext_q8_0_f32_r1_2', name = 'kernel_mul_mv_ext_q8_0_f32_r1_2_nsg=2_nxpsg=16'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_ext_q8_0_f32_r1_2_nsg=2_nxpsg=16      0x9ec1a8900 | th_max =  832 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_flash_attn_ext_vec_f16_dk128_dv128', name = 'kernel_flash_attn_ext_vec_f16_dk128_dv128_mask=1_sink=0_bias=0_scap=0_kvpad=0_ns10=128_ns20=128_nsg=1_nwg=32'
+ggml_metal_library_compile_pipeline: loaded kernel_flash_attn_ext_vec_f16_dk128_dv128_mask=1_sink=0_bias=0_scap=0_kvpad=0_ns10=128_ns20=128_nsg=1_nwg=32      0x9ec1a8c00 | th_max =  448 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_flash_attn_ext_vec_reduce', name = 'kernel_flash_attn_ext_vec_reduce_dv=128_nwg=32'
+ggml_metal_library_compile_pipeline: loaded kernel_flash_attn_ext_vec_reduce_dv=128_nwg=32      0x9ec1a8f00 | th_max = 1024 | th_width =   32
+[music-cli] lm   1/250  (t=119ms)
+[music-cli] lm   9/250  (t=213ms)
+[music-cli] lm   17/250  (t=302ms)
+[music-cli] lm   25/250  (t=404ms)
+[music-cli] lm   33/250  (t=513ms)
+[music-cli] lm   41/250  (t=630ms)
+[music-cli] lm   49/250  (t=718ms)
+[music-cli] lm   57/250  (t=804ms)
+[music-cli] lm   65/250  (t=916ms)
+[music-cli] lm   73/250  (t=1015ms)
+[music-cli] lm   81/250  (t=1113ms)
+[music-cli] lm   89/250  (t=1207ms)
+[music-cli] lm   97/250  (t=1298ms)
+[lm-pipeline]   step 100, 101 codes
+[music-cli] lm   105/250  (t=1394ms)
+[music-cli] lm   113/250  (t=1481ms)
+[music-cli] lm   121/250  (t=1563ms)
+[music-cli] lm   129/250  (t=1642ms)
+[music-cli] lm   137/250  (t=1727ms)
+[music-cli] lm   145/250  (t=1796ms)
+[lm-pipeline] generated 149 audio codes
+[lm-pipeline] codes: 10616,49636,61413,12802,62405,23639,25600,14739,51661,3638,27653,49646,24791,29503,7622,44622,28206,2048,24347,44602,33401,2308,2672,17666,27786,33352,7684,30768,178,13507,63323,12627,16721,15210,23169,10308,51041,53427,33578,5625,4603,9863,10109,13305,12663,37915,5612,2822,60469,33815,48589,3591,11668,25558,49335,30839,25464,29850,48722,30653,24034,56314,11618,56075,62434,30588,59881,27626,20474,23940,36812,40908,28006,51392,27727,36295,50154,11726,29546,44670,42256,40403,40413,25550,57276,40399,1071,57935,52838,44101,25528,19658,35019,12746,35826,41970,62914,10722,54731,11746,63971,16323,38058,11902,2132,62645,15165,13005,21447,30659,2546,52574,25648,25412,43519,39420,14811,372,39625,42378,47041,13763,6999,53202,7464,12423,39877,55815,15673,54748,8283,28843,28034,35855,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,62151
+[music-cli] lm   1/1  (t=1829ms)
+[acestep-stream] LM->detok overlap: 19 batches, 365.5 ms worker compute
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_get_rows_bf16', name = 'kernel_get_rows_bf16'
+ggml_metal_library_compile_pipeline: loaded kernel_get_rows_bf16                          0x9ec1a9200 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f32_f32', name = 'kernel_mul_mm_f32_f32_bci=0_bco=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f32_f32_bci=0_bco=1             0x9ec1a9500 | th_max =  832 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_soft_max_f16_4', name = 'kernel_soft_max_f16_4'
+ggml_metal_library_compile_pipeline: loaded kernel_soft_max_f16_4                         0x9ec1a9800 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f32_f32', name = 'kernel_mul_mm_f32_f32_bci=1_bco=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f32_f32_bci=1_bco=1             0x9ec1a9b00 | th_max =  896 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f32_f32_prec', name = 'kernel_mul_mm_f32_f32_prec_bci=0_bco=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f32_f32_prec_bci=0_bco=1        0x9ec1a9e00 | th_max =  640 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_f32_f32_4', name = 'kernel_mul_mv_f32_f32_4_nsg=1_bias=0_res=0'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_f32_f32_4_nsg=1_bias=0_res=0      0x9ec1aa100 | th_max =  768 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_soft_max_f32_4', name = 'kernel_soft_max_f32_4'
+ggml_metal_library_compile_pipeline: loaded kernel_soft_max_f32_4                         0x9ec1aa400 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32_4', name = 'kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=1_cb=0'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=1_cb=0      0x9ec1aa700 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_soft_max_f16', name = 'kernel_soft_max_f16'
+ggml_metal_library_compile_pipeline: loaded kernel_soft_max_f16                           0x9ec1aaa00 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_f32_f32_short', name = 'kernel_mul_mv_f32_f32_short_nsg=1_bias=0_res=0'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_f32_f32_short_nsg=1_bias=0_res=0      0x9ec1aad00 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_soft_max_f32', name = 'kernel_soft_max_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_soft_max_f32                           0x9ec1ab000 | th_max = 1024 | th_width =   32
+[acestep-engine] DiT: turbo=1 steps=8 shift=3.00 T=746 task=text2music
+[music-cli] dit  0/8  (t=1891ms)
+[music-cli] dit  0/8  (t=1891ms)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_unary_f32_f32', name = 'kernel_unary_f32_f32_op=10_cnt=1'
+ggml_metal_library_compile_pipeline: loaded kernel_unary_f32_f32_op=10_cnt=1              0x9ec1ab300 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_timestep_embedding_f32', name = 'kernel_timestep_embedding_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_timestep_embedding_f32                 0x9ec1ab600 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_unary_f32_f32_4', name = 'kernel_unary_f32_f32_4_op=106_cnt=1'
+ggml_metal_library_compile_pipeline: loaded kernel_unary_f32_f32_4_op=106_cnt=1           0x9ec1ab900 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32', name = 'kernel_bin_fuse_f32_f32_f32_op=1_nf=1_rb=1_cb=0'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_op=1_nf=1_rb=1_cb=0      0x9ec1abc00 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32', name = 'kernel_bin_fuse_f32_f32_f32_op=0_nf=1_rb=1_cb=1'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_op=0_nf=1_rb=1_cb=1      0x9ec214000 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32_4', name = 'kernel_bin_fuse_f32_f32_f32_4_op=2_nf=1_rb=0_cb=0'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_4_op=2_nf=1_rb=0_cb=0      0x9ec214300 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32_4', name = 'kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=1_cb=1'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=1_cb=1      0x9ec214600 | th_max = 1024 | th_width =   32
+[music-cli] dit  1/8  (t=2057ms)
+[music-cli] dit  2/8  (t=2225ms)
+[music-cli] dit  3/8  (t=2391ms)
+[music-cli] dit  4/8  (t=2560ms)
+[music-cli] dit  5/8  (t=2732ms)
+[music-cli] dit  6/8  (t=2900ms)
+[music-cli] dit  7/8  (t=3070ms)
+[music-cli] dit  8/8  (t=3235ms)
+[music-cli] vae  0/1  (t=3235ms)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_im2col_f16', name = 'kernel_im2col_f16'
+ggml_metal_library_compile_pipeline: loaded kernel_im2col_f16                             0x9ec214900 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f16_f16', name = 'kernel_mul_mm_f16_f16_bci=0_bco=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f16_f16_bci=0_bco=1             0x9ec214c00 | th_max =  896 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32', name = 'kernel_bin_fuse_f32_f32_f32_op=0_nf=1_rb=0_cb=1'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_op=0_nf=1_rb=0_cb=1      0x9ec214f00 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_snake_f32', name = 'kernel_snake_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_snake_f32                              0x9ec215200 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f16_f32', name = 'kernel_mul_mm_f16_f32_bci=0_bco=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f16_f32_bci=0_bco=1             0x9ec215500 | th_max =  896 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_col2im_1d_f32', name = 'kernel_col2im_1d_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_col2im_1d_f32                          0x9ec215800 | th_max = 1024 | th_width =   32
+[music-cli] vae  16/1005  (t=3306ms)
+[music-cli] vae  32/1005  (t=3311ms)
+[music-cli] vae  48/1005  (t=3316ms)
+[music-cli] vae  64/1005  (t=3322ms)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f16_f32', name = 'kernel_mul_mm_f16_f32_bci=0_bco=0'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f16_f32_bci=0_bco=0             0x9ec215b00 | th_max = 1024 | th_width =   32
+[music-cli] vae  80/1005  (t=3328ms)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f16_f16', name = 'kernel_mul_mm_f16_f16_bci=0_bco=0'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f16_f16_bci=0_bco=0             0x9ec215e00 | th_max = 1024 | th_width =   32
+[music-cli] vae  96/1005  (t=3338ms)
+[music-cli] vae  112/1005  (t=3346ms)
+[music-cli] vae  128/1005  (t=3357ms)
+[music-cli] vae  144/1005  (t=3366ms)
+[music-cli] vae  160/1005  (t=3377ms)
+[music-cli] vae  176/1005  (t=3390ms)
+[music-cli] vae  192/1005  (t=3402ms)
+[music-cli] vae  208/1005  (t=3414ms)
+[music-cli] vae  224/1005  (t=3436ms)
+[music-cli] vae  240/1005  (t=3456ms)
+[music-cli] vae  256/1005  (t=3475ms)
+[music-cli] vae  272/1005  (t=3497ms)
+[music-cli] vae  288/1005  (t=3538ms)
+[music-cli] vae  304/1005  (t=3578ms)
+[music-cli] vae  320/1005  (t=3618ms)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_f16_f16_4', name = 'kernel_mul_mv_f16_f16_4_nsg=4_bias=0_res=0'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_f16_f16_4_nsg=4_bias=0_res=0      0x9ec216100 | th_max = 1024 | th_width =   32
+[music-cli] vae  335/1005  (t=3653ms)
+[music-cli] vae  351/1005  (t=3974ms)
+[music-cli] vae  367/1005  (t=3984ms)
+[music-cli] vae  383/1005  (t=3992ms)
+[music-cli] vae  399/1005  (t=3999ms)
+[music-cli] vae  415/1005  (t=4005ms)
+[music-cli] vae  431/1005  (t=4016ms)
+[music-cli] vae  447/1005  (t=4026ms)
+[music-cli] vae  463/1005  (t=4036ms)
+[music-cli] vae  479/1005  (t=4046ms)
+[music-cli] vae  495/1005  (t=4060ms)
+[music-cli] vae  511/1005  (t=4074ms)
+[music-cli] vae  527/1005  (t=4088ms)
+[music-cli] vae  543/1005  (t=4102ms)
+[music-cli] vae  559/1005  (t=4124ms)
+[music-cli] vae  575/1005  (t=4148ms)
+[music-cli] vae  591/1005  (t=4172ms)
+[music-cli] vae  607/1005  (t=4197ms)
+[music-cli] vae  623/1005  (t=4243ms)
+[music-cli] vae  639/1005  (t=4290ms)
+[music-cli] vae  655/1005  (t=4335ms)
+[music-cli] vae  670/1005  (t=4375ms)
+[music-cli] vae  686/1005  (t=4675ms)
+[music-cli] vae  702/1005  (t=4682ms)
+[music-cli] vae  718/1005  (t=4690ms)
+[music-cli] vae  734/1005  (t=4696ms)
+[music-cli] vae  750/1005  (t=4702ms)
+[music-cli] vae  766/1005  (t=4710ms)
+[music-cli] vae  782/1005  (t=4720ms)
+[music-cli] vae  798/1005  (t=4727ms)
+[music-cli] vae  814/1005  (t=4737ms)
+[music-cli] vae  830/1005  (t=4747ms)
+[music-cli] vae  846/1005  (t=4761ms)
+[music-cli] vae  862/1005  (t=4772ms)
+[music-cli] vae  878/1005  (t=4784ms)
+[music-cli] vae  894/1005  (t=4802ms)
+[music-cli] vae  910/1005  (t=4821ms)
+[music-cli] vae  926/1005  (t=4839ms)
+[music-cli] vae  942/1005  (t=4859ms)
+[music-cli] vae  958/1005  (t=4895ms)
+[music-cli] vae  974/1005  (t=4934ms)
+[music-cli] vae  990/1005  (t=4970ms)
+[music-cli] vae  1005/1005  (t=5002ms) VAE render=1766ms
+[music-cli] vae  1/1  (t=5004ms) VAE render=1768ms
+[acestep-timing] per-stage wall clock (total 5004 ms)
+[acestep-timing]   lm              1828.9 ms   36.5%
+[acestep-timing]   detok-tail        11.9 ms    0.2%
+[acestep-timing]   textenc           33.1 ms    0.7%
+[acestep-timing]   cond              15.2 ms    0.3%
+[acestep-timing]   noise              1.3 ms    0.0%
+[acestep-timing]   dit             1345.0 ms   26.9%
+[acestep-timing]   vae             1768.6 ms   35.3%
+[music-cli] benchmark run 1/5: wall=5004.1 ms audio=29.84 s RTF=0.1677
+[music-cli] lm   0/1  (t=0ms)
+[lm-pipeline] prefill cond=211 uncond=30, max_new=250, temp=0.85 top_p=0.90 top_k=0 cfg=2.00 (batched decode)
+[music-cli] lm   1/250  (t=89ms)
+[music-cli] lm   9/250  (t=190ms)
+[music-cli] lm   17/250  (t=278ms)
+[music-cli] lm   25/250  (t=388ms)
+[music-cli] lm   33/250  (t=501ms)
+[music-cli] lm   41/250  (t=604ms)
+[music-cli] lm   49/250  (t=692ms)
+[music-cli] lm   57/250  (t=776ms)
+[music-cli] lm   65/250  (t=879ms)
+[music-cli] lm   73/250  (t=989ms)
+[music-cli] lm   81/250  (t=1102ms)
+[music-cli] lm   89/250  (t=1204ms)
+[music-cli] lm   97/250  (t=1308ms)
+[lm-pipeline]   step 100, 101 codes
+[music-cli] lm   105/250  (t=1415ms)
+[music-cli] lm   113/250  (t=1504ms)
+[music-cli] lm   121/250  (t=1587ms)
+[music-cli] lm   129/250  (t=1676ms)
+[music-cli] lm   137/250  (t=1767ms)
+[music-cli] lm   145/250  (t=1837ms)
+[lm-pipeline] generated 149 audio codes
+[lm-pipeline] codes: 10616,49636,61413,12802,62405,23639,25600,14739,51661,3638,27653,49646,24791,29503,7622,44622,28206,2048,24347,44602,33401,2308,2672,17666,27786,33352,7684,30768,178,13507,63323,12627,16721,15210,23169,10308,51041,53427,33578,5625,4603,9863,10109,13305,12663,37915,5612,2822,60469,33815,48589,3591,11668,25558,49335,30839,25464,29850,48722,30653,24034,56314,11618,56075,62434,30588,59881,27626,20474,23940,36812,40908,28006,51392,27727,36295,50154,11726,29546,44670,42256,40403,40413,25550,57276,40399,1071,57935,52838,44101,25528,19658,35019,12746,35826,41970,62914,10722,54731,11746,63971,16323,38058,11902,2132,62645,15165,13005,21447,30659,2546,52574,25648,25412,43519,39420,14811,372,39625,42378,47041,13763,6999,53202,7464,12423,39877,55815,15673,54748,8283,28843,28034,35855,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,62151
+[music-cli] lm   1/1  (t=1870ms)
+[acestep-stream] LM->detok overlap: 19 batches, 355.2 ms worker compute
+[acestep-engine] DiT: turbo=1 steps=8 shift=3.00 T=746 task=text2music
+[music-cli] dit  0/8  (t=1928ms)
+[music-cli] dit  0/8  (t=1928ms)
+[music-cli] dit  1/8  (t=2094ms)
+[music-cli] dit  2/8  (t=2262ms)
+[music-cli] dit  3/8  (t=2429ms)
+[music-cli] dit  4/8  (t=2598ms)
+[music-cli] dit  5/8  (t=2768ms)
+[music-cli] dit  6/8  (t=2937ms)
+[music-cli] dit  7/8  (t=3106ms)
+[music-cli] dit  8/8  (t=3276ms)
+[music-cli] vae  0/1  (t=3277ms)
+[music-cli] vae  16/1005  (t=3349ms)
+[music-cli] vae  32/1005  (t=3354ms)
+[music-cli] vae  48/1005  (t=3358ms)
+[music-cli] vae  64/1005  (t=3366ms)
+[music-cli] vae  80/1005  (t=3371ms)
+[music-cli] vae  96/1005  (t=3382ms)
+[music-cli] vae  112/1005  (t=3390ms)
+[music-cli] vae  128/1005  (t=3400ms)
+[music-cli] vae  144/1005  (t=3408ms)
+[music-cli] vae  160/1005  (t=3420ms)
+[music-cli] vae  176/1005  (t=3433ms)
+[music-cli] vae  192/1005  (t=3444ms)
+[music-cli] vae  208/1005  (t=3457ms)
+[music-cli] vae  224/1005  (t=3476ms)
+[music-cli] vae  240/1005  (t=3498ms)
+[music-cli] vae  256/1005  (t=3518ms)
+[music-cli] vae  272/1005  (t=3540ms)
+[music-cli] vae  288/1005  (t=3579ms)
+[music-cli] vae  304/1005  (t=3619ms)
+[music-cli] vae  320/1005  (t=3659ms)
+[music-cli] vae  335/1005  (t=3693ms)
+[music-cli] vae  351/1005  (t=3787ms)
+[music-cli] vae  367/1005  (t=3794ms)
+[music-cli] vae  383/1005  (t=3801ms)
+[music-cli] vae  399/1005  (t=3806ms)
+[music-cli] vae  415/1005  (t=3814ms)
+[music-cli] vae  431/1005  (t=3824ms)
+[music-cli] vae  447/1005  (t=3835ms)
+[music-cli] vae  463/1005  (t=3845ms)
+[music-cli] vae  479/1005  (t=3855ms)
+[music-cli] vae  495/1005  (t=3869ms)
+[music-cli] vae  511/1005  (t=3884ms)
+[music-cli] vae  527/1005  (t=3897ms)
+[music-cli] vae  543/1005  (t=3910ms)
+[music-cli] vae  559/1005  (t=3934ms)
+[music-cli] vae  575/1005  (t=3957ms)
+[music-cli] vae  591/1005  (t=3981ms)
+[music-cli] vae  607/1005  (t=4006ms)
+[music-cli] vae  623/1005  (t=4051ms)
+[music-cli] vae  639/1005  (t=4099ms)
+[music-cli] vae  655/1005  (t=4144ms)
+[music-cli] vae  670/1005  (t=4185ms)
+[music-cli] vae  686/1005  (t=4260ms)
+[music-cli] vae  702/1005  (t=4266ms)
+[music-cli] vae  718/1005  (t=4270ms)
+[music-cli] vae  734/1005  (t=4275ms)
+[music-cli] vae  750/1005  (t=4281ms)
+[music-cli] vae  766/1005  (t=4289ms)
+[music-cli] vae  782/1005  (t=4299ms)
+[music-cli] vae  798/1005  (t=4307ms)
+[music-cli] vae  814/1005  (t=4315ms)
+[music-cli] vae  830/1005  (t=4325ms)
+[music-cli] vae  846/1005  (t=4337ms)
+[music-cli] vae  862/1005  (t=4349ms)
+[music-cli] vae  878/1005  (t=4359ms)
+[music-cli] vae  894/1005  (t=4380ms)
+[music-cli] vae  910/1005  (t=4399ms)
+[music-cli] vae  926/1005  (t=4417ms)
+[music-cli] vae  942/1005  (t=4438ms)
+[music-cli] vae  958/1005  (t=4473ms)
+[music-cli] vae  974/1005  (t=4512ms)
+[music-cli] vae  990/1005  (t=4549ms)
+[music-cli] vae  1005/1005  (t=4581ms) VAE render=1304ms
+[music-cli] vae  1/1  (t=4582ms) VAE render=1306ms
+[acestep-timing] per-stage wall clock (total 4582 ms)
+[acestep-timing]   lm              1869.7 ms   40.8%
+[acestep-timing]   detok-tail        11.9 ms    0.3%
+[acestep-timing]   textenc           31.1 ms    0.7%
+[acestep-timing]   cond              14.0 ms    0.3%
+[acestep-timing]   noise              1.2 ms    0.0%
+[acestep-timing]   dit             1348.9 ms   29.4%
+[acestep-timing]   vae             1305.6 ms   28.5%
+[music-cli] benchmark run 2/5: wall=4582.3 ms audio=29.84 s RTF=0.1536
+[music-cli] lm   0/1  (t=0ms)
+[lm-pipeline] prefill cond=211 uncond=30, max_new=250, temp=0.85 top_p=0.90 top_k=0 cfg=2.00 (batched decode)
+[music-cli] lm   1/250  (t=93ms)
+[music-cli] lm   9/250  (t=192ms)
+[music-cli] lm   17/250  (t=278ms)
+[music-cli] lm   25/250  (t=390ms)
+[music-cli] lm   33/250  (t=500ms)
+[music-cli] lm   41/250  (t=611ms)
+[music-cli] lm   49/250  (t=699ms)
+[music-cli] lm   57/250  (t=783ms)
+[music-cli] lm   65/250  (t=882ms)
+[music-cli] lm   73/250  (t=980ms)
+[music-cli] lm   81/250  (t=1075ms)
+[music-cli] lm   89/250  (t=1173ms)
+[music-cli] lm   97/250  (t=1277ms)
+[lm-pipeline]   step 100, 101 codes
+[music-cli] lm   105/250  (t=1377ms)
+[music-cli] lm   113/250  (t=1479ms)
+[music-cli] lm   121/250  (t=1568ms)
+[music-cli] lm   129/250  (t=1644ms)
+[music-cli] lm   137/250  (t=1729ms)
+[music-cli] lm   145/250  (t=1794ms)
+[lm-pipeline] generated 149 audio codes
+[lm-pipeline] codes: 10616,49636,61413,12802,62405,23639,25600,14739,51661,3638,27653,49646,24791,29503,7622,44622,28206,2048,24347,44602,33401,2308,2672,17666,27786,33352,7684,30768,178,13507,63323,12627,16721,15210,23169,10308,51041,53427,33578,5625,4603,9863,10109,13305,12663,37915,5612,2822,60469,33815,48589,3591,11668,25558,49335,30839,25464,29850,48722,30653,24034,56314,11618,56075,62434,30588,59881,27626,20474,23940,36812,40908,28006,51392,27727,36295,50154,11726,29546,44670,42256,40403,40413,25550,57276,40399,1071,57935,52838,44101,25528,19658,35019,12746,35826,41970,62914,10722,54731,11746,63971,16323,38058,11902,2132,62645,15165,13005,21447,30659,2546,52574,25648,25412,43519,39420,14811,372,39625,42378,47041,13763,6999,53202,7464,12423,39877,55815,15673,54748,8283,28843,28034,35855,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,62151
+[music-cli] lm   1/1  (t=1828ms)
+[acestep-stream] LM->detok overlap: 19 batches, 353.1 ms worker compute
+[acestep-engine] DiT: turbo=1 steps=8 shift=3.00 T=746 task=text2music
+[music-cli] dit  0/8  (t=1886ms)
+[music-cli] dit  0/8  (t=1886ms)
+[music-cli] dit  1/8  (t=2052ms)
+[music-cli] dit  2/8  (t=2219ms)
+[music-cli] dit  3/8  (t=2387ms)
+[music-cli] dit  4/8  (t=2554ms)
+[music-cli] dit  5/8  (t=2723ms)
+[music-cli] dit  6/8  (t=2892ms)
+[music-cli] dit  7/8  (t=3061ms)
+[music-cli] dit  8/8  (t=3227ms)
+[music-cli] vae  0/1  (t=3227ms)
+[music-cli] vae  16/1005  (t=3295ms)
+[music-cli] vae  32/1005  (t=3302ms)
+[music-cli] vae  48/1005  (t=3306ms)
+[music-cli] vae  64/1005  (t=3312ms)
+[music-cli] vae  80/1005  (t=3318ms)
+[music-cli] vae  96/1005  (t=3327ms)
+[music-cli] vae  112/1005  (t=3338ms)
+[music-cli] vae  128/1005  (t=3347ms)
+[music-cli] vae  144/1005  (t=3356ms)
+[music-cli] vae  160/1005  (t=3368ms)
+[music-cli] vae  176/1005  (t=3381ms)
+[music-cli] vae  192/1005  (t=3392ms)
+[music-cli] vae  208/1005  (t=3405ms)
+[music-cli] vae  224/1005  (t=3424ms)
+[music-cli] vae  240/1005  (t=3445ms)
+[music-cli] vae  256/1005  (t=3466ms)
+[music-cli] vae  272/1005  (t=3488ms)
+[music-cli] vae  288/1005  (t=3527ms)
+[music-cli] vae  304/1005  (t=3569ms)
+[music-cli] vae  320/1005  (t=3608ms)
+[music-cli] vae  335/1005  (t=3642ms)
+[music-cli] vae  351/1005  (t=3734ms)
+[music-cli] vae  367/1005  (t=3740ms)
+[music-cli] vae  383/1005  (t=3746ms)
+[music-cli] vae  399/1005  (t=3752ms)
+[music-cli] vae  415/1005  (t=3758ms)
+[music-cli] vae  431/1005  (t=3770ms)
+[music-cli] vae  447/1005  (t=3781ms)
+[music-cli] vae  463/1005  (t=3791ms)
+[music-cli] vae  479/1005  (t=3801ms)
+[music-cli] vae  495/1005  (t=3816ms)
+[music-cli] vae  511/1005  (t=3829ms)
+[music-cli] vae  527/1005  (t=3843ms)
+[music-cli] vae  543/1005  (t=3857ms)
+[music-cli] vae  559/1005  (t=3880ms)
+[music-cli] vae  575/1005  (t=3903ms)
+[music-cli] vae  591/1005  (t=3926ms)
+[music-cli] vae  607/1005  (t=3952ms)
+[music-cli] vae  623/1005  (t=3996ms)
+[music-cli] vae  639/1005  (t=4043ms)
+[music-cli] vae  655/1005  (t=4088ms)
+[music-cli] vae  670/1005  (t=4127ms)
+[music-cli] vae  686/1005  (t=4205ms)
+[music-cli] vae  702/1005  (t=4211ms)
+[music-cli] vae  718/1005  (t=4217ms)
+[music-cli] vae  734/1005  (t=4222ms)
+[music-cli] vae  750/1005  (t=4227ms)
+[music-cli] vae  766/1005  (t=4236ms)
+[music-cli] vae  782/1005  (t=4244ms)
+[music-cli] vae  798/1005  (t=4254ms)
+[music-cli] vae  814/1005  (t=4261ms)
+[music-cli] vae  830/1005  (t=4274ms)
+[music-cli] vae  846/1005  (t=4285ms)
+[music-cli] vae  862/1005  (t=4296ms)
+[music-cli] vae  878/1005  (t=4308ms)
+[music-cli] vae  894/1005  (t=4326ms)
+[music-cli] vae  910/1005  (t=4345ms)
+[music-cli] vae  926/1005  (t=4364ms)
+[music-cli] vae  942/1005  (t=4385ms)
+[music-cli] vae  958/1005  (t=4420ms)
+[music-cli] vae  974/1005  (t=4457ms)
+[music-cli] vae  990/1005  (t=4495ms)
+[music-cli] vae  1005/1005  (t=4528ms) VAE render=1301ms
+[music-cli] vae  1/1  (t=4529ms) VAE render=1302ms
+[acestep-timing] per-stage wall clock (total 4529 ms)
+[acestep-timing]   lm              1827.7 ms   40.4%
+[acestep-timing]   detok-tail        11.8 ms    0.3%
+[acestep-timing]   textenc           30.5 ms    0.7%
+[acestep-timing]   cond              14.4 ms    0.3%
+[acestep-timing]   noise              1.2 ms    0.0%
+[acestep-timing]   dit             1341.4 ms   29.6%
+[acestep-timing]   vae             1302.0 ms   28.7%
+[music-cli] benchmark run 3/5: wall=4529.0 ms audio=29.84 s RTF=0.1518
+[music-cli] lm   0/1  (t=0ms)
+[lm-pipeline] prefill cond=211 uncond=30, max_new=250, temp=0.85 top_p=0.90 top_k=0 cfg=2.00 (batched decode)
+[music-cli] lm   1/250  (t=91ms)
+[music-cli] lm   9/250  (t=191ms)
+[music-cli] lm   17/250  (t=274ms)
+[music-cli] lm   25/250  (t=369ms)
+[music-cli] lm   33/250  (t=463ms)
+[music-cli] lm   41/250  (t=565ms)
+[music-cli] lm   49/250  (t=662ms)
+[music-cli] lm   57/250  (t=749ms)
+[music-cli] lm   65/250  (t=850ms)
+[music-cli] lm   73/250  (t=942ms)
+[music-cli] lm   81/250  (t=1030ms)
+[music-cli] lm   89/250  (t=1118ms)
+[music-cli] lm   97/250  (t=1208ms)
+[lm-pipeline]   step 100, 101 codes
+[music-cli] lm   105/250  (t=1302ms)
+[music-cli] lm   113/250  (t=1391ms)
+[music-cli] lm   121/250  (t=1465ms)
+[music-cli] lm   129/250  (t=1537ms)
+[music-cli] lm   137/250  (t=1615ms)
+[music-cli] lm   145/250  (t=1683ms)
+[lm-pipeline] generated 149 audio codes
+[lm-pipeline] codes: 10616,49636,61413,12802,62405,23639,25600,14739,51661,3638,27653,49646,24791,29503,7622,44622,28206,2048,24347,44602,33401,2308,2672,17666,27786,33352,7684,30768,178,13507,63323,12627,16721,15210,23169,10308,51041,53427,33578,5625,4603,9863,10109,13305,12663,37915,5612,2822,60469,33815,48589,3591,11668,25558,49335,30839,25464,29850,48722,30653,24034,56314,11618,56075,62434,30588,59881,27626,20474,23940,36812,40908,28006,51392,27727,36295,50154,11726,29546,44670,42256,40403,40413,25550,57276,40399,1071,57935,52838,44101,25528,19658,35019,12746,35826,41970,62914,10722,54731,11746,63971,16323,38058,11902,2132,62645,15165,13005,21447,30659,2546,52574,25648,25412,43519,39420,14811,372,39625,42378,47041,13763,6999,53202,7464,12423,39877,55815,15673,54748,8283,28843,28034,35855,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,62151
+[music-cli] lm   1/1  (t=1715ms)
+[acestep-stream] LM->detok overlap: 19 batches, 354.5 ms worker compute
+[acestep-engine] DiT: turbo=1 steps=8 shift=3.00 T=746 task=text2music
+[music-cli] dit  0/8  (t=1773ms)
+[music-cli] dit  0/8  (t=1774ms)
+[music-cli] dit  1/8  (t=1939ms)
+[music-cli] dit  2/8  (t=2104ms)
+[music-cli] dit  3/8  (t=2271ms)
+[music-cli] dit  4/8  (t=2440ms)
+[music-cli] dit  5/8  (t=2606ms)
+[music-cli] dit  6/8  (t=2776ms)
+[music-cli] dit  7/8  (t=2946ms)
+[music-cli] dit  8/8  (t=3114ms)
+[music-cli] vae  0/1  (t=3114ms)
+[music-cli] vae  16/1005  (t=3188ms)
+[music-cli] vae  32/1005  (t=3193ms)
+[music-cli] vae  48/1005  (t=3199ms)
+[music-cli] vae  64/1005  (t=3206ms)
+[music-cli] vae  80/1005  (t=3211ms)
+[music-cli] vae  96/1005  (t=3221ms)
+[music-cli] vae  112/1005  (t=3229ms)
+[music-cli] vae  128/1005  (t=3239ms)
+[music-cli] vae  144/1005  (t=3247ms)
+[music-cli] vae  160/1005  (t=3259ms)
+[music-cli] vae  176/1005  (t=3273ms)
+[music-cli] vae  192/1005  (t=3285ms)
+[music-cli] vae  208/1005  (t=3296ms)
+[music-cli] vae  224/1005  (t=3316ms)
+[music-cli] vae  240/1005  (t=3337ms)
+[music-cli] vae  256/1005  (t=3357ms)
+[music-cli] vae  272/1005  (t=3379ms)
+[music-cli] vae  288/1005  (t=3417ms)
+[music-cli] vae  304/1005  (t=3457ms)
+[music-cli] vae  320/1005  (t=3496ms)
+[music-cli] vae  335/1005  (t=3531ms)
+[music-cli] vae  351/1005  (t=3615ms)
+[music-cli] vae  367/1005  (t=3624ms)
+[music-cli] vae  383/1005  (t=3629ms)
+[music-cli] vae  399/1005  (t=3635ms)
+[music-cli] vae  415/1005  (t=3642ms)
+[music-cli] vae  431/1005  (t=3654ms)
+[music-cli] vae  447/1005  (t=3664ms)
+[music-cli] vae  463/1005  (t=3675ms)
+[music-cli] vae  479/1005  (t=3686ms)
+[music-cli] vae  495/1005  (t=3699ms)
+[music-cli] vae  511/1005  (t=3713ms)
+[music-cli] vae  527/1005  (t=3728ms)
+[music-cli] vae  543/1005  (t=3742ms)
+[music-cli] vae  559/1005  (t=3764ms)
+[music-cli] vae  575/1005  (t=3789ms)
+[music-cli] vae  591/1005  (t=3811ms)
+[music-cli] vae  607/1005  (t=3838ms)
+[music-cli] vae  623/1005  (t=3881ms)
+[music-cli] vae  639/1005  (t=3928ms)
+[music-cli] vae  655/1005  (t=3975ms)
+[music-cli] vae  670/1005  (t=4014ms)
+[music-cli] vae  686/1005  (t=4090ms)
+[music-cli] vae  702/1005  (t=4095ms)
+[music-cli] vae  718/1005  (t=4100ms)
+[music-cli] vae  734/1005  (t=4106ms)
+[music-cli] vae  750/1005  (t=4110ms)
+[music-cli] vae  766/1005  (t=4120ms)
+[music-cli] vae  782/1005  (t=4128ms)
+[music-cli] vae  798/1005  (t=4136ms)
+[music-cli] vae  814/1005  (t=4144ms)
+[music-cli] vae  830/1005  (t=4156ms)
+[music-cli] vae  846/1005  (t=4167ms)
+[music-cli] vae  862/1005  (t=4179ms)
+[music-cli] vae  878/1005  (t=4191ms)
+[music-cli] vae  894/1005  (t=4209ms)
+[music-cli] vae  910/1005  (t=4228ms)
+[music-cli] vae  926/1005  (t=4246ms)
+[music-cli] vae  942/1005  (t=4267ms)
+[music-cli] vae  958/1005  (t=4305ms)
+[music-cli] vae  974/1005  (t=4342ms)
+[music-cli] vae  990/1005  (t=4378ms)
+[music-cli] vae  1005/1005  (t=4410ms) VAE render=1296ms
+[music-cli] vae  1/1  (t=4412ms) VAE render=1298ms
+[acestep-timing] per-stage wall clock (total 4412 ms)
+[acestep-timing]   lm              1715.3 ms   38.9%
+[acestep-timing]   detok-tail        11.9 ms    0.3%
+[acestep-timing]   textenc           30.2 ms    0.7%
+[acestep-timing]   cond              14.4 ms    0.3%
+[acestep-timing]   noise              1.2 ms    0.0%
+[acestep-timing]   dit             1340.6 ms   30.4%
+[acestep-timing]   vae             1297.9 ms   29.4%
+[music-cli] benchmark run 4/5: wall=4411.7 ms audio=29.84 s RTF=0.1478
+[music-cli] lm   0/1  (t=0ms)
+[lm-pipeline] prefill cond=211 uncond=30, max_new=250, temp=0.85 top_p=0.90 top_k=0 cfg=2.00 (batched decode)
+[music-cli] lm   1/250  (t=90ms)
+[music-cli] lm   9/250  (t=193ms)
+[music-cli] lm   17/250  (t=279ms)
+[music-cli] lm   25/250  (t=376ms)
+[music-cli] lm   33/250  (t=485ms)
+[music-cli] lm   41/250  (t=586ms)
+[music-cli] lm   49/250  (t=670ms)
+[music-cli] lm   57/250  (t=756ms)
+[music-cli] lm   65/250  (t=861ms)
+[music-cli] lm   73/250  (t=965ms)
+[music-cli] lm   81/250  (t=1056ms)
+[music-cli] lm   89/250  (t=1146ms)
+[music-cli] lm   97/250  (t=1239ms)
+[lm-pipeline]   step 100, 101 codes
+[music-cli] lm   105/250  (t=1340ms)
+[music-cli] lm   113/250  (t=1432ms)
+[music-cli] lm   121/250  (t=1507ms)
+[music-cli] lm   129/250  (t=1588ms)
+[music-cli] lm   137/250  (t=1670ms)
+[music-cli] lm   145/250  (t=1740ms)
+[lm-pipeline] generated 149 audio codes
+[lm-pipeline] codes: 10616,49636,61413,12802,62405,23639,25600,14739,51661,3638,27653,49646,24791,29503,7622,44622,28206,2048,24347,44602,33401,2308,2672,17666,27786,33352,7684,30768,178,13507,63323,12627,16721,15210,23169,10308,51041,53427,33578,5625,4603,9863,10109,13305,12663,37915,5612,2822,60469,33815,48589,3591,11668,25558,49335,30839,25464,29850,48722,30653,24034,56314,11618,56075,62434,30588,59881,27626,20474,23940,36812,40908,28006,51392,27727,36295,50154,11726,29546,44670,42256,40403,40413,25550,57276,40399,1071,57935,52838,44101,25528,19658,35019,12746,35826,41970,62914,10722,54731,11746,63971,16323,38058,11902,2132,62645,15165,13005,21447,30659,2546,52574,25648,25412,43519,39420,14811,372,39625,42378,47041,13763,6999,53202,7464,12423,39877,55815,15673,54748,8283,28843,28034,35855,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,35847,62151
+[music-cli] lm   1/1  (t=1772ms)
+[acestep-stream] LM->detok overlap: 19 batches, 351.8 ms worker compute
+[acestep-engine] DiT: turbo=1 steps=8 shift=3.00 T=746 task=text2music
+[music-cli] dit  0/8  (t=1830ms)
+[music-cli] dit  0/8  (t=1831ms)
+[music-cli] dit  1/8  (t=1997ms)
+[music-cli] dit  2/8  (t=2164ms)
+[music-cli] dit  3/8  (t=2336ms)
+[music-cli] dit  4/8  (t=2503ms)
+[music-cli] dit  5/8  (t=2667ms)
+[music-cli] dit  6/8  (t=2839ms)
+[music-cli] dit  7/8  (t=3005ms)
+[music-cli] dit  8/8  (t=3169ms)
+[music-cli] vae  0/1  (t=3169ms)
+[music-cli] vae  16/1005  (t=3245ms)
+[music-cli] vae  32/1005  (t=3250ms)
+[music-cli] vae  48/1005  (t=3255ms)
+[music-cli] vae  64/1005  (t=3262ms)
+[music-cli] vae  80/1005  (t=3267ms)
+[music-cli] vae  96/1005  (t=3277ms)
+[music-cli] vae  112/1005  (t=3285ms)
+[music-cli] vae  128/1005  (t=3295ms)
+[music-cli] vae  144/1005  (t=3303ms)
+[music-cli] vae  160/1005  (t=3315ms)
+[music-cli] vae  176/1005  (t=3328ms)
+[music-cli] vae  192/1005  (t=3339ms)
+[music-cli] vae  208/1005  (t=3351ms)
+[music-cli] vae  224/1005  (t=3371ms)
+[music-cli] vae  240/1005  (t=3393ms)
+[music-cli] vae  256/1005  (t=3412ms)
+[music-cli] vae  272/1005  (t=3434ms)
+[music-cli] vae  288/1005  (t=3473ms)
+[music-cli] vae  304/1005  (t=3512ms)
+[music-cli] vae  320/1005  (t=3551ms)
+[music-cli] vae  335/1005  (t=3586ms)
+[music-cli] vae  351/1005  (t=3677ms)
+[music-cli] vae  367/1005  (t=3682ms)
+[music-cli] vae  383/1005  (t=3689ms)
+[music-cli] vae  399/1005  (t=3695ms)
+[music-cli] vae  415/1005  (t=3701ms)
+[music-cli] vae  431/1005  (t=3712ms)
+[music-cli] vae  447/1005  (t=3722ms)
+[music-cli] vae  463/1005  (t=3732ms)
+[music-cli] vae  479/1005  (t=3744ms)
+[music-cli] vae  495/1005  (t=3757ms)
+[music-cli] vae  511/1005  (t=3770ms)
+[music-cli] vae  527/1005  (t=3785ms)
+[music-cli] vae  543/1005  (t=3800ms)
+[music-cli] vae  559/1005  (t=3823ms)
+[music-cli] vae  575/1005  (t=3846ms)
+[music-cli] vae  591/1005  (t=3868ms)
+[music-cli] vae  607/1005  (t=3895ms)
+[music-cli] vae  623/1005  (t=3939ms)
+[music-cli] vae  639/1005  (t=3986ms)
+[music-cli] vae  655/1005  (t=4032ms)
+[music-cli] vae  670/1005  (t=4071ms)
+[music-cli] vae  686/1005  (t=4152ms)
+[music-cli] vae  702/1005  (t=4157ms)
+[music-cli] vae  718/1005  (t=4162ms)
+[music-cli] vae  734/1005  (t=4167ms)
+[music-cli] vae  750/1005  (t=4172ms)
+[music-cli] vae  766/1005  (t=4182ms)
+[music-cli] vae  782/1005  (t=4190ms)
+[music-cli] vae  798/1005  (t=4198ms)
+[music-cli] vae  814/1005  (t=4206ms)
+[music-cli] vae  830/1005  (t=4216ms)
+[music-cli] vae  846/1005  (t=4228ms)
+[music-cli] vae  862/1005  (t=4239ms)
+[music-cli] vae  878/1005  (t=4251ms)
+[music-cli] vae  894/1005  (t=4269ms)
+[music-cli] vae  910/1005  (t=4288ms)
+[music-cli] vae  926/1005  (t=4306ms)
+[music-cli] vae  942/1005  (t=4326ms)
+[music-cli] vae  958/1005  (t=4362ms)
+[music-cli] vae  974/1005  (t=4398ms)
+[music-cli] vae  990/1005  (t=4435ms)
+[music-cli] vae  1005/1005  (t=4467ms) VAE render=1298ms
+[music-cli] vae  1/1  (t=4470ms) VAE render=1301ms
+[acestep-timing] per-stage wall clock (total 4471 ms)
+[acestep-timing]   lm              1772.4 ms   39.6%
+[acestep-timing]   detok-tail        11.7 ms    0.3%
+[acestep-timing]   textenc           30.5 ms    0.7%
+[acestep-timing]   cond              14.2 ms    0.3%
+[acestep-timing]   noise              1.3 ms    0.0%
+[acestep-timing]   dit             1338.9 ms   29.9%
+[acestep-timing]   vae             1301.5 ms   29.1%
+[music-cli] benchmark run 5/5: wall=4470.6 ms audio=29.84 s RTF=0.1498
+[music-cli] generated 149 codes, seed=4242, 1432320 frames (29.84s)
+[music-cli] wrote /Volumes/FreddyHD/Work/Tether/repos/qvac-ext-lib-whisper.cpp/engines/audiogen/output/qvac-22655/e2e-stream-cpu-repeat5.wav: 1432320 frames, 29.84s @ 48000 Hz stereo
+ggml_metal_free: deallocating
+ggml_metal_free: deallocating

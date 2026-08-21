@@ -1,0 +1,154 @@
+[music-cli] reference audio: /Volumes/FreddyHD/Work/Tether/repos/qvac-ext-lib-whisper.cpp/engines/audiogen/output/qvac-22886/dlg-ref-20s.wav (20.00s, 48 kHz stereo)
+ggml_metal_device_init: error: MTLCreateSystemDefaultDevice returned nil - Metal not available on this device
+ggml_backend_metal_reg: error: failed to init Metal device 0 - skipping
+[bpe] loaded from GGUF: 151643 vocab, 151387 merges
+[bpe] loaded from GGUF: 151643 vocab, 151387 merges
+[acestep-engine] ready (threads=20, stages lazy/low-mem)
+[acestep-engine] loading VAE
+[acestep-vae] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/vae-BF16.gguf: 321.9 MB, encoder+decoder, upsample=1920x
+[music-cli] reference 0/1  (t=2664ms)
+[acestep-engine] reference audio: 20.00s -> 500 timbre frames
+[music-cli] reference 1/1  (t=12679ms)
+[music-cli] lm   0/1  (t=12694ms)
+[acestep-engine] loading LM
+[acestep-lm] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-5Hz-lm-0.6B-Q8_0.gguf: 671.9 MB weights, 28 layers H=1024 V=217204 Nh=16/8 D=128, KV 448.0 MB (2 sets), FA=off
+[FSM] Prefix trees: bpm=301, dur=601, key=106, lang=53, tsig=5 nodes
+[lm-phase1] prefill 125 tokens, fsm=1 inspire=0 gen_lyrics=0
+[lm-phase1] generated 127 tokens:
+bpm:96
+caption: An upbeat Latin pop track driven by an energetic salsa rhythm section featuring
+  prominent congas, timbales, and a syncopated bassline. A lively piano montuno provides
+  harmonic drive while a powerful brass horn section punctuates the arrangement with
+  sharp stabs and melodic flourishes. The passionate male lead vocal carries the melody
+  over the vibrant instrumental bed before transitioning into a brief instrumental
+  break that highlights the horns and percussion interplay.
+duration: 42
+keyscale:A minor
+language:es
+timesignature:4
+</think>
+[lm-phase1] filled: bpm=96 dur=24 key='A minor' tsig='4' lang='es'
+[lm-pipeline] prefill cond=297 uncond=30, max_new=220, temp=0.85 top_p=0.90 top_k=0 cfg=2.00
+[music-cli] lm   1/220  (t=49414ms)
+[music-cli] lm   9/220  (t=53846ms)
+[music-cli] lm   17/220  (t=65268ms)
+[music-cli] lm   25/220  (t=69032ms)
+[music-cli] lm   33/220  (t=73892ms)
+[music-cli] lm   41/220  (t=75399ms)
+[music-cli] lm   49/220  (t=81391ms)
+[music-cli] lm   57/220  (t=83355ms)
+[music-cli] lm   65/220  (t=84885ms)
+[music-cli] lm   73/220  (t=95140ms)
+[music-cli] lm   81/220  (t=96659ms)
+[music-cli] lm   89/220  (t=107830ms)
+[music-cli] lm   97/220  (t=112434ms)
+[lm-pipeline]   step 100, 101 codes
+[music-cli] lm   105/220  (t=114855ms)
+[music-cli] lm   113/220  (t=125702ms)
+[lm-pipeline] generated 116 audio codes
+[lm-pipeline] codes: 62493,573,446,16393,32264,16967,14851,37932,37941,63550,57928,32272,28704,51248,38424,22916,33663,57319,62720,13544,10544,16786,54259,53141,51467,1410,53715,39395,7183,1105,26562,39385,7928,1047,30231,60998,18184,7343,14898,41599,50065,32752,2096,30240,18432,58860,6648,12712,51888,2112,60136,10408,38080,37504,33138,4453,12658,22435,7654,52991,2689,26683,50159,39299,23029,36870,16424,60680,30584,13284,3273,13795,1159,38664,62912,58672,25205,5115,54615,57599,6641,20466,45904,13251,56585,18940,7750,58398,30215,23733,10967,44223,24096,36952,26112,2065,25712,2592,35334,11361,545,51244,51200,27712,10796,25729,55152,48576,20272,48472,16160,12164,18617,43776,45824,25446
+[music-cli] lm   1/1  (t=126111ms)
+[acestep-engine] freeing LM (low-mem)
+[acestep-engine] loading FSQ detokenizer
+[acestep-detok] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-v15-turbo-Q8_0.gguf: 106.5 MB, FSQ(6->2048) + 2L encoder(S=5, 2048->64)
+[acestep-engine] freeing FSQ detokenizer (low-mem)
+[acestep-engine] loading cond-encoder
+[acestep-cond] encoder_hidden_size=0 special_token=1 -> use_timbre_cls=0
+[acestep-cond] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-v15-turbo-Q8_0.gguf: 617.0 MB, lyric(8L) timbre(4L) text_proj null_emb(2048)
+[acestep-engine] loading text-encoder
+[acestep-txt] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/Qwen3-Embedding-0.6B-Q8_0.gguf: 742.7 MB, 28 layers H=1024 Nh=16/8 D=128
+[acestep-engine] freeing text-encoder (low-mem)
+[acestep-engine] freeing cond-encoder (low-mem)
+[acestep-engine] DiT: turbo=1 steps=8 shift=3.00 T=580
+[acestep-engine] loading DiT
+[acestep-dit] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-v15-turbo-Q8_0.gguf: 5.9 MB alloc + 1594.8 MB mmapped, 24 layers H=2048 Nh=16/8 D=128
+[music-cli] dit  0/8  (t=132684ms)
+[music-cli] dit  0/8  (t=132684ms)
+[music-cli] dit  1/8  (t=141165ms)
+[music-cli] dit  2/8  (t=143853ms)
+[music-cli] dit  3/8  (t=147275ms)
+[music-cli] dit  4/8  (t=152745ms)
+[music-cli] dit  5/8  (t=157440ms)
+[music-cli] dit  6/8  (t=159747ms)
+[music-cli] dit  7/8  (t=163094ms)
+[music-cli] dit  8/8  (t=168564ms)
+[acestep-engine] freeing DiT (low-mem)
+[acestep-engine] loading VAE
+[acestep-vae] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/vae-BF16.gguf: 161.1 MB, decoder, upsample=1920x
+[music-cli] vae  0/1  (t=170001ms)
+[music-cli] vae  16/1005  (t=170104ms)
+[music-cli] vae  32/1005  (t=170255ms)
+[music-cli] vae  48/1005  (t=170350ms)
+[music-cli] vae  64/1005  (t=170469ms)
+[music-cli] vae  80/1005  (t=170608ms)
+[music-cli] vae  96/1005  (t=170909ms)
+[music-cli] vae  112/1005  (t=171075ms)
+[music-cli] vae  128/1005  (t=171212ms)
+[music-cli] vae  144/1005  (t=171325ms)
+[music-cli] vae  160/1005  (t=171672ms)
+[music-cli] vae  176/1005  (t=171893ms)
+[music-cli] vae  192/1005  (t=172111ms)
+[music-cli] vae  208/1005  (t=172394ms)
+[music-cli] vae  224/1005  (t=173429ms)
+[music-cli] vae  240/1005  (t=173685ms)
+[music-cli] vae  256/1005  (t=173903ms)
+[music-cli] vae  272/1005  (t=174164ms)
+[music-cli] vae  288/1005  (t=175380ms)
+[music-cli] vae  304/1005  (t=176055ms)
+[music-cli] vae  320/1005  (t=176689ms)
+[music-cli] vae  335/1005  (t=176971ms)
+[music-cli] vae  351/1005  (t=177165ms)
+[music-cli] vae  367/1005  (t=177417ms)
+[music-cli] vae  383/1005  (t=177627ms)
+[music-cli] vae  399/1005  (t=177784ms)
+[music-cli] vae  415/1005  (t=177952ms)
+[music-cli] vae  431/1005  (t=178402ms)
+[music-cli] vae  447/1005  (t=178659ms)
+[music-cli] vae  463/1005  (t=178904ms)
+[music-cli] vae  479/1005  (t=179185ms)
+[music-cli] vae  495/1005  (t=179650ms)
+[music-cli] vae  511/1005  (t=179929ms)
+[music-cli] vae  527/1005  (t=180162ms)
+[music-cli] vae  543/1005  (t=180428ms)
+[music-cli] vae  559/1005  (t=181409ms)
+[music-cli] vae  575/1005  (t=181875ms)
+[music-cli] vae  591/1005  (t=182262ms)
+[music-cli] vae  607/1005  (t=182788ms)
+[music-cli] vae  623/1005  (t=184029ms)
+[music-cli] vae  639/1005  (t=184611ms)
+[music-cli] vae  655/1005  (t=185158ms)
+[music-cli] vae  670/1005  (t=185411ms)
+[music-cli] vae  686/1005  (t=185492ms)
+[music-cli] vae  702/1005  (t=185553ms)
+[music-cli] vae  718/1005  (t=185598ms)
+[music-cli] vae  734/1005  (t=185642ms)
+[music-cli] vae  750/1005  (t=185695ms)
+[music-cli] vae  766/1005  (t=185819ms)
+[music-cli] vae  782/1005  (t=185894ms)
+[music-cli] vae  798/1005  (t=185949ms)
+[music-cli] vae  814/1005  (t=186021ms)
+[music-cli] vae  830/1005  (t=186154ms)
+[music-cli] vae  846/1005  (t=186224ms)
+[music-cli] vae  862/1005  (t=186299ms)
+[music-cli] vae  878/1005  (t=186376ms)
+[music-cli] vae  894/1005  (t=186716ms)
+[music-cli] vae  910/1005  (t=186876ms)
+[music-cli] vae  926/1005  (t=186983ms)
+[music-cli] vae  942/1005  (t=187096ms)
+[music-cli] vae  958/1005  (t=187592ms)
+[music-cli] vae  974/1005  (t=187809ms)
+[music-cli] vae  990/1005  (t=187996ms)
+[music-cli] vae  1005/1005  (t=188122ms) VAE render=18122ms
+[music-cli] vae  1/1  (t=188132ms) VAE render=18131ms
+[acestep-timing] per-stage wall clock (total 188132 ms)
+[acestep-timing]   reference      12679.1 ms    6.7%
+[acestep-timing]   lm            113441.2 ms   60.3%
+[acestep-timing]   detok           1605.6 ms    0.9%
+[acestep-timing]   textenc         2544.6 ms    1.4%
+[acestep-timing]   cond            2339.5 ms    1.2%
+[acestep-timing]   noise              0.9 ms    0.0%
+[acestep-timing]   dit            35953.5 ms   19.1%
+[acestep-timing]   vae            19567.4 ms   10.4%
+[acestep-engine] freeing VAE (low-mem)
+[music-cli] generated 116 codes, seed=22886, 1113600 frames (23.20s)
+[music-cli] wrote /Volumes/FreddyHD/Work/Tether/repos/qvac-ext-lib-whisper.cpp/engines/audiogen/output/qvac-22886/dlg-ref-gen-144826.wav: 1113600 frames, 23.20s @ 48000 Hz stereo

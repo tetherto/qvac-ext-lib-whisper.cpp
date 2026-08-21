@@ -1,0 +1,293 @@
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 0.012 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M1 Ultra)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple7  (1007)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 55662.79 MB
+ggml_metal_init: allocating
+ggml_metal_init: found device: Apple M1 Ultra
+ggml_metal_init: picking default device: Apple M1 Ultra
+ggml_metal_init: use fusion         = true
+ggml_metal_init: use concurrency    = true
+ggml_metal_init: use graph optimize = true
+[acestep-engine] DiT/VAE on GPU backend: MTL0
+[acestep-engine] backends: enc=MTL0 lm=MTL0 detok=CPU dit/vae=MTL0
+[bpe] loaded from GGUF: 151643 vocab, 151387 merges
+[bpe] loaded from GGUF: 151643 vocab, 151387 merges
+[acestep-engine] loading text-encoder
+[acestep-txt] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/Qwen3-Embedding-0.6B-Q8_0.gguf: 742.7 MB, 28 layers H=1024 Nh=16/8 D=128
+[acestep-engine] loading LM
+[acestep-lm] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-5Hz-lm-0.6B-Q8_0.gguf: 671.9 MB weights, 28 layers H=1024 V=217204 Nh=16/8 D=128, KV 448.0 MB (2 sets), FA=on
+[acestep-engine] loading cond-encoder
+[acestep-cond] encoder_hidden_size=0 special_token=1 -> use_timbre_cls=0
+[acestep-cond] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-v15-turbo-Q8_0.gguf: 617.0 MB, lyric(8L) timbre(4L) text_proj null_emb(2048)
+[acestep-engine] loading FSQ detokenizer
+[acestep-detok] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-v15-turbo-Q8_0.gguf: 106.5 MB, FSQ(6->2048) + 2L encoder(S=5, 2048->64)
+[acestep-engine] loading DiT
+[acestep-dit] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-v15-turbo-Q8_0.gguf: 1600.7 MB alloc + 0.0 MB mmapped, 24 layers H=2048 Nh=16/8 D=128
+[acestep-engine] loading VAE
+ggml_metal_init: allocating
+ggml_metal_init: found device: Apple M1 Ultra
+ggml_metal_init: picking default device: Apple M1 Ultra
+ggml_metal_init: use fusion         = true
+ggml_metal_init: use concurrency    = true
+ggml_metal_init: use graph optimize = true
+[acestep-vae] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/vae-BF16.gguf: 161.1 MB, decoder, upsample=1920x
+[acestep-engine] ready (threads=10, stages resident)
+[music-cli] lm   0/1  (t=0ms)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_get_rows_q8_0', name = 'kernel_get_rows_q8_0'
+ggml_metal_library_compile_pipeline: loaded kernel_get_rows_q8_0                          0x102924f20 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_rms_norm_mul_f32_4', name = 'kernel_rms_norm_mul_f32_4'
+ggml_metal_library_compile_pipeline: loaded kernel_rms_norm_mul_f32_4                     0x102925720 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_q8_0_f32', name = 'kernel_mul_mm_q8_0_f32_bci=0_bco=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_q8_0_f32_bci=0_bco=1            0x102925f20 | th_max =  896 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_rope_neox_f32', name = 'kernel_rope_neox_f32_imrope=0'
+ggml_metal_library_compile_pipeline: loaded kernel_rope_neox_f32_imrope=0                 0x102926720 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_cpy_f32_f32', name = 'kernel_cpy_f32_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_cpy_f32_f32                            0x102926f20 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_set_rows_f16_i64', name = 'kernel_set_rows_f16_i64'
+ggml_metal_library_compile_pipeline: loaded kernel_set_rows_f16_i64                       0x102927220 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_flash_attn_ext_blk', name = 'kernel_flash_attn_ext_blk_nqptg=8_ncpsg=64'
+ggml_metal_library_compile_pipeline: loaded kernel_flash_attn_ext_blk_nqptg=8_ncpsg=64      0x102927520 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_flash_attn_ext_f16_dk128_dv128', name = 'kernel_flash_attn_ext_f16_dk128_dv128_mask=1_sinks=0_bias=0_scap=0_kvpad=0_bcm=1_ns10=128_ns20=128_nsg=4'
+ggml_metal_library_compile_pipeline: loaded kernel_flash_attn_ext_f16_dk128_dv128_mask=1_sinks=0_bias=0_scap=0_kvpad=0_bcm=1_ns10=128_ns20=128_nsg=4      0x102927960 | th_max =  704 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32_4', name = 'kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=0_cb=0'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=0_cb=0      0x8215b8000 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_swiglu_f32', name = 'kernel_swiglu_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_swiglu_f32                             0x8215b8300 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_q8_0_f32', name = 'kernel_mul_mv_q8_0_f32_nsg=4_bias=0_res=0'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_q8_0_f32_nsg=4_bias=0_res=0      0x8215b8600 | th_max = 1024 | th_width =   32
+[lm-pipeline] prefill cond=93 uncond=30, max_new=140, temp=0.85 top_p=0.90 top_k=0 cfg=2.00 (batched decode)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_ext_q8_0_f32_r1_2', name = 'kernel_mul_mv_ext_q8_0_f32_r1_2_nsg=2_nxpsg=16'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_ext_q8_0_f32_r1_2_nsg=2_nxpsg=16      0x8215b8900 | th_max =  832 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_flash_attn_ext_vec_f16_dk128_dv128', name = 'kernel_flash_attn_ext_vec_f16_dk128_dv128_mask=1_sink=0_bias=0_scap=0_kvpad=0_ns10=128_ns20=128_nsg=1_nwg=32'
+ggml_metal_library_compile_pipeline: loaded kernel_flash_attn_ext_vec_f16_dk128_dv128_mask=1_sink=0_bias=0_scap=0_kvpad=0_ns10=128_ns20=128_nsg=1_nwg=32      0x8215b8c00 | th_max =  448 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_flash_attn_ext_vec_reduce', name = 'kernel_flash_attn_ext_vec_reduce_dv=128_nwg=32'
+ggml_metal_library_compile_pipeline: loaded kernel_flash_attn_ext_vec_reduce_dv=128_nwg=32      0x8215b8f00 | th_max = 1024 | th_width =   32
+[music-cli] lm   1/140  (t=427ms)
+[music-cli] lm   9/140  (t=527ms)
+[music-cli] lm   17/140  (t=638ms)
+[music-cli] lm   25/140  (t=754ms)
+[music-cli] lm   33/140  (t=854ms)
+[lm-pipeline] generated 40 audio codes
+[lm-pipeline] codes: 43979,62426,56298,1530,58824,51147,60371,61410,18377,16339,10710,11155,63963,1475,11739,36992,50134,61900,34259,49628,49661,59860,61403,21467,37851,33731,11220,63963,16338,24019,61718,10213,58850,13818,39374,38389,1493,61411,32855,35847
+[music-cli] lm   1/1  (t=932ms)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_get_rows_bf16', name = 'kernel_get_rows_bf16'
+ggml_metal_library_compile_pipeline: loaded kernel_get_rows_bf16                          0x8215b9200 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f32_f32', name = 'kernel_mul_mm_f32_f32_bci=0_bco=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f32_f32_bci=0_bco=1             0x8215b9500 | th_max =  832 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_soft_max_f16', name = 'kernel_soft_max_f16'
+ggml_metal_library_compile_pipeline: loaded kernel_soft_max_f16                           0x8215b9800 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_f32_f32', name = 'kernel_mul_mv_f32_f32_nsg=1_bias=0_res=0'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_f32_f32_nsg=1_bias=0_res=0      0x8215b9b00 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32_4', name = 'kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=1_cb=0'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=1_cb=0      0x8215b9e00 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f32_f32_prec', name = 'kernel_mul_mm_f32_f32_prec_bci=0_bco=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f32_f32_prec_bci=0_bco=1        0x8215ba100 | th_max =  640 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_f32_f32_short', name = 'kernel_mul_mv_f32_f32_short_nsg=1_bias=0_res=0'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_f32_f32_short_nsg=1_bias=0_res=0      0x8215ba400 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_soft_max_f32', name = 'kernel_soft_max_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_soft_max_f32                           0x8215ba700 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_f32_f32_4', name = 'kernel_mul_mv_f32_f32_4_nsg=1_bias=0_res=0'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_f32_f32_4_nsg=1_bias=0_res=0      0x8215baa00 | th_max =  768 | th_width =   32
+[acestep-engine] DiT: turbo=1 steps=8 shift=3.00 T=200 task=text2music
+[music-cli] dit  0/8  (t=1392ms)
+[music-cli] dit  0/8  (t=1392ms)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_unary_f32_f32', name = 'kernel_unary_f32_f32_op=10_cnt=1'
+ggml_metal_library_compile_pipeline: loaded kernel_unary_f32_f32_op=10_cnt=1              0x8215bad00 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_timestep_embedding_f32', name = 'kernel_timestep_embedding_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_timestep_embedding_f32                 0x8215bb000 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_unary_f32_f32_4', name = 'kernel_unary_f32_f32_4_op=106_cnt=1'
+ggml_metal_library_compile_pipeline: loaded kernel_unary_f32_f32_4_op=106_cnt=1           0x8215bb300 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32', name = 'kernel_bin_fuse_f32_f32_f32_op=1_nf=1_rb=1_cb=0'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_op=1_nf=1_rb=1_cb=0      0x8215bb600 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32', name = 'kernel_bin_fuse_f32_f32_f32_op=0_nf=1_rb=1_cb=1'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_op=0_nf=1_rb=1_cb=1      0x8215bb900 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32_4', name = 'kernel_bin_fuse_f32_f32_f32_4_op=2_nf=1_rb=0_cb=0'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_4_op=2_nf=1_rb=0_cb=0      0x8215bbc00 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_soft_max_f16_4', name = 'kernel_soft_max_f16_4'
+ggml_metal_library_compile_pipeline: loaded kernel_soft_max_f16_4                         0x821628000 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f32_f32', name = 'kernel_mul_mm_f32_f32_bci=1_bco=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f32_f32_bci=1_bco=1             0x821628300 | th_max =  896 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_soft_max_f32_4', name = 'kernel_soft_max_f32_4'
+ggml_metal_library_compile_pipeline: loaded kernel_soft_max_f32_4                         0x821628600 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32_4', name = 'kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=1_cb=1'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=1_cb=1      0x821628900 | th_max = 1024 | th_width =   32
+[music-cli] dit  1/8  (t=1459ms)
+[music-cli] dit  2/8  (t=1526ms)
+[music-cli] dit  3/8  (t=1592ms)
+[music-cli] dit  4/8  (t=1658ms)
+[music-cli] dit  5/8  (t=1724ms)
+[music-cli] dit  6/8  (t=1791ms)
+[music-cli] dit  7/8  (t=1862ms)
+[music-cli] dit  8/8  (t=1932ms)
+[music-cli] vae  0/1  (t=1932ms)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_im2col_f16', name = 'kernel_im2col_f16'
+ggml_metal_library_compile_pipeline: loaded kernel_im2col_f16                             0x821628c00 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f16_f16', name = 'kernel_mul_mm_f16_f16_bci=0_bco=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f16_f16_bci=0_bco=1             0x821628f00 | th_max =  896 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32', name = 'kernel_bin_fuse_f32_f32_f32_op=0_nf=1_rb=0_cb=1'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_op=0_nf=1_rb=0_cb=1      0x821629200 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_snake_f32', name = 'kernel_snake_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_snake_f32                              0x821629500 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f16_f32', name = 'kernel_mul_mm_f16_f32_bci=0_bco=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f16_f32_bci=0_bco=1             0x821629800 | th_max =  896 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_col2im_1d_f32', name = 'kernel_col2im_1d_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_col2im_1d_f32                          0x821629b00 | th_max = 1024 | th_width =   32
+[music-cli] vae  16/335  (t=2401ms)
+[music-cli] vae  32/335  (t=2406ms)
+[music-cli] vae  48/335  (t=2411ms)
+[music-cli] vae  64/335  (t=2417ms)
+[music-cli] vae  80/335  (t=2420ms)
+[music-cli] vae  96/335  (t=2427ms)
+[music-cli] vae  112/335  (t=2433ms)
+[music-cli] vae  128/335  (t=2439ms)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f16_f32', name = 'kernel_mul_mm_f16_f32_bci=0_bco=0'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f16_f32_bci=0_bco=0             0x821629e00 | th_max = 1024 | th_width =   32
+[music-cli] vae  144/335  (t=2446ms)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f16_f16', name = 'kernel_mul_mm_f16_f16_bci=0_bco=0'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f16_f16_bci=0_bco=0             0x82162a100 | th_max = 1024 | th_width =   32
+[music-cli] vae  160/335  (t=2453ms)
+[music-cli] vae  176/335  (t=2463ms)
+[music-cli] vae  192/335  (t=2470ms)
+[music-cli] vae  208/335  (t=2479ms)
+[music-cli] vae  224/335  (t=2491ms)
+[music-cli] vae  240/335  (t=2506ms)
+[music-cli] vae  256/335  (t=2520ms)
+[music-cli] vae  272/335  (t=2535ms)
+[music-cli] vae  288/335  (t=2559ms)
+[music-cli] vae  304/335  (t=2587ms)
+[music-cli] vae  320/335  (t=2614ms)
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_f16_f16_4', name = 'kernel_mul_mv_f16_f16_4_nsg=4_bias=0_res=0'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_f16_f16_4_nsg=4_bias=0_res=0      0x82162a400 | th_max = 1024 | th_width =   32
+[music-cli] vae  335/335  (t=2636ms) VAE render=704ms
+[music-cli] vae  1/1  (t=2637ms) VAE render=705ms
+[acestep-timing] per-stage wall clock (total 2637 ms)
+[acestep-timing]   lm               932.5 ms   35.4%
+[acestep-timing]   detok            400.8 ms   15.2%
+[acestep-timing]   textenc           45.4 ms    1.7%
+[acestep-timing]   cond              12.6 ms    0.5%
+[acestep-timing]   noise              0.3 ms    0.0%
+[acestep-timing]   dit              540.5 ms   20.5%
+[acestep-timing]   vae              705.1 ms   26.7%
+[music-cli] benchmark run 1/3: wall=2637.3 ms audio=8.00 s RTF=0.3297
+[music-cli] lm   0/1  (t=0ms)
+[lm-pipeline] prefill cond=93 uncond=30, max_new=140, temp=0.85 top_p=0.90 top_k=0 cfg=2.00 (batched decode)
+[music-cli] lm   1/140  (t=80ms)
+[music-cli] lm   9/140  (t=174ms)
+[music-cli] lm   17/140  (t=269ms)
+[music-cli] lm   25/140  (t=365ms)
+[music-cli] lm   33/140  (t=456ms)
+[lm-pipeline] generated 40 audio codes
+[lm-pipeline] codes: 43979,62426,56298,1530,58824,51147,60371,61410,18377,16339,10710,11155,63963,1475,11739,36992,50134,61900,34259,49628,49661,59860,61403,21467,37851,33731,11220,63963,16338,24019,61718,10213,58850,13818,39374,38389,1493,61411,32855,35847
+[music-cli] lm   1/1  (t=531ms)
+[acestep-engine] DiT: turbo=1 steps=8 shift=3.00 T=200 task=text2music
+[music-cli] dit  0/8  (t=678ms)
+[music-cli] dit  0/8  (t=678ms)
+[music-cli] dit  1/8  (t=744ms)
+[music-cli] dit  2/8  (t=811ms)
+[music-cli] dit  3/8  (t=877ms)
+[music-cli] dit  4/8  (t=943ms)
+[music-cli] dit  5/8  (t=1012ms)
+[music-cli] dit  6/8  (t=1079ms)
+[music-cli] dit  7/8  (t=1148ms)
+[music-cli] dit  8/8  (t=1216ms)
+[music-cli] vae  0/1  (t=1216ms)
+[music-cli] vae  16/335  (t=1280ms)
+[music-cli] vae  32/335  (t=1284ms)
+[music-cli] vae  48/335  (t=1287ms)
+[music-cli] vae  64/335  (t=1291ms)
+[music-cli] vae  80/335  (t=1295ms)
+[music-cli] vae  96/335  (t=1301ms)
+[music-cli] vae  112/335  (t=1307ms)
+[music-cli] vae  128/335  (t=1313ms)
+[music-cli] vae  144/335  (t=1318ms)
+[music-cli] vae  160/335  (t=1327ms)
+[music-cli] vae  176/335  (t=1335ms)
+[music-cli] vae  192/335  (t=1343ms)
+[music-cli] vae  208/335  (t=1351ms)
+[music-cli] vae  224/335  (t=1364ms)
+[music-cli] vae  240/335  (t=1378ms)
+[music-cli] vae  256/335  (t=1392ms)
+[music-cli] vae  272/335  (t=1407ms)
+[music-cli] vae  288/335  (t=1433ms)
+[music-cli] vae  304/335  (t=1460ms)
+[music-cli] vae  320/335  (t=1486ms)
+[music-cli] vae  335/335  (t=1509ms) VAE render=293ms
+[music-cli] vae  1/1  (t=1510ms) VAE render=294ms
+[acestep-timing] per-stage wall clock (total 1510 ms)
+[acestep-timing]   lm               531.4 ms   35.2%
+[acestep-timing]   detok             95.6 ms    6.3%
+[acestep-timing]   textenc           37.4 ms    2.5%
+[acestep-timing]   cond              13.0 ms    0.9%
+[acestep-timing]   noise              0.3 ms    0.0%
+[acestep-timing]   dit              538.1 ms   35.6%
+[acestep-timing]   vae              293.9 ms   19.5%
+[music-cli] benchmark run 2/3: wall=1509.8 ms audio=8.00 s RTF=0.1887
+[music-cli] lm   0/1  (t=0ms)
+[lm-pipeline] prefill cond=93 uncond=30, max_new=140, temp=0.85 top_p=0.90 top_k=0 cfg=2.00 (batched decode)
+[music-cli] lm   1/140  (t=75ms)
+[music-cli] lm   9/140  (t=171ms)
+[music-cli] lm   17/140  (t=272ms)
+[music-cli] lm   25/140  (t=366ms)
+[music-cli] lm   33/140  (t=458ms)
+[lm-pipeline] generated 40 audio codes
+[lm-pipeline] codes: 43979,62426,56298,1530,58824,51147,60371,61410,18377,16339,10710,11155,63963,1475,11739,36992,50134,61900,34259,49628,49661,59860,61403,21467,37851,33731,11220,63963,16338,24019,61718,10213,58850,13818,39374,38389,1493,61411,32855,35847
+[music-cli] lm   1/1  (t=530ms)
+[acestep-engine] DiT: turbo=1 steps=8 shift=3.00 T=200 task=text2music
+[music-cli] dit  0/8  (t=675ms)
+[music-cli] dit  0/8  (t=675ms)
+[music-cli] dit  1/8  (t=742ms)
+[music-cli] dit  2/8  (t=808ms)
+[music-cli] dit  3/8  (t=875ms)
+[music-cli] dit  4/8  (t=941ms)
+[music-cli] dit  5/8  (t=1008ms)
+[music-cli] dit  6/8  (t=1074ms)
+[music-cli] dit  7/8  (t=1140ms)
+[music-cli] dit  8/8  (t=1207ms)
+[music-cli] vae  0/1  (t=1207ms)
+[music-cli] vae  16/335  (t=1266ms)
+[music-cli] vae  32/335  (t=1269ms)
+[music-cli] vae  48/335  (t=1272ms)
+[music-cli] vae  64/335  (t=1276ms)
+[music-cli] vae  80/335  (t=1282ms)
+[music-cli] vae  96/335  (t=1287ms)
+[music-cli] vae  112/335  (t=1293ms)
+[music-cli] vae  128/335  (t=1299ms)
+[music-cli] vae  144/335  (t=1305ms)
+[music-cli] vae  160/335  (t=1313ms)
+[music-cli] vae  176/335  (t=1321ms)
+[music-cli] vae  192/335  (t=1330ms)
+[music-cli] vae  208/335  (t=1339ms)
+[music-cli] vae  224/335  (t=1352ms)
+[music-cli] vae  240/335  (t=1366ms)
+[music-cli] vae  256/335  (t=1378ms)
+[music-cli] vae  272/335  (t=1393ms)
+[music-cli] vae  288/335  (t=1419ms)
+[music-cli] vae  304/335  (t=1445ms)
+[music-cli] vae  320/335  (t=1473ms)
+[music-cli] vae  335/335  (t=1495ms) VAE render=288ms
+[music-cli] vae  1/1  (t=1499ms) VAE render=292ms
+[acestep-timing] per-stage wall clock (total 1499 ms)
+[acestep-timing]   lm               529.8 ms   35.3%
+[acestep-timing]   detok            100.5 ms    6.7%
+[acestep-timing]   textenc           32.8 ms    2.2%
+[acestep-timing]   cond              11.6 ms    0.8%
+[acestep-timing]   noise              0.3 ms    0.0%
+[acestep-timing]   dit              531.9 ms   35.5%
+[acestep-timing]   vae              292.5 ms   19.5%
+[music-cli] benchmark run 3/3: wall=1499.6 ms audio=8.00 s RTF=0.1874
+[music-cli] generated 40 codes, seed=22655, 384000 frames (8.00s)
+[music-cli] wrote /Volumes/FreddyHD/Work/Tether/repos/qvac-ext-lib-whisper.cpp/engines/audiogen/output/qvac-22655/resident-detok-cpu-repeat-3.wav: 384000 frames, 8.00s @ 48000 Hz stereo
+ggml_metal_free: deallocating
+ggml_metal_free: deallocating

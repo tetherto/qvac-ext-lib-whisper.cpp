@@ -497,10 +497,6 @@ static constexpr int TURBO_STEPS            = 8;
 static constexpr int STANDARD_STEPS         = 50;
 static constexpr float TURBO_SHIFT          = 3.0f;
 static constexpr float STANDARD_SHIFT       = 1.0f;
-static constexpr float TURBO_GUIDANCE       = 1.0f;
-static constexpr float STANDARD_GUIDANCE    = 7.0f;
-static constexpr const char * LEGO_ERROR_TURBO =
-    "acestep engine: task 'lego' requires a base/sft DiT (turbo does not support stem tasks)";
 static constexpr int DIT_BATCH_SIZE         = 1;
 static constexpr int EDIT_CONTEXT_PLANES    = 2;
 static constexpr int EDIT_NO_SOURCE_FRAMES  = 0;
@@ -960,8 +956,9 @@ static void encode_cross_attention(EngineImpl & engine, const PromptEncoding & p
 }
 
 static void validate_lego_model(const DitConfig & config, const GenerateTask & task) {
-    if (is_lego_task(task.type) && config.is_turbo) {
-        throw std::invalid_argument(LEGO_ERROR_TURBO);
+    if (!is_lego_task(task.type)) return;
+    if (const std::string error = lego_model_error(config.is_turbo, config.is_sft); !error.empty()) {
+        throw std::invalid_argument(error);
     }
 }
 
@@ -1044,18 +1041,13 @@ static void dump_parity_inputs(const std::vector<float> & latent, const NoiseSch
 }
 #endif
 
-static float resolve_guidance_scale(const GenerateParams & params, const DitConfig & config) {
-    if (params.guidance_scale > 0.0f) return params.guidance_scale;
-    return config.is_turbo ? TURBO_GUIDANCE : STANDARD_GUIDANCE;
-}
-
 template <typename EngineImpl>
 static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params,
                               const GenerationState & state, EncoderConditioning & conditioning,
                               NoiseSchedule & noise, const StageReporter & report,
                               StageDump & dump, StageTimes & timing, std::vector<float> & latent) {
     const DitConfig & config = engine.dit_cfg;
-    const float guidance = resolve_guidance_scale(params, config);
+    const float guidance = resolve_guidance_scale(params.guidance_scale, config.is_turbo);
     if (engine.opts.verbose) {
         fprintf(stderr, "[acestep-engine] DiT: turbo=%d steps=%d shift=%.2f guidance=%.2f T=%d task=%s\n",
                 (int) config.is_turbo, noise.steps, noise.shift, guidance,
@@ -1077,9 +1069,7 @@ static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params
     sample.real_enc_S = &conditioning.sequence;
     sample.guidance_scale = guidance;
     sample.null_cond_emb = conditioning.null_emb.empty() ? nullptr : conditioning.null_emb.data();
-    // DCW is a turbo-preset correction: the official UI disables it for
-    // base/sft models, and base-model quality is validated without it.
-    sample.dcw_enabled = params.dcw_enabled && config.is_turbo;
+    sample.dcw_enabled = resolve_dcw_enabled(params.dcw_enabled, config.is_turbo);
     sample.dcw_scaler = params.dcw_scaler;
     sample.dcw_high_scaler = params.dcw_high_scaler;
     sample.on_step = [&](int step, int total) { return report("dit", step, total); };
@@ -1127,6 +1117,16 @@ static bool decode_audio(EngineImpl & engine, const std::vector<float> & latent,
         engine.free_vae();
     }
     return true;
+}
+
+// A lego stem must mix sample-for-sample over its source: latent frames are
+// patch-aligned upward, so the decode can overshoot the source length.
+static void trim_stem_to_source(const GenerateParams & params, const GenerationState & state,
+                                GenerateResult & result) {
+    if (!is_lego_task(state.task.type)) return;
+    if (result.pcm.size() > params.source_audio.size()) {
+        result.pcm.resize(params.source_audio.size());
+    }
 }
 
 static AcePrompt make_edit_prompt(const GenerateParams & params, const std::string & caption,
@@ -1806,6 +1806,7 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
                       report, dump, timing, result)) {
         return result;
     }
+    trim_stem_to_source(params, state, result);
     populate_metadata(state, result);
     return result;
 }

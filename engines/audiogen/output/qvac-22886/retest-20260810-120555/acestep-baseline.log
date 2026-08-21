@@ -1,0 +1,99 @@
+[Request] Parsed /Volumes/FreddyHD/Work/Tether/repos/qvac-ext-lib-whisper.cpp/engines/audiogen/output/qvac-22886/retest-20260810-120555/acestep-req.json
+[Request] seed=4242 lm_batch=1 synth_batch=1
+[Request] caption: Polished modern electronic pop with crisp bright hi-hats and...
+[Request] lyrics: 201 bytes
+[Request] bpm=124 dur=30 key=A minor ts=4 lang=en
+[Request] lm: temp=0.85 cfg=2.0 top_p=0.90 top_k=0
+[Request] dit: steps=8 guidance=0.0 shift=3.0
+[Request] task_type: text2music
+[Request] solver: euler (stork_substeps=10)
+[Request] lm_mode: generate
+[Request] output_format: wav16
+[Request] peak_clip: 0
+[Request] synth_model: acestep-v15-turbo-Q8_0.gguf
+[Request] lm_model: acestep-5Hz-lm-0.6B-Q8_0.gguf
+[Request] vae: vae-BF16.gguf
+[Request] audio_codes: (present)
+[Ace-Synth] Batch: 1 request(s)
+[Registry] Qwen3-Embedding-0.6B-Q8_0.gguf -> Text-Enc
+[Registry] acestep-5Hz-lm-0.6B-Q8_0.gguf -> LM
+[Registry] acestep-5Hz-lm-4B-Q8_0.gguf -> LM
+[Registry] acestep-v15-sft-Q8_0.gguf -> DiT
+[Registry] acestep-v15-turbo-Q4_K_M.gguf -> DiT
+[Registry] acestep-v15-turbo-Q8_0.gguf -> DiT
+[Registry] vae-BF16.gguf -> VAE
+[Store] Created (policy=STRICT)
+[GGUF] models/acestep-v15-turbo-Q8_0.gguf: 678 tensors, data at offset 56864
+[GGUF] models/acestep-v15-turbo-Q8_0.gguf: 678 tensors, data at offset 56864
+[Synth-Load] Ready: turbo=yes, fa=yes, batch_cfg=yes
+[Resolve-Params] max audio codes across batch: 149 (29.8s @ 5Hz)
+[Resolve-T] T=746, S=373
+[Resolve-T] seed=4242, steps=8, guidance=1.0, shift=3.0, duration=30.0s
+[BPE] Loaded from GGUF: 151643 vocab, 151387 merges
+[Load] TextEncoder backend: CPU (CPU threads: 10)
+[GGUF] models/Qwen3-Embedding-0.6B-Q8_0.gguf: 310 tensors, data at offset 5337664
+[Load] TextEncoder: 28L, H=1024, Nh=16/8
+[Qwen3] Attn: Q+K+V fused
+[Qwen3] MLP: gate+up fused
+[WeightCtx] Loaded 310 tensors, 742.7 MB into backend
+[Store] Load TextEnc: 3167 ms
+[Store] Unload TextEnc (742.7 MB)
+[Load] CondEncoder backend: CPU (CPU threads: 10)
+[GGUF] models/acestep-v15-turbo-Q8_0.gguf: 678 tensors, data at offset 56864
+[Load] LyricEncoder: 8L
+[Qwen3] Attn: Q+K+V fused
+[Qwen3] MLP: gate+up fused
+[Load] TimbreEncoder: 4L
+[Qwen3] Attn: Q+K+V fused
+[Qwen3] MLP: gate+up fused
+[WeightCtx] Loaded 140 tensors, 616.6 MB into backend
+[Load] CondEncoder: lyric(8L), timbre(4L), text_proj, null_cond
+[Store] Load CondEnc: 2871 ms
+[CondEnc] Lyric sliding mask: 56x56, window=128
+[CondEnc] Timbre sliding mask: 1x1, window=128
+[Encode] Packed: lyric=56 + timbre=1 + text=100 = 157 tokens
+[Encode-Text Batch0] 100+56 tokens -> enc_S=157, 81.8 ms
+[Store] Unload CondEnc (616.6 MB)
+[Load] Detokenizer backend: CPU (CPU threads: 10)
+[GGUF] models/acestep-v15-turbo-Q8_0.gguf: 678 tensors, data at offset 56864
+[WeightCtx] Loaded 30 tensors, 106.5 MB into backend
+[Load] Detokenizer: FSQ(6->2048) + 2L encoder(S=5, 2048->64)
+[Store] Load FSQ-Detok: 395 ms
+[Context] Decoded: 149 codes -> 745 frames (29.8s @ 25Hz)
+[Build-Context Batch0] Detokenizer: 384.8 ms, 149 codes
+[Store] Unload FSQ-Detok (106.5 MB)
+[Init-Noise Batch0] Philox noise seed=4242, [746, 64] solver=euler
+[Init-Noise] Starting: T=746, S=373, enc_S=157, steps=8, batch=1 (cover)
+[Load] DiT backend: CPU (CPU threads: 10)
+[GGUF] models/acestep-v15-turbo-Q8_0.gguf: 678 tensors, data at offset 56864
+[DiT] Self-attn: Q+K+V fused
+[DiT] Cross-attn: Q+K+V fused
+[DiT] MLP: gate+up fused
+[Load] null_condition_emb found (CFG available)
+[WeightCtx] Loaded 478 tensors, 1600.7 MB into backend
+[Load] DiT: 24 layers, H=2048, Nh=16/8, D=128
+[Store] Load DiT: 9569 ms
+[DiT] Batch N=1, T=746, S=373, enc_S=157
+[DiT] Graph: 2129 nodes
+[DiT] Solver: ODE Euler (1 NFE/step, order 1)
+[DiT] Step 1/8 t=1.000
+[DiT] Step 2/8 t=0.955
+[DiT] Step 3/8 t=0.900
+[DiT] Step 4/8 t=0.833
+[DiT] Step 5/8 t=0.750
+[DiT] Step 6/8 t=0.643
+[DiT] Step 7/8 t=0.500
+[DiT] Step 8/8 t=0.300
+[DiT-Generate] Total: 13186.8 ms (13186.8 ms/sample)
+[Store] Unload DiT (1600.7 MB)
+[GGUF] models/vae-BF16.gguf: 365 tensors, data at offset 30048
+[Load] VAE backend: CPU (CPU threads: 10)
+[VAE] Backend: CPU, Weight buffer: 161.1 MB
+[VAE] Loaded: 5 blocks, upsample=1920x, F32 activations
+[Store] Load VAE-Dec: 1059 ms
+[VAE] Graph: 479 nodes, T_latent=746
+[VAE] Decoded: T_latent=746 -> T_audio=1432320 (29.84s @ 48kHz)
+[VAE-Decode Batch0] Decode: 15160.4 ms
+[Store] Unload VAE-Dec (161.1 MB)
+[WAV] Wrote /Volumes/FreddyHD/Work/Tether/repos/qvac-ext-lib-whisper.cpp/engines/audiogen/output/qvac-22886/retest-20260810-120555/acestep-req0.wav: 1432320 samples, 48000 Hz, stereo
+[Ace-Synth] All done

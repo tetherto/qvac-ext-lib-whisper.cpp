@@ -140,7 +140,8 @@ the [TTS capability table](engines/tts/README.md#capabilities).
 | Model | Engine | Task | Rate | Quantization | Backends | Notes |
 |---|---|---|---|---|---|---|
 | ACE-Step v15 turbo | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0`, `q4_k_m` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 8 diffusion steps by default |
-| ACE-Step v15 sft | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 50 diffusion steps by default |
+| ACE-Step v15 sft | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 50 diffusion steps by default, CFG via APG |
+| ACE-Step v15 base | audiogen | text-to-music, multi-track (lego) stems | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 50 diffusion steps by default, CFG via APG, `--task lego --track <layer>` |
 | MiniMax-Music3 | audiogen | text-to-music | 44.1 kHz stereo | `f16`, `q8_0` | CPU desktop | 25 fps, 30 flow steps, two GGUF files |
 
 ## Build

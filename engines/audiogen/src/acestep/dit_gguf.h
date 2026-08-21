@@ -95,6 +95,7 @@ inline size_t dit_gguf_mapped_bytes(ggml_context * ctx, const DitGGUF & g) {
 uint32_t dit_gguf_u32(const DitGGUF & g, const std::string & key);
 float    dit_gguf_f32(const DitGGUF & g, const std::string & key);
 bool     dit_gguf_bool(const DitGGUF & g, const std::string & key, bool def);  // def if key missing
+std::string dit_gguf_str(const DitGGUF & g, const std::string & key, const std::string & def);
 
 // Read the full DiT config from metadata. Returns false if any key is missing.
 bool dit_gguf_read_config(const DitGGUF & g, DitConfig & cfg);

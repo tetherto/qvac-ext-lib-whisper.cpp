@@ -84,12 +84,30 @@ The most specific stems (`embedding`, `vae`) are tested first so no short token 
 
 ### DiT variants
 
-Detected from the `acestep.is_turbo` GGUF key; absent means base or sft.
+Detected from the `acestep.is_turbo` GGUF key (absent means base or sft) and
+`general.name` (an "sft" substring marks the sft fine-tune).
 
-| Variant | Default steps | Default shift | Notes |
-|---|--:|--:|---|
-| turbo | 8 | 3.0 | fastest, no CFG on the DiT |
-| base / sft | 50 | 1.0 | DiT CFG and APG (`guidance > 1`) are deferred |
+| Variant | Default steps | Default shift | Default guidance | Notes |
+|---|--:|--:|--:|---|
+| turbo | 8 | 3.0 | 1.0 | fastest; guidance-distilled, CFG overrides are clamped to 1.0 |
+| base | 50 | 1.0 | 7.0 | CFG via APG; the only variant supporting the lego stem task |
+| sft | 50 | 1.0 | 7.0 | CFG via APG; no stem tasks |
+
+### Multi-Track (lego)
+
+`task_type: "lego"` generates a new instrument layer that follows
+`source_audio` and returns only that stem, trimmed to the source length for
+sample-for-sample mixing. It requires a base DiT (turbo and sft are rejected)
+and a `track` name — one of vocals, backing_vocals, drums, bass, guitar,
+keyboard, percussion, strings, synth, fx, brass, woodwinds:
+
+```bash
+music-cli --models <dir> --task lego --track guitar \
+  --caption "clean electric guitar with syncopated fills" \
+  --lyrics "[Instrumental]" --src-audio song.wav --out stem.wav
+```
+
+`--guidance F` overrides the DiT guidance scale on base/sft (0 = auto).
 
 Weights load quantized. `f32`, `f16`, and `bf16` are handled for norms and biases, and the detokenizer's `special_tokens` may be `q8_0`. This tree ships no converter: the stage GGUFs come from `convert.py` in [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp), the upstream C++/ggml implementation this port follows, which also publishes pre-quantized GGUFs at [Serveurperso/ACE-Step-1.5-GGUF](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF).
 

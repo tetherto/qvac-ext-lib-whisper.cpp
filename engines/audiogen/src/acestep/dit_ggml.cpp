@@ -830,9 +830,6 @@ static void preserve_repaint_latent(const DitSampleParams & params, size_t laten
         (size_t) params.T, params.repaint_crossfade_frames, channels);
 }
 
-// APG (Adaptive Projected Guidance), official ACE-Step base/sft CFG combine.
-// Math in double precision; norms and projection run per channel over the
-// temporal axis (upstream apg_forward with dims=[1] on [B, T, C]).
 static constexpr double DIT_APG_MOMENTUM       = -0.75;
 static constexpr double DIT_APG_NORM_THRESHOLD = 2.5;
 
@@ -897,6 +894,32 @@ static void apg_project_orthogonal(double * diff, const float * cond, int T, int
     }
 }
 
+static std::vector<double> apg_velocity_difference(const std::vector<float> & velocity,
+                                                   const std::vector<float> & velocity_uncond) {
+    std::vector<double> diff(velocity.size());
+    for (size_t i = 0; i < diff.size(); i++) {
+        diff[i] = (double) velocity[i] - (double) velocity_uncond[i];
+    }
+    return diff;
+}
+
+static void apg_shape_batch_updates(std::vector<double> & diff, const std::vector<float> & velocity,
+                                    int T, int Oc, int N) {
+    const size_t n_per = (size_t) T * Oc;
+    for (int b = 0; b < N; b++) {
+        apg_clip_channel_norms(diff.data() + (size_t) b * n_per, T, Oc);
+        apg_project_orthogonal(diff.data() + (size_t) b * n_per, velocity.data() + (size_t) b * n_per, T, Oc);
+    }
+}
+
+static void apg_apply_guided_update(std::vector<float> & velocity, const std::vector<double> & diff,
+                                    float guidance_scale) {
+    const double weight = (double) guidance_scale - 1.0;
+    for (size_t i = 0; i < diff.size(); i++) {
+        velocity[i] = (float) ((double) velocity[i] + weight * diff[i]);
+    }
+}
+
 void dit_apg_guide(std::vector<float> &       velocity,
                    const std::vector<float> & velocity_uncond,
                    std::vector<double> &      momentum,
@@ -904,20 +927,10 @@ void dit_apg_guide(std::vector<float> &       velocity,
                    int                        T,
                    int                        Oc,
                    int                        N) {
-    const size_t n_per = (size_t) T * Oc;
-    std::vector<double> diff(n_per * N);
-    for (size_t i = 0; i < diff.size(); i++) {
-        diff[i] = (double) velocity[i] - (double) velocity_uncond[i];
-    }
+    std::vector<double> diff = apg_velocity_difference(velocity, velocity_uncond);
     apg_accumulate_momentum(momentum, diff);
-    for (int b = 0; b < N; b++) {
-        apg_clip_channel_norms(diff.data() + (size_t) b * n_per, T, Oc);
-        apg_project_orthogonal(diff.data() + (size_t) b * n_per, velocity.data() + (size_t) b * n_per, T, Oc);
-    }
-    const double weight = (double) guidance_scale - 1.0;
-    for (size_t i = 0; i < diff.size(); i++) {
-        velocity[i] = (float) ((double) velocity[i] + weight * diff[i]);
-    }
+    apg_shape_batch_updates(diff, velocity, T, Oc, N);
+    apg_apply_guided_update(velocity, diff, guidance_scale);
 }
 
 static std::vector<float> make_null_enc_hidden(const float * null_emb, int H_enc, int enc_S, int N) {

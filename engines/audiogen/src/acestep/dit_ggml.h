@@ -45,6 +45,8 @@ struct DitConfig {
     float rms_norm_eps      = 0.0f;
     int   enc_hidden_size   = 0;     // condition_embedder input dim (from weight shape)
     bool  is_turbo          = true;  // acestep.is_turbo: turbo=8 steps/shift 3; base/sft=50/shift 1
+    bool  is_sft            = false; // general.name contains "sft": CFG-capable, no stem tasks
+    std::string model_name;          // general.name from the GGUF (checkpoint dir name)
 };
 
 struct DitModel;  // opaque: fused weight tensors + backend weight buffer

@@ -1,0 +1,22 @@
+{
+  "caption": "Polished modern electronic pop with crisp bright hi-hats and cymbals, tight punchy drums locked to 124 BPM, deep controlled sub bass, detailed stereo synths, clear female vocal, clean professional mix",
+  "seed": 4242,
+  "lyrics": "[Verse]\nSilver sparks are falling through the midnight air\nEvery beat is calling and it pulls me there\n[Chorus]\nHold the rhythm steady, let the skyline glow\nBright above the city, deep beneath the flow",
+  "bpm": 124,
+  "duration": 30.0,
+  "keyscale": "A minor",
+  "timesignature": "4",
+  "vocal_language": "en",
+  "lm_seed": 4242,
+  "use_cot_caption": false,
+  "inference_steps": 8,
+  "shift": 3.0,
+  "solver": "euler",
+  "lm_mode": "generate",
+  "output_format": "wav16",
+  "task_type": "text2music",
+  "peak_clip": 0,
+  "synth_model": "acestep-v15-turbo-Q8_0.gguf",
+  "lm_model": "acestep-5Hz-lm-0.6B-Q8_0.gguf",
+  "vae": "vae-BF16.gguf"
+}

@@ -1,0 +1,111 @@
+[music-cli] --req: 149 pre-supplied audio codes (LM bypass)
+ggml_metal_device_init: error: MTLCreateSystemDefaultDevice returned nil - Metal not available on this device
+ggml_backend_metal_reg: error: failed to init Metal device 0 - skipping
+[bpe] loaded from GGUF: 151643 vocab, 151387 merges
+[bpe] loaded from GGUF: 151643 vocab, 151387 merges
+[acestep-engine] ready (threads=20, stages lazy/low-mem)
+[music-cli] lm   0/1  (t=0ms)
+[acestep-engine] using 149 pre-supplied codes (LM skipped)
+[music-cli] lm   1/1  (t=0ms)
+[acestep-engine] loading FSQ detokenizer
+[acestep-detok] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-v15-turbo-Q8_0.gguf: 106.5 MB, FSQ(6->2048) + 2L encoder(S=5, 2048->64)
+[acestep-engine] freeing FSQ detokenizer (low-mem)
+[acestep-engine] loading cond-encoder
+[acestep-cond] encoder_hidden_size=0 special_token=1 -> use_timbre_cls=0
+[acestep-cond] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-v15-turbo-Q8_0.gguf: 617.0 MB, lyric(8L) timbre(4L) text_proj null_emb(2048)
+[acestep-engine] loading text-encoder
+[acestep-txt] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/Qwen3-Embedding-0.6B-Q8_0.gguf: 742.7 MB, 28 layers H=1024 Nh=16/8 D=128
+[acestep-engine] freeing text-encoder (low-mem)
+[acestep-engine] freeing cond-encoder (low-mem)
+[acestep-engine] DiT: turbo=1 steps=8 shift=3.00 T=746
+[acestep-engine] loading DiT
+[acestep-dit] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/acestep-v15-turbo-Q8_0.gguf: 5.9 MB alloc + 1594.8 MB mmapped, 24 layers H=2048 Nh=16/8 D=128
+[music-cli] dit  0/8  (t=9755ms)
+[music-cli] dit  0/8  (t=9755ms)
+[music-cli] dit  1/8  (t=18481ms)
+[music-cli] dit  2/8  (t=23102ms)
+[music-cli] dit  3/8  (t=26261ms)
+[music-cli] dit  4/8  (t=31867ms)
+[music-cli] dit  5/8  (t=35866ms)
+[music-cli] dit  6/8  (t=39637ms)
+[music-cli] dit  7/8  (t=42334ms)
+[music-cli] dit  8/8  (t=45881ms)
+[acestep-engine] freeing DiT (low-mem)
+[acestep-engine] loading VAE
+[acestep-vae] loaded /Volumes/FreddyHD/Work/Tether/repos/acestep.cpp/models/vae-BF16.gguf: 161.1 MB, decoder, upsample=1920x
+[music-cli] vae  0/1  (t=47048ms)
+[music-cli] vae  16/1005  (t=47154ms)
+[music-cli] vae  32/1005  (t=47285ms)
+[music-cli] vae  48/1005  (t=47388ms)
+[music-cli] vae  64/1005  (t=47480ms)
+[music-cli] vae  80/1005  (t=47582ms)
+[music-cli] vae  96/1005  (t=47924ms)
+[music-cli] vae  112/1005  (t=48146ms)
+[music-cli] vae  128/1005  (t=48275ms)
+[music-cli] vae  144/1005  (t=48481ms)
+[music-cli] vae  160/1005  (t=48806ms)
+[music-cli] vae  176/1005  (t=48991ms)
+[music-cli] vae  192/1005  (t=49183ms)
+[music-cli] vae  208/1005  (t=49464ms)
+[music-cli] vae  224/1005  (t=50271ms)
+[music-cli] vae  240/1005  (t=51043ms)
+[music-cli] vae  256/1005  (t=51518ms)
+[music-cli] vae  272/1005  (t=51852ms)
+[music-cli] vae  288/1005  (t=52989ms)
+[music-cli] vae  304/1005  (t=53486ms)
+[music-cli] vae  320/1005  (t=53949ms)
+[music-cli] vae  335/1005  (t=54204ms)
+[music-cli] vae  351/1005  (t=54367ms)
+[music-cli] vae  367/1005  (t=54535ms)
+[music-cli] vae  383/1005  (t=54673ms)
+[music-cli] vae  399/1005  (t=54769ms)
+[music-cli] vae  415/1005  (t=54898ms)
+[music-cli] vae  431/1005  (t=55291ms)
+[music-cli] vae  447/1005  (t=55511ms)
+[music-cli] vae  463/1005  (t=55706ms)
+[music-cli] vae  479/1005  (t=55891ms)
+[music-cli] vae  495/1005  (t=56305ms)
+[music-cli] vae  511/1005  (t=56732ms)
+[music-cli] vae  527/1005  (t=57027ms)
+[music-cli] vae  543/1005  (t=57279ms)
+[music-cli] vae  559/1005  (t=58261ms)
+[music-cli] vae  575/1005  (t=58614ms)
+[music-cli] vae  591/1005  (t=58907ms)
+[music-cli] vae  607/1005  (t=59276ms)
+[music-cli] vae  623/1005  (t=60624ms)
+[music-cli] vae  639/1005  (t=61247ms)
+[music-cli] vae  655/1005  (t=61799ms)
+[music-cli] vae  670/1005  (t=62117ms)
+[music-cli] vae  686/1005  (t=62260ms)
+[music-cli] vae  702/1005  (t=62415ms)
+[music-cli] vae  718/1005  (t=62509ms)
+[music-cli] vae  734/1005  (t=62598ms)
+[music-cli] vae  750/1005  (t=62698ms)
+[music-cli] vae  766/1005  (t=63047ms)
+[music-cli] vae  782/1005  (t=63235ms)
+[music-cli] vae  798/1005  (t=63380ms)
+[music-cli] vae  814/1005  (t=63512ms)
+[music-cli] vae  830/1005  (t=63873ms)
+[music-cli] vae  846/1005  (t=64050ms)
+[music-cli] vae  862/1005  (t=64243ms)
+[music-cli] vae  878/1005  (t=64387ms)
+[music-cli] vae  894/1005  (t=65250ms)
+[music-cli] vae  910/1005  (t=65497ms)
+[music-cli] vae  926/1005  (t=65794ms)
+[music-cli] vae  942/1005  (t=66215ms)
+[music-cli] vae  958/1005  (t=67390ms)
+[music-cli] vae  974/1005  (t=67995ms)
+[music-cli] vae  990/1005  (t=68531ms)
+[music-cli] vae  1005/1005  (t=68790ms) VAE render=21741ms
+[music-cli] vae  1/1  (t=68833ms) VAE render=21785ms
+[acestep-timing] per-stage wall clock (total 68833 ms)
+[acestep-timing]   lm                 0.0 ms    0.0%
+[acestep-timing]   detok           6219.7 ms    9.0%
+[acestep-timing]   textenc         1970.9 ms    2.9%
+[acestep-timing]   cond            1494.6 ms    2.2%
+[acestep-timing]   noise              1.2 ms    0.0%
+[acestep-timing]   dit            36195.0 ms   52.6%
+[acestep-timing]   vae            22951.9 ms   33.3%
+[acestep-engine] freeing VAE (low-mem)
+[music-cli] generated 149 codes, seed=4242, 1432320 frames (29.84s)
+[music-cli] wrote /Volumes/FreddyHD/Work/Tether/repos/qvac-ext-lib-whisper.cpp/engines/audiogen/output/qvac-22886/retest-20260810-120555/baseline.wav: 1432320 frames, 29.84s @ 48000 Hz stereo
