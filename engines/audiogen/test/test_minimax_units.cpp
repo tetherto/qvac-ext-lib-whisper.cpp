@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -49,6 +50,20 @@ bool throws_runtime_error(Function function) {
         return true;
     }
     return false;
+}
+
+// MSVC has no POSIX setenv/unsetenv; _putenv_s(key, "") removes the variable,
+// which matches backend_configure_device treating an empty value as unset.
+void set_env(const char * key, const char * value) {
+#ifdef _WIN32
+    _putenv_s(key, value ? value : "");
+#else
+    if (value) {
+        setenv(key, value, 1);
+    } else {
+        unsetenv(key);
+    }
+#endif
 }
 
 bool close(float left, float right, float tolerance = 1e-6f) {
@@ -782,17 +797,17 @@ void test_backend_configuration() {
 void test_device_configuration() {
     CHECK(throws_runtime_error([] { backend_configure_device("fast"); }));
 
-    setenv("MM3_DEVICE", "auto", 1);
+    set_env("MM3_DEVICE", "auto");
     backend_configure_device("cpu");
     CHECK(g_backend_device == "cpu");
 
     backend_configure_device("");
     CHECK(g_backend_device == "auto");
 
-    setenv("MM3_DEVICE", "vulkan", 1);
+    set_env("MM3_DEVICE", "vulkan");
     CHECK(throws_runtime_error([] { backend_configure_device(""); }));
 
-    unsetenv("MM3_DEVICE");
+    set_env("MM3_DEVICE", nullptr);
     backend_configure_device("");
     CHECK(g_backend_device == "cpu");
 }
