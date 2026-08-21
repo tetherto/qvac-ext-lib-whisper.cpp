@@ -40,8 +40,15 @@ MiniMax uses two GGUF files: `mm3-lm-<quant>.gguf` for the Qwen3 global LM and
 and vocoder. Set `EngineOptions::model_dir`, or provide `lm_model_path` and
 `synth_model_path` explicitly. Directory discovery matches quantized pairs
 case-insensitively, prefers `q8_0`, then `f16`, then `bf16`, and rejects
-duplicate candidates. The engine is CPU-only and desktop-only. One MiniMax
-engine instance may be active at a time because its compute graphs are shared.
+duplicate candidates. The engine is desktop-only. It runs on CPU by default;
+`EngineOptions::device` (or, when that is empty, the `MM3_DEVICE` environment
+variable) accepts `cpu`, `gpu`, or `auto`. `gpu` requires a usable GPU backend
+and fails engine creation without one; `auto` takes a GPU when available and
+otherwise falls back to the CPU. On a GPU the weights and graphs live on the
+first usable backend the ggml registry offers (CUDA, Vulkan, Metal, ...) and a
+CPU backend backs any unsupported op; the full model pair must fit in device
+memory (~22 GB for the f16 pair). One MiniMax engine instance may be active at
+a time because its compute graphs are shared.
 
 The frame rate, maximum frame count, flow defaults, and output sample rate come
 from GGUF metadata. Current converted files specify 25 frames per second, at
@@ -57,6 +64,18 @@ python scripts/convert-minimax-music3-to-gguf.py \
 The converter emits the two-file contract and writes the
 MiniMax-Music3 Community License identifier into both files. Ship the upstream
 model license with converted weights.
+
+`mm3-replay` (built with `AUDIOGEN_BUILD_EXECUTABLES`) is the MiniMax parity
+harness: `--mode full` runs the pipeline from a caption/lyrics pair, `--mode
+replay` forces recorded prompt tokens, semantic/acoustic codes, and per-window
+initial noise through the native pipeline and dumps the per-window latents,
+frame hiddens, and stitched audio for 1:1 comparison against the official
+implementation, and `--mode condcheck` verifies the DiT emits byte-identical
+velocities across repeated computes. `test-minimax-quality` (built with
+`AUDIOGEN_BUILD_TESTS`, skipped unless `AUDIOGEN_TEST_MINIMAX_MODELS_DIR` is
+set) is the model-backed regression: it asserts DiT determinism and that a
+short generation's final flow latents land on the learned data manifold
+instead of stalling near the Gaussian noise they started from.
 
 ### ACE-Step audio editing
 

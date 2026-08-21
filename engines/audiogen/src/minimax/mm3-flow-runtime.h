@@ -8,13 +8,7 @@
 
 using MM3DitReadback = std::function<bool(float *, size_t, std::string *)>;
 
-static void mm3_negate_dit_output(float * output, size_t count) {
-    for (size_t index = 0; index < count; ++index) {
-        output[index] = -output[index];
-    }
-}
-
-static bool mm3_read_dit_output(float * output, size_t count, bool output_negated,
+static bool mm3_read_dit_output(float * output, size_t count,
                                 const MM3DitReadback & readback, std::string * error) {
     if (!output || !readback || count > std::numeric_limits<size_t>::max() / sizeof(float)) {
         if (error) {
@@ -24,9 +18,6 @@ static bool mm3_read_dit_output(float * output, size_t count, bool output_negate
     }
     if (!readback(output, count * sizeof(float), error)) {
         return false;
-    }
-    if (output_negated) {
-        mm3_negate_dit_output(output, count);
     }
     return true;
 }

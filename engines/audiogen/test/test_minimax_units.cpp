@@ -1,12 +1,15 @@
 #include "minimax/logic.h"
+#include "minimax/backend.h"
 #include "minimax/bpe.h"
 #include "minimax/mm3-flow-runtime.h"
+#include "minimax/mm3-replay-io.h"
 #include "minimax/mm3-window-orchestrator.h"
 #include "minimax/progress.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -37,6 +40,30 @@ bool throws_invalid_argument(Function function) {
         return true;
     }
     return false;
+}
+
+template <typename Function>
+bool throws_runtime_error(Function function) {
+    try {
+        function();
+    } catch (const std::runtime_error &) {
+        return true;
+    }
+    return false;
+}
+
+// MSVC has no POSIX setenv/unsetenv; _putenv_s(key, "") removes the variable,
+// which matches backend_configure_device treating an empty value as unset.
+void set_env(const char * key, const char * value) {
+#ifdef _WIN32
+    _putenv_s(key, value ? value : "");
+#else
+    if (value) {
+        setenv(key, value, 1);
+    } else {
+        unsetenv(key);
+    }
+#endif
 }
 
 bool close(float left, float right, float tolerance = 1e-6f) {
@@ -141,7 +168,7 @@ void test_flow_schedule() {
     CHECK(throws_invalid_argument([&] { flow_schedule(0, sigmas, timesteps); }));
 }
 
-void test_production_dit_readback_polarity() {
+void test_production_dit_readback_preserves_velocity() {
     const std::vector<float> raw = {1.0f, -2.0f, 0.5f};
     size_t requested_bytes = 0;
     const MM3DitReadback readback =
@@ -150,17 +177,12 @@ void test_production_dit_readback_polarity() {
             std::copy(raw.begin(), raw.end(), output);
             return true;
         };
-    std::vector<float> negated(raw.size());
+    std::vector<float> output(raw.size());
     std::string error;
-    CHECK(mm3_read_dit_output(negated.data(), negated.size(), true, readback, &error));
+    CHECK(mm3_read_dit_output(output.data(), output.size(), readback, &error));
     CHECK(error.empty());
     CHECK(requested_bytes == raw.size() * sizeof(float));
-    CHECK(negated == std::vector<float>({-1.0f, 2.0f, -0.5f}));
-
-    std::vector<float> unchanged(raw.size());
-    CHECK(mm3_read_dit_output(unchanged.data(), unchanged.size(), false, readback,
-                              &error));
-    CHECK(unchanged == raw);
+    CHECK(output == raw);
 }
 
 void test_production_cfg_euler_step() {
@@ -772,6 +794,108 @@ void test_backend_configuration() {
     CHECK(!backend_configuration_matches(1, 4, "first", 4, "second"));
 }
 
+void test_device_configuration() {
+    CHECK(throws_runtime_error([] { backend_configure_device("fast"); }));
+
+    set_env("MM3_DEVICE", "auto");
+    backend_configure_device("cpu");
+    CHECK(g_backend_device == "cpu");
+
+    backend_configure_device("");
+    CHECK(g_backend_device == "auto");
+
+    set_env("MM3_DEVICE", "vulkan");
+    CHECK(throws_runtime_error([] { backend_configure_device(""); }));
+
+    set_env("MM3_DEVICE", nullptr);
+    backend_configure_device("");
+    CHECK(g_backend_device == "cpu");
+}
+
+void test_device_backend_init() {
+    ggml_backend_load_all();
+    ggml_backend_t probe = tts_cpp::acestep::backend_gpu_init();
+    const bool gpu_available = probe != nullptr;
+    if (probe) {
+        ggml_backend_free(probe);
+    }
+
+    backend_configure_device("cpu");
+    BackendPair cpu_pair = backend_init("test");
+    CHECK(cpu_pair.cpu_backend != nullptr);
+    CHECK(!cpu_pair.has_gpu);
+    CHECK(cpu_pair.backend == cpu_pair.cpu_backend);
+    CHECK(throws_runtime_error([] { backend_configure_device("auto"); }));
+    backend_release(cpu_pair.backend, cpu_pair.cpu_backend);
+
+    backend_configure_device("auto");
+    BackendPair auto_pair = backend_init("test");
+    CHECK(auto_pair.cpu_backend != nullptr);
+    CHECK(auto_pair.has_gpu == gpu_available);
+    backend_release(auto_pair.backend, auto_pair.cpu_backend);
+
+    backend_configure_device("gpu");
+    if (gpu_available) {
+        BackendPair gpu_pair = backend_init("test");
+        CHECK(gpu_pair.has_gpu);
+        CHECK(gpu_pair.backend != gpu_pair.cpu_backend);
+        backend_release(gpu_pair.backend, gpu_pair.cpu_backend);
+    } else {
+        CHECK(throws_runtime_error([] { backend_init("test"); }));
+    }
+    backend_configure_device("cpu");
+}
+
+void test_replay_io() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "mm3-replay-io-test";
+    fs::remove_all(dir);
+    std::string error;
+    CHECK(mm3_replay_prepare_output_dir(dir.string(), &error));
+    CHECK(mm3_replay_prepare_output_dir(dir.string(), &error));
+
+    const std::vector<float> payload = {1.0f, -2.5f, 0.25f};
+    const std::string raw_path = (dir / "data.f32").string();
+    CHECK(mm3_replay_write_raw(raw_path, payload.data(), payload.size()));
+    std::vector<float> loaded;
+    CHECK(mm3_replay_read_raw(raw_path, loaded));
+    CHECK(loaded == payload);
+
+    const std::vector<float> planar = {0.5f, -0.5f, 1.5f, -1.5f};
+    const std::string wav_path = (dir / "audio.wav").string();
+    CHECK(mm3_replay_write_wav(wav_path, planar, 2, 44100));
+    CHECK(fs::file_size(wav_path) == 44 + 2 * 2 * sizeof(int16_t));
+
+    const std::string missing = (dir / "missing-subdir" / "data.f32").string();
+    CHECK(!mm3_replay_write_raw(missing, payload.data(), payload.size()));
+    CHECK(!mm3_replay_write_wav(missing, planar, 2, 44100));
+
+    std::string not_a_dir_error;
+    CHECK(!mm3_replay_prepare_output_dir(raw_path, &not_a_dir_error));
+    CHECK(!not_a_dir_error.empty());
+
+    std::vector<float> absent;
+    CHECK(!mm3_replay_read_raw((dir / "absent.bin").string(), absent));
+
+    const std::string empty_path = (dir / "empty.f32").string();
+    CHECK(mm3_replay_write_raw(empty_path, payload.data(), 0));
+    std::vector<float> from_empty;
+    CHECK(!mm3_replay_read_raw(empty_path, from_empty));
+
+    const std::string truncated_path = (dir / "truncated.f32").string();
+    const char truncated_bytes[5] = {1, 2, 3, 4, 5};
+    CHECK(mm3_replay_write_raw(truncated_path, truncated_bytes, sizeof(truncated_bytes)));
+    std::vector<float> from_truncated;
+    CHECK(!mm3_replay_read_raw(truncated_path, from_truncated));
+
+    CHECK(mm3_replay_mode_is_supported("full"));
+    CHECK(mm3_replay_mode_is_supported("replay"));
+    CHECK(mm3_replay_mode_is_supported("condcheck"));
+    CHECK(!mm3_replay_mode_is_supported("ful"));
+    CHECK(!mm3_replay_mode_is_supported(""));
+    fs::remove_all(dir);
+}
+
 void test_engine_instance_limit() {
     using tts_cpp::minimax::detail::engine_instance_available;
     CHECK(engine_instance_available(0));
@@ -804,7 +928,7 @@ int main() {
     test_unconditional_mask();
     test_noise();
     test_flow_schedule();
-    test_production_dit_readback_polarity();
+    test_production_dit_readback_preserves_velocity();
     test_production_cfg_euler_step();
     test_malformed_synthesis_metadata();
     test_vocoder_output_shape();
@@ -826,6 +950,9 @@ int main() {
     test_malformed_utf8();
     test_model_pair_resolution();
     test_backend_configuration();
+    test_device_configuration();
+    test_device_backend_init();
+    test_replay_io();
     test_engine_instance_limit();
     test_cancellation();
     test_progress_cancellation();
