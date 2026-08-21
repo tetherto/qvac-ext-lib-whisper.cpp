@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -148,12 +149,74 @@ static bool test_wav_case(const parler_model & model, const std::string & ref_di
 // that straddle window boundaries, sit at the sequence ends, and are empty.
 // This is what streaming relies on, and it is what would silently regress if the
 // context/keep arithmetic were ever wrong.
+
+// Mirror of the window enumeration in parler_dac_decode: outputs [begin, end)
+// decode in W-frame windows, each padded with the receptive field. Keep in
+// lockstep with that loop.
+static std::vector<std::pair<int, int>> dac_window_graphs(int begin, int end, int n_frames, int rf) {
+    std::vector<std::pair<int, int>> graphs;
+    for (int a = begin; a < end; a += PARLER_DAC_WINDOW_FRAMES) {
+        const int b = std::min(a + PARLER_DAC_WINDOW_FRAMES, end);
+        graphs.emplace_back(std::max(0, a - rf), std::min(n_frames, b + rf));
+    }
+    return graphs;
+}
+
+// A ranged decode is bit-identical to the full decode exactly when every
+// window graph it builds also occurs in the full decode: identical graph,
+// identical kernels, identical bits. A window whose graph the full decode
+// never built computes the same values through differently shaped GPU
+// kernels, whose reduction order differs, so those ranges are held to a
+// measured tolerance instead. On the CPU every shape reduces in one
+// deterministic order and bit identity always holds.
+static bool range_shares_full_decode_graphs(int a, int b, int n_frames, int rf) {
+    const auto full   = dac_window_graphs(0, n_frames, n_frames, rf);
+    const auto ranged = dac_window_graphs(a, b, n_frames, rf);
+    for (const auto & g : ranged) {
+        if (std::find(full.begin(), full.end(), g) == full.end()) return false;
+    }
+    return true;
+}
+
+// Worst observed on an RTX 3090: 5.12e-4 on a single-frame edge range under
+// CUDA, under 1e-5 on Vulkan. The window-arithmetic errors the check exists
+// to catch are hop-scale, orders of magnitude past this bar.
+static constexpr double RANGE_TOLERANCE = 2e-3;
+
+static bool range_values_match(const float * got, const float * ref, size_t n,
+                               bool bit_identical, compare_stats & stats) {
+    stats = compare_f32(got, ref, n);
+    if (bit_identical) return memcmp(got, ref, n * sizeof(float)) == 0;
+    return stats.non_finite == 0 && stats.max_abs_err <= RANGE_TOLERANCE;
+}
+
+// The tolerance path must reject non-finite values: compare_f32 accumulates
+// its maxima with `>`, which is false for NaN, so only the non_finite count
+// can catch them.
+static bool test_tolerance_rejects_non_finite() {
+    const float got[2] = { 1.0f, std::numeric_limits<float>::quiet_NaN() };
+    const float ref[2] = { 1.0f, 1.0f };
+    compare_stats stats;
+    if (range_values_match(got, ref, 2, /*bit_identical=*/false, stats)) {
+        fprintf(stderr, "range-equivalence: tolerance path accepted a NaN\n");
+        return false;
+    }
+    const float inf_got[2] = { 1.0f, std::numeric_limits<float>::infinity() };
+    compare_stats inf_stats;
+    if (range_values_match(inf_got, ref, 2, /*bit_identical=*/false, inf_stats)) {
+        fprintf(stderr, "range-equivalence: tolerance path accepted an Inf\n");
+        return false;
+    }
+    return true;
+}
+
 static bool test_range_equivalence(const parler_model & model, const std::string & ref_dir,
                                    const char * codes_name) {
     std::vector<int32_t> codes;
     int n_frames = 0;
     if (!load_codes_i32(ref_dir + "/" + codes_name, codes, n_frames)) return false;
     fprintf(stderr, "  [range-equivalence] %s: %d frames\n", codes_name, n_frames);
+    if (!test_tolerance_rejects_non_finite()) return false;
 
     const int hop = model.hparams.dac_hop;
     const int lat = model.hparams.dac_latent;
@@ -170,27 +233,7 @@ static bool test_range_equivalence(const parler_model & model, const std::string
 
     const int W = PARLER_DAC_WINDOW_FRAMES;
     const int R = parler_dac_rf_frames(model);
-    // A ranged decode near a sequence edge builds a shorter graph than the
-    // full decode, and a GPU GEMM over a different shape reduces in a
-    // different order, so the same logical values need not match bitwise.
-    // The CPU decodes every shape in one deterministic order, so bit
-    // identity stays the bar there.
-    const bool  exact = ::tts_cpp::detail::backend_is_cpu(model.backend);
-    // Worst observed on an RTX 3090: 5.12e-4 on the first-frame range under
-    // CUDA, where a within-tolerance latent difference amplifies through the
-    // vocoder tail; Vulkan stays under 1e-5 on every range. The window and
-    // context arithmetic errors this check exists to catch are hop-scale,
-    // orders of magnitude past this bar.
-    const float RANGE_TOLERANCE = 2e-3f;
-    auto matches = [&](const float * got, const float * ref, size_t n, double & max_abs) {
-        max_abs = 0.0;
-        if (exact) return memcmp(got, ref, n * sizeof(float)) == 0;
-        for (size_t i = 0; i < n; ++i) {
-            const double d = std::fabs((double) got[i] - (double) ref[i]);
-            if (d > max_abs) max_abs = d;
-        }
-        return max_abs <= RANGE_TOLERANCE;
-    };
+    const bool cpu_backend = ::tts_cpp::detail::backend_is_cpu(model.backend);
     const std::vector<std::pair<int, int>> ranges = {
         {0, n_frames},                                          // whole sequence
         {0, 1},                                                 // first frame only
@@ -218,12 +261,15 @@ static bool test_range_equivalence(const parler_model & model, const std::string
             ok = false;
             continue;
         }
-        double wav_max_abs = 0.0;
+        const bool bit_identical = cpu_backend || range_shares_full_decode_graphs(a, b, n_frames, R);
+        const char * bar = bit_identical ? "bit-identical" : "2e-3";
+        compare_stats wav_stats;
         if (want != 0 &&
-            !matches(part.data(), full.data() + (size_t) a * hop, want, wav_max_abs)) {
+            !range_values_match(part.data(), full.data() + (size_t) a * hop, want,
+                                bit_identical, wav_stats)) {
             fprintf(stderr, "range-equivalence: [%d, %d) does not match the full decode "
-                    "(max_abs=%.3e, bar=%s)\n",
-                    a, b, wav_max_abs, exact ? "bit-identical" : "2e-3");
+                    "(max_abs=%.3e, non_finite=%zu, bar=%s)\n",
+                    a, b, wav_stats.max_abs_err, wav_stats.non_finite, bar);
             ok = false;
             continue;
         }
@@ -235,17 +281,18 @@ static bool test_range_equivalence(const parler_model & model, const std::string
             ok = false;
             continue;
         }
-        double lat_max_abs = 0.0;
+        compare_stats lat_stats;
         if (want_lat != 0 &&
-            !matches(part_lat.data(), full_lat.data() + (size_t) a * lat, want_lat, lat_max_abs)) {
+            !range_values_match(part_lat.data(), full_lat.data() + (size_t) a * lat, want_lat,
+                                bit_identical, lat_stats)) {
             fprintf(stderr, "range-equivalence: [%d, %d) latent does not match "
-                    "(max_abs=%.3e, bar=%s)\n",
-                    a, b, lat_max_abs, exact ? "bit-identical" : "2e-3");
+                    "(max_abs=%.3e, non_finite=%zu, bar=%s)\n",
+                    a, b, lat_stats.max_abs_err, lat_stats.non_finite, bar);
             ok = false;
             continue;
         }
-        fprintf(stderr, "  [range %d, %d) matches (%zu samples, %zu latent, wav_max_abs=%.3e)\n",
-                a, b, want, want_lat, wav_max_abs);
+        fprintf(stderr, "  [range %d, %d) matches (%zu samples, %zu latent, bar=%s, wav_max_abs=%.3e)\n",
+                a, b, want, want_lat, bar, wav_stats.max_abs_err);
     }
     return ok;
 }
