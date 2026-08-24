@@ -158,6 +158,24 @@ stays off the allowlist (would need the F32-parity protocol + addon backend
 map work); Vulkan remains the product path. Future headroom: LM submit-side
 work on Vulkan, or CUDA ports of the tiled kernels.
 
+### H1 — WRONG magnitude, kept — DiT graph cache (stretch item)
+
+- Hypothesis: per-step DiT graph+gallocr rebuild costs ~16-24 ms/step; caching
+  it should cut ~1 s from sft (50 steps).
+- Change: DitGraphCache mirrors LMGraphCache (key: T/N/enc_S/H_enc/mask
+  presence); inputs still re-uploaded every step.
+- Outcome: bit-identical WAVs (q4 and sft), unit tests pass, but DiT stage
+  time UNCHANGED (sft 5713 vs 5683 ms). The stage-wall-minus-GPU-op gap is
+  command-buffer encode + input upload/readback, not graph construction.
+  Kept: removes per-step allocator churn and is the prerequisite for any
+  future device-resident-latent step; cost-neutral.
+- STEP-BACK (two magnitude-misses in a row, H5 then H1, same class): "host
+  overhead" on this Vulkan backend is dominated by per-submit command
+  encoding, which neither graph caching nor allocation reuse touches.
+  Further wins in that class need backend-level command replay — out of this
+  campaign's scope. The class is closed in this ledger; remaining in-plan
+  levers are memory-pattern kernels (im2col tiling) only.
+
 ## Hypothesis ledger
 
 (entries appended below; format: Hn — status — hypothesis — why — test — changes —
