@@ -173,6 +173,50 @@ GPU op time => ~3 s host-side churn; DiT ~0.87 s GPU-bound.
   watchdog (context lost) — not an engine bug.
 - Next: LM host-side churn (H5), then loads (H3c), DiT (H1/H2).
 
+### H5 — PARTIAL (observation smaller than hypothesis) — LM graph cache
+
+- Hypothesis: per-token graph+gallocr rebuild is most of the LM stage's ~3 s
+  host gap. Change: LMGraphCache in lm_ggml.cpp — the decode graph and its
+  allocation are keyed on (batch, S, n_kv_pad, kv set, head tensor) and reused
+  until the key moves (n_kv_pad steps by 256), for both the single and
+  batched-CFG paths; debug layer_states path stays uncached.
+- Gates: per-step logit dumps BIT-IDENTICAL to pre-change (prefill 300 +
+  decode 100), batched-CFG regression PASS, unit tests pass, engine WAV hash
+  unchanged.
+- Outcome: LM stage only 4.7 -> 4.55 s. Perf-logger split shows the remaining
+  host cost is per-submit command encoding + fence (~4.5 ms/token vs 5.3 ms
+  GPU), comparable to upstream Vulkan norms. Verdict: mechanism partially
+  right, magnitude wrong; deeper submit-side work deprioritized (R6).
+- Learning: graph BUILD cost is small vs command-buffer encode on this
+  backend; measure the split before attacking "host overhead" as one number.
+
+### H3-load — CORRECT — parallel VAE weight-norm resolution
+
+- The default per-generation VAE load spent ~1.2 s in single-threaded
+  weight-norm resolution (bf16 g/v -> per-channel norm/scale/transpose) +
+  f32->f16 conversion (vae_gguf.cpp). Parallelized per-channel (rows
+  independent -> bit-identical). Engine: q4 9.2 -> 8.0 s, hash unchanged.
+
+### H10b — CORRECT — large-tile transpose copy + switch-routing bug fix
+
+- VAE decode does 20 big [T,C]->[C,T] transposes (op_conv_t1d cont) = 334 ms;
+  test-backend-ops showed the upstream 32x32 cpy_transpose collapsing to
+  2.6-5 GB/s on DRAM-resident skinny matrices and HANGING the GPU (watchdog)
+  on large f16 cases. Root cause same as col2im: 128 B strided segments.
+- SELF-INFLICTED BUG found en route: the earlier col2im elements-switch split
+  had attached the shared elementwise case-label list (CPY/UNARY/GLU/...) to
+  the new COL2IM_1D case, silently dropping the cpy_transpose and conv2d_dw
+  element overrides — correctness survived only because the tiled shaders
+  grid-stride over the full range. LESSON: when splitting a case out of a
+  shared label list, re-check which labels the ORIGINAL body retains; verify
+  with a print that the intended branch actually executes (R8 applies to
+  one's own changes too).
+- Fix: copy_transpose_large.comp (64x128 LDS tile, 512-B reads / 256-B
+  writes, >=32 MiB + device-limit gated) + restored case routing. Transposes:
+  5 -> ~190 GB/s (f32), f16 hang gone. Correctness: full CPY/DUP/CONT +
+  affected-op suite green, ragged-dim large cases added.
+- Engine result: q4 7.9 s (2.00x), q8 8.1 s (2.38x), WAVs bit-identical.
+
 ### Pre-registered backlog (from plan, ordered; re-rank after Phase 2 data)
 
 - H4 LM placement: LM-on-Vulkan may beat LM-on-CPU on Strix (policy is a Mali
