@@ -50,7 +50,7 @@ engine, not every backend ggml can compile.
 | Supertonic 2 | `en`, `ko`, `es`, `pt`, `fr` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Supertonic 3 | 31 languages plus `na` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Parler-TTS mini/large/Indic | English or 21 Indic languages | natural-language description | 44.1 kHz | yes | yes | yes | yes | yes |
-| Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice or zero-shot/cross-lingual reference WAV; instruct controls | 24 kHz | yes | yes | yes | yes | no |
+| Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice or zero-shot/cross-lingual reference WAV; instruct controls | 24 kHz | yes | yes | yes | yes | yes |
 | Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | yes | yes | yes | no |
 | LavaSR denoiser | language agnostic | input PCM | rate preserving | yes | yes | yes | yes | yes |
 | LavaSR enhancer | language agnostic | input PCM | 48 kHz | yes | yes | yes | yes | yes |
@@ -96,6 +96,14 @@ sequence edge builds a shorter graph than the full decode and a GEMM over a
 different shape legitimately reduces in a different order (worst observed:
 5.12e-4 on CUDA, under 1e-5 on Vulkan, against a 2e-3 bar; the window
 arithmetic errors the check exists to catch are hop-scale).
+
+CosyVoice3 on CUDA is covered by the same per-stage reference harnesses as
+its other GPU backends, with the four core stages registered per backend as
+`test-cosyvoice-{flow,llm,hift,conv1d}-{cuda,vulkan}`: the full CosyVoice and
+s3tokenizer suite passes 27/27 pinned to CUDA and to Vulkan, and greedy
+long-form synthesis (67 s of audio, well past the launch-abort threshold the
+grid-striding fix removed) produces the identical sample count on CUDA,
+Vulkan and CPU.
 
 Supertonic on CUDA rests on a backend-capability distinction the F16-weight
 auto policy now probes: the conv-via-im2col lowerings put the weight in

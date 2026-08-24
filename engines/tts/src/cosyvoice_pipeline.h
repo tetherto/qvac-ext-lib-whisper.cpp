@@ -48,7 +48,7 @@ inline ::tts_cpp::detail::GpuBackendRequirement cosyvoice_gpu_requirement() {
     using ::tts_cpp::detail::GpuBackendRequirement;
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
     return GpuBackendRequirement::Metal | GpuBackendRequirement::OpenCL |
-           GpuBackendRequirement::Vulkan;
+           GpuBackendRequirement::Vulkan | GpuBackendRequirement::CUDA;
 #else
     return GpuBackendRequirement::Metal | GpuBackendRequirement::OpenCL;
 #endif
