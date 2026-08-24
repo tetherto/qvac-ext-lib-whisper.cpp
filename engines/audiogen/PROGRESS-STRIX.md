@@ -20,6 +20,26 @@ Benchmark protocol: `~/qvac-campaigns/QVAC-24013/bin/bench.sh` — pinned prompt
 
 ## Status
 
+CAMPAIGN COMPLETE. Final milestone m3 (branch HEAD, all changes committed):
+
+| Config | Baseline warm | Final warm | Speedup | Cold speedup |
+|---|---|---|---|---|
+| turbo-q4 / P1 | 15.8 s | 7.6 s | 2.07x | 2.09x |
+| turbo-q4 / P2 | 16.9 s | 7.6 s | 2.22x | 2.24x |
+| turbo-q8 / P1 | 19.3 s | 7.9 s | 2.45x | 2.51x |
+| turbo-q8 / P2 | 17.5 s | 7.8 s | 2.24x | 2.43x |
+| sft-q8 / P1 (not gated) | 22.5 s | 12.5 s | 1.81x | 1.78x |
+
+All m3 output hashes identical to milestone m2 (bit-exactness held through the
+DiT graph cache and tiled-im2col changes). Remaining known headroom, awaiting
+direction: Vulkan per-submit encode (LM ~2.5 s host; HIP proves the ceiling),
+CUDA/HIP ports of the tiled kernels, IM2COL_3D pre-existing crash fix, ROCm
+allowlist validation.
+
+Campaign history below.
+
+## Earlier status (Phase 0)
+
 Phase 0 (infrastructure) complete; Phase 1 baseline matrix running.
 
 Phase 0 verified facts:
