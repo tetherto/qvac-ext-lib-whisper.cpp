@@ -197,9 +197,10 @@ foreach(_tts_ggml_backend metal vulkan cuda opencl)
         set(TTS_CPP_GGML_${_tts_ggml_backend_uc} TRUE)
     endif()
 endforeach()
-# Parler allowlist: Metal / Vulkan / OpenCL (parler/gguf.cpp).
+# Parler allowlist: Metal / Vulkan / OpenCL / CUDA (parler/gguf.cpp).
 set(TTS_CPP_PARLER_GPU FALSE)
-if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_VULKAN OR TTS_CPP_GGML_OPENCL)
+if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_VULKAN OR TTS_CPP_GGML_OPENCL OR
+    TTS_CPP_GGML_CUDA)
     set(TTS_CPP_PARLER_GPU TRUE)
 endif()
 # CosyVoice3 allowlist: Metal / OpenCL everywhere, Vulkan on Windows and
