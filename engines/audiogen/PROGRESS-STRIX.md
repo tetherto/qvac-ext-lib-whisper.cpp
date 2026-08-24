@@ -139,6 +139,40 @@ outcome — verdict (observation / mechanism) — learning — next)
 - Next: remeasure milestone matrix on new HEAD; then attack VAE (~5 s) and
   LM-on-GPU internals (H5 gallocr churn, MMVQ), DiT H1/H2, load cost H3c.
 
+### Milestone m1 (H4 only): q4 12.0 s (1.32-1.41x), q8 12.2 s (1.46-1.58x),
+sft 16.8 s (1.34x); all deterministic. Perf-logger decomposition: VAE GPU op
+time dominated by COL2IM_1D (2391 ms of 3684 ms); LM stage wall 4.8 s vs 1.8 s
+GPU op time => ~3 s host-side churn; DiT ~0.87 s GPU-bound.
+
+### H10a — CORRECT (mechanism confirmed) — tiled col2im_1d Vulkan kernel
+
+- Hypothesis chain (2 refuted, 1 confirmed — kept for the record):
+  (1) REFUTED "uncoalesced per-thread reads": first tiled kernel (TT=128,
+  OCB=8, 256 thr) only gave 2-2.5x; (2) REFUTED "UMA prefer_host memory type":
+  prefer-host OFF rebuild changed nothing (H3b answered on Strix: keep ON);
+  (3) CONFIRMED by microprobes: disabling global loads made the kernel 30-60x
+  faster while disabled gather changed nothing => the entire cost is DRAM reads
+  of small (256 B) segments at large (8 KiB) stride; a 393 MB linear ADD
+  streams at 208 GB/s on the same box, so it is pattern, not bandwidth.
+- Fix: col2im_1d_tiled.comp — 64 t_out x 64 oc tile staged in 48 KiB LDS,
+  1024 threads, contiguous 1-5 KiB row-slab loads, coalesced writes, identical
+  t_in summation order (bit-identical results). Host gates: pipeline created
+  only when device limits allow (>=1024 invocations, >=48 KiB shared); tiled
+  selected only when smem fits, grid fits, and columns+signal >= 32 MiB
+  (cache-resident shapes stay on the untiled pipeline, which wins there).
+- Results (test-backend-ops perf, ACE-Step VAE shapes): 4.8-22 GB/s -> 88-146
+  GB/s; per-generation col2im ~2391 ms -> ~40 ms. Engine: q4 15.8 -> 9.2-9.3 s
+  (1.70x), q8 19.3 -> 8.8 s (2.19x, past the bar). Gate A: WAVs bit-identical
+  pre/post for both quants. Correctness suite extended with tiled-path shapes
+  (ragged tails, k != 2*s0) — all pass; SNAKE/ZERO_UPSAMPLE/CHANNEL_SHUFFLE/
+  AFFINE_PRELU/CPY unaffected.
+- Learning: on Strix Halo, small-segment strided DRAM reads are ~20x slower
+  than linear streaming; occupancy (threads in flight) doubles throughput
+  twice (256->512->1024 threads). Microprobe-by-deletion beats access-pattern
+  theorizing. Also: perf-mode batching of a slow kernel can trip the GPU
+  watchdog (context lost) — not an engine bug.
+- Next: LM host-side churn (H5), then loads (H3c), DiT (H1/H2).
+
 ### Pre-registered backlog (from plan, ordered; re-rank after Phase 2 data)
 
 - H4 LM placement: LM-on-Vulkan may beat LM-on-CPU on Strix (policy is a Mali
