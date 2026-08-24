@@ -310,11 +310,25 @@ void test_predicate_deny_list_empty_name_safe() {
 
 } // namespace
 
+// The auto policy must refuse F16 whenever either mul_mat orientation is
+// refused: the attention sites dispatch the weight as src0 and the
+// conv-via-im2col sites as src1, and a backend can accept one while
+// rejecting the other.
+static void test_f16_auto_policy() {
+    CHECK(supertonic_f16_weights_auto_policy(false, false, false, true, true));
+    CHECK(!supertonic_f16_weights_auto_policy(false, false, false, true, false));
+    CHECK(!supertonic_f16_weights_auto_policy(false, false, false, false, true));
+    CHECK(!supertonic_f16_weights_auto_policy(true,  false, false, true, true));
+    CHECK(!supertonic_f16_weights_auto_policy(false, true,  false, true, true));
+    CHECK(!supertonic_f16_weights_auto_policy(false, false, true,  true, true));
+}
+
 int main(int argc, char ** argv) {
     // Unit-level predicate tests run unconditionally; no model.
     test_predicate_positives();
     test_predicate_negatives();
     test_predicate_edges();
+    test_f16_auto_policy();
     // round 6 — 2-arg overload tests (TDD: these are
     // the new symbol; whole block must fail compilation before
     // implementation, then pass after).

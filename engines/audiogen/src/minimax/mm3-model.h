@@ -103,7 +103,6 @@ struct MM3DitConfig {
     std::string rope_type;
     uint32_t fourier_dim      = 0;
     std::string glu_order;
-    bool     output_negated           = false;
     bool     timestep_token_prepended = false;
     bool     pre_post_conv_residual   = false;
     bool     attn_bias                = false;
@@ -487,7 +486,6 @@ static void mm3_parse_synth_config(const GGUFModel & gf, MM3SynthConfig * c) {
     t.rope_type                  = gf_get_str(gf, "mm3.dit.rope_type");
     t.fourier_dim                = gf_get_u32(gf, "mm3.dit.fourier_dim");
     t.glu_order                  = gf_get_str(gf, "mm3.dit.glu_order");
-    t.output_negated             = gf_get_bool(gf, "mm3.dit.output_negated");
     t.timestep_token_prepended   = gf_get_bool(gf, "mm3.dit.timestep_token_prepended");
     t.pre_post_conv_residual     = gf_get_bool(gf, "mm3.dit.pre_post_conv_residual");
     t.attn_bias                  = gf_get_bool(gf, "mm3.dit.attn_bias");

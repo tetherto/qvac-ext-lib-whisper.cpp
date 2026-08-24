@@ -652,6 +652,35 @@ bool backend_supports_f16_mul_mat_uncached(ggml_backend_t backend) {
     return ok;
 }
 
+bool backend_supports_f16_src1_mul_mat_uncached(ggml_backend_t backend) {
+    if (!backend) return false;
+    ggml_init_params probe_params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 8,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * probe_ctx = ggml_init(probe_params);
+    if (!probe_ctx) return false;
+    bool ok = false;
+    try {
+        constexpr int pointwise_width           = 512;
+        constexpr int pointwise_frame_count     = 96;
+        constexpr int pointwise_output_channels = 2048;
+        ggml_tensor * activation = ggml_new_tensor_2d(
+            probe_ctx, GGML_TYPE_F32, pointwise_width, pointwise_frame_count);
+        ggml_tensor * f16_weight = ggml_new_tensor_2d(
+            probe_ctx, GGML_TYPE_F16, pointwise_width, pointwise_output_channels);
+        ggml_tensor * weight_as_second_operand =
+            ggml_mul_mat(probe_ctx, activation, f16_weight);
+        ok = (weight_as_second_operand != nullptr) &&
+             ggml_backend_supports_op(backend, weight_as_second_operand);
+    } catch (...) {
+        ok = false;
+    }
+    ggml_free(probe_ctx);
+    return ok;
+}
+
 // follow-up — process-wide capability-probe cache.
 //
 // Three sites probe the same `ggml_backend_t` for the same op
@@ -683,6 +712,9 @@ struct backend_capabilities {
     bool native_leaky_relu;
     bool f16_kv_flash_attn;
     bool f16_mul_mat;
+    // F16 weight accepted as mul_mat src1 (the conv-via-im2col orientation);
+    // independent of f16_mul_mat, which probes the weight as src0.
+    bool f16_src1_mul_mat;
     // follow-up — Q8_0 K/V flash-attn support. Probed
     // here as a forward-compat capability; the dispatch isn't yet
     // wired (see `backend_supports_q8_0_kv_flash_attn_uncached`'s
@@ -779,6 +811,7 @@ const backend_capabilities & cached_backend_capabilities(ggml_backend_t backend)
     caps.native_leaky_relu   = backend_supports_native_leaky_relu(backend);
     caps.f16_kv_flash_attn   = backend_supports_f16_kv_flash_attn_uncached(backend);
     caps.f16_mul_mat         = backend_supports_f16_mul_mat_uncached(backend);
+    caps.f16_src1_mul_mat    = backend_supports_f16_src1_mul_mat_uncached(backend);
     caps.q8_0_kv_flash_attn  = backend_supports_q8_0_kv_flash_attn_uncached(backend);
     caps.bf16_kv_flash_attn  = backend_supports_bf16_kv_flash_attn_uncached(backend);
     caps.pinned_host_buffer  = backend_supports_pinned_host_buffer_uncached(backend);
@@ -916,6 +949,10 @@ bool supertonic_backend_supports_f16_kv_flash_attn(ggml_backend_t backend) {
 // synth call.  Cached.
 bool supertonic_backend_supports_f16_mul_mat(ggml_backend_t backend) {
     return cached_backend_capabilities(backend).f16_mul_mat;
+}
+
+bool supertonic_backend_supports_f16_src1_mul_mat(ggml_backend_t backend) {
+    return cached_backend_capabilities(backend).f16_src1_mul_mat;
 }
 
 // follow-up — public forwarder for the Q8_0 K/V
@@ -1992,10 +2029,12 @@ bool load_supertonic_gguf(const std::string & path,
             // operands, so an F16 weight with a <64 output dim would re-expose the Valhall
             // small-output miscompute. Gating on the same flag keeps "pad on" and "F16 off"
             // from ever drifting apart.
-            model.use_f16_weights = !model.backend_is_cpu &&
-                                    !::tts_cpp::detail::backend_is_opencl(model.backend) &&
-                                    !model.mulmat_needs_pad &&
-                                    cached_backend_capabilities(model.backend).f16_mul_mat;
+            model.use_f16_weights = supertonic_f16_weights_auto_policy(
+                model.backend_is_cpu,
+                ::tts_cpp::detail::backend_is_opencl(model.backend),
+                model.mulmat_needs_pad,
+                cached_backend_capabilities(model.backend).f16_mul_mat,
+                cached_backend_capabilities(model.backend).f16_src1_mul_mat);
         } else {
             model.use_f16_weights = (f16_weights != 0);
         }

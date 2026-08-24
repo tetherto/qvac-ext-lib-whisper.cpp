@@ -85,6 +85,20 @@ hold -- both backends produce audio, and within 1.35x of each other's duration,
 which truncation, runaway generation and silent failure all break. T3 on CUDA
 is gated at that strength and no more.
 
+Supertonic on CUDA rests on a backend-capability distinction the F16-weight
+auto policy now probes: the conv-via-im2col lowerings put the weight in
+mul_mat's second operand, and ggml-cuda (and ggml-cpu) accept an F16 weight as
+the first operand while rejecting it as the second, where ggml-vulkan accepts
+both. Materialising F16 weights on such a backend left the scheduler with a
+node no backend claims and aborted the first synthesis. The auto policy
+requires both orientations, so CUDA and any future backend in its position
+keep F32 weights -- slower but correct, the same trade the policy already
+makes on CPU and OpenCL -- while Vulkan and Metal keep the F16 roster. With
+that in place all three Supertonic generations synthesize on CUDA at every
+shipped tier (f32, f16, q8_0, q4_0), the direct and scheduler paths are
+bit-identical per backend (`test-supertonic-sched-equivalence-{cuda,vulkan}`),
+and CUDA matches the CPU's output length exactly on the reference sentences.
+
 Where a build carries both CUDA and Vulkan, selection prefers CUDA on NVIDIA:
 measured on one binary on an RTX 3090, Chatterbox Turbo is 8.6x faster on CUDA
 than on that card's Vulkan adapter. Set `TTS_CPP_GPU_BACKEND` to `cuda`,

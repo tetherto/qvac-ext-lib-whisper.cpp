@@ -1693,6 +1693,25 @@ if (TTS_CPP_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "${_tcb_super2_gguf}" "99"
         REQUIRES "${_tcb_super2_gguf}")
+    # Per-backend pins of the same bit-exactness check, so a host carrying
+    # several GPU backends covers each by name instead of whichever selection
+    # prefers. TTS_CPP_GPU_BACKEND fails loud when the named backend is
+    # absent, so an arm cannot pass on the CPU.
+    function(tts_cpp_register_supertonic_sched_arm suffix)
+        tts_cpp_register_test(test-supertonic-sched-equivalence-${suffix}
+            EXE      test-supertonic-sched-equivalence
+            LABEL    "gpu"
+            ARGS     "${_tcb_super2_gguf}" "99"
+            REQUIRES "${_tcb_super2_gguf}")
+        set_property(TEST test-supertonic-sched-equivalence-${suffix} APPEND
+                     PROPERTY ENVIRONMENT "TTS_CPP_GPU_BACKEND=${suffix}")
+    endfunction()
+    if (TTS_CPP_GGML_CUDA)
+        tts_cpp_register_supertonic_sched_arm(cuda)
+    endif()
+    if (TTS_CPP_GGML_VULKAN)
+        tts_cpp_register_supertonic_sched_arm(vulkan)
+    endif()
 
     # ------------------------------------------------------------------
     # Multilingual integration tests (23 languages).
@@ -2362,6 +2381,12 @@ if (TTS_CPP_BUILD_TESTS)
         test/test_supertonic_text_encoder_caches.cpp)
     add_supertonic_harness(test-supertonic-f16-weights
         test/test_supertonic_f16_weights.cpp)
+    # The harness gates on the reference dump, which CI never has, so the
+    # deviceless predicate and policy checks get their own registration that
+    # always runs: with no arguments main exercises exactly that block.
+    tts_cpp_register_test(test-supertonic-f16-policy
+        EXE   test-supertonic-f16-weights
+        LABEL "unit")
     # Phase 2D profile-CSV emitter — unit-level, no GGUF needed.
     add_executable(test-supertonic-profile-csv
         test/test_supertonic_profile_csv.cpp)
