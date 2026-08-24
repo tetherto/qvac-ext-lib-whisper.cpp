@@ -41,20 +41,103 @@ Phase 0 verified facts:
   to the max_tokens cap (dur*5+100 = 125 codes -> 25.2 s actual audio). Benchmarks
   record actual WAV seconds; RTF computed against actual.
 
-## Baseline (Phase 1) — TBD
+## Baseline (Phase 1) — measured 2026-08-24, engine e0e08fc4 / ggml cd3b4159
 
-| Config | Median warm wall (s) | RTF | Notes |
-|---|---|---|---|
-| turbo-q4 / P1 / s42 | | | |
-| turbo-q4 / P2 / s42 | | | |
-| turbo-q8 / P1 / s42 | | | |
-| turbo-q8 / P2 / s42 | | | |
-| sft-q8 / P1 / s42 | | | tracking only |
+Protocol: 30 s requested (actual audio 29.4-30.2 s), 1 cold + 3 warm, median warm.
+All runs bit-deterministic (identical WAV sha256 across cold+warm of each config).
+
+| Config | Cold (s) | Median warm wall (s) | RTF | 2x target (s) |
+|---|---|---|---|---|
+| turbo-q4 / P1 / s42 | 15.4 | 15.8 | 2.08 | 7.9 |
+| turbo-q4 / P2 / s42 | 16.6 | 16.9 (CV 11%) | 1.75 | 8.5 |
+| turbo-q8 / P1 / s42 | 19.7 | 19.3 | 1.46 | 9.7 |
+| turbo-q8 / P2 / s42 | 18.9 | 17.5 | 1.69 | 8.8 |
+| turbo-q4 / P1 / s1337 | 16.9 | 18.4 | 1.62 | seed-variance probe |
+| turbo-q8 / P1 / s1337 | 17.8 | 16.6 | 1.63 | seed-variance probe |
+| sft-q8 / P1 / s42 | 22.2 | 22.5 | 1.33 | tracking only |
+
+Stage shares (median warm): turbo-q4 = LM 53.5% (8.3 s, CPU) / VAE 37.8% (5.9 s) /
+DiT 6.4% (1.0 s); turbo-q8 = LM 58.9% (11.2 s) / VAE 33.2% / DiT 5.7%; sft = LM 46% /
+VAE 26.7% / DiT 25.3% (5.7 s, 50 steps ~113 ms/step). wall - stages_sum ~ 0.3 s only.
+
+Observations with verdicts:
+- LM-on-CPU stage time is HIGH-VARIANCE (7.4-13.1 s across all baseline runs,
+  same 677 MB Q8_0 LM). The apparent q4-vs-q8 LM delta was noise, NOT a mechanism
+  (governor=powersave, shared power envelope). VERDICT: noise — do not chase.
+  GPU stage times are stable (DiT ~990/1080 ms, VAE 5.4-6.3 s).
+- GPU temps 27-36 C before/after every run — no thermal confound at these loads.
+- --dur is a soft target: LM generates codes to its own EOS/cap; requested 30 s
+  produced 29.4-30.2 s. RTF computed against actual WAV seconds.
+
+## Phase 2 — env A/B matrix (turbo-q4/P1/s42, 1 warmup + 2 timed each)
+
+Caveat applied to all rows: LM-on-CPU noise (7.4-13.1 s) pollutes wall deltas of
+rows that do not touch the LM; verdicts below use the stable VAE/DiT stage columns.
+
+| Row | Result | Verdict |
+|---|---|---|
+| A1 ACESTEP_LM_GPU=1 | wall 11.1/11.3 s (base 15.8), LM 4638/4066 ms (was ~8300) | CONFIRMED observation: LM-on-Vulkan ~2x faster than CPU on Strix. Output deterministic but differs from CPU-LM (expected); quality gates pending. |
+| A2 ACESTEP_KEEP_STAGES=1 | WAV bit-identical to baseline; VAE stage 4700 ms (was ~5900), DiT 860 ms (was ~990) | CONFIRMED: ~1.2 s VAE + 0.13 s DiT of per-generate weight reload eliminated. H3a mechanism proven (load cost is inside stage timings). |
+| A3 DISABLE_HOST_VISIBLE_VIDMEM | VAE/DiT unchanged | no effect — killed |
+| A4 ALLOW_GRAPHICS_QUEUE | VAE slightly worse | no win — killed |
+| A5 DISABLE_FUSION (control) | VAE/DiT unchanged | expected no-op confirmed — methodology control passed |
+| A6 DISABLE_COOPMAT | DiT 1421 ms (+43%), VAE +8% | coopmat active and valuable in baseline (negative control) |
+| A7 ASYNC_USE_TRANSFER_QUEUE | unchanged | no effect — killed |
+| A7b DISABLE_ASYNC | unchanged | no effect — killed |
+| A9 ALLOW_SYSMEM_FALLBACK | unchanged | no effect — killed |
+
+H4 pre-verification: PASSED (A1). H3a pre-verification: PASSED (A2).
+
+Combined LM_GPU+KEEP_STAGES (single-shot CLI): q4 12.2 s, q8 12.2 s — WORSE than
+A1 alone (11.2 s) because KEEP_STAGES moves weight loads upfront; for a single
+generation it only relocates the ~1.5 s load cost. KEEP_STAGES pays off only for
+multi-generation processes (addon). Single-shot load cost must be attacked via
+faster loads (H3c zero-copy), not via residency. Learning recorded.
+
+H4 quality gates:
+- lm-smoke --gpu --quantized-batch-cfg-regression (Q8 LM): PASS, cosine=1.000000000,
+  max_abs=0, argmax 189417/189417 — GPU LM logit-exact vs the gate's tolerance.
+- WER (large-v3-turbo, 30 s clips; absolute WER dominated by deletions since only
+  part of the lyrics fits in 30 s; seed band ~0.10): baselines q4 0.575 (s42) /
+  0.479 (s1337), q8 0.603 (s42); GPU-LM q4 0.657 (within band, PASS);
+  GPU-LM q8 0.781 (single sample, outside band) -> extra seeds being scored
+  before verdict. Sampled tokens legitimately differ from CPU-LM (different song,
+  not degraded logits — parity gate above is the mechanism evidence).
+- OBSERVATION (not our target): base-sft P1/s42 output has WER 1.0 (zero lyric
+  hits in first 30 s) — sft path parity is documented as unverified upstream;
+  flagged for user listening, not investigated further in this campaign.
 
 ## Hypothesis ledger
 
 (entries appended below; format: Hn — status — hypothesis — why — test — changes —
 outcome — verdict (observation / mechanism) — learning — next)
+
+### H4 — CORRECT (mechanism confirmed) — LM belongs on the GPU on Strix Vulkan
+
+- Hypothesis: the LM-on-CPU-under-Vulkan policy is a Mali carry-over; on Strix
+  Halo RADV the GPU LM is faster with no quality loss.
+- Why: policy comment cites only Mali-G715; Strix has coopmat+fp16 and the LM is
+  54-59% of baseline wall.
+- Test before change: A1 env A/B (ACESTEP_LM_GPU=1) -> wall 15.8->11.2 s, LM
+  8.3->4.3 s. Quality: lm-smoke batched-CFG PASS (GPU-internal consistency);
+  then F32-dequant reference protocol (README "Backends"): on 3 seeds of
+  300-token prefills GPU-Q8 matches F32 argmax 3/3 with cosine >= 0.99999995,
+  top-50 overlap 50/50; CPU-Q8 matches argmax 1/3, cosine ~0.9998, max_abs up
+  to 5.4. GPU LM is MORE faithful than the CPU path (CPU quantizes activations
+  to Q8_1). WER across seeds statistically inconclusive (seed band ~0.1-0.3)
+  and superseded by the mechanism evidence; sampled songs legitimately differ.
+- Changes: stage_placement.h vulkan_device_lm_validated (device-desc "RADV"
+  substring, per-device allowlist), resolve_stage_placement takes device_desc;
+  backend_registry.h backend_dev_description helper; engine.cpp passes it;
+  placement unit tests extended (RADV lifts LM, Mali/Xclipse/NVIDIA/proprietary
+  AMD/non-Vulkan names do not, hatches still override); engine README updated.
+- Outcome: default run places lm=Vulkan0 on this box; WAV bit-identical to the
+  A1 env run (sha b6e2839802d5...); wall 10.9 s (1.45x vs q4 baseline on that
+  run). All 5 unit suites pass. HOW confirmed: placement log line + hash match.
+- Learning: same-backend smoke gates are NOT cross-backend parity evidence;
+  the F32-dequant protocol is the decisive instrument. Mali default unchanged.
+- Next: remeasure milestone matrix on new HEAD; then attack VAE (~5 s) and
+  LM-on-GPU internals (H5 gallocr churn, MMVQ), DiT H1/H2, load cost H3c.
 
 ### Pre-registered backlog (from plan, ordered; re-rank after Phase 2 data)
 

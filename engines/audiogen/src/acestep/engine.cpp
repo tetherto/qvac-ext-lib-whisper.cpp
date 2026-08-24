@@ -300,7 +300,8 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     ggml_backend_t detok_backend = m->backend;
     if (on_gpu) {
         const StagePlacement place =
-            resolve_stage_placement(backend_reg_name(m->backend), placement_overrides_from_env());
+            resolve_stage_placement(backend_reg_name(m->backend), backend_dev_description(m->backend),
+                                    placement_overrides_from_env());
         if (!place.enc_on_gpu)   enc_backend   = m->backend_cpu;
         if (!place.lm_on_gpu)    lm_backend    = m->backend_cpu;
         if (!place.detok_on_gpu) detok_backend = m->backend_cpu;

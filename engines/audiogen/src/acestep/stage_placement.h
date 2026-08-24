@@ -42,6 +42,18 @@ inline bool backend_name_is_cuda(const char * name) {
     return name && std::strcmp(name, "CUDA") == 0;
 }
 
+// The Vulkan LM placement is per-DEVICE, not per-backend: on Arm Mali-G715 the
+// LM collapses to repeated codes, while on Mesa RADV (AMD Strix Halo, Radeon
+// 8060S) the GPU LM is ~2x faster than the CPU path and closer to the F32
+// ground truth than the CPU's Q8_1-activation matmul (per-step logit cosine vs
+// F32-dequantized reference: ~0.99999995 GPU vs ~0.9998 CPU; argmax parity 3/3
+// GPU vs 1/3 CPU on 300-token prefills). Match the Mesa RADV driver substring
+// in the device description; every other Vulkan device keeps the CPU placement
+// until measured the same way.
+inline bool vulkan_device_lm_validated(const char * device_desc) {
+    return device_desc && std::strstr(device_desc, "RADV") != nullptr;
+}
+
 // Environment escape hatches, read once at create(). Presence is what counts:
 // ACESTEP_LM_CPU=0 still forces the LM to the CPU, matching the getenv() checks
 // this replaced.
@@ -66,17 +78,21 @@ struct StagePlacement {
 //
 // The LM and the detokenizer are allowlisted rather than denylisted: a backend
 // nobody has measured keeps the CPU placement and cannot silently regress
-// generated audio. Vulkan is validated for the detokenizer but not for the
-// autoregressive LM: on Mali-G715 the LM collapses to repeated codes and may
-// terminate far short of the requested duration. Keep that stage on CPU while
-// the encoders, detokenizer, DiT and VAE remain GPU-accelerated.
-// OpenCL is validated for both stages on Adreno 740. CUDA keeps the Vulkan
-// placement -- detokenizer on the GPU, LM on the CPU until the parity
-// measurement is taken; README "Backends" records the rationale.
-inline StagePlacement resolve_stage_placement(const char * reg_name, const PlacementOverrides & ov) {
+// generated audio. Vulkan is validated for the detokenizer everywhere, and for
+// the autoregressive LM per-device (vulkan_device_lm_validated): Mesa RADV
+// devices run the LM on the GPU, while Mali-G715 -- where the LM collapses to
+// repeated codes and may terminate far short of the requested duration -- and
+// every other unmeasured Vulkan device keep it on the CPU.
+// OpenCL is validated for both stages on Adreno 740. CUDA keeps the
+// detokenizer on the GPU and the LM on the CPU until the parity measurement is
+// taken; README "Backends" records the rationale.
+inline StagePlacement resolve_stage_placement(const char * reg_name, const char * device_desc,
+                                              const PlacementOverrides & ov) {
     StagePlacement p;
 
-    if (backend_name_is_vulkan(reg_name) || backend_name_is_cuda(reg_name)) {
+    if (backend_name_is_vulkan(reg_name)) {
+        p.lm_on_gpu = vulkan_device_lm_validated(device_desc);
+    } else if (backend_name_is_cuda(reg_name)) {
         p.lm_on_gpu = false;
     } else if (!backend_name_is_metal(reg_name) && !backend_name_is_opencl(reg_name)) {
         p.lm_on_gpu    = false;
