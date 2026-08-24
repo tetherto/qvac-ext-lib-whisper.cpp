@@ -45,7 +45,7 @@ else()
     set(AUDIOGEN_MOBILE OFF)
     set(AUDIOGEN_MINIMAX_DEFAULT ON)
 endif()
-option(AUDIOGEN_BUILD_MINIMAX "audiogen-cpp: build the desktop CPU MiniMax-Music3 engine" ${AUDIOGEN_MINIMAX_DEFAULT})
+option(AUDIOGEN_BUILD_MINIMAX "audiogen-cpp: build the desktop MiniMax-Music3 engine (CPU default, GPU via EngineOptions::device)" ${AUDIOGEN_MINIMAX_DEFAULT})
 if (AUDIOGEN_MOBILE)
     set(AUDIOGEN_BUILD_MINIMAX OFF CACHE BOOL "audiogen-cpp: MiniMax-Music3 is unavailable on mobile" FORCE)
 endif()
@@ -220,6 +220,11 @@ if (AUDIOGEN_BUILD_EXECUTABLES)
         src/acestep/mini_json.cpp
         src/acestep/music_cli_edit.cpp
     )
+
+    if (AUDIOGEN_BUILD_MINIMAX)
+        add_executable(mm3-replay src/minimax/mm3_replay_cli.cpp)
+        audiogen_link_in_tree_binary(mm3-replay)
+    endif()
 endif()
 
 # ---- tests ----------------------------------------------------------------
@@ -270,6 +275,14 @@ if (AUDIOGEN_BUILD_TESTS)
         audiogen_apply_ccache(test-minimax-integration)
         audiogen_register_test(test-minimax-integration LABEL "integration")
         set_property(TEST test-minimax-integration PROPERTY SKIP_RETURN_CODE 77)
+
+        # Model-backed quality regression over engine internals: DiT
+        # determinism across computes and the on-manifold final-latent check
+        # that rejects the historical "valid WAV but noise" failure.
+        add_executable(test-minimax-quality test/test_minimax_quality.cpp)
+        audiogen_link_in_tree_binary(test-minimax-quality)
+        audiogen_register_test(test-minimax-quality LABEL "integration")
+        set_property(TEST test-minimax-quality PROPERTY SKIP_RETURN_CODE 77)
 
         find_package(Python3 COMPONENTS Interpreter)
         if (Python3_Interpreter_FOUND)

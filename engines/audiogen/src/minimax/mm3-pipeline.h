@@ -89,7 +89,11 @@ static bool mm3_flow_sample_chunk(const MM3Model & m, const float * noise, const
 
         const auto t0 = std::chrono::steady_clock::now();
 
-        if (!mm3_dit_run(m, &g_mm3_dit, out_latents.data(), i == 0 ? cond : nullptr, 1.0f, t, L, pred_c.data(), err)) {
+        // The condition tensor must be re-uploaded on every forward: the graph
+        // allocator recycles input blocks for intermediates once their last
+        // consumer has run, so data left in mm3_dit_cond does not survive a
+        // graph compute.
+        if (!mm3_dit_run(m, &g_mm3_dit, out_latents.data(), cond, 1.0f, t, L, pred_c.data(), err)) {
             return false;
         }
 
@@ -100,7 +104,7 @@ static bool mm3_flow_sample_chunk(const MM3Model & m, const float * noise, const
             return false;
         }
 
-        if (!mm3_dit_run(m, &g_mm3_dit, out_latents.data(), nullptr, 0.0f, t, L, pred_u.data(), err)) {
+        if (!mm3_dit_run(m, &g_mm3_dit, out_latents.data(), cond, 0.0f, t, L, pred_u.data(), err)) {
             return false;
         }
 

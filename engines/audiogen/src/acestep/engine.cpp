@@ -1133,7 +1133,10 @@ static bool decode_audio(EngineImpl & engine, const std::vector<float> & latent,
         completed = report("vae", done, total);
         return completed;
     });
-    if (!completed) return false;
+    if (!completed) {
+        result.pcm.clear();
+        return false;
+    }
     if (result.pcm.empty()) throw std::runtime_error("acestep engine: VAE decode failed");
     report("vae", 1, 1);
     timing.mark("vae");
@@ -1731,7 +1734,10 @@ static GenerateResult decode_edit_plan_result(
           completed = report(EDIT_STAGE_VAE, done, total);
           return completed;
         });
-    if (!completed) return result;
+    if (!completed) {
+        result.pcm.clear();
+        return result;
+    }
     if (result.pcm.empty()) {
         throw std::runtime_error(EDIT_ERROR_FINAL_DECODE);
     }
