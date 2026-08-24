@@ -160,11 +160,6 @@ ggml_tensor * quantize_bank(ggml_context * ctx, const std::vector<quantizer_weig
     return residual;
 }
 
-ggml_tensor * build_conv_stack(ggml_context * ctx, const codec_model & model,
-                               int n_samples) {
-    return run_conv_stack(ctx, model, input_f32(ctx, AUDIO_INPUT, /*ne0=*/1, n_samples));
-}
-
 analysis_graph build_analysis(ggml_context * ctx, const codec_model & model, int positions,
                               int n_frames) {
     ggml_tensor * features = input_f32(ctx, FEATURE_INPUT, feature_width(model), positions);
@@ -338,6 +333,12 @@ bool check_encodable(const codec_model & model, int n_frames, std::string * erro
 }
 
 }  // namespace
+
+ggml_tensor * build_conv_stack(ggml_context * ctx, const codec_model & model,
+                               int n_samples) {
+    return run_conv_stack(ctx, model, input_f32(ctx, AUDIO_INPUT, /*ne0=*/1, n_samples));
+}
+
 
 bool encode_audio(codec_model & model, const float * pcm, int n_samples, int n_threads,
                   const cancel_hook & cancel, std::vector<int32_t> & codes_out,

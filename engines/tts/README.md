@@ -51,7 +51,7 @@ engine, not every backend ggml can compile.
 | Supertonic 3 | 31 languages plus `na` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Parler-TTS mini/large/Indic | English or 21 Indic languages | natural-language description | 44.1 kHz | yes | yes | yes | yes | yes |
 | Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice or zero-shot/cross-lingual reference WAV; instruct controls | 24 kHz | yes | yes | yes | yes | yes |
-| Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | yes | yes | yes | no |
+| Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | yes | yes | yes | yes |
 | LavaSR denoiser | language agnostic | input PCM | rate preserving | yes | yes | yes | yes | yes |
 | LavaSR enhancer | language agnostic | input PCM | 48 kHz | yes | yes | yes | yes | yes |
 
@@ -96,6 +96,23 @@ sequence edge builds a shorter graph than the full decode and a GEMM over a
 different shape legitimately reduces in a different order (worst observed:
 5.12e-4 on CUDA, under 1e-5 on Vulkan, against a 2e-3 bar; the window
 arithmetic errors the check exists to catch are hop-scale).
+
+Audio8 on CUDA required one ggml-cuda fix and a rethink of what its
+harnesses measure. The fix: the transpose fast path of the CUDA copy kernel
+ignores destination strides, so the V-cache append -- a transposed source
+into a strided cache view -- corrupted attention from the first prefill step;
+with the guarded kernel the LM's per-step numerics match the Vulkan-vs-CPU
+baseline node for node. The rethink: Audio8's networks are expansive enough
+that sub-ulp cross-backend rounding grows into large per-element differences,
+and its rollouts are free-running, so one differing argmax re-rolls the rest.
+The harnesses now gate on observables that are stable across backends -- a
+teacher-forced LM trace with per-step numeric bounds and a token-agreement
+rate (CPU exact, CUDA 96.9 percent, Vulkan 100), codec codes agreement with
+energy-level latent bounds, and rollout audio sanity with correlation
+reported for information -- with every bar measured on all three backends.
+The same redesign is what fixed test-audio8-codec and test-audio8-lm-vulkan,
+which had been failing on unmodified master since the speech ggml moved past
+their calibration.
 
 CosyVoice3 on CUDA is covered by the same per-stage reference harnesses as
 its other GPU backends, each registered per backend --

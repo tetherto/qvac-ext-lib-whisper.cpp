@@ -1231,11 +1231,15 @@ if (TTS_CPP_BUILD_TESTS)
                      "${_tcb_audio8_ref_wav}")
         set_property(TEST test-audio8-lm-${suffix} test-audio8-codec-${suffix}
                           test-audio8-engine-${suffix} APPEND
-                     PROPERTY ENVIRONMENT "AUDIO8_TEST_GPU=${suffix}")
+                     PROPERTY ENVIRONMENT "AUDIO8_TEST_GPU=${suffix}"
+                                          "TTS_CPP_GPU_BACKEND=${suffix}")
     endfunction()
 
-    # Audio8 allowlist: Vulkan / Metal / OpenCL (audio8/gguf.cpp
-    # GpuBackendRequirement::Vulkan | Metal | OpenCL).
+    # Audio8 allowlist: Vulkan / Metal / OpenCL / CUDA (audio8/gguf.cpp
+    # GpuBackendRequirement::Vulkan | Metal | OpenCL | CUDA).
+    if (TTS_CPP_GGML_CUDA)
+        tts_cpp_register_audio8_gpu_tests(cuda)
+    endif()
     if (TTS_CPP_GGML_VULKAN)
         tts_cpp_register_audio8_gpu_tests(vulkan)
         if (TARGET audio8-cli)
@@ -1250,6 +1254,8 @@ if (TTS_CPP_BUILD_TESTS)
                            "--out" "${CMAKE_CURRENT_BINARY_DIR}/audio8-vulkan-q8_0.wav"
                 PASS_REGEX "on Vulkan"
                 REQUIRES   "${_tcb_audio8_lm_q8}" "${_tcb_audio8_decoder_q8}")
+            set_property(TEST test-audio8-cli-vulkan-q8_0 APPEND PROPERTY ENVIRONMENT
+                         "TTS_CPP_GPU_BACKEND=vulkan")
         endif()
     endif()
     if (TTS_CPP_GGML_METAL)

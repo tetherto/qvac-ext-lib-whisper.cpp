@@ -23,6 +23,7 @@ namespace audio8_test {
 constexpr const char * METAL_ARM = "metal";
 constexpr const char * VULKAN_ARM = "vulkan";
 constexpr const char * OPENCL_ARM = "opencl";
+constexpr const char * CUDA_ARM = "cuda";
 
 inline std::string requested_gpu() {
     const char * name = std::getenv("AUDIO8_TEST_GPU");
@@ -46,6 +47,7 @@ inline bool registry_is_requested(const char * registry) {
     if (want == METAL_ARM) return tts_cpp::detail::reg_name_is_metal(registry);
     if (want == VULKAN_ARM) return tts_cpp::detail::reg_name_is_vulkan(registry);
     if (want == OPENCL_ARM) return tts_cpp::detail::reg_name_is_opencl(registry);
+    if (want == CUDA_ARM) return tts_cpp::detail::reg_name_is_cuda(registry);
     return false;
 }
 

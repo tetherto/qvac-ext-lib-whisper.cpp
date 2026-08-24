@@ -327,6 +327,23 @@ prompt_frames build_frames(const lm_hparams & hp, const PromptSegments & segment
 // Runs the slow transformer over `width` frames ending at position `n_past`,
 // returning the semantic logits for the last frame ([codebook_size + 1], the
 // codebook rows followed by EOS) and the hidden state the fast head consumes.
+// The codec analysis front end (raw audio through the causal conv stack),
+// exposed for the same two-backend node comparison as the LM graph.
+ggml_tensor * build_conv_stack(ggml_context * ctx, const codec_model & model,
+                               int n_samples);
+
+// The slow transformer's prefill/step graph, exposed so a harness can compute
+// the identical graph on two backends and compare it node by node.
+struct scratch;
+struct slow_graph_outputs {
+    ggml_tensor * logits  = nullptr;
+    ggml_tensor * carried = nullptr;
+};
+void build_slow_graph(lm_model & model, scratch & build, int width, int n_past,
+                      slow_graph_outputs & outs);
+void set_slow_graph_inputs(const lm_model & model, ggml_cgraph * graph,
+                           const int32_t * frames, int width, int n_past);
+
 bool slow_step(lm_model & model, const int32_t * frames, int width, int n_past,
                int n_threads, std::vector<float> & sem_logits,
                std::vector<float> & fast_input, std::string * error);
