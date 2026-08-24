@@ -1,7 +1,7 @@
 #pragma once
 
 // Which backend a GPU arm asked for. ctest names it in AUDIO8_TEST_GPU
-// ("metal", "vulkan", "opencl"); a CPU arm leaves the variable unset.
+// ("cuda", "metal", "vulkan", "opencl"); a CPU arm leaves the variable unset.
 //
 // Both GPU arms run the same binaries and backend selection picks on its own
 // preference order, so an arm that does not check its backend passes on

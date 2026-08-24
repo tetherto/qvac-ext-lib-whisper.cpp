@@ -3,8 +3,8 @@
 // The reference dump records, per generated frame, the semantic logits over
 // the 4096 codebook rows plus EOS, the hidden state handed to the fast head,
 // the fast head's own logits and the ten codebook values. Replaying the
-// fixture's prompt through the engine and teacher-forcing nothing (the engine
-// picks its own tokens) checks the whole loop: embedding gate, KV cache,
+// fixture's prompt through the engine with teacher-forced reference tokens checks
+// the whole loop: embedding gate, KV cache,
 // baked RoPE tables and both heads.
 
 #include "audio8/internal.h"

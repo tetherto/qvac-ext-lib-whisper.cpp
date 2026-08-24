@@ -339,7 +339,6 @@ ggml_tensor * build_conv_stack(ggml_context * ctx, const codec_model & model,
     return run_conv_stack(ctx, model, input_f32(ctx, AUDIO_INPUT, /*ne0=*/1, n_samples));
 }
 
-
 bool encode_audio(codec_model & model, const float * pcm, int n_samples, int n_threads,
                   const cancel_hook & cancel, std::vector<int32_t> & codes_out,
                   int & n_frames, std::string * error, encode_taps * taps) {
