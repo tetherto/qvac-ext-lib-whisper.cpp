@@ -2,8 +2,10 @@
 
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 namespace tts_cpp::acestep {
@@ -44,10 +46,37 @@ static float bf16_to_f32(uint16_t v) {
     ggml_bf16_t b; b.bits = v; return ggml_bf16_to_fp32(b);
 }
 
+// Weight-norm resolution and f16 conversion walk every conv weight on the
+// host at load time; single-threaded they cost ~1.2 s per VAE load. The rows
+// are independent, so split [0, n) into per-thread ranges (bit-identical:
+// per-row arithmetic order is unchanged).
+template <typename F>
+static void parallel_rows(int n, F && fn) {
+    const unsigned hw        = std::thread::hardware_concurrency();
+    const int      n_threads = (int) std::min<unsigned>(hw ? hw : 1, 16);
+    if (n < 128 || n_threads <= 1) {
+        fn(0, n);
+        return;
+    }
+    const int chunk = (n + n_threads - 1) / n_threads;
+    std::vector<std::thread> workers;
+    for (int t = 0; t < n_threads; t++) {
+        const int begin = t * chunk;
+        const int end   = std::min(n, begin + chunk);
+        if (begin >= end) break;
+        workers.emplace_back([&fn, begin, end] { fn(begin, end); });
+    }
+    for (auto & w : workers) w.join();
+}
+
 static void upload_f32_as(ggml_tensor * dst, const std::vector<float> & w) {
     if (dst->type == GGML_TYPE_F16) {
         std::vector<ggml_fp16_t> h(w.size());
-        ggml_fp32_to_fp16_row(w.data(), h.data(), (int) w.size());
+        parallel_rows((int) (w.size() / 4096) + 1, [&](int begin, int end) {
+            const size_t lo = (size_t) begin * 4096;
+            const size_t hi = std::min(w.size(), (size_t) end * 4096);
+            if (lo < hi) ggml_fp32_to_fp16_row(w.data() + lo, h.data() + lo, (int) (hi - lo));
+        });
         ggml_backend_tensor_set(dst, h.data(), 0, h.size() * sizeof(ggml_fp16_t));
     } else {
         ggml_backend_tensor_set(dst, w.data(), 0, w.size() * sizeof(float));
@@ -62,12 +91,14 @@ void vae_fuse_wn(ggml_tensor * dst, const VaeGGUF & g, const std::string & pfx) 
     const int        dim0 = (int) mv->ne[nd - 1];
     const int        fan  = (int) (ggml_nelements(mv) / dim0);
     std::vector<float> w((size_t) dim0 * fan);
-    for (int d = 0; d < dim0; d++) {
-        float gv = bf16_to_f32(gp[d]), nsq = 0.0f;
-        for (int i = 0; i < fan; i++) { float vv = bf16_to_f32(vp[(size_t) d * fan + i]); nsq += vv * vv; }
-        float s = gv / (sqrtf(nsq) + 1e-12f);
-        for (int i = 0; i < fan; i++) w[(size_t) d * fan + i] = bf16_to_f32(vp[(size_t) d * fan + i]) * s;
-    }
+    parallel_rows(dim0, [&](int begin, int end) {
+        for (int d = begin; d < end; d++) {
+            float gv = bf16_to_f32(gp[d]), nsq = 0.0f;
+            for (int i = 0; i < fan; i++) { float vv = bf16_to_f32(vp[(size_t) d * fan + i]); nsq += vv * vv; }
+            float s = gv / (sqrtf(nsq) + 1e-12f);
+            for (int i = 0; i < fan; i++) w[(size_t) d * fan + i] = bf16_to_f32(vp[(size_t) d * fan + i]) * s;
+        }
+    });
     upload_f32_as(dst, w);
 }
 
@@ -79,12 +110,14 @@ void vae_fuse_wn_ct(ggml_tensor * dst, const VaeGGUF & g, const std::string & pf
     const int        dim0 = (int) mv->ne[nd - 1];              // IC
     const int        fan  = (int) (ggml_nelements(mv) / dim0); // K*OC
     std::vector<float> w((size_t) dim0 * fan);
-    for (int d = 0; d < dim0; d++) {
-        float gv = bf16_to_f32(gp[d]), nsq = 0.0f;
-        for (int i = 0; i < fan; i++) { float vv = bf16_to_f32(vp[(size_t) d * fan + i]); nsq += vv * vv; }
-        float s = gv / (sqrtf(nsq) + 1e-12f);
-        for (int i = 0; i < fan; i++) w[(size_t) i * dim0 + d] = bf16_to_f32(vp[(size_t) d * fan + i]) * s;  // transpose
-    }
+    parallel_rows(dim0, [&](int begin, int end) {
+        for (int d = begin; d < end; d++) {
+            float gv = bf16_to_f32(gp[d]), nsq = 0.0f;
+            for (int i = 0; i < fan; i++) { float vv = bf16_to_f32(vp[(size_t) d * fan + i]); nsq += vv * vv; }
+            float s = gv / (sqrtf(nsq) + 1e-12f);
+            for (int i = 0; i < fan; i++) w[(size_t) i * dim0 + d] = bf16_to_f32(vp[(size_t) d * fan + i]) * s;  // transpose
+        }
+    });
     upload_f32_as(dst, w);
 }
 
