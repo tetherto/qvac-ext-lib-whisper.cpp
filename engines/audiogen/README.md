@@ -48,7 +48,9 @@ otherwise falls back to the CPU. On a GPU the weights and graphs live on the
 first usable backend the ggml registry offers (CUDA, Vulkan, Metal, ...) and a
 CPU backend backs any unsupported op; the full model pair must fit in device
 memory (~22 GB for the f16 pair). One MiniMax engine instance may be active at
-a time because its compute graphs are shared.
+a time because its compute graphs are shared. The weight-free
+`test-minimax-metal-ops` regression compares the 4096-channel condition
+projection and every DAC transposed-convolution stride against CPU on Metal.
 
 The frame rate, maximum frame count, flow defaults, and output sample rate come
 from GGUF metadata. Current converted files specify 25 frames per second, at
@@ -244,8 +246,8 @@ directory such as `Release/` beneath the executable directory. See the
 |---|---|---|
 | `AUDIOGEN_BUILD_LIBRARY` | `ON` | build the library; linkage follows `BUILD_SHARED_LIBS` |
 | `AUDIOGEN_BUILD_EXECUTABLES` | `ON` standalone, `OFF` as a subdirectory | CLIs and per-stage smoke harnesses |
-| `AUDIOGEN_BUILD_TESTS` | `ON` standalone, `OFF` as a subdirectory | CPU-only unit tests |
-| `AUDIOGEN_BUILD_MINIMAX` | `ON` on desktop, unavailable on Android and iOS | MiniMax-Music3 CPU engine |
+| `AUDIOGEN_BUILD_TESTS` | `ON` standalone, `OFF` as a subdirectory | unit, integration, and backend parity tests |
+| `AUDIOGEN_BUILD_MINIMAX` | `ON` on desktop, unavailable on Android and iOS | MiniMax-Music3 engine; CPU by default, GPU through `EngineOptions::device` |
 | `AUDIOGEN_INSTALL` | `ON` | generate install rules |
 | `AUDIOGEN_USE_SYSTEM_GGML` | `ON` | `find_package(ggml)`; required, there is no supported vendored ggml in this tree |
 | `AUDIOGEN_CCACHE` | `ON` | use ccache when available |
@@ -520,6 +522,9 @@ condition length, window stitching, sampler edge cases, and converter output
 transactions. Set `AUDIOGEN_TEST_MINIMAX_MODELS_DIR` to a directory containing
 the MiniMax GGUF pair to run `test-minimax-integration`, which covers model
 loading, generation output, progress, and cancellation.
+On a Metal build, `ctest --test-dir build/audiogen -R
+test-minimax-metal-ops` runs the model-free CPU/Metal condition and vocoder
+parity regression; it skips with return code 77 when Metal is unavailable.
 `test-acestep-integration` exercises the ACE-Step public API when model paths
 are supplied and otherwise reports a skipped test.
 
