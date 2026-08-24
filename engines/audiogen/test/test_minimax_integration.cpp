@@ -125,6 +125,24 @@ void verify_cancellation(tts_cpp::minimax::Engine & engine) {
     CHECK(result.pcm.empty());
 }
 
+// Deterministic regression for the startup race: a cancellation requested
+// before generate() is entered must cancel that run immediately (no progress
+// callback needed), be consumed by it, and leave the next run unaffected.
+void verify_pre_armed_cancellation(tts_cpp::minimax::Engine & engine) {
+    engine.cancel();
+    bool progressed = false;
+    const auto cancelled = engine.generate(
+        make_generate_params(),
+        [&progressed](const std::string &, int64_t, int64_t) {
+            progressed = true;
+            return true;
+        });
+    CHECK(cancelled.pcm.empty());
+    CHECK(!progressed);
+    const auto subsequent = engine.generate(make_generate_params());
+    verify_result(engine, subsequent);
+}
+
 // When the environment requests a non-CPU device, run one generation with the
 // engine deferring to MM3_DEVICE. device=gpu on a machine without a usable GPU
 // must fail engine creation (only device=auto may fall back to the CPU).
@@ -156,6 +174,7 @@ int run_integration(const char * models_dir) {
             CHECK(engine->backend_name() == "CPU");
             verify_recursive_generation(*engine);
             verify_cancellation(*engine);
+            verify_pre_armed_cancellation(*engine);
         }
         verify_environment_device_request(models_dir);
     } catch (const std::exception & error) {

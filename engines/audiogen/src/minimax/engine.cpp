@@ -184,6 +184,22 @@ private:
     bool & generating_;
 };
 
+// A cancellation is consumed by the generation that observes it, never erased
+// at startup: cancel() arriving between a caller's own precheck and generate()
+// entry must cancel that run instead of stalling until the first progress
+// callback re-arms the flag.
+class CancellationScope {
+public:
+    explicit CancellationScope(std::atomic<bool> & cancelled) : cancelled_(cancelled) {}
+
+    ~CancellationScope() {
+        cancelled_.store(false);
+    }
+
+private:
+    std::atomic<bool> & cancelled_;
+};
+
 }
 
 struct Engine::Impl {
@@ -230,7 +246,7 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & input) {
 GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn & progress) const {
     std::lock_guard<std::recursive_mutex> lock(engine_mutex());
     GenerationScope generation_scope(impl_->generating);
-    impl_->cancelled.store(false);
+    CancellationScope cancellation_scope(impl_->cancelled);
     AbortScope abort_scope(impl_->model.backend, impl_->model.cpu_backend, impl_->cancelled);
 
     const int model_max_frames = static_cast<int>(impl_->model.lm_cfg.max_audio_frames);
@@ -245,6 +261,10 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
         params.cfg_scale > 0.0f ? params.cfg_scale : impl_->model.synth_cfg.flow.cfg_scale;
     if (!std::isfinite(cfg_scale) || cfg_scale <= 0.0f) {
         throw std::invalid_argument("CFG scale must be finite and greater than zero");
+    }
+
+    if (impl_->cancelled.load()) {
+        return {};
     }
 
     MM3GenRequest request;
