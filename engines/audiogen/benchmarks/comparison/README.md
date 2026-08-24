@@ -42,6 +42,9 @@ building:
 - Python is optional. CLAP scoring needs Python 3.10+ and the pins in
   `quality/requirements.txt`. Fréchet Audio Distance is not run by default
   because this harness does not ship a licensed reference corpus.
+- CUDA builds require the NVIDIA CUDA toolkit. RTX 50-series native (`sm_120`)
+  compilation requires CUDA 12.8 or newer; older toolkits can use
+  forward-compatible PTX as described below.
 
 Do not pipe remote installers into a shell.
 
@@ -72,6 +75,11 @@ From the whisper.cpp / speech-stack repository root. Review
 `https://github.com/tetherto/qvac-ext-ggml` (`speech` branch) before compiling;
 the VAE needs `ggml_snake` and `ggml_col2im_1d`.
 
+The reviewed ggml revision for the committed reports is
+`0a76e3ed969781da6de41d6c9a1c3fc471c0978b`. Check it out after cloning when
+reproducing those reports. A newer revision is a new comparison input and must
+be recorded in the platform verification report.
+
 CPU (Metal disabled):
 
 ```sh
@@ -100,6 +108,28 @@ cmake -S engines/audiogen -B engines/audiogen/build-metal -DCMAKE_BUILD_TYPE=Rel
 cmake --build engines/audiogen/build-metal --target music-cli -j
 ```
 
+CUDA:
+
+```sh
+git clone --branch speech https://github.com/tetherto/qvac-ext-ggml ggml-src-cuda
+git -C ggml-src-cuda checkout 0a76e3ed969781da6de41d6c9a1c3fc471c0978b
+cmake -S ggml-src-cuda -B ggml-src-cuda/build -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=ON -DGGML_METAL=OFF \
+  -DCMAKE_INSTALL_PREFIX=$PWD/ggml-install-cuda
+cmake --build ggml-src-cuda/build -j
+cmake --install ggml-src-cuda/build
+cmake -S engines/audiogen -B engines/audiogen/build-cuda \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$PWD/ggml-install-cuda
+cmake --build engines/audiogen/build-cuda --target music-cli -j
+```
+
+On an RTX 50-series GPU with CUDA older than 12.8, add
+`-DCMAKE_CUDA_ARCHITECTURES=89-virtual` to both ggml CMake configurations.
+The NVIDIA driver JIT-compiles that PTX for the installed GPU. This is valid
+for an implementation comparison, but label the report as PTX rather than a
+native `sm_120` build. Set `CUDA_VISIBLE_DEVICES` before environment capture
+and generation when the host has more than one GPU.
+
 Set `ACESTEP_QVAC_CLI` to the `music-cli` you intend to measure.
 
 ## Build acestep.cpp
@@ -109,8 +139,13 @@ Checkout next to this comparison directory (`vendor/acestep.cpp`) or set
 build. On macOS a default build enables Metal; a CPU comparison requires a
 separate tree with Metal off.
 
+The reviewed acestep.cpp revision for the committed reports is
+`9761469d95fc204b5468623c68a1a2203e50b1f9`. Check it out before initialising
+its pinned ggml submodule when reproducing those reports.
+
 ```sh
 git clone https://github.com/ServeurpersoCom/acestep.cpp.git vendor/acestep.cpp
+git -C vendor/acestep.cpp checkout 9761469d95fc204b5468623c68a1a2203e50b1f9
 git -C vendor/acestep.cpp submodule update --init
 cmake -S vendor/acestep.cpp -B vendor/acestep.cpp/build-cpu \
   -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=OFF
@@ -118,29 +153,36 @@ cmake --build vendor/acestep.cpp/build-cpu --target ace-lm ace-synth -j
 cmake -S vendor/acestep.cpp -B vendor/acestep.cpp/build-metal \
   -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON
 cmake --build vendor/acestep.cpp/build-metal --target ace-lm ace-synth -j
+cmake -S vendor/acestep.cpp -B vendor/acestep.cpp/build-cuda \
+  -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_METAL=OFF
+cmake --build vendor/acestep.cpp/build-cuda --target ace-lm ace-synth -j
 ```
 
+Use the same `CMAKE_CUDA_ARCHITECTURES` value for both engines.
 Set `ACESTEP_CPP_LM` and `ACESTEP_CPP_SYNTH`.
 
 ## Run
 
 ```sh
 cd engines/audiogen/benchmarks/comparison
-node --test tests/backend.test.js tests/timing.test.js tests/aggregate.test.js \
-  tests/report.test.js tests/audio.test.js tests/adapters.test.js tests/clap.test.js \
-  tests/process.test.js
-node capture-environment.js
+node --test tests/*.test.js
+ACESTEP_QVAC_GGML_DIR=/path/to/ggml-src-cuda node capture-environment.js
 node run-comparison.js --dry-run --backend cpu
 ACESTEP_QVAC_CLI=... ACESTEP_CPP_LM=... ACESTEP_CPP_SYNTH=... \
   node run-comparison.js --backend cpu
 ACESTEP_QVAC_CLI=... ACESTEP_CPP_LM=... ACESTEP_CPP_SYNTH=... \
   node run-comparison.js --backend metal
+ACESTEP_QVAC_CLI=... ACESTEP_CPP_LM=... ACESTEP_CPP_SYNTH=... \
+  node run-comparison.js --backend cuda
 ```
 
 Interrupted runs resume from `out/rounds/`. `--force` rebuilds every round.
 `--prompts instrumental-folk,short-drone` selects a subset.
 `ACESTEP_COMPARE_ORDER=random|alternate|qvac-first|acestep-first` and
 `ACESTEP_COMPARE_COOLDOWN_MS` control order and pauses.
+Set `ACESTEP_QVAC_GGML_DIR` during environment capture so the report records
+the exact external ggml revision. The acestep.cpp revision and its ggml
+submodule are discovered automatically.
 
 `node generate-report.js out/cpu.json` regenerates Markdown from JSON. Generated
 reports include Mermaid bar charts for overall generation time, real-time
@@ -158,6 +200,7 @@ Review `quality/requirements.txt`, then:
 python3 -m pip install -r quality/requirements.txt
 node score-clap.js --backend cpu
 node score-clap.js --backend metal
+node score-clap.js --backend cuda
 ```
 
 First run downloads `laion/larger_clap_music_and_speech` into the Hugging Face
@@ -166,8 +209,9 @@ only**. Override with `ACESTEP_CLAP_TEXT_POLICY=caption+lyrics`.
 `--force` rescores. `--include-warmup` scores warm-up WAVs too.
 `clap.elapsedMs` is scorer time and is not added to generation time.
 
-Copy reviewed JSON/Markdown into `reports/mac-arm64/` and write
-`verification-report.md`. Keep large WAVs out of git; record checksums.
+Copy reviewed JSON/Markdown into `reports/<target>/` and complete the
+`verification-report.md` checklist described in `reports/README.md`. Keep
+large WAVs out of git; record checksums.
 
 ## Interpreting metrics
 
@@ -187,7 +231,10 @@ Medians and distributions are reported, not only the fastest run.
 
 ## Adding another platform
 
-1. Capture environment with `capture-environment.js`.
+1. Set the GPU visibility variables, then capture the environment with
+   `capture-environment.js`.
 2. Build CPU and the platform GPU backend for **both** engines.
 3. Run `--backend cpu` and the GPU name only if logs prove both used that GPU.
-4. Store reports under `reports/<target>/`.
+4. Store reports and the prompt manifest under `reports/<target>/`.
+5. Complete `verification-report.md`, including revisions, build flags,
+   environment, backend evidence, failures, and known limitations.

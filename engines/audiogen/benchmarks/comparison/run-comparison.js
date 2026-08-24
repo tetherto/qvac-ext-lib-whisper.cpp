@@ -40,7 +40,7 @@ function printHelp (config) {
   console.log(`ACE-Step direct engine comparison
 
 Usage:
-  node run-comparison.js [--dry-run] [--force] [--backend cpu|metal] [--prompts id,id]
+  node run-comparison.js [--dry-run] [--force] [--backend cpu|metal|cuda|vulkan] [--prompts id,id]
 
 Measures QVAC music-cli against acestep.cpp ace-lm + ace-synth. No addon, SDK,
 or packages/audiogen-ggml is used.

@@ -66,3 +66,8 @@ test('qvac args pass explicit metadata and do not enable GPU on cpu', () => {
   assert.equal(args[args.indexOf('--dur') + 1], '8')
   assert.equal(args[args.indexOf('--tsig') + 1], '4')
 })
+
+test('qvac args enable GPU for CUDA', () => {
+  const args = buildQvacArgs({ ...config, backend: 'cuda' }, prompt, '/tmp/out.wav')
+  assert.equal(args.includes('--gpu'), true)
+})

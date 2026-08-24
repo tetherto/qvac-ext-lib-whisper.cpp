@@ -9,9 +9,11 @@ const {
   detectQvacBackend
 } = require('../lib/backend')
 
-test('canonicalBackend maps Metal device names', () => {
+test('canonicalBackend maps GPU device names', () => {
   assert.equal(canonicalBackend('MTL0'), 'metal')
   assert.equal(canonicalBackend('ggml-metal'), 'metal')
+  assert.equal(canonicalBackend('CUDA0'), 'cuda')
+  assert.equal(canonicalBackend('Vulkan1'), 'vulkan')
   assert.equal(canonicalBackend('CPU'), 'cpu')
 })
 
@@ -29,6 +31,7 @@ test('detectQvacBackend reads engine logs', () => {
 test('detectAcestepBackend flags CPU fallback', () => {
   assert.equal(detectAcestepBackend('falling back to CPU'), 'cpu-fallback')
   assert.equal(detectAcestepBackend('using ggml-metal'), 'Metal')
+  assert.equal(detectAcestepBackend('using backend CUDA0'), 'CUDA0')
 })
 
 test('assertBackend fails closed on GPU fallback', () => {
@@ -37,4 +40,5 @@ test('assertBackend fails closed on GPU fallback', () => {
     /GPU-to-CPU fallback/
   )
   assert.doesNotThrow(() => assertBackend('MTL0', 'metal'))
+  assert.doesNotThrow(() => assertBackend('CUDA0', 'cuda'))
 })

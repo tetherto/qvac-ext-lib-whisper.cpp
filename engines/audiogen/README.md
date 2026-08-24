@@ -7,7 +7,7 @@ Native [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) and MiniMax-Musi
 | CMake project | `audiogen-cpp` v0.1.0 |
 | Public API | `tts_cpp::acestep::Engine`, `tts_cpp::minimax::Engine` |
 | Output | interleaved stereo PCM, model-defined sample rate, `pcm[t * 2 + ch]` |
-| Backends | CPU, Vulkan (including Android Mali iGPUs), Metal, OpenCL (validated on Adreno 700+) |
+| Backends | CPU, CUDA, Vulkan (including Android Mali iGPUs), Metal, OpenCL (validated on Adreno 700+) |
 | ggml | requires the `ggml-speech` port for the custom `ggml_snake` and `ggml_col2im_1d` ops |
 | Consumed by | the `@qvac/audiogen-ggml` addon in [QVAC](https://github.com/tetherto/qvac) |
 
@@ -541,7 +541,7 @@ comparison.
 
 ## Performance
 
-There is no CI benchmark suite for this engine yet. `music-cli` always enables
+There is no CI benchmark lane for this engine yet. `music-cli` always enables
 verbose engine output and prints per-stage wall clock to stderr (`[music-cli]`,
 `[acestep-timing]`). Direct library use prints `[acestep-timing]` only when
 `EngineOptions::verbose` is enabled; it defaults to `false`.

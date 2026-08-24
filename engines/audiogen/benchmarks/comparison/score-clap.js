@@ -39,7 +39,7 @@ function printHelp () {
   console.log(`Score saved comparison WAVs with LAION CLAP (off the inference clock).
 
 Usage:
-  node score-clap.js [--backend cpu|metal] [--force] [--include-warmup]
+  node score-clap.js [--backend cpu|metal|cuda|vulkan] [--force] [--include-warmup]
 
 Does not run music-cli or ace-synth. Generation commands are unchanged.
 Requires Python deps from quality/requirements.txt and a CLAP checkpoint

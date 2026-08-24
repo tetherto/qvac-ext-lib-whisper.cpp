@@ -32,10 +32,10 @@ function detectAcestepBackend (logText) {
   if (/ggml_metal|ggml-metal/i.test(text)) return 'Metal'
   const metal = text.match(/\b(MTL\d*|Metal)\b/i)
   const vulkan = text.match(/\bVulkan\d*\b/i)
-  const cuda = text.match(/\bCUDA\b/i)
+  const cuda = text.match(/\bCUDA\d*\b/i)
   if (metal) return metal[1]
   if (vulkan) return vulkan[0]
-  if (cuda) return 'CUDA'
+  if (cuda) return cuda[0]
   return 'cpu'
 }
 
