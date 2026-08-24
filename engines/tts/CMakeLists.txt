@@ -782,6 +782,15 @@ if (TTS_CPP_BUILD_TESTS)
                 ARGS     "--llm-gguf" "${_tcb_cosy_llm_quant_gguf}" "--in-dir" "${_tcb_cosy_ref}"
                 REQUIRES "${_tcb_cosy_llm_quant_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
             set_property(TEST test-cosyvoice-llm-gpu-${_tcb_cosy_quant} APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+            foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+                tts_cpp_register_test(test-cosyvoice-llm-${_tcb_cosy_arm}-${_tcb_cosy_quant}
+                    EXE      test-cosyvoice-llm
+                    LABEL    "gpu"
+                    ARGS     "--llm-gguf" "${_tcb_cosy_llm_quant_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+                    REQUIRES "${_tcb_cosy_llm_quant_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
+                set_property(TEST test-cosyvoice-llm-${_tcb_cosy_arm}-${_tcb_cosy_quant} APPEND PROPERTY ENVIRONMENT
+                             "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+            endforeach()
         endforeach()
     endif()
 
@@ -856,6 +865,15 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--in-dir" "${_tcb_cosy_s3tok_ref}"
             REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
         set_property(TEST test-s3tokenizer-v3-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+            tts_cpp_register_test(test-s3tokenizer-v3-${_tcb_cosy_arm}
+                EXE      test-s3tokenizer-v3
+                LABEL    "gpu"
+                ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--in-dir" "${_tcb_cosy_s3tok_ref}"
+                REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
+            set_property(TEST test-s3tokenizer-v3-${_tcb_cosy_arm} APPEND PROPERTY ENVIRONMENT
+                         "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+        endforeach()
         set(_tcb_cosy_s3tok_q8_gguf "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-s3tok-q8_0.gguf")
         tts_cpp_register_test(test-s3tokenizer-v3-gpu-q8_0
             EXE      test-s3tokenizer-v3
@@ -863,6 +881,15 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_q8_gguf}" "--in-dir" "${_tcb_cosy_s3tok_ref}" "--min-token-match" "0.93"
             REQUIRES "${_tcb_cosy_s3tok_q8_gguf}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
         set_property(TEST test-s3tokenizer-v3-gpu-q8_0 APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+            tts_cpp_register_test(test-s3tokenizer-v3-${_tcb_cosy_arm}-q8_0
+                EXE      test-s3tokenizer-v3
+                LABEL    "gpu"
+                ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_q8_gguf}" "--in-dir" "${_tcb_cosy_s3tok_ref}" "--min-token-match" "0.93"
+                REQUIRES "${_tcb_cosy_s3tok_q8_gguf}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
+            set_property(TEST test-s3tokenizer-v3-${_tcb_cosy_arm}-q8_0 APPEND PROPERTY ENVIRONMENT
+                         "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+        endforeach()
     endif()
 
     # ---- CosyVoice3 cloning front-end round-trip -------------------------
@@ -908,6 +935,17 @@ if (TTS_CPP_BUILD_TESTS)
             REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
                      "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/prompt_stok.npy")
         set_property(TEST test-cosyvoice-frontend-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+            tts_cpp_register_test(test-cosyvoice-frontend-${_tcb_cosy_arm}
+                EXE      test-cosyvoice-frontend
+                LABEL    "gpu"
+                ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--campplus-gguf" "${_tcb_cosy_campplus_gguf}"
+                         "--wav" "${_tcb_cosy_prompt_wav}" "--in-dir" "${_tcb_cosy_ref}"
+                REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                         "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/prompt_stok.npy")
+            set_property(TEST test-cosyvoice-frontend-${_tcb_cosy_arm} APPEND PROPERTY ENVIRONMENT
+                         "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+        endforeach()
     endif()
 
     # Thread-safety guard for the shared mel/fbank extraction (concurrent
@@ -1006,6 +1044,19 @@ if (TTS_CPP_BUILD_TESTS)
                      "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
                      "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/gen_tokens.npy")
         set_property(TEST test-cosyvoice-clone-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+            tts_cpp_register_test(test-cosyvoice-clone-${_tcb_cosy_arm}
+                EXE      test-cosyvoice-clone
+                LABEL    "gpu"
+                ARGS     "--model-dir" "${TTS_CPP_TEST_MODEL_DIR}" "--wav" "${_tcb_cosy_prompt_wav}"
+                         "--tokens-npy" "${_tcb_cosy_ref}/gen_tokens.npy" "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--campplus-gguf" "${_tcb_cosy_campplus_gguf}"
+                REQUIRES "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-f32.gguf"
+                         "${TTS_CPP_TEST_MODEL_DIR}/voice.gguf"
+                         "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                         "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/gen_tokens.npy")
+            set_property(TEST test-cosyvoice-clone-${_tcb_cosy_arm} APPEND PROPERTY ENVIRONMENT
+                         "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+        endforeach()
     endif()
 
     # Deviceless policy test for GpuBackendRequirement filtering (the per-device

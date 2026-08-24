@@ -98,12 +98,18 @@ different shape legitimately reduces in a different order (worst observed:
 arithmetic errors the check exists to catch are hop-scale).
 
 CosyVoice3 on CUDA is covered by the same per-stage reference harnesses as
-its other GPU backends, with the four core stages registered per backend as
-`test-cosyvoice-{flow,llm,hift,conv1d}-{cuda,vulkan}`: the full CosyVoice and
-s3tokenizer suite passes 27/27 pinned to CUDA and to Vulkan, and greedy
-long-form synthesis (67 s of audio, well past the launch-abort threshold the
-grid-striding fix removed) produces the identical sample count on CUDA,
-Vulkan and CPU.
+its other GPU backends, each registered per backend --
+`test-cosyvoice-{flow,llm,hift,conv1d,frontend,clone}-{cuda,vulkan}` and
+`test-s3tokenizer-v3-{cuda,vulkan}[-q8_0]` -- so both desktop backends stay
+pinned rather than whichever selection prefers: the full CosyVoice and
+s3tokenizer suite passes 27/27 pinned to CUDA and to Vulkan. Greedy long-form
+synthesis (67 s of audio, well past the launch-abort threshold the
+grid-striding fix removed) produces the identical sample count (1617600) on
+CUDA, Vulkan and the CPU -- each measured -- at roughly 12 s wall on either
+GPU against 526 s on the CPU. The CUDA column here is engine-level validation; the consumer path --
+the published `speech-cpp[cuda]` port and the addon behind it -- ships with
+the registry bump that closes this model series, which is when that port and
+the qvac workflows exercise it end to end.
 
 Supertonic on CUDA rests on a backend-capability distinction the F16-weight
 auto policy now probes: the conv-via-im2col lowerings put the weight in
