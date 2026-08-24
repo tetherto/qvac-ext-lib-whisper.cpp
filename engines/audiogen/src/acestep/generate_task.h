@@ -60,10 +60,17 @@ inline std::string resolve_generate_task(const GenerateParams & params, Generate
     if (task.type == TASK_COVER) {
         return "acestep engine: task 'cover' is not implemented yet (needs FSQ tokenizer); use cover-nofsq";
     }
-    if (task.audio_cover_strength < 1.0f) {
-        return "acestep engine: audio_cover_strength < 1 is not implemented yet for cover-nofsq";
-    }
     return {};
+}
+
+inline bool needs_cover_conditioning_switch(const GenerateTask & task) {
+    return is_cover_task(task.type) && task.audio_cover_strength < 1.0f;
+}
+
+// Step index where the DiT drops the source conditioning; -1 disables the switch.
+inline int resolve_cover_switch_step(const GenerateTask & task, int num_steps) {
+    if (!needs_cover_conditioning_switch(task)) return -1;
+    return (int) ((float) num_steps * task.audio_cover_strength);
 }
 
 } // namespace tts_cpp::acestep

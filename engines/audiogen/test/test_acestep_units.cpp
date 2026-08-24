@@ -616,7 +616,38 @@ void test_generate_task_errors() {
 
     params.task_type = TASK_COVER_NOFSQ;
     params.audio_cover_strength = 0.5f;
-    CHECK(resolve_generate_task(params, task).find("audio_cover_strength") != std::string::npos);
+    CHECK(resolve_generate_task(params, task).empty());
+    CHECK(approx(task.audio_cover_strength, 0.5f));
+}
+
+void test_cover_conditioning_switch() {
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::TASK_COVER_NOFSQ;
+    using tts_cpp::acestep::TASK_TEXT2MUSIC;
+    using tts_cpp::acestep::needs_cover_conditioning_switch;
+    using tts_cpp::acestep::resolve_cover_switch_step;
+
+    GenerateTask task;
+    task.type = TASK_COVER_NOFSQ;
+    task.audio_cover_strength = 1.0f;
+    CHECK(!needs_cover_conditioning_switch(task));
+    CHECK(resolve_cover_switch_step(task, 50) == -1);
+
+    task.audio_cover_strength = 0.5f;
+    CHECK(needs_cover_conditioning_switch(task));
+    CHECK(resolve_cover_switch_step(task, 50) == 25);
+    CHECK(resolve_cover_switch_step(task, 8) == 4);
+
+    task.audio_cover_strength = 0.75f;
+    CHECK(resolve_cover_switch_step(task, 8) == 6);
+
+    task.audio_cover_strength = 0.0f;
+    CHECK(resolve_cover_switch_step(task, 8) == 0);
+
+    task.type = TASK_TEXT2MUSIC;
+    task.audio_cover_strength = 0.5f;
+    CHECK(!needs_cover_conditioning_switch(task));
+    CHECK(resolve_cover_switch_step(task, 50) == -1);
 }
 
 void test_generate_task_strengths() {
@@ -1127,6 +1158,7 @@ int main() {
     test_generate_task_audio_layout();
     test_generate_task_errors();
     test_generate_task_strengths();
+    test_cover_conditioning_switch();
     test_generation_plans();
     test_generation_conditioning();
     test_cover_noise_blending();

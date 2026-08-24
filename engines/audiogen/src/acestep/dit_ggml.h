@@ -116,6 +116,17 @@ struct DitSampleParams {
     int           repaint_crossfade_frames = DIT_REPAINT_DISABLED_CROSSFADE;
     bool          repaint_preserve_latent = false;
 
+    // Cover conditioning switch (audio_cover_strength < 1): from step
+    // `cover_switch_step` on, the context channels swap to `context_switch`
+    // (silence) and the encoder states swap to `enc_hidden_switch` (the
+    // text2music-instruction encoding, zero-padded to enc_S rows;
+    // `real_enc_S_switch` carries its true per-batch lengths for the
+    // cross-attention mask). -1 disables the switch.
+    const float * context_switch    = nullptr;  // [in_channels-out_channels, T, N]
+    const float * enc_hidden_switch = nullptr;  // [H_enc, enc_S, N]
+    const int *   real_enc_S_switch = nullptr;  // [N]
+    int           cover_switch_step = -1;
+
     // Optional per-step progress hook, fired at the start of each Euler step
     // with (step, num_steps). Return false to request cancellation (the sampler
     // then aborts and dit_sample returns false). The diffusion loop is the bulk
