@@ -176,6 +176,23 @@ work on Vulkan, or CUDA ports of the tiled kernels.
   campaign's scope. The class is closed in this ledger; remaining in-plan
   levers are memory-pattern kernels (im2col tiling) only.
 
+### H10c — CORRECT — tiled 1D im2col Vulkan pipeline (stretch item, in-plan)
+
+- Same strided-read disease as col2im (KW-wide gathers at input-row stride):
+  im2col_1d_tiled.comp stages the contiguous input window for a 128x16 output
+  tile in LDS; writes stay contiguous along CHW. Gated: 1D, window fits LDS,
+  dst addressable without BDA, SIGNAL >= 32 MiB (crossover measured — the
+  cache-resident-input shape prefers the generic shader and stays on it).
+- TRAP found: on BDA-capable devices ggml_vk_op_f32 binds the im2col dst as a
+  1-byte dummy (stock shaders write via device address). A non-BDA pipeline
+  behind GGML_OP_IM2COL silently writes into the dummy -> garbage without any
+  error. Fixed by binding the real dst for the tiled pipelines. Recorded as a
+  structural fact.
+- Results: VAE-shaped 1D im2col 74-87 -> 157-186 GB/s on DRAM-resident
+  shapes (per-window im2col 10.6 -> 6.9 ms); engine q4 7.7 s / sft 12.4 s,
+  WAVs bit-identical. Correctness suite extended (ragged large 1D cases,
+  k=1 and dilated k=7); IM2COL/CONV_TRANSPOSE_1D suites green.
+
 ## Hypothesis ledger
 
 (entries appended below; format: Hn — status — hypothesis — why — test — changes —
