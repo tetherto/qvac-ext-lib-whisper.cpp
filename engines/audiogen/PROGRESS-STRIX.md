@@ -138,6 +138,26 @@ Milestone verification:
   cannot link this campaign's local trees without a registry release; the
   music-cli end-to-end benchmarks stand in for the production entry point.
 
+## HIP/ROCm data point (user-approved scope; no pivot)
+
+Build: -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 (ROCm 7.2), audiogen linked against
+it; registry falls through to ROCm0 (unvalidated pass), default placement
+keeps LM+detok on CPU as designed. 30 s, P1/s42, 1 warmup + 1 timed:
+
+| Config | Wall | LM | VAE | DiT |
+|---|---|---|---|---|
+| HIP default (LM CPU), q4 | 15.8 s | 10.7 s | 2.9 s | 1.1 s |
+| HIP + ACESTEP_LM_GPU, q4 | 7.8 s | 2.8 s | 2.8 s | 1.1 s |
+| HIP + ACESTEP_LM_GPU, q8 | 7.8 s | 2.8 s | 2.9 s | 1.0 s |
+
+Findings: overall parity with optimized Vulkan (7.5-8.1 s) with opposite
+strengths — the HIP/CUDA LM decode is ~1.6x faster than Vulkan's (better
+per-token submit path), while the tiled Vulkan VAE is ~1.8x faster than HIP's
+(our col2im/transpose kernels are Vulkan-only; CUDA inherits its own). ROCm
+stays off the allowlist (would need the F32-parity protocol + addon backend
+map work); Vulkan remains the product path. Future headroom: LM submit-side
+work on Vulkan, or CUDA ports of the tiled kernels.
+
 ## Hypothesis ledger
 
 (entries appended below; format: Hn — status — hypothesis — why — test — changes —
