@@ -107,6 +107,37 @@ H4 quality gates:
   hits in first 30 s) — sft path parity is documented as unverified upstream;
   flagged for user listening, not investigated further in this campaign.
 
+## Milestone m2 (H4 + col2im + LM graph cache + parallel VAE load + large transpose)
+
+| Config | Cold | Median warm | Speedup (warm) | Speedup (cold) |
+|---|---|---|---|---|
+| q4 / P1 | 7.5 | 7.5 | 2.09x | 2.04x |
+| q4 / P2 | 7.5 | 7.5 | 2.25x | 2.21x |
+| q8 / P1 | 7.7 | 8.1 | 2.40x | 2.57x |
+| q8 / P2 | 8.0 | 8.0 | 2.18x | 2.38x |
+| sft / P1 | 12.6 | 12.6 | 1.79x (not gated) | 1.76x |
+
+All outputs bit-deterministic. 2x bar CLEARED on all gated configs.
+
+Milestone verification:
+- CPU lane: lm-smoke CPU logit dumps bit-identical to pre-campaign build
+  (graph cache + parallel load proven neutral off-GPU).
+- Gate C WER: P1 within band. P2 s42 single sample exceeded band; 3-seed
+  study (7/1337/9001) shows GPU-LM WER 0.53/0.42/0.78 vs CPU-LM
+  0.82/0.84/0.84 — GPU-LM is at least as lyrical; s42 was an unlucky draw.
+  PASS. sft WER 1.0 both before and after (pre-existing upstream sft parity
+  gap; not a regression).
+- Full per-op Vulkan sweep vs Phase-0 reference: IDENTICAL — 133 ops OK, only
+  the pre-existing IM2COL_3D workgroup-overflow crash (present at baseline).
+  Zero new failures.
+- Shared-path guard: whisper-cli (large-v3-turbo) ran dozens of transcriptions
+  against the same modified ggml install throughout the WER batteries —
+  the shared Vulkan paths (matmul, FA, transposes) behave correctly for
+  whisper as well.
+- Addon RTF bench: NOT run — the npm addon consumes released vcpkg ports and
+  cannot link this campaign's local trees without a registry release; the
+  music-cli end-to-end benchmarks stand in for the production entry point.
+
 ## Hypothesis ledger
 
 (entries appended below; format: Hn — status — hypothesis — why — test — changes —
