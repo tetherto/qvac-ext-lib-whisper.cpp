@@ -830,6 +830,30 @@ static void preserve_repaint_latent(const DitSampleParams & params, size_t laten
         (size_t) params.T, params.repaint_crossfade_frames, channels);
 }
 
+static void fill_ca_mask_rows(std::vector<uint16_t> & ca_mask, const int * real_enc_S,
+                              int enc_S, int S, int N) {
+    for (int b = 0; b < N; b++) {
+        int re = real_enc_S ? real_enc_S[b] : enc_S;
+        for (int qi = 0; qi < S; qi++) {
+            for (int ki = 0; ki < enc_S; ki++) {
+                float v = (ki < re) ? 0.0f : -INFINITY;
+                ca_mask[(size_t) b * enc_S * S + (size_t) qi * enc_S + ki] = ggml_fp32_to_fp16(v);
+            }
+        }
+    }
+}
+
+static void splice_context_channels(std::vector<float> & input_buf, const float * context,
+                                    int T, int N, int in_ch, int ctx_ch) {
+    for (int b = 0; b < N; b++) {
+        for (int t = 0; t < T; t++) {
+            memcpy(&input_buf[(size_t) b * T * in_ch + (size_t) t * in_ch],
+                   &context[(size_t) b * T * ctx_ch + (size_t) t * ctx_ch],
+                   (size_t) ctx_ch * sizeof(float));
+        }
+    }
+}
+
 bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & latent_out) {
     const DitConfig & c      = m->cfg;
     const int         Oc     = c.out_channels;                 // 64 (noisy latent channels)
@@ -864,29 +888,16 @@ bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & la
     // Cross-attention padding mask [enc_S, S, 1, N] (F16): block encoder positions
     // beyond the real (unpadded) length; value depends only on ki.
     std::vector<uint16_t> ca_mask((size_t) enc_S * S * N);
-    for (int b = 0; b < N; b++) {
-        int re = p.real_enc_S ? p.real_enc_S[b] : enc_S;
-        for (int qi = 0; qi < S; qi++) {
-            for (int ki = 0; ki < enc_S; ki++) {
-                float v = (ki < re) ? 0.0f : -INFINITY;
-                ca_mask[(size_t) b * enc_S * S + (size_t) qi * enc_S + ki] = ggml_fp32_to_fp16(v);
-            }
-        }
-    }
+    fill_ca_mask_rows(ca_mask, p.real_enc_S, enc_S, S, N);
 
     // x_t (current noisy latent) starts at the supplied noise.
     std::vector<float> xt(p.noise, p.noise + (size_t) n_per * N);
 
-    // Per-step DiT input [in_ch, T, N]: context channels are constant, the last
-    // Oc channels carry x_t and are refreshed each step.
+    // Per-step DiT input [in_ch, T, N]: context channels are constant between
+    // conditioning switches, the last Oc channels carry x_t and are refreshed
+    // each step.
     std::vector<float> input_buf((size_t) in_ch * T * N);
-    for (int b = 0; b < N; b++) {
-        for (int t = 0; t < T; t++) {
-            memcpy(&input_buf[(size_t) b * T * in_ch + (size_t) t * in_ch],
-                   &p.context_latents[(size_t) b * T * ctx_ch + (size_t) t * ctx_ch],
-                   (size_t) ctx_ch * sizeof(float));
-        }
-    }
+    splice_context_channels(input_buf, p.context_latents, T, N, in_ch, ctx_ch);
 
     std::vector<float> vt;
     std::vector<float> xt_before;
@@ -895,9 +906,19 @@ bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & la
         xt_before.resize(n_per * N);
         denoised.resize(n_per * N);
     }
+    const float * enc_hidden_active = p.enc_hidden;
+    bool          cover_switched    = false;
     for (int step = 0; step < p.num_steps; step++) {
         if (p.on_step && !p.on_step(step, p.num_steps)) return false;
         const float t_curr = p.schedule[step];
+
+        if (p.cover_switch_step >= 0 && step >= p.cover_switch_step && !cover_switched &&
+            p.context_switch != nullptr && p.enc_hidden_switch != nullptr) {
+            cover_switched = true;
+            splice_context_channels(input_buf, p.context_switch, T, N, in_ch, ctx_ch);
+            enc_hidden_active = p.enc_hidden_switch;
+            fill_ca_mask_rows(ca_mask, p.real_enc_S_switch, enc_S, S, N);
+        }
 
         // splice x_t into the trailing Oc channels of the DiT input
         for (int b = 0; b < N; b++) {
@@ -912,7 +933,7 @@ bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & la
         fin.input_latents = input_buf.data();
         fin.T             = T;
         fin.N             = N;
-        fin.enc_hidden    = p.enc_hidden;
+        fin.enc_hidden    = enc_hidden_active;
         fin.enc_S         = enc_S;
         fin.H_enc         = p.H_enc;
         fin.t             = t_curr;

@@ -309,10 +309,14 @@ void test_backend_device_types() {
     CHECK(backend_reg_name_is_validated_gpu("Vulkan"));
     CHECK(backend_reg_name_is_validated_gpu("MTL"));
     CHECK(backend_reg_name_is_validated_gpu("Metal"));
+    CHECK(backend_reg_name_is_validated_gpu("CUDA"));
     // OpenCL is deliberately absent: it is reached by its own Adreno pass in
-    // backend_gpu_init(), not by this Vulkan/Metal preference.
+    // backend_gpu_init(), not by this validated-backend preference.
     CHECK(!backend_reg_name_is_validated_gpu("OpenCL"));
-    CHECK(!backend_reg_name_is_validated_gpu("CUDA"));
+    // The HIP/MUSA builds of ggml-cuda register under their own names and stay
+    // unvalidated until measured.
+    CHECK(!backend_reg_name_is_validated_gpu("ROCm"));
+    CHECK(!backend_reg_name_is_validated_gpu("MUSA"));
     CHECK(!backend_reg_name_is_validated_gpu(nullptr));
 
     // That Adreno pass gates on the generation parsed out of the device
@@ -336,7 +340,23 @@ void test_backend_device_types() {
 // device lane. Mirrors the three branches Engine::create() relies on: the
 // backend allowlist, the CPU fallback for everything else, and the env
 // overrides layered on top.
+
+// A backend validated for every stage except the autoregressive LM keeps the
+// LM on the CPU while the detokenizer and encoders follow the GPU.
+void check_gpu_backend_keeps_lm_on_cpu(const char * name) {
+    using tts_cpp::acestep::PlacementOverrides;
+    using tts_cpp::acestep::resolve_stage_placement;
+    using tts_cpp::acestep::StagePlacement;
+
+    const PlacementOverrides none;
+    StagePlacement p = resolve_stage_placement(name, none);
+    CHECK(!p.lm_on_gpu);
+    CHECK(p.detok_on_gpu);
+    CHECK(p.enc_on_gpu);
+}
+
 void test_stage_placement() {
+    using tts_cpp::acestep::backend_name_is_cuda;
     using tts_cpp::acestep::backend_name_is_metal;
     using tts_cpp::acestep::backend_name_is_opencl;
     using tts_cpp::acestep::backend_name_is_vulkan;
@@ -354,12 +374,18 @@ void test_stage_placement() {
     // not what reaches here.
     CHECK(backend_name_is_opencl("OpenCL"));
     CHECK(!backend_name_is_opencl("GPUOpenCL"));
+    // ggml-cuda's REGISTRY name; the HIP/MUSA builds of the same backend
+    // register as "ROCm"/"MUSA" and must not match.
+    CHECK(backend_name_is_cuda("CUDA"));
+    CHECK(!backend_name_is_cuda("ROCm"));
+    CHECK(!backend_name_is_cuda("MUSA"));
 
     // The input is the REGISTRY name, which carries no device-index suffix.
     // ggml_backend_name() would hand over "MTL0" / "Vulkan0" and match nothing.
     CHECK(!backend_name_is_metal("MTL0"));
     CHECK(!backend_name_is_vulkan("Vulkan0"));
     CHECK(!backend_name_is_opencl("OpenCL0"));
+    CHECK(!backend_name_is_cuda("CUDA0"));
 
     // Exact compare: no case folding, no substring match, and null/empty safe.
     CHECK(!backend_name_is_metal("mtl"));
@@ -368,15 +394,19 @@ void test_stage_placement() {
     CHECK(!backend_name_is_vulkan("vulkan"));
     CHECK(!backend_name_is_opencl("opencl"));
     CHECK(!backend_name_is_metal("CUDA"));
+    CHECK(!backend_name_is_cuda("cuda"));
     CHECK(!backend_name_is_vulkan("MTL"));
     CHECK(!backend_name_is_metal("Vulkan"));
     CHECK(!backend_name_is_opencl("Vulkan"));
+    CHECK(!backend_name_is_cuda("Vulkan"));
     CHECK(!backend_name_is_metal(""));
     CHECK(!backend_name_is_vulkan(""));
     CHECK(!backend_name_is_opencl(""));
+    CHECK(!backend_name_is_cuda(""));
     CHECK(!backend_name_is_metal(nullptr));
     CHECK(!backend_name_is_vulkan(nullptr));
     CHECK(!backend_name_is_opencl(nullptr));
+    CHECK(!backend_name_is_cuda(nullptr));
 
     const PlacementOverrides none;
 
@@ -388,20 +418,19 @@ void test_stage_placement() {
         CHECK(p.enc_on_gpu);  // encoders follow the GPU on every backend
     }
 
-    // Vulkan is validated for every stage except the autoregressive LM. On
-    // Mali-G715, GPU LM logits collapse to repeated codes and truncate songs.
-    {
-        StagePlacement p = resolve_stage_placement("Vulkan", none);
-        CHECK(!p.lm_on_gpu);
-        CHECK(p.detok_on_gpu);
-        CHECK(p.enc_on_gpu);
-    }
+    // Vulkan and CUDA are validated for every stage except the autoregressive
+    // LM (README "Backends" records the per-backend rationale).
+    check_gpu_backend_keeps_lm_on_cpu("Vulkan");
+    check_gpu_backend_keeps_lm_on_cpu("CUDA");
 
     // -- fallback: everything else keeps the shipping CPU placement -----------
     // Unmeasured backends must not silently pick up the GPU path. "MTL0" is in
-    // this list on purpose: a suffixed name is NOT the allowlisted one.
-    const char * const others[] = { "CUDA",     "SYCL",     "BLAS", "CPU",  "MTL0",
-                                    "Vulkan0",  "OpenCL0",  "",     nullptr };
+    // this list on purpose: a suffixed name is NOT the allowlisted one. "ROCm"
+    // and "MUSA" are the HIP/MUSA builds of ggml-cuda: same code base, different
+    // silicon, unmeasured.
+    const char * const others[] = { "ROCm",     "MUSA",     "SYCL", "BLAS", "CPU",
+                                    "MTL0",     "Vulkan0",  "OpenCL0", "CUDA0",
+                                    "",         nullptr };
     for (const char * other : others) {
         StagePlacement p = resolve_stage_placement(other, none);
         CHECK(!p.lm_on_gpu);
@@ -415,14 +444,14 @@ void test_stage_placement() {
     {
         PlacementOverrides ov;
         ov.lm_gpu        = true;
-        StagePlacement p = resolve_stage_placement("CUDA", ov);
+        StagePlacement p = resolve_stage_placement("SYCL", ov);
         CHECK(p.lm_on_gpu);
         CHECK(!p.detok_on_gpu);  // the LM hatch must not move the detokenizer
     }
     {
         PlacementOverrides ov;
         ov.detok_gpu     = true;
-        StagePlacement p = resolve_stage_placement("CUDA", ov);
+        StagePlacement p = resolve_stage_placement("SYCL", ov);
         CHECK(p.detok_on_gpu);
         CHECK(!p.lm_on_gpu);
     }
@@ -587,7 +616,38 @@ void test_generate_task_errors() {
 
     params.task_type = TASK_COVER_NOFSQ;
     params.audio_cover_strength = 0.5f;
-    CHECK(resolve_generate_task(params, task).find("audio_cover_strength") != std::string::npos);
+    CHECK(resolve_generate_task(params, task).empty());
+    CHECK(approx(task.audio_cover_strength, 0.5f));
+}
+
+void test_cover_conditioning_switch() {
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::TASK_COVER_NOFSQ;
+    using tts_cpp::acestep::TASK_TEXT2MUSIC;
+    using tts_cpp::acestep::needs_cover_conditioning_switch;
+    using tts_cpp::acestep::resolve_cover_switch_step;
+
+    GenerateTask task;
+    task.type = TASK_COVER_NOFSQ;
+    task.audio_cover_strength = 1.0f;
+    CHECK(!needs_cover_conditioning_switch(task));
+    CHECK(resolve_cover_switch_step(task, 50) == -1);
+
+    task.audio_cover_strength = 0.5f;
+    CHECK(needs_cover_conditioning_switch(task));
+    CHECK(resolve_cover_switch_step(task, 50) == 25);
+    CHECK(resolve_cover_switch_step(task, 8) == 4);
+
+    task.audio_cover_strength = 0.75f;
+    CHECK(resolve_cover_switch_step(task, 8) == 6);
+
+    task.audio_cover_strength = 0.0f;
+    CHECK(resolve_cover_switch_step(task, 8) == 0);
+
+    task.type = TASK_TEXT2MUSIC;
+    task.audio_cover_strength = 0.5f;
+    CHECK(!needs_cover_conditioning_switch(task));
+    CHECK(resolve_cover_switch_step(task, 50) == -1);
 }
 
 void test_generate_task_strengths() {
@@ -1098,6 +1158,7 @@ int main() {
     test_generate_task_audio_layout();
     test_generate_task_errors();
     test_generate_task_strengths();
+    test_cover_conditioning_switch();
     test_generation_plans();
     test_generation_conditioning();
     test_cover_noise_blending();

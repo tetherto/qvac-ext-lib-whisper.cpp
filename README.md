@@ -116,10 +116,10 @@ Pair any CTC, TDT, or EOU GGUF with a Sortformer GGUF via `--diarization-model` 
 | Supertonic v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming |
 | Supertonic v2 | tts | 5 (`en`, `ko`, `es`, `pt`, `fr`) | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming |
 | Supertonic v3 | tts | 31 + `na` | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming, `na` for unknown source language |
-| Parler-TTS mini-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | description-conditioned voice, no cloning |
-| Parler-TTS large-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | description-conditioned voice |
-| Indic Parler-TTS | tts | 21 Indic | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | Indic prompt BPE tokenizer |
-| Fun-CosyVoice3-0.5B | tts | model-advertised multilingual text | 24 kHz | `f32` | CPU, Metal, Vulkan, OpenCL | Qwen2.5 LM + DiT flow + CausalHiFT; zero-shot/cross-lingual cloning from a reference WAV (native speech_tokenizer_v3 + CAM++); Metal, desktop Vulkan, and OpenCL are the validated GPU paths |
+| Parler-TTS mini-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL, CUDA | description-conditioned voice, no cloning |
+| Parler-TTS large-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL, CUDA | description-conditioned voice |
+| Indic Parler-TTS | tts | 21 Indic | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL, CUDA | Indic prompt BPE tokenizer |
+| Fun-CosyVoice3-0.5B | tts | model-advertised multilingual text | 24 kHz | `f32` | CPU, Metal, Vulkan, OpenCL, CUDA | Qwen2.5 LM + DiT flow + CausalHiFT; zero-shot/cross-lingual cloning from a reference WAV (native speech_tokenizer_v3 + CAM++); Metal, desktop Vulkan, desktop CUDA, and OpenCL are the validated GPU paths |
 | Audio8-TTS-Preview-0.6B | tts | multilingual | 44.1 kHz | `f32`, `f16`, `q8_0`; LM also `q4_0` | CPU, Metal, Vulkan, OpenCL | DualAR + DAC codec, zero-shot cloning from reference audio and transcript |
 
 When a TTS build carries both CUDA and Vulkan, backend selection prefers CUDA
@@ -139,8 +139,8 @@ the [TTS capability table](engines/tts/README.md#capabilities).
 
 | Model | Engine | Task | Rate | Quantization | Backends | Notes |
 |---|---|---|---|---|---|---|
-| ACE-Step v15 turbo | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0`, `q4_k_m` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 8 diffusion steps by default |
-| ACE-Step v15 sft | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 50 diffusion steps by default |
+| ACE-Step v15 turbo | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0`, `q4_k_m` | CPU, Vulkan, Metal, OpenCL (Adreno 700+), CUDA | 8 diffusion steps by default |
+| ACE-Step v15 sft | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal, OpenCL (Adreno 700+), CUDA | 50 diffusion steps by default |
 | MiniMax-Music3 | audiogen | text-to-music | 44.1 kHz stereo | `f16`, `q8_0` | desktop CPU + GPU (CUDA, Vulkan, Metal via `EngineOptions::device`) | 25 fps, 30 flow steps, two GGUF files; Metal condition/vocoder parity runs in CI |
 
 ## Build

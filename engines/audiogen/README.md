@@ -7,7 +7,7 @@ Native [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) and MiniMax-Musi
 | CMake project | `audiogen-cpp` v0.1.0 |
 | Public API | `tts_cpp::acestep::Engine`, `tts_cpp::minimax::Engine` |
 | Output | interleaved stereo PCM, model-defined sample rate, `pcm[t * 2 + ch]` |
-| Backends | CPU, Vulkan (including Android Mali iGPUs), Metal, OpenCL (validated on Adreno 700+) |
+| Backends | CPU, Vulkan (including Android Mali iGPUs), Metal, OpenCL (validated on Adreno 700+), CUDA |
 | ggml | requires the `ggml-speech` port for the custom `ggml_snake` and `ggml_col2im_1d` ops |
 | Consumed by | the `@qvac/audiogen-ggml` addon in [QVAC](https://github.com/tetherto/qvac) |
 
@@ -150,20 +150,20 @@ not the combinations validated by QVAC.
 ## Backends
 
 `n_gpu_layers > 0` (`--gpu` on the CLI) selects a GPU backend through the ggml
-registry. Selection tries Adreno 700+ OpenCL first; validated Vulkan/Metal
-discrete devices, then validated integrated devices; and finally other
-discrete, then integrated GPU backends. Integrated-device support is required
-because Vulkan reports Android UMA adapters such as Pixel's Mali-G715 as
-`IGPU`.
+registry. Selection tries Adreno 700+ OpenCL first; validated
+Vulkan/Metal/CUDA discrete devices, then validated integrated devices; and
+finally other discrete, then integrated GPU backends. Integrated-device
+support is required because Vulkan reports Android UMA adapters such as
+Pixel's Mali-G715 as `IGPU`.
 
 | Stage | Placement when a GPU is selected |
 |---|---|
 | DiT, VAE | GPU |
 | Text encoder, condition encoder | GPU, unless `ACESTEP_ENCODERS_CPU` is present |
-| LM | GPU on Metal and OpenCL; CPU on Vulkan and every unmeasured backend |
-| FSQ detokenizer | GPU on Vulkan, Metal, and OpenCL; CPU on every unmeasured backend |
+| LM | GPU on Metal and OpenCL; CPU on Vulkan, CUDA, and every unmeasured backend |
+| FSQ detokenizer | GPU on Vulkan, Metal, OpenCL, and CUDA; CPU on every unmeasured backend |
 
-The LM and detokenizer use an allowlist rather than a denylist: a backend keeps the CPU placement until the stage has been measured on it, so adding one cannot silently regress generated audio. Metal and OpenCL are validated for both stages; the recorded OpenCL validation used an Adreno 740. Vulkan is validated for the detokenizer, but the autoregressive LM remains on CPU because Mali-G715 testing showed code collapse and early termination on Vulkan.
+The LM and detokenizer use an allowlist rather than a denylist: a backend keeps the CPU placement until the stage has been measured on it, so adding one cannot silently regress generated audio. Metal and OpenCL are validated for both stages; the recorded OpenCL validation used an Adreno 740. Vulkan is validated for the detokenizer, but the autoregressive LM remains on CPU because Mali-G715 testing showed code collapse and early termination on Vulkan. CUDA needs the `snake` / `col2im_1d` VAE kernels from the `ggml-speech` fork's CUDA backend; `test-backend-ops` on an RTX 5090 passes them and the detokenizer's Q8_0 mul_mat stress cases, but the LM-shaped q4_0/q4_K strided-B `b_absmax=1e5` stress cases produce NaN on CUDA, so the LM keeps the CPU placement until the F32-reference parity measurement below is taken (`ACESTEP_LM_GPU`). The HIP/MUSA builds of the same backend register as `ROCm`/`MUSA` and stay off the allowlist until measured.
 
 Measurement is against an F32-dequantized reference (`scripts/dequant_gguf.py`), not against CPU. CPU is not automatically ground truth for a quantized model — ggml's CPU matmul quantizes activations to Q8_1 internally. On Metal the LM reproduces the F32 argmax trajectory exactly where CPU Q8_0 diverges at the first token. On Mali Vulkan, however, the LM produces repeated semantic codes and can terminate at roughly half the requested duration, while the same device produces a diverse full-length sequence with the LM on CPU.
 

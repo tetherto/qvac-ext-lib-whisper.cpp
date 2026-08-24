@@ -408,6 +408,19 @@ void run_edit_scenarios(tts_cpp::acestep::Engine & engine, const fs::path & dump
     run_edit_vae_cancel_scenario(engine, fixture);
 }
 
+void run_cover_strength_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+    GenerateParams params = make_generate_params();
+    params.audio_cover_strength = 0.5f;
+    params.cover_noise_strength = 0.0f;
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(result.sample_rate == TEST_SAMPLE_RATE);
+    CHECK(stages.contains("source"));
+    CHECK(!stages.contains(TEST_LM_STAGE));
+}
+
 int run_integration(const char * models_dir) {
     using namespace tts_cpp::acestep;
 
@@ -429,6 +442,7 @@ int run_integration(const char * models_dir) {
         CHECK(stages.contains("reference"));
         CHECK(!stages.contains("lm"));
         verify_stage_dumps(dump_dir);
+        run_cover_strength_scenario(*engine);
         run_edit_scenarios(*engine, dump_dir);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "FAIL integration exception: %s\n", error.what());

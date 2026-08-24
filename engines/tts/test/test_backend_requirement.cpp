@@ -32,8 +32,9 @@ int main() {
     const auto opencl  = GpuBackendRequirement::OpenCL;
     const auto vkmtl   = GpuBackendRequirement::Vulkan | GpuBackendRequirement::Metal;
     const auto mtlcl   = GpuBackendRequirement::Metal  | GpuBackendRequirement::OpenCL;
-    // Every backend either engine has validated: Audio8 asks for this set on
-    // every platform, CosyVoice3 on desktop (cosyvoice_gpu_requirement()).
+    // Audio8's set on every platform (audio8/gguf.cpp); CosyVoice3's desktop
+    // set moved on to the four-backend `desktop` variable below when it
+    // admitted CUDA (cosyvoice_gpu_requirement()).
     const auto vkmtlcl = GpuBackendRequirement::Vulkan | GpuBackendRequirement::Metal |
                          GpuBackendRequirement::OpenCL;
 
@@ -79,6 +80,8 @@ int main() {
     // while one that has can name it without widening to every other backend.
     const auto cuda    = GpuBackendRequirement::CUDA;
     const auto vkcuda  = GpuBackendRequirement::Vulkan | GpuBackendRequirement::CUDA;
+    // CosyVoice3's desktop set (cosyvoice_gpu_requirement()) and the widest an
+    // engine names today.
     const auto desktop = GpuBackendRequirement::Vulkan | GpuBackendRequirement::Metal |
                          GpuBackendRequirement::OpenCL | GpuBackendRequirement::CUDA;
 

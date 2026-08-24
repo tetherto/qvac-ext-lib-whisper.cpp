@@ -348,9 +348,12 @@ bool parler_dac_decode(const parler_model & model, const int32_t * codes, int n_
     }
 
     // One graph per window, each padded with a receptive field of real context so
-    // the kept interior matches a whole-sequence decode exactly. No op here reduces
+    // the kept interior matches a whole-sequence decode. No op here reduces
     // along the sequence, so window length changes only how many outputs are
-    // computed, never the arithmetic that produces each one.
+    // computed, never the per-element arithmetic. The match is bitwise on the
+    // CPU; a GPU kernel's reduction order depends on the graph shape, so two
+    // windows of different length agree within floating-point tolerance, not
+    // bit for bit.
     const int rf = parler_dac_rf_frames(model);
     bool ok = true;
     for (int a = out_begin; a < out_end && ok; a += PARLER_DAC_WINDOW_FRAMES) {
