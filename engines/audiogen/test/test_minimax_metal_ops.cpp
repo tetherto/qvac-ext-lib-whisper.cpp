@@ -19,6 +19,9 @@ constexpr int64_t CONDITION_CHANNELS = 4096;
 constexpr int64_t CONDITION_OUTPUT_CHANNELS = 4;
 constexpr int64_t CONDITION_FRAMES = 17;
 constexpr float ABSOLUTE_TOLERANCE = 1e-4f;
+// Looser than the vocoder's: the condition projection reduces over 12288
+// elements per output, so float accumulation order alone moves the result more.
+constexpr float CONDITION_ABSOLUTE_TOLERANCE = 1e-3f;
 
 std::vector<float> make_values(size_t count, float frequency, float amplitude = 1.0f) {
     std::vector<float> values(count);
@@ -110,7 +113,11 @@ bool condition_outputs_match(const std::vector<float> & expected,
     if (expected.size() != actual.size() || expected.empty()) return false;
     for (size_t i = 0; i < expected.size(); ++i) {
         const float difference = std::fabs(expected[i] - actual[i]);
-        if (!std::isfinite(actual[i]) || difference > 1e-3f) {
+        // Guard the CPU reference too, not just the Metal result: if expected[i]
+        // were NaN then difference is NaN, `difference > tol` is false, and a
+        // broken oracle would silently score as a match.
+        if (!std::isfinite(expected[i]) || !std::isfinite(actual[i]) ||
+            difference > CONDITION_ABSOLUTE_TOLERANCE) {
             std::fprintf(stderr,
                          "FAIL condition projection index=%zu cpu=%.8f metal=%.8f difference=%.8f\n",
                          i,
@@ -193,7 +200,9 @@ bool outputs_match(const std::vector<float> & expected,
     }
     for (size_t i = 0; i < expected.size(); ++i) {
         const float difference = std::fabs(expected[i] - actual[i]);
-        if (!std::isfinite(actual[i]) || difference > ABSOLUTE_TOLERANCE) {
+        // See condition_outputs_match: a NaN CPU reference must fail, not pass.
+        if (!std::isfinite(expected[i]) || !std::isfinite(actual[i]) ||
+            difference > ABSOLUTE_TOLERANCE) {
             std::fprintf(stderr,
                          "FAIL stride=%d index=%zu cpu=%.8f metal=%.8f difference=%.8f\n",
                          stride,
