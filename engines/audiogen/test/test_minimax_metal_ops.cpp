@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 namespace {
@@ -22,6 +23,9 @@ constexpr float ABSOLUTE_TOLERANCE = 1e-4f;
 // Looser than the vocoder's: the condition projection reduces over 12288
 // elements per output, so float accumulation order alone moves the result more.
 constexpr float CONDITION_ABSOLUTE_TOLERANCE = 1e-3f;
+// Graph node budgets, sized to each case's node count with headroom.
+constexpr size_t CONDITION_MAX_NODES = 16;
+constexpr size_t VOCODER_MAX_NODES = 64;
 
 std::vector<float> make_values(size_t count, float frequency, float amplitude = 1.0f) {
     std::vector<float> values(count);
@@ -67,117 +71,61 @@ bool metal_supports_mul_mat(ggml_backend_t backend) {
     return supported;
 }
 
-std::vector<float> run_condition_projection(ggml_backend_t backend) {
-    constexpr size_t MAX_NODES = 16;
+// The tensors a case exposes to the shared runner: two inputs to fill and the
+// output to read back. The runner owns everything else.
+struct ParityGraph {
+    ggml_tensor * weights;
+    ggml_tensor * input;
+    ggml_tensor * output;
+};
+
+// Builds a case's graph inside a context the runner supplies.
+using GraphBuilder = std::function<ParityGraph(ggml_context *)>;
+
+// Shared scaffolding for every parity case: size and open a no_alloc context,
+// let the case build its graph, allocate, fill both inputs with deterministic
+// values, compute on `backend`, and read the output back. Returns an empty
+// vector if the graph did not compute, which the comparator reports as a size
+// mismatch.
+//
+// The amplitudes are per-case: the condition projection reduces over 12288
+// elements, so unit-amplitude inputs there would push the accumulation into a
+// range where f32 rounding dwarfs the tolerance.
+std::vector<float> run_parity_graph(ggml_backend_t backend,
+                                    size_t max_nodes,
+                                    const GraphBuilder & build,
+                                    float weight_amplitude,
+                                    float input_amplitude) {
     const size_t context_size =
-        ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
+        ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
     ggml_init_params params = {context_size, nullptr, true};
     ggml_context * context = ggml_init(params);
-    ggml_cgraph * graph = ggml_new_graph_custom(context, MAX_NODES, false);
+    ggml_cgraph * graph = ggml_new_graph_custom(context, max_nodes, false);
 
-    ggml_tensor * weights = ggml_new_tensor_3d(
-        context, GGML_TYPE_F32, 3, CONDITION_CHANNELS, CONDITION_OUTPUT_CHANNELS);
-    ggml_tensor * input =
-        ggml_new_tensor_2d(context, GGML_TYPE_F32, CONDITION_FRAMES, CONDITION_CHANNELS);
-    ggml_set_input(weights);
-    ggml_set_input(input);
-    ggml_tensor * output = mm3_cond_conv1d(context, weights, nullptr, input, 1);
-    ggml_set_output(output);
-    ggml_build_forward_expand(graph, output);
+    const ParityGraph built = build(context);
+    ggml_set_name(built.weights, "weights");
+    ggml_set_name(built.input, "input");
+    ggml_set_name(built.output, "output");
+    ggml_set_input(built.weights);
+    ggml_set_input(built.input);
+    ggml_set_output(built.output);
+    ggml_build_forward_expand(graph, built.output);
 
-    ggml_gallocr_t allocator =
-        ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    ggml_gallocr_reserve(allocator, graph);
-    ggml_gallocr_alloc_graph(allocator, graph);
-    const std::vector<float> weight_values =
-        make_values(static_cast<size_t>(ggml_nelements(weights)), 0.013f, 0.01f);
-    const std::vector<float> input_values =
-        make_values(static_cast<size_t>(ggml_nelements(input)), 0.031f, 0.1f);
-    ggml_backend_tensor_set(weights, weight_values.data(), 0, ggml_nbytes(weights));
-    ggml_backend_tensor_set(input, input_values.data(), 0, ggml_nbytes(input));
-
-    const enum ggml_status status = ggml_backend_graph_compute(backend, graph);
-    std::vector<float> values(static_cast<size_t>(ggml_nelements(output)));
-    if (status == GGML_STATUS_SUCCESS) {
-        ggml_backend_tensor_get(output, values.data(), 0, ggml_nbytes(output));
-    } else {
-        values.clear();
-    }
-    ggml_gallocr_free(allocator);
-    ggml_free(context);
-    return values;
-}
-
-bool condition_outputs_match(const std::vector<float> & expected,
-                             const std::vector<float> & actual) {
-    if (expected.size() != actual.size() || expected.empty()) return false;
-    for (size_t i = 0; i < expected.size(); ++i) {
-        const float difference = std::fabs(expected[i] - actual[i]);
-        // Guard the CPU reference too, not just the Metal result: if expected[i]
-        // were NaN then difference is NaN, `difference > tol` is false, and a
-        // broken oracle would silently score as a match.
-        if (!std::isfinite(expected[i]) || !std::isfinite(actual[i]) ||
-            difference > CONDITION_ABSOLUTE_TOLERANCE) {
-            std::fprintf(stderr,
-                         "FAIL condition projection index=%zu cpu=%.8f metal=%.8f difference=%.8f\n",
-                         i,
-                         expected[i],
-                         actual[i],
-                         difference);
-            return false;
-        }
-    }
-    return true;
-}
-
-bool verify_condition_projection(ggml_backend_t cpu, ggml_backend_t metal) {
-    const std::vector<float> expected = run_condition_projection(cpu);
-    const std::vector<float> actual = run_condition_projection(metal);
-    if (!condition_outputs_match(expected, actual)) return false;
-    std::fprintf(stderr, "PASS MiniMax condition projection\n");
-    return true;
-}
-
-std::vector<float> run_vocoder_convt(ggml_backend_t backend, int stride) {
-    constexpr size_t MAX_NODES = 64;
-    const size_t context_size =
-        ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
-    ggml_init_params params = {context_size, nullptr, true};
-    ggml_context * context = ggml_init(params);
-    ggml_cgraph * graph = ggml_new_graph_custom(context, MAX_NODES, false);
-
-    const int64_t kernel_size = 2 * stride;
-    ggml_tensor * weights =
-        ggml_new_tensor_2d(context, GGML_TYPE_F32, INPUT_CHANNELS, kernel_size * OUTPUT_CHANNELS);
-    ggml_tensor * input =
-        ggml_new_tensor_2d(context, GGML_TYPE_F32, INPUT_LENGTH, INPUT_CHANNELS);
-    ggml_set_name(weights, "weights");
-    ggml_set_name(input, "input");
-    ggml_set_input(weights);
-    ggml_set_input(input);
-
-    ggml_tensor * output =
-        mm3_voc_convt(context, weights, nullptr, input, stride, OUTPUT_CHANNELS);
-    ggml_set_name(output, "output");
-    ggml_set_output(output);
-    ggml_build_forward_expand(graph, output);
-
-    ggml_gallocr_t allocator =
-        ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_gallocr_t allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     ggml_gallocr_reserve(allocator, graph);
     ggml_gallocr_alloc_graph(allocator, graph);
 
-    const std::vector<float> weight_values =
-        make_values(static_cast<size_t>(ggml_nelements(weights)), 0.013f);
-    const std::vector<float> input_values =
-        make_values(static_cast<size_t>(ggml_nelements(input)), 0.031f);
-    ggml_backend_tensor_set(weights, weight_values.data(), 0, ggml_nbytes(weights));
-    ggml_backend_tensor_set(input, input_values.data(), 0, ggml_nbytes(input));
+    const std::vector<float> weight_values = make_values(
+        static_cast<size_t>(ggml_nelements(built.weights)), 0.013f, weight_amplitude);
+    const std::vector<float> input_values = make_values(
+        static_cast<size_t>(ggml_nelements(built.input)), 0.031f, input_amplitude);
+    ggml_backend_tensor_set(built.weights, weight_values.data(), 0, ggml_nbytes(built.weights));
+    ggml_backend_tensor_set(built.input, input_values.data(), 0, ggml_nbytes(built.input));
 
     const enum ggml_status status = ggml_backend_graph_compute(backend, graph);
-    std::vector<float> values(static_cast<size_t>(ggml_nelements(output)));
+    std::vector<float> values(static_cast<size_t>(ggml_nelements(built.output)));
     if (status == GGML_STATUS_SUCCESS) {
-        ggml_backend_tensor_get(output, values.data(), 0, ggml_nbytes(output));
+        ggml_backend_tensor_get(built.output, values.data(), 0, ggml_nbytes(built.output));
     } else {
         values.clear();
     }
@@ -187,25 +135,30 @@ std::vector<float> run_vocoder_convt(ggml_backend_t backend, int stride) {
     return values;
 }
 
+// Element-wise CPU-vs-Metal comparison. `label` names the case in failure
+// output, e.g. "condition projection" or "vocoder convt stride=8".
 bool outputs_match(const std::vector<float> & expected,
                    const std::vector<float> & actual,
-                   int stride) {
+                   float tolerance,
+                   const char * label) {
     if (expected.size() != actual.size() || expected.empty()) {
         std::fprintf(stderr,
-                     "FAIL stride=%d output size cpu=%zu metal=%zu\n",
-                     stride,
+                     "FAIL %s output size cpu=%zu metal=%zu\n",
+                     label,
                      expected.size(),
                      actual.size());
         return false;
     }
     for (size_t i = 0; i < expected.size(); ++i) {
         const float difference = std::fabs(expected[i] - actual[i]);
-        // See condition_outputs_match: a NaN CPU reference must fail, not pass.
+        // Guard the CPU reference too, not just the Metal result: if expected[i]
+        // were NaN then difference is NaN, `difference > tolerance` is false, and
+        // a broken oracle would silently score as a match.
         if (!std::isfinite(expected[i]) || !std::isfinite(actual[i]) ||
-            difference > ABSOLUTE_TOLERANCE) {
+            difference > tolerance) {
             std::fprintf(stderr,
-                         "FAIL stride=%d index=%zu cpu=%.8f metal=%.8f difference=%.8f\n",
-                         stride,
+                         "FAIL %s index=%zu cpu=%.8f metal=%.8f difference=%.8f\n",
+                         label,
                          i,
                          expected[i],
                          actual[i],
@@ -216,12 +169,57 @@ bool outputs_match(const std::vector<float> & expected,
     return true;
 }
 
+std::vector<float> run_condition_projection(ggml_backend_t backend) {
+    return run_parity_graph(
+        backend,
+        CONDITION_MAX_NODES,
+        [](ggml_context * context) {
+            ggml_tensor * weights = ggml_new_tensor_3d(
+                context, GGML_TYPE_F32, 3, CONDITION_CHANNELS, CONDITION_OUTPUT_CHANNELS);
+            ggml_tensor * input =
+                ggml_new_tensor_2d(context, GGML_TYPE_F32, CONDITION_FRAMES, CONDITION_CHANNELS);
+            return ParityGraph{weights, input, mm3_cond_conv1d(context, weights, nullptr, input, 1)};
+        },
+        0.01f,
+        0.1f);
+}
+
+bool verify_condition_projection(ggml_backend_t cpu, ggml_backend_t metal) {
+    const std::vector<float> expected = run_condition_projection(cpu);
+    const std::vector<float> actual = run_condition_projection(metal);
+    if (!outputs_match(expected, actual, CONDITION_ABSOLUTE_TOLERANCE, "condition projection")) {
+        return false;
+    }
+    std::fprintf(stderr, "PASS MiniMax condition projection\n");
+    return true;
+}
+
+std::vector<float> run_vocoder_convt(ggml_backend_t backend, int stride) {
+    return run_parity_graph(
+        backend,
+        VOCODER_MAX_NODES,
+        [stride](ggml_context * context) {
+            const int64_t kernel_size = 2 * stride;
+            ggml_tensor * weights = ggml_new_tensor_2d(
+                context, GGML_TYPE_F32, INPUT_CHANNELS, kernel_size * OUTPUT_CHANNELS);
+            ggml_tensor * input =
+                ggml_new_tensor_2d(context, GGML_TYPE_F32, INPUT_LENGTH, INPUT_CHANNELS);
+            return ParityGraph{
+                weights, input,
+                mm3_voc_convt(context, weights, nullptr, input, stride, OUTPUT_CHANNELS)};
+        },
+        1.0f,
+        1.0f);
+}
+
 bool verify_vocoder_strides(ggml_backend_t cpu, ggml_backend_t metal) {
     constexpr int STRIDES[] = {8, 4, 2};
     for (int stride : STRIDES) {
+        char label[64];
+        std::snprintf(label, sizeof(label), "vocoder convt stride=%d", stride);
         const std::vector<float> expected = run_vocoder_convt(cpu, stride);
         const std::vector<float> actual = run_vocoder_convt(metal, stride);
-        if (!outputs_match(expected, actual, stride)) return false;
+        if (!outputs_match(expected, actual, ABSOLUTE_TOLERANCE, label)) return false;
         std::fprintf(stderr, "PASS MiniMax vocoder convt stride=%d\n", stride);
     }
     return true;
