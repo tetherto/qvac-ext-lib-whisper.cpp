@@ -133,7 +133,10 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -o pipefail
-          ctest --test-dir build -R '^test-minimax-metal-ops$' --output-on-failure --timeout 600 2>&1 | tee metal-test.log
+          # -V, not --output-on-failure: the markers below are printed by a test
+          # that SKIPS, and --output-on-failure shows output only for failures,
+          # so the greps would silently never match.
+          ctest --test-dir build -R '^test-minimax-metal-ops$' -V --timeout 600 2>&1 | tee metal-test.log
           if grep -q "SKIP Metal backend is unavailable" metal-test.log; then
             echo "::error::Metal backend absent on a macOS runner — the parity test never ran"
             exit 1
