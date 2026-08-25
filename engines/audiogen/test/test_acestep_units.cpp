@@ -33,6 +33,7 @@
 #include "vae_ggml.h"
 #include "wav_reader.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -593,14 +594,16 @@ void test_placement_env() {
 void test_parallel_rows() {
     using tts_cpp::acestep::parallel_rows;
     for (int n : { 0, 1, 127, 128, 129, 255, 4096, 12345 }) {
-        std::vector<int> hits((size_t) n, 0);
+        // Workers only touch atomics; every CHECK stays on the main thread.
+        std::vector<std::atomic<int>> hits((size_t) n);
+        std::atomic<bool>             bounds_ok{ true };
         parallel_rows(n, [&](int begin, int end) {
-            CHECK(begin >= 0);
-            CHECK(end <= n);
-            for (int i = begin; i < end; i++) hits[(size_t) i]++;
+            if (begin < 0 || end > n) bounds_ok = false;
+            for (int i = begin; i < end && i >= 0; i++) hits[(size_t) i].fetch_add(1);
         });
+        CHECK(bounds_ok);
         bool all_once = true;
-        for (int h : hits) all_once = all_once && h == 1;
+        for (const auto & h : hits) all_once = all_once && h.load() == 1;
         CHECK(all_once);
     }
 }
@@ -608,10 +611,14 @@ void test_parallel_rows() {
 void test_convert_f32_to_f16_rows() {
     using tts_cpp::acestep::convert_f32_to_f16_rows;
     using tts_cpp::acestep::F16_CONVERT_CHUNK;
+    using tts_cpp::acestep::LOAD_SERIAL_MIN_ROWS;
     std::mt19937                          rng(123);
     std::uniform_real_distribution<float> dist(-8.0f, 8.0f);
+    // The last size crosses LOAD_SERIAL_MIN_ROWS chunks, exercising the
+    // threaded branch with a ragged tail.
+    const size_t threaded = (size_t) LOAD_SERIAL_MIN_ROWS * F16_CONVERT_CHUNK + 7;
     for (size_t count : { (size_t) 0, (size_t) 1, F16_CONVERT_CHUNK - 1, F16_CONVERT_CHUNK,
-                          F16_CONVERT_CHUNK + 1, 2 * F16_CONVERT_CHUNK, (size_t) 65537 }) {
+                          F16_CONVERT_CHUNK + 1, 2 * F16_CONVERT_CHUNK, (size_t) 65537, threaded }) {
         std::vector<float> src(count);
         for (auto & v : src) v = dist(rng);
         std::vector<ggml_fp16_t> serial(count);
