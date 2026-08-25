@@ -42,6 +42,28 @@ ggml_backend_t find_metal_backend() {
     return nullptr;
 }
 
+// Both parity graphs are matmul-based: mm3_cond_conv1d is im2col + MUL_MAT, and
+// mm3_voc_convt opens with a MUL_MAT. ggml's Metal backend gates GGML_OP_MUL_MAT
+// on has_simdgroup_reduction, which it derives from MTLGPUFamilyApple7; hosted
+// macOS runners expose a paravirtual GPU reporting only Apple5, so every MUL_MAT
+// is unsupported there regardless of shape or type.
+//
+// Ask before computing. ggml_backend_graph_compute() does not consult
+// supports_op — it encodes node by node and ggml_abort()s on the first one the
+// device cannot take, which surfaces as a bare backtrace with no diagnosis. The
+// engine never hits this because it computes through ggml_backend_sched, which
+// does consult supports_op and reroutes such nodes to the CPU.
+bool metal_supports_mul_mat(ggml_backend_t backend) {
+    ggml_init_params params = {ggml_tensor_overhead() * 4, nullptr, true};
+    ggml_context * context = ggml_init(params);
+    if (!context) return false;
+    ggml_tensor * lhs = ggml_new_tensor_2d(context, GGML_TYPE_F32, 32, 4);
+    ggml_tensor * rhs = ggml_new_tensor_2d(context, GGML_TYPE_F32, 32, 4);
+    const bool supported = ggml_backend_supports_op(backend, ggml_mul_mat(context, lhs, rhs));
+    ggml_free(context);
+    return supported;
+}
+
 std::vector<float> run_condition_projection(ggml_backend_t backend) {
     constexpr size_t MAX_NODES = 16;
     const size_t context_size =
@@ -208,6 +230,19 @@ int main() {
     if (!metal) {
         ggml_backend_free(cpu);
         std::fprintf(stderr, "SKIP Metal backend is unavailable\n");
+        return 77;
+    }
+
+    if (!metal_supports_mul_mat(metal)) {
+        ggml_backend_dev_t device = ggml_backend_get_device(metal);
+        const char * description = device ? ggml_backend_dev_description(device) : "unknown device";
+        std::fprintf(stderr,
+                     "SKIP Metal device cannot run MUL_MAT (%s): the parity graphs are "
+                     "matmul-based and ggml gates GGML_OP_MUL_MAT on simdgroup reduction "
+                     "(MTLGPUFamilyApple7+). Matmul parity needs a non-virtualized Apple GPU.\n",
+                     description);
+        ggml_backend_free(metal);
+        ggml_backend_free(cpu);
         return 77;
     }
 

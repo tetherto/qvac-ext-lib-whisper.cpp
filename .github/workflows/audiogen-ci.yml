@@ -116,9 +116,31 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
         run: ctest --test-dir build -LE 'gpu|perf' --output-on-failure --timeout 600
 
+      # The parity test exits 77 (a ctest SKIP, which ctest scores as success) in
+      # two very different situations, and only one of them is acceptable here:
+      #
+      #   * "Metal backend is unavailable" — Metal missing entirely on a macOS
+      #     runner means a broken build or runner, and the lane would go green
+      #     having exercised nothing. Fail.
+      #   * "Metal device cannot run MUL_MAT" — hosted runners expose a
+      #     paravirtual GPU reporting MTLGPUFamilyApple5, and ggml gates
+      #     GGML_OP_MUL_MAT on simdgroup reduction (Apple7+), so no matmul can
+      #     execute. Not fixable from here; tolerate it, but keep it loud.
+      #
+      # Consequence: this lane proves the test builds and runs, NOT that Metal
+      # matches CPU. Real matmul parity needs an Apple7+ GPU — see the gpu lane.
       - name: Test (Metal)
         if: runner.os == 'macOS'
-        run: ctest --test-dir build -R '^test-minimax-metal-ops$' --output-on-failure --timeout 600
+        run: |
+          set -o pipefail
+          ctest --test-dir build -R '^test-minimax-metal-ops$' --output-on-failure --timeout 600 2>&1 | tee metal-test.log
+          if grep -q "SKIP Metal backend is unavailable" metal-test.log; then
+            echo "::error::Metal backend absent on a macOS runner — the parity test never ran"
+            exit 1
+          fi
+          if grep -q "SKIP Metal device cannot run MUL_MAT" metal-test.log; then
+            echo "::warning::Metal parity skipped: this runner's GPU lacks simdgroup reduction, so MUL_MAT is unsupported. Matmul parity is NOT covered by this lane."
+          fi
 
   # Non-Metal GPU lane stays opt-in until self-hosted GPU runners exist.
   gpu:

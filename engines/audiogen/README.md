@@ -524,7 +524,12 @@ the MiniMax GGUF pair to run `test-minimax-integration`, which covers model
 loading, generation output, progress, and cancellation.
 On a Metal build, `ctest --test-dir build/audiogen -R
 test-minimax-metal-ops` runs the model-free CPU/Metal condition and vocoder
-parity regression; it skips with return code 77 when Metal is unavailable.
+parity regression. It skips with return code 77 either when Metal is
+unavailable or when the Metal device cannot run `MUL_MAT` — both parity graphs
+are matmul-based, and ggml gates `GGML_OP_MUL_MAT` on simdgroup reduction
+(`MTLGPUFamilyApple7`+), which virtualized GPUs such as the ones on hosted macOS
+CI runners do not report. Meaningful parity coverage therefore needs a
+non-virtualized Apple GPU.
 `test-acestep-integration` exercises the ACE-Step public API when model paths
 are supplied and otherwise reports a skipped test.
 
