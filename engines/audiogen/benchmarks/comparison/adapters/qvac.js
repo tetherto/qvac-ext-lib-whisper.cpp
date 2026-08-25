@@ -57,8 +57,6 @@ function runQvacRound (config, prompt, outputWav) {
   const backend = config.backend === 'cpu' ? 'cpu' : detectQvacBackend(execution.logText)
   if (config.backend !== 'cpu') {
     assertBackend(backend, config.backend, { failOnFallback: config.failOnGpuFallback })
-  } else if (detectQvacBackend(execution.logText) === 'cpu-fallback') {
-    // CPU runs should not request GPU; no-op.
   }
   let audio = null
   let wavSha256 = null
@@ -67,7 +65,7 @@ function runQvacRound (config, prompt, outputWav) {
     wavSha256 = crypto.createHash('sha256').update(buffer).digest('hex')
     audio = analyseWav(buffer)
   }
-  const ok = execution.status === 0 && Boolean(audio) && !audio.malformed
+  const ok = execution.status === 0 && Boolean(audio)
   const generationMs = timings.generationMs
   const e2eMs = execution.wallMs
   return {

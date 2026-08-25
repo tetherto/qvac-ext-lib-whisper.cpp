@@ -15,8 +15,8 @@ test('rtf is generation seconds over audio seconds', () => {
 
 test('aggregateRounds retains failures and unique hashes', () => {
   const stats = aggregateRounds([
-    { engine: 'qvac', ok: true, generationMs: 10, e2eMs: 12, rtf: 0.5, peakRssBytes: 100, wavSha256: 'a', audio: { durationSeconds: 8, silenceRatio: 0.1, clippingRatio: 0, malformed: false, silent: false } },
-    { engine: 'qvac', ok: true, generationMs: 14, e2eMs: 16, rtf: 0.6, peakRssBytes: 110, wavSha256: 'a', audio: { durationSeconds: 8.1, silenceRatio: 0.1, clippingRatio: 0, malformed: false, silent: false } },
+    { engine: 'qvac', ok: true, generationMs: 10, e2eMs: 12, rtf: 0.5, peakRssBytes: 100, wavSha256: 'a', audio: { durationSeconds: 8, silenceRatio: 0.1, clippingRatio: 0, silent: false } },
+    { engine: 'qvac', ok: true, generationMs: 14, e2eMs: 16, rtf: 0.6, peakRssBytes: 110, wavSha256: 'a', audio: { durationSeconds: 8.1, silenceRatio: 0.1, clippingRatio: 0, silent: false } },
     { engine: 'qvac', ok: false, error: 'boom' }
   ]).qvac
   assert.equal(stats.successCount, 2)

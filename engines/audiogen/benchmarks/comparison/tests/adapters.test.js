@@ -2,7 +2,10 @@
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { buildRequest } = require('../adapters/acestep')
+const fs = require('fs')
+const os = require('os')
+const path = require('path')
+const { buildRequest, prepareWorkDir } = require('../adapters/acestep')
 const { buildQvacArgs } = require('../adapters/qvac')
 
 const config = {
@@ -70,4 +73,18 @@ test('qvac args pass explicit metadata and do not enable GPU on cpu', () => {
 test('qvac args enable GPU for CUDA', () => {
   const args = buildQvacArgs({ ...config, backend: 'cuda' }, prompt, '/tmp/out.wav')
   assert.equal(args.includes('--gpu'), true)
+})
+
+test('acestep gives each round a clean isolated work directory', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acestep-round-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const outputWav = path.join(root, 'timed-0.wav')
+  const workDir = `${outputWav}.work`
+  fs.writeFileSync(outputWav, 'stale output')
+  fs.mkdirSync(workDir)
+  fs.writeFileSync(path.join(workDir, 'stale.wav'), 'stale work file')
+
+  assert.equal(prepareWorkDir(outputWav), workDir)
+  assert.equal(fs.existsSync(outputWav), false)
+  assert.deepEqual(fs.readdirSync(workDir), [])
 })

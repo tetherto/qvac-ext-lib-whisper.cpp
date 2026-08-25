@@ -4,10 +4,9 @@ function parseQvacTimings (logText) {
   const text = String(logText || '')
   const totalMatch = text.match(/\[acestep-timing\] per-stage wall clock \(total\s+([\d.]+)\s+ms\)/i)
   const stages = {}
-  const stageRe = /\[acestep-timing\]\s+(\S+)\s+([\d.]+)\s+ms/g
+  const stageRe = /^\[acestep-timing\][ \t]{2,}(\S+)\s+([\d.]+)\s+ms/gm
   let match
   while ((match = stageRe.exec(text)) !== null) {
-    if (match[1] === 'per-stage') continue
     stages[match[1]] = Number.parseFloat(match[2])
   }
   const codesMatch = text.match(/generated\s+(\d+)\s+codes, seed=(-?\d+),\s+(\d+)\s+frames\s+\(([\d.]+)s\)/i)

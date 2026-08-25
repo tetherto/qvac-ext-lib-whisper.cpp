@@ -52,8 +52,8 @@ function loadHarnessConfig (overrides = {}) {
       'build/engines/audiogen/music-cli',
       'build/audiogen/music-cli',
       'engines/audiogen/build/music-cli',
-      'engines/audiogen/build-metal/music-cli',
-      'engines/audiogen/build-cpu/music-cli'
+      'engines/audiogen/build-cpu/music-cli',
+      'engines/audiogen/build-metal/music-cli'
     ]),
     path.join(engineDir(), 'build', 'music-cli')
   ))
@@ -63,8 +63,8 @@ function loadHarnessConfig (overrides = {}) {
     firstExisting(acestepDir, [
       'build/ace-lm',
       'build/Release/ace-lm',
-      'build-metal/ace-lm',
-      'build-cpu/ace-lm'
+      'build-cpu/ace-lm',
+      'build-metal/ace-lm'
     ]),
     path.join(acestepDir, 'build', 'ace-lm')
   ))
@@ -74,8 +74,8 @@ function loadHarnessConfig (overrides = {}) {
     firstExisting(acestepDir, [
       'build/ace-synth',
       'build/Release/ace-synth',
-      'build-metal/ace-synth',
-      'build-cpu/ace-synth'
+      'build-cpu/ace-synth',
+      'build-metal/ace-synth'
     ]),
     path.join(acestepDir, 'build', 'ace-synth')
   ))

@@ -59,7 +59,9 @@ function renderOverallCharts (engines) {
       title: 'Median peak memory (lower is better)',
       yAxis: 'MiB',
       digits: 1,
-      selectValue: stats => stats.peakRssBytes.median / (1024 * 1024)
+      selectValue: stats => stats.peakRssBytes.median == null
+        ? null
+        : stats.peakRssBytes.median / (1024 * 1024)
     },
     {
       title: 'Median CLAP score (higher is better)',
@@ -132,5 +134,6 @@ function renderMarkdownReport (data) {
 module.exports = {
   formatBytes,
   formatNumber,
-  renderMarkdownReport
+  renderMarkdownReport,
+  renderOverallCharts
 }

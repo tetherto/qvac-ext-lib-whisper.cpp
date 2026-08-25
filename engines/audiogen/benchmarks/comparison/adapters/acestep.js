@@ -52,12 +52,19 @@ function findOutputWav (workDir) {
   return files[0]
 }
 
+function prepareWorkDir (outputWav) {
+  const workDir = `${outputWav}.work`
+  fs.rmSync(outputWav, { force: true })
+  fs.rmSync(workDir, { recursive: true, force: true })
+  fs.mkdirSync(workDir, { recursive: true })
+  return workDir
+}
+
 function runAcestepRound (config, prompt, outputWav) {
   if (!fs.existsSync(config.aceLm) || !fs.existsSync(config.aceSynth)) {
     throw new Error(`acestep.cpp CLIs not found: lm=${config.aceLm} synth=${config.aceSynth}`)
   }
-  const workDir = path.dirname(outputWav)
-  fs.mkdirSync(workDir, { recursive: true })
+  const workDir = prepareWorkDir(outputWav)
   const requestPath = path.join(workDir, 'request.json')
   writeJson(requestPath, buildRequest(config, prompt))
   const env = { ...process.env }
@@ -102,7 +109,7 @@ function runAcestepRound (config, prompt, outputWav) {
   const e2eMs = lm.wallMs + synth.wallMs
   const generationMs = (lmTimings.generationMs || lm.wallMs) + (synthTimings.generationMs || synth.wallMs)
   const initMs = (lmTimings.loadMs || 0) + (synthTimings.loadMs || 0)
-  const ok = lm.status === 0 && synth.status === 0 && Boolean(audio) && !audio.malformed
+  const ok = lm.status === 0 && synth.status === 0 && Boolean(audio)
 
   return {
     engine: 'acestep.cpp',
@@ -132,5 +139,6 @@ function runAcestepRound (config, prompt, outputWav) {
 
 module.exports = {
   buildRequest,
+  prepareWorkDir,
   runAcestepRound
 }

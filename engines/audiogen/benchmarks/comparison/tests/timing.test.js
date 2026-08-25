@@ -13,6 +13,7 @@ test('parseQvacTimings extracts stage totals', () => {
   const parsed = parseQvacTimings(log)
   assert.equal(parsed.generationMs, 1234)
   assert.equal(parsed.stages.lm, 800)
+  assert.equal(parsed.stages['(total'], undefined)
   assert.equal(parsed.nCodes, 40)
   assert.equal(parsed.audioSecondsLogged, 8)
 })

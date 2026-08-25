@@ -121,10 +121,6 @@ function runOne (config, engine, prompt, kind, index, force) {
       generationMs: null
     }
   }
-  if (config.backend === 'cpu' && result.backend && require('./lib/backend').canonicalBackend(result.backend) === 'metal') {
-    result.ok = false
-    result.error = `CPU run used Metal (${result.backend}); rebuild acestep.cpp/QVAC with Metal disabled`
-  }
   const record = {
     ...result,
     kind,

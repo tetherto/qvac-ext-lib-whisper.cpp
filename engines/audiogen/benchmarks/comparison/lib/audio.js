@@ -63,7 +63,6 @@ function analyseWav (buffer) {
   const rms = samples.length ? Math.sqrt(sumSquares / samples.length) / 32768 : 0
   const peakNorm = peak / 32768
   return {
-    valid: true,
     sampleRate,
     channels,
     frames,
@@ -74,9 +73,7 @@ function analyseWav (buffer) {
     rms,
     silenceRatio: samples.length ? silent / samples.length : 1,
     clippingRatio: samples.length ? clipped / samples.length : 0,
-    malformed: false,
-    silent: peak <= silenceThreshold,
-    truncated: false
+    silent: peak <= silenceThreshold
   }
 }
 

@@ -2,7 +2,7 @@
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { renderMarkdownReport } = require('../lib/report')
+const { renderMarkdownReport, renderOverallCharts } = require('../lib/report')
 
 test('renderMarkdownReport includes medians not only fastest runs', () => {
   const markdown = renderMarkdownReport({
@@ -56,4 +56,16 @@ test('renderMarkdownReport includes medians not only fastest runs', () => {
   assert.match(markdown, /Median CLAP score \(higher is better\)/)
   assert.match(markdown, /qvac by prompt/)
   assert.match(markdown, /"test-prompt"/)
+})
+
+test('renderOverallCharts omits peak memory when RSS is unavailable', () => {
+  const charts = renderOverallCharts({
+    qvac: {
+      generationMs: { median: 1000 },
+      rtf: { median: 0.2 },
+      peakRssBytes: { median: null },
+      clap: { median: 0.4 }
+    }
+  }).join('\n')
+  assert.doesNotMatch(charts, /Median peak memory/)
 })
