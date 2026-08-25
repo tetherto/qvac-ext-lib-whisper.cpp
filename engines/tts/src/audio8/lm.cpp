@@ -151,6 +151,30 @@ prompt_frames build_frames(const lm_hparams & hp, const PromptSegments & segment
     return frames;
 }
 
+void build_slow_graph(lm_model & model, scratch & build, int width, int n_past,
+                      slow_graph_outputs & outs) {
+    const lm_hparams & hp = model.hp;
+    ggml_context * ctx = build.ctx;
+    ggml_tensor * mask = input_f32(ctx, "mask", n_past + width, width);
+    ggml_tensor * hidden = embed_frames(ctx, model, width);
+    const rope_planes rope = rope_window(ctx, model.rope_cos, model.rope_sin, n_past, width);
+    hidden = run_blocks(ctx, build.graph, model.blocks, hidden, rope, model.slow_kv,
+                        slow_shape(model, width, n_past), mask, hp.rms_eps);
+
+    ggml_tensor * tail = ggml_cont(ctx, last_column(ctx, hidden));
+    ggml_tensor * normed = rms_norm(ctx, tail, model.norm, hp.rms_eps);
+    outs.logits = mark_output(
+        build.graph, multiply_mat(ctx, model.sem_head, normed, model.precise_outputs));
+    outs.carried = mark_output(build.graph, hp.norm_fast_input ? normed : tail);
+}
+
+void set_slow_graph_inputs(const lm_model & model, ggml_cgraph * graph,
+                           const int32_t * frames, int width, int n_past) {
+    frame_inputs inputs;
+    fill_frame_inputs(model.hp, frames, width, n_past, inputs);
+    set_frame_inputs(graph, inputs);
+}
+
 bool slow_step(lm_model & model, const int32_t * frames, int width, int n_past,
                int n_threads, std::vector<float> & sem_logits,
                std::vector<float> & fast_input, std::string * error) {
@@ -164,27 +188,17 @@ bool slow_step(lm_model & model, const int32_t * frames, int width, int n_past,
         if (error) *error = "audio8: failed to create the slow graph context";
         return false;
     }
-    ggml_context * ctx = build.ctx;
-    ggml_tensor * mask = input_f32(ctx, "mask", n_past + width, width);
-    ggml_tensor * hidden = embed_frames(ctx, model, width);
-    const rope_planes rope = rope_window(ctx, model.rope_cos, model.rope_sin, n_past, width);
-    hidden = run_blocks(ctx, build.graph, model.blocks, hidden, rope, model.slow_kv,
-                        slow_shape(model, width, n_past), mask, hp.rms_eps);
-
-    ggml_tensor * tail = ggml_cont(ctx, last_column(ctx, hidden));
-    ggml_tensor * normed = rms_norm(ctx, tail, model.norm, hp.rms_eps);
-    ggml_tensor * logits = mark_output(
-        build.graph, multiply_mat(ctx, model.sem_head, normed, model.precise_outputs));
-    ggml_tensor * carried = mark_output(build.graph, hp.norm_fast_input ? normed : tail);
+    slow_graph_outputs outs;
+    build_slow_graph(model, build, width, n_past, outs);
+    ggml_tensor * logits  = outs.logits;
+    ggml_tensor * carried = outs.carried;
 
     bool use_sched = false;
     if (!prepare_graph(model.backend, model.sched, model.buffer_w, model.slow_allocr,
                        build.graph, "slow", use_sched, error)) {
         return false;
     }
-    frame_inputs inputs;
-    fill_frame_inputs(hp, frames, width, n_past, inputs);
-    set_frame_inputs(build.graph, inputs);
+    set_slow_graph_inputs(model, build.graph, frames, width, n_past);
     if (!compute_graph(model.backend, model.sched, build.graph, use_sched, n_threads,
                        "slow", error)) {
         return false;

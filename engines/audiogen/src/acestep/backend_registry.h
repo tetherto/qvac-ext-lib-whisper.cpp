@@ -62,7 +62,8 @@ inline bool backend_device_type_is_gpu(enum ggml_backend_dev_type type) {
 inline bool backend_reg_name_is_validated_gpu(const char * name) {
     return name && (std::strcmp(name, "Vulkan") == 0 ||
                     std::strcmp(name, "MTL") == 0 ||
-                    std::strcmp(name, "Metal") == 0);
+                    std::strcmp(name, "Metal") == 0 ||
+                    std::strcmp(name, "CUDA") == 0);
 }
 
 // Adreno generation from a device name/description: "Adreno (TM) 740" -> 740, the

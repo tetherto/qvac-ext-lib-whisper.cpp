@@ -36,9 +36,10 @@ constexpr int kCosyvoiceNativeSampleRate = 24000;
 
 // GPU admission policy shared by the engine and the per-stage parity
 // harnesses (test-cosyvoice-{flow,llm,hift}), so the backends a test
-// validates are exactly the backends the engine will select. Vulkan is
-// admitted positively on Windows and non-Android Linux -- the platforms
-// its reference runs cover -- rather than "everywhere but Android":
+// validates are exactly the backends the engine will select. Vulkan and
+// CUDA share one platform gate: both are admitted positively on Windows
+// and non-Android Linux -- the platforms their reference runs cover --
+// rather than "everywhere but Android":
 // on Apple a MoltenVK registration with Metal unavailable must not let
 // Vulkan win, and on Android an always-vendor-allowed Samsung Xclipse
 // device must keep declining to CPU instead of offloading through a
@@ -48,7 +49,7 @@ inline ::tts_cpp::detail::GpuBackendRequirement cosyvoice_gpu_requirement() {
     using ::tts_cpp::detail::GpuBackendRequirement;
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
     return GpuBackendRequirement::Metal | GpuBackendRequirement::OpenCL |
-           GpuBackendRequirement::Vulkan;
+           GpuBackendRequirement::Vulkan | GpuBackendRequirement::CUDA;
 #else
     return GpuBackendRequirement::Metal | GpuBackendRequirement::OpenCL;
 #endif
