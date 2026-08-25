@@ -284,6 +284,11 @@ if (AUDIOGEN_BUILD_TESTS)
         audiogen_register_test(test-minimax-quality LABEL "integration")
         set_property(TEST test-minimax-quality PROPERTY SKIP_RETURN_CODE 77)
 
+        add_executable(test-minimax-metal-ops test/test_minimax_metal_ops.cpp)
+        audiogen_link_in_tree_binary(test-minimax-metal-ops)
+        audiogen_register_test(test-minimax-metal-ops LABEL "gpu")
+        set_property(TEST test-minimax-metal-ops PROPERTY SKIP_RETURN_CODE 77)
+
         find_package(Python3 COMPONENTS Interpreter)
         if (Python3_Interpreter_FOUND)
             add_test(NAME test-minimax-converter
