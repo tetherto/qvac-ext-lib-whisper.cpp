@@ -14,7 +14,8 @@ gate -> regression net -> verdict. Verdict has two axes (observation reproduced 
 mechanism confirmed); only mechanism-confirmed counts as CORRECT. Three WRONG in a
 row => step back + independent review.
 
-Benchmark protocol: `~/qvac-campaigns/QVAC-24013/bin/bench.sh` — pinned prompts P1
+Benchmark protocol: the campaign workspace's `bin/bench.sh` (kept outside the
+repo) — pinned prompts P1
 (pop, clean English lyrics) / P2 (rock), seeds 42/1337, 30 s, 1 discarded cold run +
 3 warm runs, median warm wall = the metric. Results: benchmarks/results.jsonl.
 

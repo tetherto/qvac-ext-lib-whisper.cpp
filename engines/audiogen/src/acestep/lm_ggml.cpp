@@ -17,11 +17,8 @@
 
 namespace tts_cpp::acestep {
 
-// Reused forward graph. Rebuilding the graph and its allocation on every call
-// costs more host time than the device spends computing a single-token decode
-// (measured on Strix Halo Vulkan: ~3 s of a ~4.5 s LM stage). The graph shape
-// is fully determined by the key fields, and n_kv_pad moves in 256-row steps,
-// so one cached graph serves ~256 consecutive decode steps.
+// Reused forward graph: the key fields fully determine the graph shape, and
+// n_kv_pad moves in 256-row steps, so one graph serves ~256 decode steps.
 struct LMGraphCache {
     ggml_context * ctx = nullptr;
     ggml_cgraph *  gf  = nullptr;

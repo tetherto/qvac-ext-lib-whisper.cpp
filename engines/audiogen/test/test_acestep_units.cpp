@@ -439,9 +439,8 @@ void test_stage_placement() {
         CHECK(p.enc_on_gpu);
     }
 
-    // Vulkan on any other device, and CUDA everywhere, are validated for every
-    // stage except the autoregressive LM (README "Backends" records the
-    // per-backend rationale).
+    // Vulkan on any other device, and CUDA everywhere, keep the LM on the CPU
+    // (README "Backends" records the per-backend rationale).
     check_gpu_backend_keeps_lm_on_cpu("Vulkan", "Mali-G715");
     check_gpu_backend_keeps_lm_on_cpu("Vulkan", "Samsung Xclipse 920");
     check_gpu_backend_keeps_lm_on_cpu("Vulkan", "");

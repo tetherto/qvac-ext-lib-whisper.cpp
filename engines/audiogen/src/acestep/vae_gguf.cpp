@@ -46,10 +46,8 @@ static float bf16_to_f32(uint16_t v) {
     ggml_bf16_t b; b.bits = v; return ggml_bf16_to_fp32(b);
 }
 
-// Weight-norm resolution and f16 conversion walk every conv weight on the
-// host at load time; single-threaded they cost ~1.2 s per VAE load. The rows
-// are independent, so split [0, n) into per-thread ranges (bit-identical:
-// per-row arithmetic order is unchanged).
+// Splits [0, n) across joined threads; rows are independent and per-row
+// arithmetic order is unchanged, so results match the single-threaded pass.
 template <typename F>
 static void parallel_rows(int n, F && fn) {
     const unsigned hw        = std::thread::hardware_concurrency();

@@ -180,9 +180,8 @@ inline const char * backend_reg_name(ggml_backend_t backend) {
     return name ? name : "";
 }
 
-// Device description of the backend's active device ("Radeon 8060S Graphics
-// (RADV GFX1151)", "Mali-G715", ...). Feeds the device-scoped placement
-// decisions in stage_placement.h; empty when unavailable.
+// Device description of the backend's active device; feeds the device-scoped
+// placement decisions in stage_placement.h. Empty when unavailable.
 inline const char * backend_dev_description(ggml_backend_t backend) {
     if (!backend) return "";
     ggml_backend_dev_t dev  = ggml_backend_get_device(backend);

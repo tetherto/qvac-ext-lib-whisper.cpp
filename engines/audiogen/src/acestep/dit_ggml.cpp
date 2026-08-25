@@ -64,12 +64,8 @@ struct DitLayer {
     int layer_type = 0;                         // 0 = sliding window, 1 = full
 };
 
-// Reused forward graph. The sampler calls dit_model_forward once per Euler
-// step with identical shapes; rebuilding the 24-layer graph and its allocation
-// every step only re-pays graph build, allocation, and descriptor setup 8x
-// (turbo) or 50x (sft) per generation. The graph shape is fully determined by
-// the key fields, so the built graph and its allocation are reused until the
-// key changes. Inputs are re-uploaded every call, exactly as before.
+// Reused forward graph: the sampler calls dit_model_forward once per Euler step
+// with identical shapes, so the built graph and its allocation are kept.
 struct DitGraphCache {
     ggml_context * ctx = nullptr;
     ggml_cgraph *  gf  = nullptr;

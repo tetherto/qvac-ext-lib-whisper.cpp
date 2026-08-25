@@ -42,14 +42,8 @@ inline bool backend_name_is_cuda(const char * name) {
     return name && std::strcmp(name, "CUDA") == 0;
 }
 
-// The Vulkan LM placement is per-DEVICE, not per-backend: on Arm Mali-G715 the
-// LM collapses to repeated codes, while on Mesa RADV (AMD Strix Halo, Radeon
-// 8060S) the GPU LM is ~2x faster than the CPU path and closer to the F32
-// ground truth than the CPU's Q8_1-activation matmul (per-step logit cosine vs
-// F32-dequantized reference: ~0.99999995 GPU vs ~0.9998 CPU; argmax parity 3/3
-// GPU vs 1/3 CPU on 300-token prefills). Match the Mesa RADV driver substring
-// in the device description; every other Vulkan device keeps the CPU placement
-// until measured the same way.
+// Per-device Vulkan LM allowlist: Mesa RADV is validated against the
+// F32-dequantized reference (README "Backends"); other devices stay on CPU.
 inline bool vulkan_device_lm_validated(const char * device_desc) {
     return device_desc && std::strstr(device_desc, "RADV") != nullptr;
 }
@@ -76,16 +70,8 @@ struct StagePlacement {
 // Allowlist, then the overrides. Only meaningful when a GPU backend actually
 // initialised -- Engine::create() does not consult it on the CPU-only path.
 //
-// The LM and the detokenizer are allowlisted rather than denylisted: a backend
-// nobody has measured keeps the CPU placement and cannot silently regress
-// generated audio. Vulkan is validated for the detokenizer everywhere, and for
-// the autoregressive LM per-device (vulkan_device_lm_validated): Mesa RADV
-// devices run the LM on the GPU, while Mali-G715 -- where the LM collapses to
-// repeated codes and may terminate far short of the requested duration -- and
-// every other unmeasured Vulkan device keep it on the CPU.
-// OpenCL is validated for both stages on Adreno 740. CUDA keeps the
-// detokenizer on the GPU and the LM on the CPU until the parity measurement is
-// taken; README "Backends" records the rationale.
+// Allowlist, then the overrides: an unmeasured backend keeps the CPU placement
+// and cannot silently regress audio; README "Backends" records the rationale.
 inline StagePlacement resolve_stage_placement(const char * reg_name, const char * device_desc,
                                               const PlacementOverrides & ov) {
     StagePlacement p;
