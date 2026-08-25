@@ -48,7 +48,22 @@ otherwise falls back to the CPU. On a GPU the weights and graphs live on the
 first usable backend the ggml registry offers (CUDA, Vulkan, Metal, ...) and a
 CPU backend backs any unsupported op; the full model pair must fit in device
 memory (~22 GB for the f16 pair). One MiniMax engine instance may be active at
-a time because its compute graphs are shared.
+a time because its compute graphs are shared. The weight-free
+`test-minimax-metal-ops` regression compares the 4096-channel condition
+projection and every DAC transposed-convolution stride against CPU on Metal.
+
+Vulkan and CUDA are the measured GPU backends, both on an RTX 5090. On each,
+`mm3-replay --mode replay` forcing the recorded official prompt tokens, codes,
+and noise reproduces the CPU rendering (time-domain audio correlation 0.9998
+on Vulkan, 0.9993 on CUDA), `--mode condcheck` confirms byte-identical DiT
+velocities across repeated computes, and `test-minimax-quality` lands the
+final flow latents on the learned manifold. Vulkan is measured with both the
+`q8_0` and the `f16` pair; the 22 GB `f16` pair far exceeds ggml's 1 GiB
+Vulkan suballocation block and loads through the chunked device buffers ggml
+creates automatically. The full `test-backend-ops` suite passes on the same
+device, including the `b_absmax=1e5` LM-shaped `mul_mat` stress cases.
+Metal and OpenCL remain unmeasured for MiniMax and take the same all-on-GPU
+placement, so measure them the same way before shipping them.
 
 The frame rate, maximum frame count, flow defaults, and output sample rate come
 from GGUF metadata. Current converted files specify 25 frames per second, at
@@ -244,8 +259,8 @@ directory such as `Release/` beneath the executable directory. See the
 |---|---|---|
 | `AUDIOGEN_BUILD_LIBRARY` | `ON` | build the library; linkage follows `BUILD_SHARED_LIBS` |
 | `AUDIOGEN_BUILD_EXECUTABLES` | `ON` standalone, `OFF` as a subdirectory | CLIs and per-stage smoke harnesses |
-| `AUDIOGEN_BUILD_TESTS` | `ON` standalone, `OFF` as a subdirectory | CPU-only unit tests |
-| `AUDIOGEN_BUILD_MINIMAX` | `ON` on desktop, unavailable on Android and iOS | MiniMax-Music3 CPU engine |
+| `AUDIOGEN_BUILD_TESTS` | `ON` standalone, `OFF` as a subdirectory | unit, integration, and backend parity tests |
+| `AUDIOGEN_BUILD_MINIMAX` | `ON` on desktop, unavailable on Android and iOS | MiniMax-Music3 engine; CPU by default, GPU through `EngineOptions::device` |
 | `AUDIOGEN_INSTALL` | `ON` | generate install rules |
 | `AUDIOGEN_USE_SYSTEM_GGML` | `ON` | `find_package(ggml)`; required, there is no supported vendored ggml in this tree |
 | `AUDIOGEN_CCACHE` | `ON` | use ccache when available |
@@ -520,6 +535,16 @@ condition length, window stitching, sampler edge cases, and converter output
 transactions. Set `AUDIOGEN_TEST_MINIMAX_MODELS_DIR` to a directory containing
 the MiniMax GGUF pair to run `test-minimax-integration`, which covers model
 loading, generation output, progress, and cancellation.
+On a Metal build, `ctest --test-dir build/audiogen -R
+test-minimax-metal-ops` runs the model-free CPU/Metal condition and vocoder
+parity regression. It skips with return code 77 either when Metal is
+unavailable or when the Metal device cannot run `MUL_MAT` — both parity graphs
+are matmul-based, and ggml gates `GGML_OP_MUL_MAT` on simdgroup reduction
+(`MTLGPUFamilyApple7`+), which virtualized GPUs such as the ones on hosted macOS
+CI runners do not report. Meaningful parity coverage therefore needs a
+non-virtualized Apple GPU, which is why the audiogen CI macOS lane runs on the
+self-hosted `qvac-macos26-arm64-gpu` runner and fails rather than passes if the
+test skips there.
 `test-acestep-integration` exercises the ACE-Step public API when model paths
 are supplied and otherwise reports a skipped test.
 
