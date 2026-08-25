@@ -4,9 +4,9 @@
 # Scope: build the audiogen-cpp library + its unit tests against
 # system ggml (qvac-ext-ggml @ speech — mandatory here: AUDIOGEN_USE_SYSTEM_GGML
 # defaults ON and the engine needs the custom snake / col2im_1d ops that live
-# on that branch), then run the non-GPU ctest suite and the weight-free MiniMax
-# Metal parity test on hosted macOS. Model-dependent smoke harnesses stay
-# downstream on-device.
+# on that branch), then run the non-GPU ctest suite on both lanes and the
+# weight-free MiniMax Metal parity test on the self-hosted Apple-silicon
+# runner. Model-dependent smoke harnesses stay downstream on-device.
 name: audiogen CI
 
 on:
@@ -42,15 +42,35 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-24.04
+          # Self-hosted Apple silicon, not hosted macOS. GitHub's hosted macOS
+          # runners expose an "Apple Paravirtual device" reporting only
+          # MTLGPUFamilyApple5, and ggml gates GGML_OP_MUL_MAT on simdgroup
+          # reduction (Apple7+), so no matmul can execute there and the parity
+          # test could only ever skip. Same conclusion tts-ci.yml reached in
+          # QVAC-22775. This is the runner the qvac monorepo uses for its
+          # Metal lanes (integration-test-asr-ggml.yml, cpp-tests-*.yml).
+          - os: macos-26
+            runner: qvac-macos26-arm64-gpu
+    runs-on: ${{ matrix.runner || matrix.os }}
     timeout-minutes: 60
     steps:
+      # Self-hosted runners are persistent, so a previous run's tree can survive
+      # into this one. See docs/ci/SELF-HOSTED-RUNNERS.md in the qvac monorepo.
+      - name: Manual Workspace Cleanup
+        run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
+        shell: bash
+        working-directory: .
+        if: runner.environment != 'github-hosted'
+
       - uses: actions/checkout@v4
 
       - name: Install ccache
         run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then brew install ccache; else sudo apt-get update -q && sudo apt-get install -y ccache; fi
+          if [ "$RUNNER_ENVIRONMENT" = "github-hosted" ]; then
+            if [ "$RUNNER_OS" = "macOS" ]; then brew install ccache; else sudo apt-get update -q && sudo apt-get install -y ccache; fi
+          fi
           echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
 
       - name: Resolve ggml pin (tip of ${{ env.GGML_BRANCH }})
@@ -73,7 +93,7 @@ jobs:
           key: ccache-audiogen-${{ matrix.os }}-${{ github.sha }}
           restore-keys: ccache-audiogen-${{ matrix.os }}-
 
-      # Hosted macOS exposes Metal; Linux remains a portable CPU-only build.
+      # macOS builds with Metal for the parity test; Linux stays portable CPU-only.
       - name: Build ggml (system ggml, qvac-ext-ggml@${{ env.GGML_BRANCH }})
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
@@ -116,19 +136,11 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
         run: ctest --test-dir build -LE 'gpu|perf' --output-on-failure --timeout 600
 
-      # The parity test exits 77 (a ctest SKIP, which ctest scores as success) in
-      # two very different situations, and only one of them is acceptable here:
-      #
-      #   * "Metal backend is unavailable" — Metal missing entirely on a macOS
-      #     runner means a broken build or runner, and the lane would go green
-      #     having exercised nothing. Fail.
-      #   * "Metal device cannot run MUL_MAT" — hosted runners expose a
-      #     paravirtual GPU reporting MTLGPUFamilyApple5, and ggml gates
-      #     GGML_OP_MUL_MAT on simdgroup reduction (Apple7+), so no matmul can
-      #     execute. Not fixable from here; tolerate it, but keep it loud.
-      #
-      # Consequence: this lane proves the test builds and runs, NOT that Metal
-      # matches CPU. Real matmul parity needs an Apple7+ GPU — see the gpu lane.
+      # ctest scores a SKIP (return code 77) as success, so a green tick here
+      # would not by itself mean the parity assertions ran. On this lane they
+      # must: the runner is real Apple silicon, so Metal is expected to be
+      # present AND to support MUL_MAT. Either skip marker means the job proved
+      # nothing, and is treated as a failure rather than a pass.
       - name: Test (Metal)
         if: runner.os == 'macOS'
         run: |
@@ -138,11 +150,12 @@ jobs:
           # so the greps would silently never match.
           ctest --test-dir build -R '^test-minimax-metal-ops$' -V --timeout 600 2>&1 | tee metal-test.log
           if grep -q "SKIP Metal backend is unavailable" metal-test.log; then
-            echo "::error::Metal backend absent on a macOS runner — the parity test never ran"
+            echo "::error::Metal backend absent on the Apple-silicon runner — the parity test never ran"
             exit 1
           fi
           if grep -q "SKIP Metal device cannot run MUL_MAT" metal-test.log; then
-            echo "::warning::Metal parity skipped: this runner's GPU lacks simdgroup reduction, so MUL_MAT is unsupported. Matmul parity is NOT covered by this lane."
+            echo "::error::Metal device lacks simdgroup reduction, so MUL_MAT is unsupported — this runner was expected to expose an Apple7+ GPU"
+            exit 1
           fi
 
   # Non-Metal GPU lane stays opt-in until self-hosted GPU runners exist.

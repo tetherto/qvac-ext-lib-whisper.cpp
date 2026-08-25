@@ -529,7 +529,9 @@ unavailable or when the Metal device cannot run `MUL_MAT` — both parity graphs
 are matmul-based, and ggml gates `GGML_OP_MUL_MAT` on simdgroup reduction
 (`MTLGPUFamilyApple7`+), which virtualized GPUs such as the ones on hosted macOS
 CI runners do not report. Meaningful parity coverage therefore needs a
-non-virtualized Apple GPU.
+non-virtualized Apple GPU, which is why the audiogen CI macOS lane runs on the
+self-hosted `qvac-macos26-arm64-gpu` runner and fails rather than passes if the
+test skips there.
 `test-acestep-integration` exercises the ACE-Step public API when model paths
 are supplied and otherwise reports a skipped test.
 
