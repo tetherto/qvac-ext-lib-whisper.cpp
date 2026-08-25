@@ -34,8 +34,10 @@ CAMPAIGN COMPLETE. Final milestone m3 (branch HEAD, all changes committed):
 All m3 output hashes identical to milestone m2 (bit-exactness held through the
 DiT graph cache and tiled-im2col changes). Remaining known headroom, awaiting
 direction: Vulkan per-submit encode (LM ~2.5 s host; HIP proves the ceiling),
-CUDA/HIP ports of the tiled kernels, IM2COL_3D pre-existing crash fix, ROCm
-allowlist validation.
+CUDA/HIP ports of the tiled kernels, ROCm allowlist validation. The IM2COL_3D
+workgroup-overflow crash, pre-existing at baseline, was fixed on the ggml
+branch after this table was recorded (y grid-stride + host clamp; the full
+single-process Vulkan op sweep now completes with zero failures).
 
 Campaign history below.
 
@@ -271,6 +273,8 @@ GPU op time => ~3 s host-side churn; DiT ~0.87 s GPU-bound.
   GB/s; per-generation col2im ~2391 ms -> ~40 ms. Engine: q4 15.8 -> 9.2-9.3 s
   (1.70x), q8 19.3 -> 8.8 s (2.19x, past the bar). Gate A: WAVs bit-identical
   pre/post for both quants. Correctness suite extended with tiled-path shapes
+  (NOTE: the gate later changed from an element-count to a 32 MiB byte
+  threshold; the eval shapes were re-enlarged to cross it in the review pass)
   (ragged tails, k != 2*s0) — all pass; SNAKE/ZERO_UPSAMPLE/CHANNEL_SHUFFLE/
   AFFINE_PRELU/CPY unaffected.
 - Learning: on Strix Halo, small-segment strided DRAM reads are ~20x slower
@@ -293,7 +297,8 @@ GPU op time => ~3 s host-side churn; DiT ~0.87 s GPU-bound.
 - Outcome: LM stage only 4.7 -> 4.55 s. Perf-logger split shows the remaining
   host cost is per-submit command encoding + fence (~4.5 ms/token vs 5.3 ms
   GPU), comparable to upstream Vulkan norms. Verdict: mechanism partially
-  right, magnitude wrong; deeper submit-side work deprioritized (R6).
+  right, magnitude wrong; deeper submit-side work deprioritized (cheapest
+  remaining levers first).
 - Learning: graph BUILD cost is small vs command-buffer encode on this
   backend; measure the split before attacking "host overhead" as one number.
 
@@ -316,8 +321,8 @@ GPU op time => ~3 s host-side churn; DiT ~0.87 s GPU-bound.
   element overrides — correctness survived only because the tiled shaders
   grid-stride over the full range. LESSON: when splitting a case out of a
   shared label list, re-check which labels the ORIGINAL body retains; verify
-  with a print that the intended branch actually executes (R8 applies to
-  one's own changes too).
+  with a print that the intended branch actually executes before trusting a
+  contradictory measurement.
 - Fix: copy_transpose_large.comp (64x128 LDS tile, 512-B reads / 256-B
   writes, >=32 MiB + device-limit gated) + restored case routing. Transposes:
   5 -> ~190 GB/s (f32), f16 hang gone. Correctness: full CPY/DUP/CONT +

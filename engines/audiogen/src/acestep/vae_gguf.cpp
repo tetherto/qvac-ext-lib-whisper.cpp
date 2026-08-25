@@ -2,10 +2,11 @@
 
 #include "ggml-backend.h"
 
+#include "parallel_load.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <thread>
 #include <vector>
 
 namespace tts_cpp::acestep {
@@ -46,35 +47,10 @@ static float bf16_to_f32(uint16_t v) {
     ggml_bf16_t b; b.bits = v; return ggml_bf16_to_fp32(b);
 }
 
-// Splits [0, n) across joined threads; rows are independent and per-row
-// arithmetic order is unchanged, so results match the single-threaded pass.
-template <typename F>
-static void parallel_rows(int n, F && fn) {
-    const unsigned hw        = std::thread::hardware_concurrency();
-    const int      n_threads = (int) std::min<unsigned>(hw ? hw : 1, 16);
-    if (n < 128 || n_threads <= 1) {
-        fn(0, n);
-        return;
-    }
-    const int chunk = (n + n_threads - 1) / n_threads;
-    std::vector<std::thread> workers;
-    for (int t = 0; t < n_threads; t++) {
-        const int begin = t * chunk;
-        const int end   = std::min(n, begin + chunk);
-        if (begin >= end) break;
-        workers.emplace_back([&fn, begin, end] { fn(begin, end); });
-    }
-    for (auto & w : workers) w.join();
-}
-
 static void upload_f32_as(ggml_tensor * dst, const std::vector<float> & w) {
     if (dst->type == GGML_TYPE_F16) {
         std::vector<ggml_fp16_t> h(w.size());
-        parallel_rows((int) (w.size() / 4096) + 1, [&](int begin, int end) {
-            const size_t lo = (size_t) begin * 4096;
-            const size_t hi = std::min(w.size(), (size_t) end * 4096);
-            if (lo < hi) ggml_fp32_to_fp16_row(w.data() + lo, h.data() + lo, (int) (hi - lo));
-        });
+        convert_f32_to_f16_rows(w.data(), h.data(), w.size());
         ggml_backend_tensor_set(dst, h.data(), 0, h.size() * sizeof(ggml_fp16_t));
     } else {
         ggml_backend_tensor_set(dst, w.data(), 0, w.size() * sizeof(float));

@@ -15,8 +15,10 @@
 //   6b. vae_shrink_window_core — chunked-decode window vs the backend alloc cap.
 //   7. GPU device types    — discrete and integrated GPUs are selectable.
 //   8. stage placement     — which backend the LM / detokenizer / encoders run on.
+//   9. parallel_load       — weight-load row/chunk decomposition parity.
 
 #include "backend_registry.h"
+#include "parallel_load.h"
 #include "audio_edit.h"
 #include "cover_noise.h"
 #include "dit_ggml.h"
@@ -35,6 +37,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <random>
 #include <vector>
@@ -583,6 +586,44 @@ void test_placement_env() {
     }
 
     clear_all();  // leave the environment as found
+}
+
+// 9. parallel_load -----------------------------------------------------------
+// Exactly-once row coverage and bit-parity with the single-threaded conversion.
+void test_parallel_rows() {
+    using tts_cpp::acestep::parallel_rows;
+    for (int n : { 0, 1, 127, 128, 129, 255, 4096, 12345 }) {
+        std::vector<int> hits((size_t) n, 0);
+        parallel_rows(n, [&](int begin, int end) {
+            CHECK(begin >= 0);
+            CHECK(end <= n);
+            for (int i = begin; i < end; i++) hits[(size_t) i]++;
+        });
+        bool all_once = true;
+        for (int h : hits) all_once = all_once && h == 1;
+        CHECK(all_once);
+    }
+}
+
+void test_convert_f32_to_f16_rows() {
+    using tts_cpp::acestep::convert_f32_to_f16_rows;
+    using tts_cpp::acestep::F16_CONVERT_CHUNK;
+    std::mt19937                          rng(123);
+    std::uniform_real_distribution<float> dist(-8.0f, 8.0f);
+    for (size_t count : { (size_t) 0, (size_t) 1, F16_CONVERT_CHUNK - 1, F16_CONVERT_CHUNK,
+                          F16_CONVERT_CHUNK + 1, 2 * F16_CONVERT_CHUNK, (size_t) 65537 }) {
+        std::vector<float> src(count);
+        for (auto & v : src) v = dist(rng);
+        std::vector<ggml_fp16_t> serial(count);
+        std::vector<ggml_fp16_t> chunked(count);
+        if (count > 0) {
+            ggml_fp32_to_fp16_row(src.data(), serial.data(), (int) count);
+            convert_f32_to_f16_rows(src.data(), chunked.data(), count);
+            CHECK(std::memcmp(serial.data(), chunked.data(), count * sizeof(ggml_fp16_t)) == 0);
+        } else {
+            convert_f32_to_f16_rows(src.data(), chunked.data(), count);
+        }
+    }
 }
 
 void test_generate_task_kinds() {
@@ -1196,6 +1237,8 @@ int main() {
     test_backend_device_types();
     test_stage_placement();
     test_placement_env();
+    test_parallel_rows();
+    test_convert_f32_to_f16_rows();
     test_generate_task_kinds();
     test_generate_task_defaults();
     test_generate_task_audio_layout();

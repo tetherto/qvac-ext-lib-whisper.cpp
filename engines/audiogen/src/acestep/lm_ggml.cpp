@@ -105,6 +105,9 @@ static bool lm_backend_supports_flash_attn(ggml_backend_t backend, const Qwen3Co
 }
 
 static void lm_partial_head_clear(LMModel * m) {
+    // A cached graph may reference the freed head tensor, and a reallocation
+    // can reuse its address; drop the cache so pointer identity stays sound.
+    m->graph_cache.release();
     if (m->lm_head_buf) ggml_backend_buffer_free(m->lm_head_buf);
     if (m->lm_head_ctx) ggml_free(m->lm_head_ctx);
     m->lm_head_buf     = nullptr;

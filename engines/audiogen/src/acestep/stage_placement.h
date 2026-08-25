@@ -67,11 +67,8 @@ struct StagePlacement {
     bool detok_on_gpu = true;
 };
 
-// Allowlist, then the overrides. Only meaningful when a GPU backend actually
-// initialised -- Engine::create() does not consult it on the CPU-only path.
-//
-// Allowlist, then the overrides: an unmeasured backend keeps the CPU placement
-// and cannot silently regress audio; README "Backends" records the rationale.
+// Allowlist, then the overrides; an unmeasured backend keeps the CPU placement
+// (README "Backends"). Only consulted when a GPU backend actually initialised.
 inline StagePlacement resolve_stage_placement(const char * reg_name, const char * device_desc,
                                               const PlacementOverrides & ov) {
     StagePlacement p;
