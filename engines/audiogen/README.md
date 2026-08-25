@@ -50,6 +50,19 @@ CPU backend backs any unsupported op; the full model pair must fit in device
 memory (~22 GB for the f16 pair). One MiniMax engine instance may be active at
 a time because its compute graphs are shared.
 
+Vulkan and CUDA are the measured GPU backends, both on an RTX 5090. On each,
+`mm3-replay --mode replay` forcing the recorded official prompt tokens, codes,
+and noise reproduces the CPU rendering (time-domain audio correlation 0.9998
+on Vulkan, 0.9993 on CUDA), `--mode condcheck` confirms byte-identical DiT
+velocities across repeated computes, and `test-minimax-quality` lands the
+final flow latents on the learned manifold. Vulkan is measured with both the
+`q8_0` and the `f16` pair; the 22 GB `f16` pair far exceeds ggml's 1 GiB
+Vulkan suballocation block and loads through the chunked device buffers ggml
+creates automatically. The full `test-backend-ops` suite passes on the same
+device, including the `b_absmax=1e5` LM-shaped `mul_mat` stress cases.
+Metal and OpenCL remain unmeasured for MiniMax and take the same all-on-GPU
+placement, so measure them the same way before shipping them.
+
 The frame rate, maximum frame count, flow defaults, and output sample rate come
 from GGUF metadata. Current converted files specify 25 frames per second, at
 most 9000 frames, 30 flow steps, CFG 1.7, and 44100 Hz output.
