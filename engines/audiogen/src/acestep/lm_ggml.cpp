@@ -118,6 +118,34 @@ static void lm_partial_head_clear(LMModel * m) {
     m->lm_head_offset  = -1;
 }
 
+// The copied rows must byte-match the source range; sampling the edge rows
+// catches a wrong-offset or unsupported-copy backend before the head is used.
+static bool lm_verify_head_rows(LMModel * m, int offset, int count, size_t row_bytes) {
+    std::vector<uint8_t> src_row(row_bytes);
+    std::vector<uint8_t> dst_row(row_bytes);
+    const int checks[2] = { 0, count - 1 };
+    for (int k = 0; k < 2; k++) {
+        const int r = checks[k];
+        ggml_backend_tensor_get(m->embed_tokens, src_row.data(), (size_t) (offset + r) * row_bytes, row_bytes);
+        ggml_backend_tensor_get(m->lm_head_partial, dst_row.data(), (size_t) r * row_bytes, row_bytes);
+        if (memcmp(src_row.data(), dst_row.data(), row_bytes) != 0) return false;
+    }
+    return true;
+}
+
+// Device-side copy of the tied-embedding row range into the compact head. The
+// range is one contiguous byte span, so a row-aligned view is a legal copy
+// SOURCE (it never feeds MUL_MAT - that guard stands); backends without a
+// device copy path bounce through the host inside ggml_backend_tensor_copy.
+static bool lm_copy_head_rows_device(LMModel * m, int offset, int count, size_t row_bytes) {
+    if (!m->embed_tokens->buffer || !m->embed_tokens->data) return false;
+    ggml_tensor * view = ggml_view_2d(m->lm_head_ctx, m->embed_tokens, m->cfg.hidden_size, count,
+                                      m->embed_tokens->nb[1], (size_t) offset * row_bytes);
+    if (!view || ggml_backend_view_init(view) != GGML_STATUS_SUCCESS) return false;
+    ggml_backend_tensor_copy(view, m->lm_head_partial);
+    return lm_verify_head_rows(m, offset, count, row_bytes);
+}
+
 // Copy tied-embedding rows [offset, V) into a contiguous tensor. A direct
 // ggml_view_2d is only byte-addressable for non-quantized rows on all backends;
 // a compact Q4/Q8 view may otherwise feed the wrong blocks to GPU MUL_MAT.
@@ -130,7 +158,7 @@ static bool lm_build_partial_head(LMModel * m, int offset) {
 
     const int H     = m->cfg.hidden_size;
     const int count = m->cfg.vocab_size - offset;
-    ggml_init_params hp{ ggml_tensor_overhead() * 2 + 16, nullptr, true };
+    ggml_init_params hp{ ggml_tensor_overhead() * 3 + 16, nullptr, true };
     m->lm_head_ctx = ggml_init(hp);
     if (!m->lm_head_ctx) {
         m->lm_head_failed_offset = offset;
@@ -156,9 +184,11 @@ static bool lm_build_partial_head(LMModel * m, int offset) {
     }
     const size_t nbytes = (size_t) count * row_bytes;
     const auto   t0     = std::chrono::steady_clock::now();
-    std::vector<uint8_t> tmp(nbytes);
-    ggml_backend_tensor_get(m->embed_tokens, tmp.data(), (size_t) offset * row_bytes, nbytes);
-    ggml_backend_tensor_set(m->lm_head_partial, tmp.data(), 0, nbytes);
+    if (!lm_copy_head_rows_device(m, offset, count, row_bytes)) {
+        std::vector<uint8_t> tmp(nbytes);
+        ggml_backend_tensor_get(m->embed_tokens, tmp.data(), (size_t) offset * row_bytes, nbytes);
+        ggml_backend_tensor_set(m->lm_head_partial, tmp.data(), 0, nbytes);
+    }
     m->lm_head_offset = offset;
     if (std::getenv("ACESTEP_LM_TIMING"))
         fprintf(stderr, "[lm-timing] partial-head build %.1f ms (%d rows, %.1f MB)\n",
