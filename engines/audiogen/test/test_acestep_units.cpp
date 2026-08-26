@@ -42,6 +42,7 @@
 #include <cstring>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <vector>
 
 namespace {
@@ -219,7 +220,7 @@ void test_sampler() {
 
 // Compact-slice sampling must match the historical full-vocab path exactly:
 // entries below the EOS cut were only ever masked to -1e9, so sampling the
-// [eos, V) slice (with specials re-masked) is an identity, RNG stream included.
+// [eos, V) slice via index_base is an identity, RNG stream included.
 void test_sampler_compact_equivalence() {
     using tts_cpp::acestep::sample_top_k_p;
 
@@ -238,9 +239,10 @@ void test_sampler_compact_equivalence() {
         for (int v = 1; v < base - eos; ++v) slice[v] = -1e9f;
 
         std::mt19937 r_full(trial), r_slice(trial);
-        const float  temp = (trial % 5 == 0) ? 0.0f : 0.85f;  // argmax path every 5th trial
-        int tf = sample_top_k_p(full.data(), V, temp, 0.9f, 0, r_full);
-        int ts = sample_top_k_p(slice.data(), V - eos, temp, 0.9f, 0, r_slice) + eos;
+        const float  temp  = (trial % 5 == 0) ? 0.0f : 0.85f;  // argmax path every 5th trial
+        const float  top_p = (trial % 7 == 0) ? 0.0f : 0.9f;   // also cover the disabled-top_p path
+        int tf = sample_top_k_p(full.data(), V, temp, top_p, 0, r_full);
+        int ts = sample_top_k_p(slice.data(), V - eos, temp, top_p, 0, r_slice, eos);
         CHECK(tf == ts);
         CHECK(r_full == r_slice);
 
@@ -251,10 +253,58 @@ void test_sampler_compact_equivalence() {
         for (int v = base2; v < V; ++v) full2[v] = -1e9f;
         std::vector<float> pre(raw.begin(), raw.begin() + base2);
         std::mt19937       r_f2(trial + 100), r_p2(trial + 100);
-        int tf2 = sample_top_k_p(full2.data(), V, temp, 0.9f, 0, r_f2);
-        int tp2 = sample_top_k_p(pre.data(), base2, temp, 0.9f, 0, r_p2);
+        int tf2 = sample_top_k_p(full2.data(), V, temp, top_p, 0, r_f2);
+        int tp2 = sample_top_k_p(pre.data(), base2, temp, top_p, 0, r_p2);
         CHECK(tf2 == tp2);
         CHECK(r_f2 == r_p2);
+    }
+}
+
+// r==0 edge of the compact form. dist(0, sum) yields exactly 0.0f only when
+// the raw 32-bit mt19937 output is 0 (sum >= 1.0, so no underflow path); an
+// all-zero engine state produces that draw deterministically. The historical
+// full-vector walk then lands on absolute index 0, and the index_base form
+// must land on the same spot - NOT on index_base + 0 (= EOS in phase 2).
+std::mt19937 make_zero_draw_rng() {
+    std::stringstream ss;
+    for (int i = 0; i < 624; ++i) ss << 0 << ' ';
+    ss << 0;
+    std::mt19937 rng;
+    ss >> rng;
+    return rng;
+}
+
+void test_sampler_r0_edge() {
+    using tts_cpp::acestep::sample_top_k_p;
+
+    {  // Portability guard: stream format / canonical mapping are stdlib-specific.
+        std::mt19937                          probe = make_zero_draw_rng();
+        std::uniform_real_distribution<float> d01(0.0f, 1.0f);
+        if (d01(probe) != 0.0f) {
+            std::fprintf(stderr, "[test-acestep-units] r==0 rng state not reproducible here, subtest skipped\n");
+            return;
+        }
+    }
+
+    const int                             V = 1000, eos = 100, base = 124;
+    std::mt19937                          gen(4321);
+    std::uniform_real_distribution<float> ud(-4.0f, 4.0f);
+    std::vector<float>                    raw(V);
+    for (float & v : raw) v = ud(gen);
+
+    for (float top_p : { 0.9f, 0.0f }) {  // top_p and disabled-top_p branches
+        std::vector<float> full(raw);
+        for (int v = 0; v < base; ++v)
+            if (v != eos) full[v] = -1e9f;
+        std::vector<float> slice(raw.begin() + eos, raw.end());
+        for (int v = 1; v < base - eos; ++v) slice[v] = -1e9f;
+
+        std::mt19937 r_full = make_zero_draw_rng(), r_slice = make_zero_draw_rng();
+        int tf = sample_top_k_p(full.data(), V, 0.85f, top_p, 0, r_full);
+        int ts = sample_top_k_p(slice.data(), V - eos, 0.85f, top_p, 0, r_slice, eos);
+        CHECK(tf == 0);
+        CHECK(ts == 0);
+        CHECK(r_full == r_slice);
     }
 }
 
@@ -1460,6 +1510,7 @@ int main() {
     test_fsq();
     test_sampler();
     test_sampler_compact_equivalence();
+    test_sampler_r0_edge();
     test_sampler_forced_fast_path();
     test_fsm_forced_token();
     test_sampler_fusion_oracle();

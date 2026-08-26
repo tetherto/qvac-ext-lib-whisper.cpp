@@ -47,9 +47,10 @@ int lm_consume_forced(int token, float temperature, std::mt19937 & rng) {
     return token;
 }
 
-int sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng) {
+int sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng,
+                   int index_base) {
     if (temperature <= 0.0f) {
-        return (int) (std::max_element(logits, logits + V) - logits);
+        return (int) (std::max_element(logits, logits + V) - logits) + index_base;
     }
 
     static thread_local std::vector<float>     tmp_buf;
@@ -117,12 +118,12 @@ int sample_top_k_p(float * logits, int V, float temperature, float top_p, int to
 
         std::uniform_real_distribution<float> dist(0.0f, sum);
         float r = dist(rng);
-        if (r == 0.0f) return 0;  // historical acc-walk edge: index 0 wins at acc 0
+        if (r == 0.0f) return 0;  // historical acc-walk edge: absolute index 0 wins at acc 0
         float acc = 0.0f;
         for (int j = 0; j < K; j++) {
             if (cand_dead[j]) continue;
             acc += cand_e[j];
-            if (acc >= r) return cand_id[j];
+            if (acc >= r) return cand_id[j] + index_base;
         }
         return 0;
     }
@@ -138,11 +139,12 @@ int sample_top_k_p(float * logits, int V, float temperature, float top_p, int to
     }
 
     std::uniform_real_distribution<float> dist(0.0f, sum);
-    float                                 r   = dist(rng);
-    float                                 acc = 0.0f;
+    float                                 r = dist(rng);
+    if (r == 0.0f) return 0;  // same acc-walk edge: absolute index 0 wins at acc 0
+    float acc = 0.0f;
     for (int i = 0; i < V; i++) {
         acc += logits[i];
-        if (acc >= r) return i;
+        if (acc >= r) return i + index_base;
     }
     return 0;
 }
@@ -551,7 +553,8 @@ bool lm_generate_codes(LMModel *              m,
 
     // CFG combine (cond + w*(cond-uncond)) then restrict to EOS + audio codes,
     // then sample - all in the compact [TOKEN_IM_END, V) logit space. Entries
-    // below TOKEN_IM_END were only ever masked to -1e9, so skipping them is exact.
+    // below TOKEN_IM_END were only ever masked to -1e9, so index_base sampling
+    // is exact - including the r==0 draw, which lands on absolute token 0.
     auto combine_mask_sample = [&](float * c, const float * u) -> int {
         if (use_cfg && u) {
             const float w = params.cfg_scale;
@@ -559,7 +562,7 @@ bool lm_generate_codes(LMModel *              m,
             for (int v = code0; v < out_v; v++) c[v] = u[v] + w * (c[v] - u[v]);
         }
         for (int v = 1; v < code0; v++) c[v] = -1e9f;
-        return sample_top_k_p(c, out_v, params.temperature, params.top_p, params.top_k, rng) + TOKEN_IM_END;
+        return sample_top_k_p(c, out_v, params.temperature, params.top_p, params.top_k, rng, TOKEN_IM_END);
     };
 
     const char *       dump_layers_path = std::getenv("ACESTEP_LM_DUMP_LAYERS");
