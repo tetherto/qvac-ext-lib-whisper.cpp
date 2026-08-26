@@ -374,6 +374,11 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     const bool      stop_at_reasoning = !gen_lyrics;
     const bool      inspire     = need_lyrics;  // bare caption -> INSPIRE expansion
 
+    // With the FSM active and the reasoning stop set, no sampled token can ever
+    // reach the audio-code band, so the forward projects only the prefix head.
+    const int V_lim = (use_fsm && stop_at_reasoning) ? AUDIO_CODE_BASE : 0;
+    const int V_eff = V_lim > 0 ? V_lim : V;
+
     std::vector<int> prompt_tokens;
     if (inspire) {
         std::string user_msg = base.caption;
@@ -386,7 +391,7 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     // FSM setup: constrain the CoT YAML. Force any user-provided metadata.
     MetadataFSM fsm;
     if (use_fsm) {
-        fsm.init(bpe, V, params.verbose);
+        fsm.init(bpe, V_eff, params.verbose);
         fsm.skip_caption = !use_cot_caption && !inspire;
         if (base.bpm > 0)               fsm.force_field(bpe, MetadataFSM::BPM_VALUE, std::to_string(base.bpm));
         if (base.duration > 0)          fsm.force_field(bpe, MetadataFSM::DURATION_VALUE,
@@ -408,7 +413,7 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
 
     auto t_prefill = std::chrono::steady_clock::now();
     lm_reset(m, 0);
-    if (!lm_model_forward(m, prompt_tokens.data(), (int) prompt_tokens.size(), lg, 0)) {
+    if (!lm_model_forward(m, prompt_tokens.data(), (int) prompt_tokens.size(), lg, 0, nullptr, V_lim)) {
         fprintf(stderr, "[lm-phase1] prefill failed\n");
         return false;
     }
@@ -426,7 +431,7 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
             tok = lm_consume_forced(forced, params.temperature, rng);
         } else {
             if (use_fsm && fsm.enabled) fsm.apply_mask(lg.data());
-            tok = sample_top_k_p(lg.data(), V, params.temperature, params.top_p, params.top_k, rng);
+            tok = sample_top_k_p(lg.data(), V_eff, params.temperature, params.top_p, params.top_k, rng);
         }
         sampler_ms += lm_ms_since(t_sample);
         if (tok != TOKEN_IM_END) {
@@ -441,7 +446,7 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
         if (codes_phase && stop_at_reasoning) break;
         int32_t t        = (int32_t) tok;
         auto    t_decode = std::chrono::steady_clock::now();
-        if (!lm_model_forward(m, &t, 1, lg, 0)) {
+        if (!lm_model_forward(m, &t, 1, lg, 0, nullptr, V_lim)) {
             fprintf(stderr, "[lm-phase1] decode step %d failed\n", step);
             return false;
         }
@@ -459,7 +464,7 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
                   TOKEN_IM_END;
         } else {
             if (use_fsm && fsm.enabled && !codes_phase) fsm.apply_mask(lc);
-            tok = sample_top_k_p(lc, V, params.temperature, params.top_p, params.top_k, rng);
+            tok = sample_top_k_p(lc, V_eff, params.temperature, params.top_p, params.top_k, rng);
         }
         sampler_ms += lm_ms_since(t_sample);
 

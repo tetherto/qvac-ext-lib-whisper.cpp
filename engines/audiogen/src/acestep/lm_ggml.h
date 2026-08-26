@@ -59,8 +59,11 @@ int  lm_kv_pos(const LMModel * m, int set = 0);
 // [hidden_size * n_tokens] concatenated in layer order, for CPU/GPU parity
 // debugging. It forces those tensors to stay resident, so leave it null in
 // production paths.
+// logit_limit > 0 projects only the tied-head prefix rows [0, logit_limit) and
+// returns that many logits - valid only when the caller can never select a
+// token past the limit (FSM-constrained Phase 1).
 bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std::vector<float> & logits_out,
-                      int set = 0, std::vector<float> * layer_states_out = nullptr);
+                      int set = 0, std::vector<float> * layer_states_out = nullptr, int logit_limit = 0);
 
 // Decode one token for each KV set in a single batched graph. `sets` must name
 // consecutive caches and `logit_offset` optionally projects only the tied-head

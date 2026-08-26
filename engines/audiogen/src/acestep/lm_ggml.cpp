@@ -67,13 +67,16 @@ struct LMModel {
     std::vector<ggml_tensor *> qkv_fused;
     std::vector<ggml_tensor *> gateup_fused;
 
-    // Contiguous tied-head rows used by Phase-2 batched CFG. Quantized tensors
-    // cannot be safely sliced with ggml_view_2d on every GPU backend.
+    // Contiguous tied-head row range [offset, offset+count): suffix rows for
+    // Phase-2 batched CFG, prefix rows for FSM-constrained Phase 1. Quantized
+    // tensors cannot be safely sliced with ggml_view_2d on every GPU backend.
     ggml_context *        lm_head_ctx           = nullptr;
     ggml_backend_buffer_t lm_head_buf           = nullptr;
     ggml_tensor *         lm_head_partial       = nullptr;
     int                   lm_head_offset        = -1;
+    int                   lm_head_count         = -1;
     int                   lm_head_failed_offset = -1;
+    int                   lm_head_failed_count  = -1;
 
     // KV cache: n_sets independent caches, each per-layer [D, max_seq, Nkv] f16.
     // Indexed kv_k[set * n_layers + layer]. Set 0 is the default; CFG uses set 1
@@ -122,6 +125,7 @@ static void lm_partial_head_clear(LMModel * m) {
     m->lm_head_ctx     = nullptr;
     m->lm_head_partial = nullptr;
     m->lm_head_offset  = -1;
+    m->lm_head_count   = -1;
 }
 
 // The copied rows must byte-match the source range; sampling the edge rows
@@ -152,30 +156,31 @@ static bool lm_copy_head_rows_device(LMModel * m, int offset, int count, size_t 
     return lm_verify_head_rows(m, offset, count, row_bytes);
 }
 
-// Copy tied-embedding rows [offset, V) into a contiguous tensor. A direct
-// ggml_view_2d is only byte-addressable for non-quantized rows on all backends;
-// a compact Q4/Q8 view may otherwise feed the wrong blocks to GPU MUL_MAT.
-static bool lm_build_partial_head(LMModel * m, int offset) {
-    if (!m || offset <= 0 || offset >= m->cfg.vocab_size) return false;
-    if (m->lm_head_partial && m->lm_head_offset == offset) return true;
-    if (m->lm_head_failed_offset == offset) return false;
+// Copy tied-embedding rows [offset, offset+count) into a contiguous tensor. A
+// direct ggml_view_2d is only byte-addressable for non-quantized rows on all
+// backends; a compact Q4/Q8 view may otherwise feed wrong blocks to GPU MUL_MAT.
+static bool lm_build_partial_head(LMModel * m, int offset, int count) {
+    if (!m || offset < 0 || count <= 0 || offset + count > m->cfg.vocab_size) return false;
+    if (m->lm_head_partial && m->lm_head_offset == offset && m->lm_head_count == count) return true;
+    if (m->lm_head_failed_offset == offset && m->lm_head_failed_count == count) return false;
 
     lm_partial_head_clear(m);
 
-    const int H     = m->cfg.hidden_size;
-    const int count = m->cfg.vocab_size - offset;
+    const int H = m->cfg.hidden_size;
     ggml_init_params hp{ ggml_tensor_overhead() * 3 + 16, nullptr, true };
     m->lm_head_ctx = ggml_init(hp);
     if (!m->lm_head_ctx) {
         m->lm_head_failed_offset = offset;
+        m->lm_head_failed_count  = count;
         return false;
     }
 
     m->lm_head_partial = ggml_new_tensor_2d(m->lm_head_ctx, m->embed_tokens->type, H, count);
-    ggml_set_name(m->lm_head_partial, "lm_head_phase2");
+    ggml_set_name(m->lm_head_partial, "lm_head_partial");
     m->lm_head_buf = ggml_backend_alloc_ctx_tensors(m->lm_head_ctx, m->backend);
     if (!m->lm_head_buf) {
         m->lm_head_failed_offset = offset;
+        m->lm_head_failed_count  = count;
         lm_partial_head_clear(m);
         return false;
     }
@@ -185,6 +190,7 @@ static bool lm_build_partial_head(LMModel * m, int offset) {
     if (row_bytes == 0 || (size_t) count > SIZE_MAX / row_bytes ||
         (size_t) offset > SIZE_MAX / row_bytes) {
         m->lm_head_failed_offset = offset;
+        m->lm_head_failed_count  = count;
         lm_partial_head_clear(m);
         return false;
     }
@@ -196,6 +202,7 @@ static bool lm_build_partial_head(LMModel * m, int offset) {
         ggml_backend_tensor_set(m->lm_head_partial, tmp.data(), 0, nbytes);
     }
     m->lm_head_offset = offset;
+    m->lm_head_count  = count;
     if (std::getenv("ACESTEP_LM_TIMING"))
         fprintf(stderr, "[lm-timing] partial-head build %.1f ms (%d rows, %.1f MB)\n",
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), count,
@@ -544,7 +551,7 @@ static ggml_tensor * lm_attn(ggml_context * ctx, ggml_cgraph * gf, const Qwen3Co
 }
 
 bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std::vector<float> & logits_out, int set,
-                      std::vector<float> * layer_states_out) {
+                      std::vector<float> * layer_states_out, int logit_limit) {
     const Qwen3Config & c   = m->q3;
     const LMConfig &    lc  = m->cfg;
     const int           H   = c.hidden_size;
@@ -563,10 +570,23 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
     int n_kv_pad = (int) GGML_PAD(kv_len, 256);
     if (n_kv_pad > lc.max_seq_len) n_kv_pad = lc.max_seq_len;
 
+    // Prefix head [0, logit_limit): reads fewer tied-head rows when the caller
+    // (FSM-constrained phase 1) can never select tokens past the limit.
+    ggml_tensor * head_w = m->embed_tokens;
+    int           out_V  = lc.vocab_size;
+    if (logit_limit > 0 && logit_limit < lc.vocab_size) {
+        if (!lm_build_partial_head(m, 0, logit_limit)) {
+            fprintf(stderr, "[acestep-lm] failed to build prefix head (limit=%d)\n", logit_limit);
+            return false;
+        }
+        head_w = m->lm_head_partial;
+        out_V  = logit_limit;
+    }
+
     const bool     cacheable = layer_states_out == nullptr;
     LMGraphCache & gc        = m->graph_cache;
     const bool     cache_hit = cacheable && gc.ctx != nullptr && !gc.batch && gc.S == S &&
-                               gc.n_kv_pad == n_kv_pad && gc.set0 == set && gc.head == m->embed_tokens;
+                               gc.n_kv_pad == n_kv_pad && gc.set0 == set && gc.head == head_w;
 
     ggml_context * ctx = nullptr;
     ggml_cgraph *  gf  = nullptr;
@@ -620,7 +640,7 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
         if (S > 1) {
             hidden = ggml_view_1d(ctx, hidden, H, (int64_t) (S - 1) * H * sizeof(float));  // last token
         }
-        lgt = q3_linear(ctx, m->embed_tokens, hidden, c.prec);  // [V, 1]
+        lgt = q3_linear(ctx, head_w, hidden, c.prec);  // [out_V, 1]
         ggml_set_output(lgt);
         ggml_build_forward_expand(gf, lgt);
 
@@ -639,7 +659,7 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
             gc.t_ids = t_ids; gc.positions = positions; gc.kv_rows = kv_rows;
             gc.mask  = mask;  gc.lgt = lgt;
             gc.batch = false; gc.S = S; gc.n_kv_pad = n_kv_pad; gc.set0 = set;
-            gc.n_batch = -1;  gc.head = m->embed_tokens;
+            gc.n_batch = -1;  gc.head = head_w;
         }
     }
 
@@ -668,8 +688,8 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
         return false;
     }
 
-    logits_out.resize((size_t) lc.vocab_size);
-    ggml_backend_tensor_get(lgt, logits_out.data(), 0, (size_t) lc.vocab_size * sizeof(float));
+    logits_out.resize((size_t) out_V);
+    ggml_backend_tensor_get(lgt, logits_out.data(), 0, (size_t) out_V * sizeof(float));
 
     if (layer_states_out) {
         const size_t per_layer = (size_t) H * S;
@@ -704,7 +724,8 @@ bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * 
     const LMConfig & lc = m->cfg;
     const int H = c.hidden_size, D = c.head_dim, Nh = c.n_heads, Nkv = c.n_kv_heads;
     const int requested_out_V = lc.vocab_size - logit_offset;
-    const bool compact_head = logit_offset > 0 && lm_build_partial_head(m, logit_offset);
+    const bool compact_head =
+        logit_offset > 0 && lm_build_partial_head(m, logit_offset, m->cfg.vocab_size - logit_offset);
     const int graph_out_V = compact_head ? requested_out_V : lc.vocab_size;
     int max_kv_len = 0;
     for (int i = 0; i < N; i++) {

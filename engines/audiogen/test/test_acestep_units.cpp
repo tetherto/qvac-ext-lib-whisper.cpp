@@ -243,6 +243,18 @@ void test_sampler_compact_equivalence() {
         int ts = sample_top_k_p(slice.data(), V - eos, temp, 0.9f, 0, r_slice) + eos;
         CHECK(tf == ts);
         CHECK(r_full == r_slice);
+
+        // Prefix form (phase-1 FSM shape): tail [base2, V) masked -> sampling
+        // only [0, base2) is the same identity.
+        const int          base2 = 900;
+        std::vector<float> full2(raw);
+        for (int v = base2; v < V; ++v) full2[v] = -1e9f;
+        std::vector<float> pre(raw.begin(), raw.begin() + base2);
+        std::mt19937       r_f2(trial + 100), r_p2(trial + 100);
+        int tf2 = sample_top_k_p(full2.data(), V, temp, 0.9f, 0, r_f2);
+        int tp2 = sample_top_k_p(pre.data(), base2, temp, 0.9f, 0, r_p2);
+        CHECK(tf2 == tp2);
+        CHECK(r_f2 == r_p2);
     }
 }
 
