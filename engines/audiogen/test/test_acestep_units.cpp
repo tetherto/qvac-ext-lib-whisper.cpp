@@ -216,6 +216,35 @@ void test_sampler() {
     }
 }
 
+// Compact-slice sampling must match the historical full-vocab path exactly:
+// entries below the EOS cut were only ever masked to -1e9, so sampling the
+// [eos, V) slice (with specials re-masked) is an identity, RNG stream included.
+void test_sampler_compact_equivalence() {
+    using tts_cpp::acestep::sample_top_k_p;
+
+    const int V = 1000, eos = 100, base = 124;  // mirrors TOKEN_IM_END/AUDIO_CODE_BASE layout
+    std::mt19937                          gen(1234);
+    std::uniform_real_distribution<float> ud(-4.0f, 4.0f);
+
+    for (int trial = 0; trial < 20; ++trial) {
+        std::vector<float> raw(V);
+        for (float & v : raw) v = ud(gen);
+
+        std::vector<float> full(raw);
+        for (int v = 0; v < base; ++v)
+            if (v != eos) full[v] = -1e9f;
+        std::vector<float> slice(raw.begin() + eos, raw.end());
+        for (int v = 1; v < base - eos; ++v) slice[v] = -1e9f;
+
+        std::mt19937 r_full(trial), r_slice(trial);
+        const float  temp = (trial % 5 == 0) ? 0.0f : 0.85f;  // argmax path every 5th trial
+        int tf = sample_top_k_p(full.data(), V, temp, 0.9f, 0, r_full);
+        int ts = sample_top_k_p(slice.data(), V - eos, temp, 0.9f, 0, r_slice) + eos;
+        CHECK(tf == ts);
+        CHECK(r_full == r_slice);
+    }
+}
+
 // 5. vae_progress_pct --------------------------------------------------------
 // The VAE decode reports progress per computed graph node. A GPU+CPU scheduler
 // can insert extra copy/split nodes, so the callback may fire MORE than
@@ -1236,6 +1265,7 @@ int main() {
     test_philox();
     test_fsq();
     test_sampler();
+    test_sampler_compact_equivalence();
     test_vae_progress();
     test_vae_window_core();
     test_backend_device_types();

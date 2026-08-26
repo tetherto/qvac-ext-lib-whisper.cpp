@@ -496,18 +496,20 @@ bool lm_generate_codes(LMModel *              m,
     double     sampler_ms        = 0.0;
     int        decode_steps      = 0;
 
+    const int out_v = V - TOKEN_IM_END;                // compact logit space: EOS at index 0
+    const int code0 = AUDIO_CODE_BASE - TOKEN_IM_END;  // first audio code, compact index
+
     // CFG combine (cond + w*(cond-uncond)) then restrict to EOS + audio codes,
-    // then sample. When CFG is off, `lu` is unused.
-    auto combine_mask_sample = [&]() -> int {
-        if (use_cfg) {
+    // then sample - all in the compact [TOKEN_IM_END, V) logit space. Entries
+    // below TOKEN_IM_END were only ever masked to -1e9, so skipping them is exact.
+    auto combine_mask_sample = [&](float * c, const float * u) -> int {
+        if (use_cfg && u) {
             const float w = params.cfg_scale;
-            for (int v = AUDIO_CODE_BASE; v < V; v++) lc[v] = lu[v] + w * (lc[v] - lu[v]);
-            lc[TOKEN_IM_END] = lu[TOKEN_IM_END] + w * (lc[TOKEN_IM_END] - lu[TOKEN_IM_END]);
+            c[0] = u[0] + w * (c[0] - u[0]);
+            for (int v = code0; v < out_v; v++) c[v] = u[v] + w * (c[v] - u[v]);
         }
-        for (int v = 0; v < AUDIO_CODE_BASE; v++) {
-            if (v != TOKEN_IM_END) lc[v] = -1e9f;
-        }
-        return sample_top_k_p(lc.data(), V, params.temperature, params.top_p, params.top_k, rng);
+        for (int v = 1; v < code0; v++) c[v] = -1e9f;
+        return sample_top_k_p(c, out_v, params.temperature, params.top_p, params.top_k, rng) + TOKEN_IM_END;
     };
 
     const char *       dump_layers_path = std::getenv("ACESTEP_LM_DUMP_LAYERS");
@@ -558,30 +560,27 @@ bool lm_generate_codes(LMModel *              m,
                 batch_cfg ? " (batched decode)" : "");
 
     auto t_sample = std::chrono::steady_clock::now();
-    int  tok      = combine_mask_sample();
+    int  tok = combine_mask_sample(lc.data() + TOKEN_IM_END, use_cfg ? lu.data() + TOKEN_IM_END : nullptr);
     sampler_ms += lm_ms_since(t_sample);
     if (tok != TOKEN_IM_END && tok >= AUDIO_CODE_BASE && tok < AUDIO_CODE_BASE + AUDIO_CODE_COUNT) {
         codes_out.push_back(tok - AUDIO_CODE_BASE);
     }
 
+    std::vector<float> batched;  // compact [TOKEN_IM_END, V) logits x {cond, uncond}
     for (int step = 0; step < max_tokens && tok != TOKEN_IM_END; step++) {
-        int32_t t        = (int32_t) tok;
-        auto    t_decode = std::chrono::steady_clock::now();
+        int32_t       t        = (int32_t) tok;
+        auto          t_decode = std::chrono::steady_clock::now();
+        float *       samp_c   = nullptr;
+        const float * samp_u   = nullptr;
         if (batch_cfg) {
             const int32_t ids[2] = { t, t };
             const int     sets[2] = { 0, 1 };
-            std::vector<float> batched;
             if (!lm_model_forward_batch(m, ids, sets, 2, batched, TOKEN_IM_END)) {
                 fprintf(stderr, "[lm-pipeline] batched CFG decode step %d failed\n", step);
                 return false;
             }
-            decode_ms += lm_ms_since(t_decode);
-            t_sample = std::chrono::steady_clock::now();
-            const int out_v = V - TOKEN_IM_END;
-            lc.assign((size_t) V, -1e9f);
-            lu.assign((size_t) V, -1e9f);
-            std::copy_n(batched.data(), out_v, lc.data() + TOKEN_IM_END);
-            std::copy_n(batched.data() + out_v, out_v, lu.data() + TOKEN_IM_END);
+            samp_c = batched.data();
+            samp_u = batched.data() + out_v;
         } else {
             if (!lm_model_forward(m, &t, 1, lc, 0)) {
                 fprintf(stderr, "[lm-pipeline] cond decode step %d failed\n", step);
@@ -591,11 +590,13 @@ bool lm_generate_codes(LMModel *              m,
                 fprintf(stderr, "[lm-pipeline] uncond decode step %d failed\n", step);
                 return false;
             }
-            decode_ms += lm_ms_since(t_decode);
-            t_sample = std::chrono::steady_clock::now();
+            samp_c = lc.data() + TOKEN_IM_END;
+            samp_u = use_cfg ? lu.data() + TOKEN_IM_END : nullptr;
         }
+        decode_ms += lm_ms_since(t_decode);
         decode_steps++;
-        tok = combine_mask_sample();
+        t_sample = std::chrono::steady_clock::now();
+        tok      = combine_mask_sample(samp_c, samp_u);
         sampler_ms += lm_ms_since(t_sample);
         if (tok == TOKEN_IM_END) break;
         if (tok >= AUDIO_CODE_BASE && tok < AUDIO_CODE_BASE + AUDIO_CODE_COUNT) {
