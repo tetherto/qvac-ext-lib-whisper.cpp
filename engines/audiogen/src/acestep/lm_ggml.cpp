@@ -61,6 +61,12 @@ struct LMModel {
     ggml_tensor *           final_norm   = nullptr;  // [H] F32
     std::vector<Qwen3Layer> layers;
 
+    // Load-time fused projections (q|k|v and gate|up rows concatenated): one
+    // GEMM per group instead of three/two. Empty = unfused (CPU-mapped path,
+    // non-Vulkan backends, or ACESTEP_LM_NO_FUSED).
+    std::vector<ggml_tensor *> qkv_fused;
+    std::vector<ggml_tensor *> gateup_fused;
+
     // Contiguous tied-head rows used by Phase-2 batched CFG. Quantized tensors
     // cannot be safely sliced with ggml_view_2d on every GPU backend.
     ggml_context *        lm_head_ctx           = nullptr;
@@ -197,6 +203,61 @@ static bool lm_build_partial_head(LMModel * m, int offset) {
     return true;
 }
 
+// Fused-layer creation: norms and o/down as usual, q|k|v and gate|up as single
+// row-concatenated tensors. Returns false when the GGUF shapes/types cannot fuse.
+static bool lm_create_layer_fused(ggml_context * ctx, const DitGGUF & g, const std::string & prefix, Qwen3Layer & ly,
+                                  ggml_tensor ** qkv_out, ggml_tensor ** gateup_out) {
+    ly.input_norm = q3_create_f32_like(ctx, g, prefix + ".input_layernorm.weight");
+    ly.post_norm  = q3_create_f32_like(ctx, g, prefix + ".post_attention_layernorm.weight");
+    ly.q_norm     = q3_create_f32_like(ctx, g, prefix + ".self_attn.q_norm.weight");
+    ly.k_norm     = q3_create_f32_like(ctx, g, prefix + ".self_attn.k_norm.weight");
+    ly.o_proj     = q3_create_like(ctx, g, prefix + ".self_attn.o_proj.weight");
+    ly.down_proj  = q3_create_like(ctx, g, prefix + ".mlp.down_proj.weight");
+
+    ggml_tensor * qm = dit_gmeta(g, prefix + ".self_attn.q_proj.weight");
+    ggml_tensor * km = dit_gmeta(g, prefix + ".self_attn.k_proj.weight");
+    ggml_tensor * vm = dit_gmeta(g, prefix + ".self_attn.v_proj.weight");
+    ggml_tensor * gm = dit_gmeta(g, prefix + ".mlp.gate_proj.weight");
+    ggml_tensor * um = dit_gmeta(g, prefix + ".mlp.up_proj.weight");
+    if (!qm || !km || !vm || !gm || !um) return false;
+    if (km->type != qm->type || vm->type != qm->type || um->type != gm->type) return false;
+    if (km->ne[0] != qm->ne[0] || vm->ne[0] != qm->ne[0] || um->ne[0] != gm->ne[0]) return false;
+
+    *qkv_out = ggml_new_tensor_2d(ctx, qm->type, qm->ne[0], qm->ne[1] + km->ne[1] + vm->ne[1]);
+    ggml_set_name(*qkv_out, (prefix + ".self_attn.qkv_fused").c_str());
+    *gateup_out = ggml_new_tensor_2d(ctx, gm->type, gm->ne[0], gm->ne[1] + um->ne[1]);
+    ggml_set_name(*gateup_out, (prefix + ".mlp.gateup_fused").c_str());
+    return true;
+}
+
+static void lm_load_row_block(ggml_tensor * dst, size_t & off, const DitGGUF & g, const std::string & name) {
+    const void *  src = dit_gdata(g, name);
+    ggml_tensor * mt  = dit_gmeta(g, name);
+    if (!src || !mt) {
+        fprintf(stderr, "[acestep-lm] cannot load %s\n", name.c_str());
+        return;
+    }
+    ggml_backend_tensor_set(dst, src, off, ggml_nbytes(mt));
+    off += ggml_nbytes(mt);
+}
+
+static void lm_load_layer_fused(const DitGGUF & g, const std::string & prefix, Qwen3Layer & ly, ggml_tensor * qkv,
+                                ggml_tensor * gateup) {
+    q3_load_f32(ly.input_norm, g, prefix + ".input_layernorm.weight");
+    q3_load_f32(ly.post_norm, g, prefix + ".post_attention_layernorm.weight");
+    q3_load_f32(ly.q_norm, g, prefix + ".self_attn.q_norm.weight");
+    q3_load_f32(ly.k_norm, g, prefix + ".self_attn.k_norm.weight");
+    q3_load_raw(ly.o_proj, g, prefix + ".self_attn.o_proj.weight");
+    q3_load_raw(ly.down_proj, g, prefix + ".mlp.down_proj.weight");
+    size_t off = 0;
+    lm_load_row_block(qkv, off, g, prefix + ".self_attn.q_proj.weight");
+    lm_load_row_block(qkv, off, g, prefix + ".self_attn.k_proj.weight");
+    lm_load_row_block(qkv, off, g, prefix + ".self_attn.v_proj.weight");
+    off = 0;
+    lm_load_row_block(gateup, off, g, prefix + ".mlp.gate_proj.weight");
+    lm_load_row_block(gateup, off, g, prefix + ".mlp.up_proj.weight");
+}
+
 LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int max_seq_len, bool verbose,
                         int n_kv_sets) {
     DitGGUF g;
@@ -257,8 +318,29 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
     m->embed_tokens = q3_create_like(ctx, g, "model.embed_tokens.weight", map_buf);
     m->final_norm   = q3_create_f32_like(ctx, g, "model.norm.weight");
     m->layers.resize(c.n_layers);
+    // Fusion is Vulkan-only for now (validated there; other GPU backends keep
+    // the split layout until their strided-view attention paths are verified).
+    bool fuse = !mapped && std::strncmp(ggml_backend_name(backend), "Vulkan", 6) == 0 &&
+                !std::getenv("ACESTEP_LM_NO_FUSED");
+    if (fuse) {
+        Qwen3Layer    probe;
+        ggml_tensor * pq = nullptr, *pg = nullptr;
+        ggml_init_params pp{ ggml_tensor_overhead() * 16, nullptr, true };
+        ggml_context *   pctx = ggml_init(pp);
+        fuse = pctx && lm_create_layer_fused(pctx, g, "model.layers.0", probe, &pq, &pg);
+        if (pctx) ggml_free(pctx);
+    }
+    if (fuse) {
+        m->qkv_fused.assign((size_t) c.n_layers, nullptr);
+        m->gateup_fused.assign((size_t) c.n_layers, nullptr);
+    }
     for (int i = 0; i < c.n_layers; i++) {
-        q3_create_layer(ctx, g, "model.layers." + std::to_string(i), m->layers[i], map_buf);
+        const std::string prefix = "model.layers." + std::to_string(i);
+        if (fuse) {
+            lm_create_layer_fused(ctx, g, prefix, m->layers[i], &m->qkv_fused[i], &m->gateup_fused[i]);
+        } else {
+            q3_create_layer(ctx, g, prefix, m->layers[i], map_buf);
+        }
     }
 
     // NB: ggml_backend_alloc_ctx_tensors returns NULL if EVERY tensor is already
@@ -278,7 +360,12 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
     q3_load_raw(m->embed_tokens, g, "model.embed_tokens.weight");
     q3_load_f32(m->final_norm, g, "model.norm.weight");
     for (int i = 0; i < c.n_layers; i++) {
-        q3_load_layer(g, "model.layers." + std::to_string(i), m->layers[i]);
+        const std::string prefix = "model.layers." + std::to_string(i);
+        if (fuse) {
+            lm_load_layer_fused(g, prefix, m->layers[i], m->qkv_fused[i], m->gateup_fused[i]);
+        } else {
+            q3_load_layer(g, prefix, m->layers[i]);
+        }
     }
     // Exact mmapped weight footprint (see dit_gguf_mapped_bytes); reported by
     // lm_model_weight_bytes below so mapped loads don't look like a few-MB stub.
@@ -379,20 +466,43 @@ bool lm_model_supports_batched_decode(const LMModel * m) {
 void lm_reset(LMModel * m, int set) { if (set >= 0 && set < m->n_sets) m->kv_pos[set] = 0; }
 int  lm_kv_pos(const LMModel * m, int set) { return (set >= 0 && set < m->n_sets) ? m->kv_pos[set] : 0; }
 
+// One fused-QKV projection sliced into strided [D, heads, S] views; matches the
+// split path's reshape_3d layouts except for the larger dim-2 stride.
+static void lm_qkv_views(ggml_context * ctx, const Qwen3Config & c, ggml_tensor * qkv_fused, ggml_tensor * x, int S,
+                         ggml_tensor ** q, ggml_tensor ** k, ggml_tensor ** v) {
+    const int     D = c.head_dim, Nh = c.n_heads, Nkv = c.n_kv_heads;
+    ggml_tensor * qkv = q3_linear(ctx, qkv_fused, x, c.prec);  // [(Nh+2*Nkv)*D, S]
+    const size_t  es  = ggml_element_size(qkv);
+    *q = ggml_view_3d(ctx, qkv, D, Nh, S, (size_t) D * es, qkv->nb[1], 0);
+    *k = ggml_view_3d(ctx, qkv, D, Nkv, S, (size_t) D * es, qkv->nb[1], (size_t) Nh * D * es);
+    *v = ggml_view_3d(ctx, qkv, D, Nkv, S, (size_t) D * es, qkv->nb[1], (size_t) (Nh + Nkv) * D * es);
+}
+
+// MLP with the optional fused gate|up projection (gate rows first, so the
+// single-tensor ggml_swiglu split matches swiglu_split(gate, up)).
+static ggml_tensor * lm_mlp(ggml_context * ctx, const Qwen3Config & c, Qwen3Layer * ly, ggml_tensor * gateup_fused,
+                            ggml_tensor * x) {
+    if (!gateup_fused) return q3_build_mlp(ctx, ly, x, c.prec);
+    ggml_tensor * gu = q3_linear(ctx, gateup_fused, x, c.prec);  // [2*FFN, S]
+    return q3_linear(ctx, ly->down_proj, ggml_swiglu(ctx, gu), c.prec);
+}
+
 // KV-cache self-attention for one layer. x [H, S]. Writes S fresh rows at
 // [kv_pos..kv_pos+S) then reads the [0, n_kv_pad) window. F32 attention.
 static ggml_tensor * lm_attn(ggml_context * ctx, ggml_cgraph * gf, const Qwen3Config & c, Qwen3Layer * ly,
-                             ggml_tensor * x, ggml_tensor * positions, ggml_tensor * mask, ggml_tensor * kv_rows,
-                             ggml_tensor * cache_k, ggml_tensor * cache_v, int n_kv_pad, int S, bool use_flash_attn) {
+                             ggml_tensor * qkv_fused, ggml_tensor * x, ggml_tensor * positions, ggml_tensor * mask,
+                             ggml_tensor * kv_rows, ggml_tensor * cache_k, ggml_tensor * cache_v, int n_kv_pad, int S,
+                             bool use_flash_attn) {
     const int D = c.head_dim, Nh = c.n_heads, Nkv = c.n_kv_heads;
 
-    ggml_tensor * q = q3_linear(ctx, ly->q_proj, x, c.prec);
-    ggml_tensor * k = q3_linear(ctx, ly->k_proj, x, c.prec);
-    ggml_tensor * v = q3_linear(ctx, ly->v_proj, x, c.prec);
-
-    q = ggml_reshape_3d(ctx, q, D, Nh, S);
-    k = ggml_reshape_3d(ctx, k, D, Nkv, S);
-    v = ggml_reshape_3d(ctx, v, D, Nkv, S);
+    ggml_tensor *q, *k, *v;
+    if (qkv_fused) {
+        lm_qkv_views(ctx, c, qkv_fused, x, S, &q, &k, &v);
+    } else {
+        q = ggml_reshape_3d(ctx, q3_linear(ctx, ly->q_proj, x, c.prec), D, Nh, S);
+        k = ggml_reshape_3d(ctx, q3_linear(ctx, ly->k_proj, x, c.prec), D, Nkv, S);
+        v = ggml_reshape_3d(ctx, q3_linear(ctx, ly->v_proj, x, c.prec), D, Nkv, S);
+    }
 
     q = ggml_mul(ctx, ggml_rms_norm(ctx, q, c.rms_norm_eps), q3_as_f32(ctx, ly->q_norm));
     k = ggml_mul(ctx, ggml_rms_norm(ctx, k, c.rms_norm_eps), q3_as_f32(ctx, ly->k_norm));
@@ -492,11 +602,13 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
             Qwen3Layer *  ly   = &m->layers[l];
             ggml_tensor * norm = q3_rms_norm_w(ctx, hidden, ly->input_norm, c.rms_norm_eps);
             int           idx  = set * c.n_layers + l;
-            ggml_tensor * attn = lm_attn(ctx, gf, c, ly, norm, positions, mask, kv_rows, m->kv_k[idx], m->kv_v[idx],
-                                         n_kv_pad, S, m->use_flash_attn);
+            ggml_tensor * qkvf = m->qkv_fused.empty() ? nullptr : m->qkv_fused[l];
+            ggml_tensor * guf  = m->gateup_fused.empty() ? nullptr : m->gateup_fused[l];
+            ggml_tensor * attn = lm_attn(ctx, gf, c, ly, qkvf, norm, positions, mask, kv_rows, m->kv_k[idx],
+                                         m->kv_v[idx], n_kv_pad, S, m->use_flash_attn);
             hidden             = ggml_add(ctx, hidden, attn);
             norm               = q3_rms_norm_w(ctx, hidden, ly->post_norm, c.rms_norm_eps);
-            ggml_tensor * mlp  = q3_build_mlp(ctx, ly, norm, c.prec);
+            ggml_tensor * mlp  = lm_mlp(ctx, c, ly, guf, norm);
             hidden             = ggml_add(ctx, hidden, mlp);
             if (layer_states_out) {
                 ggml_set_output(hidden);
@@ -642,12 +754,14 @@ bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * 
             Qwen3Layer * ly = &m->layers[l];
             ggml_tensor * norm = q3_rms_norm_w(ctx, hidden, ly->input_norm, c.rms_norm_eps);
 
-            ggml_tensor * q = q3_linear(ctx, ly->q_proj, norm, c.prec);
-            ggml_tensor * k = q3_linear(ctx, ly->k_proj, norm, c.prec);
-            ggml_tensor * v = q3_linear(ctx, ly->v_proj, norm, c.prec);
-            q = ggml_reshape_3d(ctx, q, D, Nh, N);
-            k = ggml_reshape_3d(ctx, k, D, Nkv, N);
-            v = ggml_reshape_3d(ctx, v, D, Nkv, N);
+            ggml_tensor *q, *k, *v;
+            if (!m->qkv_fused.empty()) {
+                lm_qkv_views(ctx, c, m->qkv_fused[l], norm, N, &q, &k, &v);
+            } else {
+                q = ggml_reshape_3d(ctx, q3_linear(ctx, ly->q_proj, norm, c.prec), D, Nh, N);
+                k = ggml_reshape_3d(ctx, q3_linear(ctx, ly->k_proj, norm, c.prec), D, Nkv, N);
+                v = ggml_reshape_3d(ctx, q3_linear(ctx, ly->v_proj, norm, c.prec), D, Nkv, N);
+            }
 
             q = ggml_mul(ctx, ggml_rms_norm(ctx, q, c.rms_norm_eps), q3_as_f32(ctx, ly->q_norm));
             k = ggml_mul(ctx, ggml_rms_norm(ctx, k, c.rms_norm_eps), q3_as_f32(ctx, ly->k_norm));
@@ -683,7 +797,8 @@ bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * 
 
             hidden = ggml_add(ctx, hidden, q3_linear(ctx, ly->o_proj, attn, c.prec));
             norm = q3_rms_norm_w(ctx, hidden, ly->post_norm, c.rms_norm_eps);
-            hidden = ggml_add(ctx, hidden, q3_build_mlp(ctx, ly, norm, c.prec));
+            hidden = ggml_add(ctx, hidden,
+                              lm_mlp(ctx, c, ly, m->gateup_fused.empty() ? nullptr : m->gateup_fused[l], norm));
         }
 
         hidden = q3_rms_norm_w(ctx, hidden, m->final_norm, c.rms_norm_eps);
