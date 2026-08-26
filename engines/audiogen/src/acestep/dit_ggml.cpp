@@ -443,15 +443,17 @@ static ggml_tensor * build_cross_attn(ggml_context * ctx, DitModel * m, DitLayer
     ggml_tensor * k = linear(ctx, ly->ca_k_proj, enc);
     ggml_tensor * v = linear(ctx, ly->ca_v_proj, enc);
 
+    // QK norms run before the permute (self-attn's order): the norm reduces over
+    // D per head either way, but the pre-permute layout is contiguous - the
+    // strided form measured 3x slower on Vulkan at long sequence lengths.
     q = ggml_reshape_4d(ctx, q, D, Nh, S, N);
+    q = ggml_mul(ctx, ggml_rms_norm(ctx, q, c.rms_norm_eps), as_f32(ctx, ly->ca_q_norm));
     q = ggml_permute(ctx, q, 0, 2, 1, 3);
     k = ggml_reshape_4d(ctx, k, D, Nkv, enc_S, N);
+    k = ggml_mul(ctx, ggml_rms_norm(ctx, k, c.rms_norm_eps), as_f32(ctx, ly->ca_k_norm));
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
     v = ggml_reshape_4d(ctx, v, D, Nkv, enc_S, N);
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
-
-    q = ggml_mul(ctx, ggml_rms_norm(ctx, q, c.rms_norm_eps), as_f32(ctx, ly->ca_q_norm));
-    k = ggml_mul(ctx, ggml_rms_norm(ctx, k, c.rms_norm_eps), as_f32(ctx, ly->ca_k_norm));
 
     const float scale = 1.0f / sqrtf((float) D);
     ggml_tensor * attn = select_attention(ctx, q, k, v, mask, scale, m->use_flash_attn);
