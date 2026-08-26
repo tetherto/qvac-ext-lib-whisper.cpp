@@ -322,6 +322,111 @@ void test_fsm_forced_token() {
     agree(fsm);  // unknown prefix -> forced newline
 }
 
+// Verbatim pre-fusion sampler, kept as an oracle: the fused sample_top_k_p must
+// match it token-for-token and draw-for-draw.
+struct RefTokenProb {
+    int   id;
+    float prob;
+};
+
+int reference_sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng) {
+    if (temperature <= 0.0f) {
+        return (int) (std::max_element(logits, logits + V) - logits);
+    }
+
+    float inv_temp = 1.0f / temperature;
+    for (int i = 0; i < V; i++) logits[i] *= inv_temp;
+
+    if (top_k > 0 && top_k < V) {
+        std::vector<float> tmp(logits, logits + V);
+        std::nth_element(tmp.begin(), tmp.begin() + (top_k - 1), tmp.end(), std::greater<float>());
+        float threshold = tmp[top_k - 1];
+        for (int i = 0; i < V; i++) {
+            if (logits[i] < threshold) logits[i] = -INFINITY;
+        }
+    }
+
+    if (top_p > 0.0f && top_p < 1.0f) {
+        float max_logit = -INFINITY;
+        for (int i = 0; i < V; i++) {
+            if (logits[i] > max_logit) max_logit = logits[i];
+        }
+        float sum_exp = 0.0f;
+        for (int i = 0; i < V; i++) sum_exp += expf(logits[i] - max_logit);
+        float inv_sum = 1.0f / sum_exp;
+
+        float                     cutoff = max_logit - 16.0f;
+        std::vector<RefTokenProb> sorted;
+        for (int i = 0; i < V; i++) {
+            if (logits[i] >= cutoff) {
+                sorted.push_back({ i, expf(logits[i] - max_logit) * inv_sum });
+            } else {
+                logits[i] = -INFINITY;
+            }
+        }
+
+        int K = (int) sorted.size();
+        if (K > 0) {
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const RefTokenProb & a, const RefTokenProb & b) { return a.prob > b.prob; });
+            float cum = 0.0f;
+            for (int i = 0; i < K; i++) {
+                if (i > 0 && cum >= top_p) logits[sorted[i].id] = -INFINITY;
+                cum += sorted[i].prob;
+            }
+        }
+    }
+
+    float max_val = -INFINITY;
+    for (int i = 0; i < V; i++) {
+        if (logits[i] > max_val) max_val = logits[i];
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < V; i++) {
+        logits[i] = expf(logits[i] - max_val);
+        sum += logits[i];
+    }
+
+    std::uniform_real_distribution<float> dist(0.0f, sum);
+    float                                 r   = dist(rng);
+    float                                 acc = 0.0f;
+    for (int i = 0; i < V; i++) {
+        acc += logits[i];
+        if (acc >= r) return i;
+    }
+    return 0;
+}
+
+void test_sampler_fusion_oracle() {
+    using tts_cpp::acestep::sample_top_k_p;
+
+    const int                             V = 4096;
+    std::mt19937                          gen(77);
+    std::uniform_real_distribution<float> ud(-6.0f, 6.0f);
+
+    for (int trial = 0; trial < 30; ++trial) {
+        std::vector<float> raw(V);
+        for (float & v : raw) v = ud(gen);
+        // Adversarial shapes: -1e9 masses, -inf islands, exact ties.
+        if (trial % 3 == 0)
+            for (int i = 0; i < V; i += 2) raw[i] = -1e9f;
+        if (trial % 4 == 0)
+            for (int i = 0; i < V / 8; ++i) raw[i] = raw[V - 1 - i];
+        if (trial % 5 == 0)
+            for (int i = 100; i < 200; ++i) raw[i] = -INFINITY;
+        const float temp  = (trial % 6 == 0) ? 0.0f : 0.85f;
+        const float top_p = (trial % 7 == 0) ? 0.0f : 0.9f;  // also cover the disabled-top_p path
+        const int   top_k = (trial % 8 == 0) ? 40 : 0;
+
+        std::vector<float> a = raw, b = raw;
+        std::mt19937       r1(trial), r2(trial);
+        int ta = reference_sample_top_k_p(a.data(), V, temp, top_p, top_k, r1);
+        int tb = sample_top_k_p(b.data(), V, temp, top_p, top_k, r2);
+        CHECK(ta == tb);
+        CHECK(r1 == r2);
+    }
+}
+
 // 5. vae_progress_pct --------------------------------------------------------
 // The VAE decode reports progress per computed graph node. A GPU+CPU scheduler
 // can insert extra copy/split nodes, so the callback may fire MORE than
@@ -1345,6 +1450,7 @@ int main() {
     test_sampler_compact_equivalence();
     test_sampler_forced_fast_path();
     test_fsm_forced_token();
+    test_sampler_fusion_oracle();
     test_vae_progress();
     test_vae_window_core();
     test_backend_device_types();

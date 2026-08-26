@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,9 +54,16 @@ int sample_top_k_p(float * logits, int V, float temperature, float top_p, int to
 
     static thread_local std::vector<float>     tmp_buf;
     static thread_local std::vector<TokenProb> sorted_buf;
+    static thread_local std::vector<int>       cand_id;
+    static thread_local std::vector<float>     cand_e;
+    static thread_local std::vector<uint8_t>   cand_dead;
 
-    float inv_temp = 1.0f / temperature;
-    for (int i = 0; i < V; i++) logits[i] *= inv_temp;
+    float inv_temp  = 1.0f / temperature;
+    float max_logit = -INFINITY;
+    for (int i = 0; i < V; i++) {
+        logits[i] *= inv_temp;
+        if (logits[i] > max_logit) max_logit = logits[i];
+    }
 
     if (top_k > 0 && top_k < V) {
         tmp_buf.resize(V);
@@ -68,35 +76,55 @@ int sample_top_k_p(float * logits, int V, float temperature, float top_p, int to
     }
 
     if (top_p > 0.0f && top_p < 1.0f) {
-        float max_logit = -INFINITY;
-        for (int i = 0; i < V; i++) {
-            if (logits[i] > max_logit) max_logit = logits[i];
-        }
+        // One ascending sweep: exp + sum + candidate collect. Bit-identical to
+        // the historical multi-pass form: expf(-inf) == 0.0f exactly, adding
+        // 0.0f preserves the accumulator, and top_k masking never drops the max.
+        float cutoff  = max_logit - 16.0f;
         float sum_exp = 0.0f;
-        for (int i = 0; i < V; i++) sum_exp += expf(logits[i] - max_logit);
-        float inv_sum = 1.0f / sum_exp;
-
-        float cutoff = max_logit - 16.0f;
-        sorted_buf.clear();
+        cand_id.clear();
+        cand_e.clear();
         for (int i = 0; i < V; i++) {
-            if (logits[i] >= cutoff) {
-                float prob = expf(logits[i] - max_logit) * inv_sum;
-                sorted_buf.push_back({ i, prob });
-            } else {
-                logits[i] = -INFINITY;
+            float x = logits[i];
+            float e = (x == -INFINITY) ? 0.0f : expf(x - max_logit);
+            sum_exp += e;
+            if (x >= cutoff) {
+                cand_id.push_back(i);
+                cand_e.push_back(e);
             }
         }
 
-        int K = (int) sorted_buf.size();
-        if (K > 0) {
-            std::sort(sorted_buf.begin(), sorted_buf.end(),
-                      [](const TokenProb & a, const TokenProb & b) { return a.prob > b.prob; });
-            float cum = 0.0f;
-            for (int i = 0; i < K; i++) {
-                if (i > 0 && cum >= top_p) logits[sorted_buf[i].id] = -INFINITY;
-                cum += sorted_buf[i].prob;
-            }
+        int K = (int) cand_id.size();
+        if (K == 0) return 0;  // all -inf: historical acc-walk lands on index 0
+
+        float inv_sum = 1.0f / sum_exp;
+        sorted_buf.clear();
+        for (int j = 0; j < K; j++) sorted_buf.push_back({ j, cand_e[j] * inv_sum });
+        std::sort(sorted_buf.begin(), sorted_buf.end(),
+                  [](const TokenProb & a, const TokenProb & b) { return a.prob > b.prob; });
+
+        cand_dead.assign((size_t) K, 0);
+        float cum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            if (k > 0 && cum >= top_p) cand_dead[sorted_buf[k].id] = 1;
+            cum += sorted_buf[k].prob;
         }
+
+        // The top-prob candidate survives and carries max_logit, so the
+        // historical re-softmax reduces to the surviving e values in id order.
+        float sum = 0.0f;
+        for (int j = 0; j < K; j++)
+            if (!cand_dead[j]) sum += cand_e[j];
+
+        std::uniform_real_distribution<float> dist(0.0f, sum);
+        float r = dist(rng);
+        if (r == 0.0f) return 0;  // historical acc-walk edge: index 0 wins at acc 0
+        float acc = 0.0f;
+        for (int j = 0; j < K; j++) {
+            if (cand_dead[j]) continue;
+            acc += cand_e[j];
+            if (acc >= r) return cand_id[j];
+        }
+        return 0;
     }
 
     float max_val = -INFINITY;
