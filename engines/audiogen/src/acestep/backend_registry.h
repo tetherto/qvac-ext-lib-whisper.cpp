@@ -180,4 +180,13 @@ inline const char * backend_reg_name(ggml_backend_t backend) {
     return name ? name : "";
 }
 
+// Device description of the backend's active device; feeds the device-scoped
+// placement decisions in stage_placement.h. Empty when unavailable.
+inline const char * backend_dev_description(ggml_backend_t backend) {
+    if (!backend) return "";
+    ggml_backend_dev_t dev  = ggml_backend_get_device(backend);
+    const char *       desc = dev ? ggml_backend_dev_description(dev) : nullptr;
+    return desc ? desc : "";
+}
+
 }  // namespace tts_cpp::acestep

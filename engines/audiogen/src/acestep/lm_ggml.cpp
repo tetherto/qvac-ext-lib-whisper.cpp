@@ -17,6 +17,29 @@
 
 namespace tts_cpp::acestep {
 
+// Reused forward graph: the key fields fully determine the graph shape, and
+// n_kv_pad moves in 256-row steps, so one graph serves ~256 decode steps.
+struct LMGraphCache {
+    ggml_context * ctx = nullptr;
+    ggml_cgraph *  gf  = nullptr;
+    ggml_gallocr_t ga  = nullptr;
+    ggml_tensor *  t_ids = nullptr, *positions = nullptr, *kv_rows = nullptr,
+                *  mask = nullptr, *lgt = nullptr;
+    // key
+    bool          batch    = false;
+    int           S        = -1;   // tokens per stream (batch: always 1)
+    int           n_kv_pad = -1;
+    int           set0     = -1;   // kv set (batch: first set)
+    int           n_batch  = -1;
+    ggml_tensor * head     = nullptr;  // tied or compact lm head in the graph
+
+    void release() {
+        if (ga)  ggml_gallocr_free(ga);
+        if (ctx) ggml_free(ctx);
+        *this = LMGraphCache{};
+    }
+};
+
 struct LMModel {
     ggml_backend_t        backend    = nullptr;  // borrowed
     ggml_context *        weight_ctx = nullptr;
@@ -56,6 +79,8 @@ struct LMModel {
     std::vector<ggml_tensor *> kv_v;
     std::vector<int>           kv_pos;  // per set
     bool                       use_flash_attn = false;
+
+    LMGraphCache graph_cache;
 };
 
 static Qwen3Config to_q3(const LMConfig & c) {
@@ -80,6 +105,9 @@ static bool lm_backend_supports_flash_attn(ggml_backend_t backend, const Qwen3Co
 }
 
 static void lm_partial_head_clear(LMModel * m) {
+    // A cached graph may reference the freed head tensor, and a reallocation
+    // can reuse its address; drop the cache so pointer identity stays sound.
+    m->graph_cache.release();
     if (m->lm_head_buf) ggml_backend_buffer_free(m->lm_head_buf);
     if (m->lm_head_ctx) ggml_free(m->lm_head_ctx);
     m->lm_head_buf     = nullptr;
@@ -279,6 +307,7 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
 
 void lm_model_free(LMModel * m) {
     if (!m) return;
+    m->graph_cache.release();
     lm_partial_head_clear(m);
     if (m->kv_buf) ggml_backend_buffer_free(m->kv_buf);
     if (m->kv_ctx) ggml_free(m->kv_ctx);
@@ -380,52 +409,82 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
     int n_kv_pad = (int) GGML_PAD(kv_len, 256);
     if (n_kv_pad > lc.max_seq_len) n_kv_pad = lc.max_seq_len;
 
-    const size_t nodes = 16384;
-    ggml_init_params gp{ ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(nodes, false), nullptr, true };
-    ggml_context *   ctx = ggml_init(gp);
+    const bool     cacheable = layer_states_out == nullptr;
+    LMGraphCache & gc        = m->graph_cache;
+    const bool     cache_hit = cacheable && gc.ctx != nullptr && !gc.batch && gc.S == S &&
+                               gc.n_kv_pad == n_kv_pad && gc.set0 == set && gc.head == m->embed_tokens;
 
-    ggml_tensor * t_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);
-    ggml_set_input(t_ids);
-    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);
-    ggml_set_input(positions);
-    ggml_tensor * kv_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, S);
-    ggml_set_input(kv_rows);
-    ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv_pad, S);
-    ggml_set_input(mask);
-
-    ggml_cgraph * gf     = ggml_new_graph_custom(ctx, nodes, false);
-    ggml_tensor * hidden = ggml_get_rows(ctx, m->embed_tokens, t_ids);  // [H, S]
+    ggml_context * ctx = nullptr;
+    ggml_cgraph *  gf  = nullptr;
+    ggml_gallocr_t ga  = nullptr;
+    ggml_tensor *t_ids = nullptr, *positions = nullptr, *kv_rows = nullptr, *mask = nullptr, *lgt = nullptr;
     std::vector<ggml_tensor *> layer_states;
-    for (int l = 0; l < c.n_layers; l++) {
-        Qwen3Layer *  ly   = &m->layers[l];
-        ggml_tensor * norm = q3_rms_norm_w(ctx, hidden, ly->input_norm, c.rms_norm_eps);
-        int           idx  = set * c.n_layers + l;
-        ggml_tensor * attn = lm_attn(ctx, gf, c, ly, norm, positions, mask, kv_rows, m->kv_k[idx], m->kv_v[idx],
-                                     n_kv_pad, S, m->use_flash_attn);
-        hidden             = ggml_add(ctx, hidden, attn);
-        norm               = q3_rms_norm_w(ctx, hidden, ly->post_norm, c.rms_norm_eps);
-        ggml_tensor * mlp  = q3_build_mlp(ctx, ly, norm, c.prec);
-        hidden             = ggml_add(ctx, hidden, mlp);
-        if (layer_states_out) {
-            ggml_set_output(hidden);
-            ggml_build_forward_expand(gf, hidden);
-            layer_states.push_back(hidden);
-        }
-    }
-    hidden = q3_rms_norm_w(ctx, hidden, m->final_norm, c.rms_norm_eps);
-    if (S > 1) {
-        hidden = ggml_view_1d(ctx, hidden, H, (int64_t) (S - 1) * H * sizeof(float));  // last token
-    }
-    ggml_tensor * lgt = q3_linear(ctx, m->embed_tokens, hidden, c.prec);  // [V, 1]
-    ggml_set_output(lgt);
-    ggml_build_forward_expand(gf, lgt);
 
-    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
-    if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
-        fprintf(stderr, "[acestep-lm] forward alloc failed (n=%d)\n", S);
-        if (ga) ggml_gallocr_free(ga);
-        ggml_free(ctx);
-        return false;
+    if (cache_hit) {
+        ctx   = gc.ctx;
+        gf    = gc.gf;
+        ga    = gc.ga;
+        t_ids = gc.t_ids; positions = gc.positions; kv_rows = gc.kv_rows;
+        mask  = gc.mask;  lgt = gc.lgt;
+    } else {
+        if (cacheable) gc.release();
+
+        const size_t nodes = 16384;
+        ggml_init_params gp{ ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(nodes, false), nullptr, true };
+        ctx = ggml_init(gp);
+
+        t_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);
+        ggml_set_input(t_ids);
+        positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);
+        ggml_set_input(positions);
+        kv_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, S);
+        ggml_set_input(kv_rows);
+        mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv_pad, S);
+        ggml_set_input(mask);
+
+        gf                   = ggml_new_graph_custom(ctx, nodes, false);
+        ggml_tensor * hidden = ggml_get_rows(ctx, m->embed_tokens, t_ids);  // [H, S]
+        for (int l = 0; l < c.n_layers; l++) {
+            Qwen3Layer *  ly   = &m->layers[l];
+            ggml_tensor * norm = q3_rms_norm_w(ctx, hidden, ly->input_norm, c.rms_norm_eps);
+            int           idx  = set * c.n_layers + l;
+            ggml_tensor * attn = lm_attn(ctx, gf, c, ly, norm, positions, mask, kv_rows, m->kv_k[idx], m->kv_v[idx],
+                                         n_kv_pad, S, m->use_flash_attn);
+            hidden             = ggml_add(ctx, hidden, attn);
+            norm               = q3_rms_norm_w(ctx, hidden, ly->post_norm, c.rms_norm_eps);
+            ggml_tensor * mlp  = q3_build_mlp(ctx, ly, norm, c.prec);
+            hidden             = ggml_add(ctx, hidden, mlp);
+            if (layer_states_out) {
+                ggml_set_output(hidden);
+                ggml_build_forward_expand(gf, hidden);
+                layer_states.push_back(hidden);
+            }
+        }
+        hidden = q3_rms_norm_w(ctx, hidden, m->final_norm, c.rms_norm_eps);
+        if (S > 1) {
+            hidden = ggml_view_1d(ctx, hidden, H, (int64_t) (S - 1) * H * sizeof(float));  // last token
+        }
+        lgt = q3_linear(ctx, m->embed_tokens, hidden, c.prec);  // [V, 1]
+        ggml_set_output(lgt);
+        ggml_build_forward_expand(gf, lgt);
+
+        ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
+        if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
+            fprintf(stderr, "[acestep-lm] forward alloc failed (n=%d)\n", S);
+            if (ga) ggml_gallocr_free(ga);
+            ggml_free(ctx);
+            return false;
+        }
+
+        if (cacheable) {
+            gc.ctx   = ctx;
+            gc.gf    = gf;
+            gc.ga    = ga;
+            gc.t_ids = t_ids; gc.positions = positions; gc.kv_rows = kv_rows;
+            gc.mask  = mask;  gc.lgt = lgt;
+            gc.batch = false; gc.S = S; gc.n_kv_pad = n_kv_pad; gc.set0 = set;
+            gc.n_batch = -1;  gc.head = m->embed_tokens;
+        }
     }
 
     ggml_backend_tensor_set(t_ids, token_ids, 0, (size_t) S * sizeof(int32_t));
@@ -444,8 +503,12 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
     ggml_backend_tensor_set(mask, md.data(), 0, md.size() * sizeof(uint16_t));
 
     if (ggml_backend_graph_compute(m->backend, gf) != GGML_STATUS_SUCCESS) {
-        ggml_gallocr_free(ga);
-        ggml_free(ctx);
+        if (cacheable) {
+            gc.release();
+        } else {
+            ggml_gallocr_free(ga);
+            ggml_free(ctx);
+        }
         return false;
     }
 
@@ -461,8 +524,10 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
         }
     }
 
-    ggml_gallocr_free(ga);
-    ggml_free(ctx);
+    if (!cacheable) {
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+    }
     m->kv_pos[set] += S;
     return true;
 }
@@ -494,81 +559,108 @@ bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * 
     int n_kv_pad = (int) GGML_PAD(max_kv_len, 256);
     if (n_kv_pad > lc.max_seq_len) n_kv_pad = lc.max_seq_len;
 
-    const size_t nodes = 16384;
-    ggml_init_params gp{ ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(nodes, false), nullptr, true };
-    ggml_context * ctx = ggml_init(gp);
+    LMGraphCache & gc        = m->graph_cache;
+    ggml_tensor *  lm_weight = compact_head ? m->lm_head_partial : m->embed_tokens;
+    const bool     cache_hit = gc.ctx != nullptr && gc.batch && gc.n_kv_pad == n_kv_pad &&
+                               gc.set0 == s0 && gc.n_batch == N && gc.head == lm_weight;
 
-    ggml_tensor * t_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
-    ggml_set_input(t_ids);
-    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
-    ggml_set_input(positions);
-    ggml_tensor * kv_rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I64, 1, 1, N);
-    ggml_set_input(kv_rows);
-    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv_pad, 1, 1, N);
-    ggml_set_input(mask);
+    ggml_context * ctx = nullptr;
+    ggml_cgraph *  gf  = nullptr;
+    ggml_gallocr_t ga  = nullptr;
+    ggml_tensor *t_ids = nullptr, *positions = nullptr, *kv_rows = nullptr, *mask = nullptr, *lgt = nullptr;
 
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, nodes, false);
-    ggml_tensor * hidden = ggml_get_rows(ctx, m->embed_tokens, t_ids);  // [H, N]
+    if (cache_hit) {
+        ctx   = gc.ctx;
+        gf    = gc.gf;
+        ga    = gc.ga;
+        t_ids = gc.t_ids; positions = gc.positions; kv_rows = gc.kv_rows;
+        mask  = gc.mask;  lgt = gc.lgt;
+    } else {
+        gc.release();
 
-    for (int l = 0; l < c.n_layers; l++) {
-        Qwen3Layer * ly = &m->layers[l];
-        ggml_tensor * norm = q3_rms_norm_w(ctx, hidden, ly->input_norm, c.rms_norm_eps);
+        const size_t nodes = 16384;
+        ggml_init_params gp{ ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(nodes, false), nullptr, true };
+        ctx = ggml_init(gp);
 
-        ggml_tensor * q = q3_linear(ctx, ly->q_proj, norm, c.prec);
-        ggml_tensor * k = q3_linear(ctx, ly->k_proj, norm, c.prec);
-        ggml_tensor * v = q3_linear(ctx, ly->v_proj, norm, c.prec);
-        q = ggml_reshape_3d(ctx, q, D, Nh, N);
-        k = ggml_reshape_3d(ctx, k, D, Nkv, N);
-        v = ggml_reshape_3d(ctx, v, D, Nkv, N);
+        t_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+        ggml_set_input(t_ids);
+        positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+        ggml_set_input(positions);
+        kv_rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I64, 1, 1, N);
+        ggml_set_input(kv_rows);
+        mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv_pad, 1, 1, N);
+        ggml_set_input(mask);
 
-        q = ggml_mul(ctx, ggml_rms_norm(ctx, q, c.rms_norm_eps), q3_as_f32(ctx, ly->q_norm));
-        k = ggml_mul(ctx, ggml_rms_norm(ctx, k, c.rms_norm_eps), q3_as_f32(ctx, ly->k_norm));
-        q = ggml_rope_ext(ctx, q, positions, nullptr, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        k = ggml_rope_ext(ctx, k, positions, nullptr, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        q = ggml_cont(ctx, q);
-        k = ggml_cont(ctx, k);
-        v = ggml_cont(ctx, v);
+        gf = ggml_new_graph_custom(ctx, nodes, false);
+        ggml_tensor * hidden = ggml_get_rows(ctx, m->embed_tokens, t_ids);  // [H, N]
 
-        const size_t off = (size_t) s0 * m->kv_k4[l]->nb[3];
-        ggml_tensor * k_sets = ggml_view_4d(ctx, m->kv_k4[l], D, lc.max_seq_len, Nkv, N,
-                                            m->kv_k4[l]->nb[1], m->kv_k4[l]->nb[2],
-                                            m->kv_k4[l]->nb[3], off);
-        ggml_tensor * v_sets = ggml_view_4d(ctx, m->kv_v4[l], D, lc.max_seq_len, Nkv, N,
-                                            m->kv_v4[l]->nb[1], m->kv_v4[l]->nb[2],
-                                            m->kv_v4[l]->nb[3], off);
-        ggml_tensor * k_new = ggml_reshape_4d(ctx, k, D, 1, Nkv, N);
-        ggml_tensor * v_new = ggml_reshape_4d(ctx, v, D, 1, Nkv, N);
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_sets, k_new, kv_rows));
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_sets, v_new, kv_rows));
+        for (int l = 0; l < c.n_layers; l++) {
+            Qwen3Layer * ly = &m->layers[l];
+            ggml_tensor * norm = q3_rms_norm_w(ctx, hidden, ly->input_norm, c.rms_norm_eps);
 
-        ggml_tensor * q4 = ggml_reshape_4d(ctx, q, D, 1, Nh, N);
-        ggml_tensor * k_batch = ggml_view_4d(ctx, m->kv_k4[l], D, n_kv_pad, Nkv, N,
-                                             m->kv_k4[l]->nb[1], m->kv_k4[l]->nb[2],
-                                             m->kv_k4[l]->nb[3], off);
-        ggml_tensor * v_batch = ggml_view_4d(ctx, m->kv_v4[l], D, n_kv_pad, Nkv, N,
-                                             m->kv_v4[l]->nb[1], m->kv_v4[l]->nb[2],
-                                             m->kv_v4[l]->nb[3], off);
-        const float scale = 1.0f / sqrtf((float) D);
-        ggml_tensor * attn = ggml_flash_attn_ext(ctx, q4, k_batch, v_batch, mask, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attn, c.prec);
-        attn = ggml_reshape_2d(ctx, attn, (int64_t) Nh * D, N);
+            ggml_tensor * q = q3_linear(ctx, ly->q_proj, norm, c.prec);
+            ggml_tensor * k = q3_linear(ctx, ly->k_proj, norm, c.prec);
+            ggml_tensor * v = q3_linear(ctx, ly->v_proj, norm, c.prec);
+            q = ggml_reshape_3d(ctx, q, D, Nh, N);
+            k = ggml_reshape_3d(ctx, k, D, Nkv, N);
+            v = ggml_reshape_3d(ctx, v, D, Nkv, N);
 
-        hidden = ggml_add(ctx, hidden, q3_linear(ctx, ly->o_proj, attn, c.prec));
-        norm = q3_rms_norm_w(ctx, hidden, ly->post_norm, c.rms_norm_eps);
-        hidden = ggml_add(ctx, hidden, q3_build_mlp(ctx, ly, norm, c.prec));
-    }
+            q = ggml_mul(ctx, ggml_rms_norm(ctx, q, c.rms_norm_eps), q3_as_f32(ctx, ly->q_norm));
+            k = ggml_mul(ctx, ggml_rms_norm(ctx, k, c.rms_norm_eps), q3_as_f32(ctx, ly->k_norm));
+            q = ggml_rope_ext(ctx, q, positions, nullptr, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            k = ggml_rope_ext(ctx, k, positions, nullptr, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            q = ggml_cont(ctx, q);
+            k = ggml_cont(ctx, k);
+            v = ggml_cont(ctx, v);
 
-    hidden = q3_rms_norm_w(ctx, hidden, m->final_norm, c.rms_norm_eps);
-    ggml_tensor * lm_weight = compact_head ? m->lm_head_partial : m->embed_tokens;
-    ggml_tensor * lgt = q3_linear(ctx, lm_weight, hidden, c.prec);  // [graph_out_V, N]
-    ggml_set_output(lgt);
-    ggml_build_forward_expand(gf, lgt);
+            const size_t off = (size_t) s0 * m->kv_k4[l]->nb[3];
+            ggml_tensor * k_sets = ggml_view_4d(ctx, m->kv_k4[l], D, lc.max_seq_len, Nkv, N,
+                                                m->kv_k4[l]->nb[1], m->kv_k4[l]->nb[2],
+                                                m->kv_k4[l]->nb[3], off);
+            ggml_tensor * v_sets = ggml_view_4d(ctx, m->kv_v4[l], D, lc.max_seq_len, Nkv, N,
+                                                m->kv_v4[l]->nb[1], m->kv_v4[l]->nb[2],
+                                                m->kv_v4[l]->nb[3], off);
+            ggml_tensor * k_new = ggml_reshape_4d(ctx, k, D, 1, Nkv, N);
+            ggml_tensor * v_new = ggml_reshape_4d(ctx, v, D, 1, Nkv, N);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_sets, k_new, kv_rows));
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_sets, v_new, kv_rows));
 
-    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
-    if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
-        if (ga) ggml_gallocr_free(ga);
-        ggml_free(ctx);
-        return false;
+            ggml_tensor * q4 = ggml_reshape_4d(ctx, q, D, 1, Nh, N);
+            ggml_tensor * k_batch = ggml_view_4d(ctx, m->kv_k4[l], D, n_kv_pad, Nkv, N,
+                                                 m->kv_k4[l]->nb[1], m->kv_k4[l]->nb[2],
+                                                 m->kv_k4[l]->nb[3], off);
+            ggml_tensor * v_batch = ggml_view_4d(ctx, m->kv_v4[l], D, n_kv_pad, Nkv, N,
+                                                 m->kv_v4[l]->nb[1], m->kv_v4[l]->nb[2],
+                                                 m->kv_v4[l]->nb[3], off);
+            const float scale = 1.0f / sqrtf((float) D);
+            ggml_tensor * attn = ggml_flash_attn_ext(ctx, q4, k_batch, v_batch, mask, scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(attn, c.prec);
+            attn = ggml_reshape_2d(ctx, attn, (int64_t) Nh * D, N);
+
+            hidden = ggml_add(ctx, hidden, q3_linear(ctx, ly->o_proj, attn, c.prec));
+            norm = q3_rms_norm_w(ctx, hidden, ly->post_norm, c.rms_norm_eps);
+            hidden = ggml_add(ctx, hidden, q3_build_mlp(ctx, ly, norm, c.prec));
+        }
+
+        hidden = q3_rms_norm_w(ctx, hidden, m->final_norm, c.rms_norm_eps);
+        lgt = q3_linear(ctx, lm_weight, hidden, c.prec);  // [graph_out_V, N]
+        ggml_set_output(lgt);
+        ggml_build_forward_expand(gf, lgt);
+
+        ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
+        if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
+            if (ga) ggml_gallocr_free(ga);
+            ggml_free(ctx);
+            return false;
+        }
+
+        gc.ctx   = ctx;
+        gc.gf    = gf;
+        gc.ga    = ga;
+        gc.t_ids = t_ids; gc.positions = positions; gc.kv_rows = kv_rows;
+        gc.mask  = mask;  gc.lgt = lgt;
+        gc.batch = true; gc.S = 1; gc.n_kv_pad = n_kv_pad; gc.set0 = s0;
+        gc.n_batch = N;  gc.head = lm_weight;
     }
 
     ggml_backend_tensor_set(t_ids, token_ids, 0, (size_t) N * sizeof(int32_t));
@@ -588,8 +680,7 @@ bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * 
     ggml_backend_tensor_set(mask, md.data(), 0, md.size() * sizeof(uint16_t));
 
     if (ggml_backend_graph_compute(m->backend, gf) != GGML_STATUS_SUCCESS) {
-        ggml_gallocr_free(ga);
-        ggml_free(ctx);
+        gc.release();
         return false;
     }
 
@@ -608,9 +699,6 @@ bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * 
         }
     }
     for (int i = 0; i < N; i++) m->kv_pos[sets[i]]++;
-
-    ggml_gallocr_free(ga);
-    ggml_free(ctx);
     return true;
 }
 

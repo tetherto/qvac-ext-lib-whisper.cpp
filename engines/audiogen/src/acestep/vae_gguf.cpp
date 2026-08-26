@@ -2,6 +2,9 @@
 
 #include "ggml-backend.h"
 
+#include "parallel_load.h"
+
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -47,7 +50,7 @@ static float bf16_to_f32(uint16_t v) {
 static void upload_f32_as(ggml_tensor * dst, const std::vector<float> & w) {
     if (dst->type == GGML_TYPE_F16) {
         std::vector<ggml_fp16_t> h(w.size());
-        ggml_fp32_to_fp16_row(w.data(), h.data(), (int) w.size());
+        convert_f32_to_f16_rows(w.data(), h.data(), w.size());
         ggml_backend_tensor_set(dst, h.data(), 0, h.size() * sizeof(ggml_fp16_t));
     } else {
         ggml_backend_tensor_set(dst, w.data(), 0, w.size() * sizeof(float));
@@ -62,12 +65,14 @@ void vae_fuse_wn(ggml_tensor * dst, const VaeGGUF & g, const std::string & pfx) 
     const int        dim0 = (int) mv->ne[nd - 1];
     const int        fan  = (int) (ggml_nelements(mv) / dim0);
     std::vector<float> w((size_t) dim0 * fan);
-    for (int d = 0; d < dim0; d++) {
-        float gv = bf16_to_f32(gp[d]), nsq = 0.0f;
-        for (int i = 0; i < fan; i++) { float vv = bf16_to_f32(vp[(size_t) d * fan + i]); nsq += vv * vv; }
-        float s = gv / (sqrtf(nsq) + 1e-12f);
-        for (int i = 0; i < fan; i++) w[(size_t) d * fan + i] = bf16_to_f32(vp[(size_t) d * fan + i]) * s;
-    }
+    parallel_rows(dim0, [&](int begin, int end) {
+        for (int d = begin; d < end; d++) {
+            float gv = bf16_to_f32(gp[d]), nsq = 0.0f;
+            for (int i = 0; i < fan; i++) { float vv = bf16_to_f32(vp[(size_t) d * fan + i]); nsq += vv * vv; }
+            float s = gv / (sqrtf(nsq) + 1e-12f);
+            for (int i = 0; i < fan; i++) w[(size_t) d * fan + i] = bf16_to_f32(vp[(size_t) d * fan + i]) * s;
+        }
+    });
     upload_f32_as(dst, w);
 }
 
@@ -79,12 +84,14 @@ void vae_fuse_wn_ct(ggml_tensor * dst, const VaeGGUF & g, const std::string & pf
     const int        dim0 = (int) mv->ne[nd - 1];              // IC
     const int        fan  = (int) (ggml_nelements(mv) / dim0); // K*OC
     std::vector<float> w((size_t) dim0 * fan);
-    for (int d = 0; d < dim0; d++) {
-        float gv = bf16_to_f32(gp[d]), nsq = 0.0f;
-        for (int i = 0; i < fan; i++) { float vv = bf16_to_f32(vp[(size_t) d * fan + i]); nsq += vv * vv; }
-        float s = gv / (sqrtf(nsq) + 1e-12f);
-        for (int i = 0; i < fan; i++) w[(size_t) i * dim0 + d] = bf16_to_f32(vp[(size_t) d * fan + i]) * s;  // transpose
-    }
+    parallel_rows(dim0, [&](int begin, int end) {
+        for (int d = begin; d < end; d++) {
+            float gv = bf16_to_f32(gp[d]), nsq = 0.0f;
+            for (int i = 0; i < fan; i++) { float vv = bf16_to_f32(vp[(size_t) d * fan + i]); nsq += vv * vv; }
+            float s = gv / (sqrtf(nsq) + 1e-12f);
+            for (int i = 0; i < fan; i++) w[(size_t) i * dim0 + d] = bf16_to_f32(vp[(size_t) d * fan + i]) * s;  // transpose
+        }
+    });
     upload_f32_as(dst, w);
 }
 

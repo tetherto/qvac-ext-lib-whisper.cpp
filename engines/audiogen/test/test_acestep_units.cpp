@@ -15,8 +15,10 @@
 //   6b. vae_shrink_window_core — chunked-decode window vs the backend alloc cap.
 //   7. GPU device types    — discrete and integrated GPUs are selectable.
 //   8. stage placement     — which backend the LM / detokenizer / encoders run on.
+//   9. parallel_load       — weight-load row/chunk decomposition parity.
 
 #include "backend_registry.h"
+#include "parallel_load.h"
 #include "audio_edit.h"
 #include "cover_noise.h"
 #include "dit_ggml.h"
@@ -31,10 +33,12 @@
 #include "vae_ggml.h"
 #include "wav_reader.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <random>
 #include <vector>
@@ -343,13 +347,13 @@ void test_backend_device_types() {
 
 // A backend validated for every stage except the autoregressive LM keeps the
 // LM on the CPU while the detokenizer and encoders follow the GPU.
-void check_gpu_backend_keeps_lm_on_cpu(const char * name) {
+void check_gpu_backend_keeps_lm_on_cpu(const char * name, const char * device_desc) {
     using tts_cpp::acestep::PlacementOverrides;
     using tts_cpp::acestep::resolve_stage_placement;
     using tts_cpp::acestep::StagePlacement;
 
     const PlacementOverrides none;
-    StagePlacement p = resolve_stage_placement(name, none);
+    StagePlacement p = resolve_stage_placement(name, device_desc, none);
     CHECK(!p.lm_on_gpu);
     CHECK(p.detok_on_gpu);
     CHECK(p.enc_on_gpu);
@@ -409,19 +413,45 @@ void test_stage_placement() {
     CHECK(!backend_name_is_cuda(nullptr));
 
     const PlacementOverrides none;
+    const char * const radv_desc = "Radeon 8060S Graphics (RADV GFX1151)";
+
+    // -- device predicate: the Vulkan LM allowlist is per-device --------------
+    using tts_cpp::acestep::vulkan_device_lm_validated;
+    CHECK(vulkan_device_lm_validated(radv_desc));
+    CHECK(vulkan_device_lm_validated("AMD Radeon Graphics (RADV GFX1100)"));
+    CHECK(!vulkan_device_lm_validated("Mali-G715"));
+    CHECK(!vulkan_device_lm_validated("Samsung Xclipse 920"));
+    CHECK(!vulkan_device_lm_validated("NVIDIA GeForce RTX 4090"));
+    CHECK(!vulkan_device_lm_validated("AMD Radeon RX 7900 XTX"));  // proprietary driver
+    CHECK(!vulkan_device_lm_validated(""));
+    CHECK(!vulkan_device_lm_validated(nullptr));
 
     // -- allowlist: Metal and OpenCL keep LM + detokenizer on GPU ---------------
     for (const char * allowed : { "MTL", "Metal", "OpenCL" }) {
-        StagePlacement p = resolve_stage_placement(allowed, none);
+        StagePlacement p = resolve_stage_placement(allowed, "", none);
         CHECK(p.lm_on_gpu);
         CHECK(p.detok_on_gpu);
         CHECK(p.enc_on_gpu);  // encoders follow the GPU on every backend
     }
 
-    // Vulkan and CUDA are validated for every stage except the autoregressive
-    // LM (README "Backends" records the per-backend rationale).
-    check_gpu_backend_keeps_lm_on_cpu("Vulkan");
-    check_gpu_backend_keeps_lm_on_cpu("CUDA");
+    // Vulkan on a Mesa RADV device runs every stage on the GPU (measured on
+    // Strix Halo: ~2x faster LM, closer to the F32 reference than the CPU path).
+    {
+        StagePlacement p = resolve_stage_placement("Vulkan", radv_desc, none);
+        CHECK(p.lm_on_gpu);
+        CHECK(p.detok_on_gpu);
+        CHECK(p.enc_on_gpu);
+    }
+
+    // Vulkan on any other device, and CUDA everywhere, keep the LM on the CPU
+    // (README "Backends" records the per-backend rationale).
+    check_gpu_backend_keeps_lm_on_cpu("Vulkan", "Mali-G715");
+    check_gpu_backend_keeps_lm_on_cpu("Vulkan", "Samsung Xclipse 920");
+    check_gpu_backend_keeps_lm_on_cpu("Vulkan", "");
+    check_gpu_backend_keeps_lm_on_cpu("CUDA", "");
+    // The device predicate is consulted only for Vulkan: a RADV description
+    // must not lift the LM on any other backend name.
+    check_gpu_backend_keeps_lm_on_cpu("CUDA", radv_desc);
 
     // -- fallback: everything else keeps the shipping CPU placement -----------
     // Unmeasured backends must not silently pick up the GPU path. "MTL0" is in
@@ -432,7 +462,8 @@ void test_stage_placement() {
                                     "MTL0",     "Vulkan0",  "OpenCL0", "CUDA0",
                                     "",         nullptr };
     for (const char * other : others) {
-        StagePlacement p = resolve_stage_placement(other, none);
+        // A RADV description must not rescue a non-Vulkan registry name either.
+        StagePlacement p = resolve_stage_placement(other, radv_desc, none);
         CHECK(!p.lm_on_gpu);
         CHECK(!p.detok_on_gpu);
         CHECK(p.enc_on_gpu);  // only the LM and the detokenizer are allowlisted
@@ -444,30 +475,46 @@ void test_stage_placement() {
     {
         PlacementOverrides ov;
         ov.lm_gpu        = true;
-        StagePlacement p = resolve_stage_placement("SYCL", ov);
+        StagePlacement p = resolve_stage_placement("SYCL", "", ov);
         CHECK(p.lm_on_gpu);
         CHECK(!p.detok_on_gpu);  // the LM hatch must not move the detokenizer
     }
     {
         PlacementOverrides ov;
         ov.detok_gpu     = true;
-        StagePlacement p = resolve_stage_placement("SYCL", ov);
+        StagePlacement p = resolve_stage_placement("SYCL", "", ov);
         CHECK(p.detok_on_gpu);
         CHECK(!p.lm_on_gpu);
+    }
+
+    // GPU hatch also lifts a non-validated Vulkan device (how a new device gets
+    // measured without a rebuild).
+    {
+        PlacementOverrides ov;
+        ov.lm_gpu        = true;
+        StagePlacement p = resolve_stage_placement("Vulkan", "Mali-G715", ov);
+        CHECK(p.lm_on_gpu);
     }
 
     // CPU hatch demotes an allowlisted backend.
     {
         PlacementOverrides ov;
         ov.lm_cpu        = true;
-        StagePlacement p = resolve_stage_placement("MTL", ov);
+        StagePlacement p = resolve_stage_placement("MTL", "", ov);
         CHECK(!p.lm_on_gpu);
         CHECK(p.detok_on_gpu);
     }
     {
         PlacementOverrides ov;
+        ov.lm_cpu        = true;
+        StagePlacement p = resolve_stage_placement("Vulkan", radv_desc, ov);
+        CHECK(!p.lm_on_gpu);  // CPU hatch demotes a validated RADV device too
+        CHECK(p.detok_on_gpu);
+    }
+    {
+        PlacementOverrides ov;
         ov.detok_cpu     = true;
-        StagePlacement p = resolve_stage_placement("Vulkan", ov);
+        StagePlacement p = resolve_stage_placement("Vulkan", "", ov);
         CHECK(!p.detok_on_gpu);
         CHECK(!p.lm_on_gpu);
     }
@@ -480,7 +527,7 @@ void test_stage_placement() {
         ov.lm_cpu        = true;
         ov.detok_gpu     = true;
         ov.detok_cpu     = true;
-        StagePlacement p = resolve_stage_placement(name, ov);
+        StagePlacement p = resolve_stage_placement(name, radv_desc, ov);
         CHECK(!p.lm_on_gpu);
         CHECK(!p.detok_on_gpu);
     }
@@ -489,7 +536,7 @@ void test_stage_placement() {
     for (const char * name : { "MTL", "Vulkan", "OpenCL", "CUDA" }) {
         PlacementOverrides ov;
         ov.encoders_cpu  = true;
-        StagePlacement p = resolve_stage_placement(name, ov);
+        StagePlacement p = resolve_stage_placement(name, "", ov);
         CHECK(!p.enc_on_gpu);
         CHECK(p.lm_on_gpu == (backend_name_is_metal(name) || backend_name_is_opencl(name)));
     }
@@ -540,6 +587,50 @@ void test_placement_env() {
     }
 
     clear_all();  // leave the environment as found
+}
+
+// 9. parallel_load -----------------------------------------------------------
+// Exactly-once row coverage and bit-parity with the single-threaded conversion.
+void test_parallel_rows() {
+    using tts_cpp::acestep::parallel_rows;
+    for (int n : { 0, 1, 127, 128, 129, 255, 4096, 12345 }) {
+        // Workers only touch atomics; every CHECK stays on the main thread.
+        std::vector<std::atomic<int>> hits((size_t) n);
+        std::atomic<bool>             bounds_ok{ true };
+        parallel_rows(n, [&](int begin, int end) {
+            if (begin < 0 || end > n) bounds_ok = false;
+            for (int i = begin; i < end && i >= 0; i++) hits[(size_t) i].fetch_add(1);
+        });
+        CHECK(bounds_ok);
+        bool all_once = true;
+        for (const auto & h : hits) all_once = all_once && h.load() == 1;
+        CHECK(all_once);
+    }
+}
+
+void test_convert_f32_to_f16_rows() {
+    using tts_cpp::acestep::convert_f32_to_f16_rows;
+    using tts_cpp::acestep::F16_CONVERT_CHUNK;
+    using tts_cpp::acestep::LOAD_SERIAL_MIN_ROWS;
+    std::mt19937                          rng(123);
+    std::uniform_real_distribution<float> dist(-8.0f, 8.0f);
+    // The last size crosses LOAD_SERIAL_MIN_ROWS chunks, exercising the
+    // threaded branch with a ragged tail.
+    const size_t threaded = (size_t) LOAD_SERIAL_MIN_ROWS * F16_CONVERT_CHUNK + 7;
+    for (size_t count : { (size_t) 0, (size_t) 1, F16_CONVERT_CHUNK - 1, F16_CONVERT_CHUNK,
+                          F16_CONVERT_CHUNK + 1, 2 * F16_CONVERT_CHUNK, (size_t) 65537, threaded }) {
+        std::vector<float> src(count);
+        for (auto & v : src) v = dist(rng);
+        std::vector<ggml_fp16_t> serial(count);
+        std::vector<ggml_fp16_t> chunked(count);
+        if (count > 0) {
+            ggml_fp32_to_fp16_row(src.data(), serial.data(), (int) count);
+            convert_f32_to_f16_rows(src.data(), chunked.data(), count);
+            CHECK(std::memcmp(serial.data(), chunked.data(), count * sizeof(ggml_fp16_t)) == 0);
+        } else {
+            convert_f32_to_f16_rows(src.data(), chunked.data(), count);
+        }
+    }
 }
 
 void test_generate_task_kinds() {
@@ -1153,6 +1244,8 @@ int main() {
     test_backend_device_types();
     test_stage_placement();
     test_placement_env();
+    test_parallel_rows();
+    test_convert_f32_to_f16_rows();
     test_generate_task_kinds();
     test_generate_task_defaults();
     test_generate_task_audio_layout();

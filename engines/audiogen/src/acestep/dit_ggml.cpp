@@ -64,6 +64,26 @@ struct DitLayer {
     int layer_type = 0;                         // 0 = sliding window, 1 = full
 };
 
+// Reused forward graph: the sampler calls dit_model_forward once per Euler step
+// with identical shapes, so the built graph and its allocation are kept.
+struct DitGraphCache {
+    ggml_context * ctx = nullptr;
+    ggml_cgraph *  gf  = nullptr;
+    ggml_gallocr_t ga  = nullptr;
+    ggml_tensor *  input = nullptr, *enc_hidden = nullptr, *t_val = nullptr,
+                *  tr_val = nullptr, *positions = nullptr, *sa_mask = nullptr,
+                *  ca_mask = nullptr, *output = nullptr;
+    // key
+    int  T = -1, N = -1, enc_S = -1, H_enc = -1;
+    bool has_sa = false, has_ca = false;
+
+    void release() {
+        if (ga)  ggml_gallocr_free(ga);
+        if (ctx) ggml_free(ctx);
+        *this = DitGraphCache{};
+    }
+};
+
 struct DitModel {
     ggml_backend_t        backend    = nullptr;  // borrowed
     ggml_context *        weight_ctx = nullptr;
@@ -98,6 +118,8 @@ struct DitModel {
     ggml_tensor * scalar_one = nullptr;  // [1] = 1.0f
 
     bool use_flash_attn = false;
+
+    DitGraphCache graph_cache;
 };
 
 // ------------------------------------------------------------------ loaders
@@ -632,6 +654,7 @@ DitModel * dit_model_load(const std::string & path, ggml_backend_t backend, bool
 
 void dit_model_free(DitModel * m) {
     if (!m) return;
+    m->graph_cache.release();
     if (m->weight_buf) ggml_backend_buffer_free(m->weight_buf);
     if (m->weight_ctx) ggml_free(m->weight_ctx);
     // Order: drop the CPU map buffer, then munmap/close the GGUF it wrapped.
@@ -662,71 +685,102 @@ bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<fl
         return false;
     }
 
-    const size_t nodes = (size_t) 8192;
-    ggml_init_params gp{ ggml_tensor_overhead() * 2048 + ggml_graph_overhead_custom(nodes, false), nullptr, true };
-    ggml_context *   ctx = ggml_init(gp);
+    const bool has_sa = in.sa_mask_sw != nullptr;
+    const bool has_ca = in.ca_mask != nullptr;
 
-    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.in_channels, T, N);
-    ggml_set_input(input);
-    ggml_tensor * enc_hidden = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, in.H_enc, enc_S, N);
-    ggml_set_input(enc_hidden);
-    ggml_tensor * t_val = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-    ggml_set_input(t_val);
-    ggml_tensor * tr_val = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-    ggml_set_input(tr_val);
-    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) S * N);
-    ggml_set_input(positions);
+    DitGraphCache & gc        = m->graph_cache;
+    const bool      cache_hit = gc.ctx != nullptr && gc.T == T && gc.N == N && gc.enc_S == enc_S &&
+                                gc.H_enc == in.H_enc && gc.has_sa == has_sa && gc.has_ca == has_ca;
 
-    ggml_tensor * sa_mask = nullptr;
-    if (in.sa_mask_sw) {
-        sa_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, S, S, 1, N);
-        ggml_set_input(sa_mask);
-    }
-    ggml_tensor * ca_mask = nullptr;
-    if (in.ca_mask) {
-        ca_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, enc_S, S, 1, N);
-        ggml_set_input(ca_mask);
-    }
+    ggml_context * ctx = nullptr;
+    ggml_cgraph *  gf  = nullptr;
+    ggml_gallocr_t ga  = nullptr;
+    ggml_tensor *input = nullptr, *enc_hidden = nullptr, *t_val = nullptr, *tr_val = nullptr,
+                *positions = nullptr, *sa_mask = nullptr, *ca_mask = nullptr, *output = nullptr;
 
-    // timestep embeddings
-    ggml_tensor * tproj_t;
-    ggml_tensor * temb_t = build_temb(ctx, &m->time_embed, t_val, &tproj_t);
-    ggml_tensor * tproj_r;
-    ggml_tensor * t_diff = ggml_sub(ctx, t_val, tr_val);
-    ggml_tensor * temb_r = build_temb(ctx, &m->time_embed_r, t_diff, &tproj_r);
-    ggml_tensor * temb   = ggml_add(ctx, temb_t, temb_r);
-    ggml_tensor * tproj  = ggml_add(ctx, tproj_t, tproj_r);
+    if (cache_hit) {
+        ctx    = gc.ctx;
+        gf     = gc.gf;
+        ga     = gc.ga;
+        input  = gc.input;  enc_hidden = gc.enc_hidden;
+        t_val  = gc.t_val;  tr_val = gc.tr_val; positions = gc.positions;
+        sa_mask = gc.sa_mask; ca_mask = gc.ca_mask; output = gc.output;
+    } else {
+        gc.release();
 
-    // proj_in (patchify) + condition embedder
-    ggml_tensor * patched = ggml_reshape_3d(ctx, input, (int64_t) c.in_channels * P, S, N);
-    ggml_tensor * hidden  = linear_b(ctx, m->proj_in_w, m->proj_in_b, patched);
-    ggml_tensor * enc     = linear_b(ctx, m->cond_emb_w, m->cond_emb_b, enc_hidden);
+        const size_t nodes = (size_t) 8192;
+        ggml_init_params gp{ ggml_tensor_overhead() * 2048 + ggml_graph_overhead_custom(nodes, false), nullptr, true };
+        ctx = ggml_init(gp);
 
-    for (int i = 0; i < c.n_layers; i++) {
-        ggml_tensor * sm = (m->layers[i].layer_type == 0) ? sa_mask : nullptr;
-        hidden = build_layer(ctx, m, i, hidden, tproj, enc, positions, sm, ca_mask, S, enc_S, N);
-    }
+        input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.in_channels, T, N);
+        ggml_set_input(input);
+        enc_hidden = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, in.H_enc, enc_S, N);
+        ggml_set_input(enc_hidden);
+        t_val = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_input(t_val);
+        tr_val = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_input(tr_val);
+        positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) S * N);
+        ggml_set_input(positions);
 
-    // output AdaLN + proj_out
-    ggml_tensor * oss = ggml_reshape_1d(ctx, as_f32(ctx, m->out_scale_shift), 2 * H);
-    size_t        Hb  = (size_t) H * sizeof(float);
-    ggml_tensor * out_shift = ggml_add(ctx, ggml_view_1d(ctx, oss, H, 0), temb);
-    ggml_tensor * out_scale = ggml_add(ctx, ggml_view_1d(ctx, oss, H, Hb), temb);
-    ggml_tensor * norm_out  = rms_norm_w(ctx, hidden, m->norm_out, c.rms_norm_eps);
-    norm_out                = adaln(ctx, norm_out, out_scale, out_shift, m->scalar_one);
-    ggml_tensor * output    = linear_b(ctx, m->proj_out_w, m->proj_out_b, norm_out);
-    output                  = ggml_reshape_3d(ctx, output, c.out_channels, T, N);
-    ggml_set_output(output);
+        if (has_sa) {
+            sa_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, S, S, 1, N);
+            ggml_set_input(sa_mask);
+        }
+        if (has_ca) {
+            ca_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, enc_S, S, 1, N);
+            ggml_set_input(ca_mask);
+        }
 
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, nodes, false);
-    ggml_build_forward_expand(gf, output);
+        // timestep embeddings
+        ggml_tensor * tproj_t;
+        ggml_tensor * temb_t = build_temb(ctx, &m->time_embed, t_val, &tproj_t);
+        ggml_tensor * tproj_r;
+        ggml_tensor * t_diff = ggml_sub(ctx, t_val, tr_val);
+        ggml_tensor * temb_r = build_temb(ctx, &m->time_embed_r, t_diff, &tproj_r);
+        ggml_tensor * temb   = ggml_add(ctx, temb_t, temb_r);
+        ggml_tensor * tproj  = ggml_add(ctx, tproj_t, tproj_r);
 
-    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
-    if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
-        fprintf(stderr, "[acestep-dit] forward alloc failed (T=%d N=%d)\n", T, N);
-        if (ga) ggml_gallocr_free(ga);
-        ggml_free(ctx);
-        return false;
+        // proj_in (patchify) + condition embedder
+        ggml_tensor * patched = ggml_reshape_3d(ctx, input, (int64_t) c.in_channels * P, S, N);
+        ggml_tensor * hidden  = linear_b(ctx, m->proj_in_w, m->proj_in_b, patched);
+        ggml_tensor * enc     = linear_b(ctx, m->cond_emb_w, m->cond_emb_b, enc_hidden);
+
+        for (int i = 0; i < c.n_layers; i++) {
+            ggml_tensor * sm = (m->layers[i].layer_type == 0) ? sa_mask : nullptr;
+            hidden = build_layer(ctx, m, i, hidden, tproj, enc, positions, sm, ca_mask, S, enc_S, N);
+        }
+
+        // output AdaLN + proj_out
+        ggml_tensor * oss = ggml_reshape_1d(ctx, as_f32(ctx, m->out_scale_shift), 2 * H);
+        size_t        Hb  = (size_t) H * sizeof(float);
+        ggml_tensor * out_shift = ggml_add(ctx, ggml_view_1d(ctx, oss, H, 0), temb);
+        ggml_tensor * out_scale = ggml_add(ctx, ggml_view_1d(ctx, oss, H, Hb), temb);
+        ggml_tensor * norm_out  = rms_norm_w(ctx, hidden, m->norm_out, c.rms_norm_eps);
+        norm_out                = adaln(ctx, norm_out, out_scale, out_shift, m->scalar_one);
+        output                  = linear_b(ctx, m->proj_out_w, m->proj_out_b, norm_out);
+        output                  = ggml_reshape_3d(ctx, output, c.out_channels, T, N);
+        ggml_set_output(output);
+
+        gf = ggml_new_graph_custom(ctx, nodes, false);
+        ggml_build_forward_expand(gf, output);
+
+        ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
+        if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
+            fprintf(stderr, "[acestep-dit] forward alloc failed (T=%d N=%d)\n", T, N);
+            if (ga) ggml_gallocr_free(ga);
+            ggml_free(ctx);
+            return false;
+        }
+
+        gc.ctx   = ctx;
+        gc.gf    = gf;
+        gc.ga    = ga;
+        gc.input = input;  gc.enc_hidden = enc_hidden;
+        gc.t_val = t_val;  gc.tr_val = tr_val; gc.positions = positions;
+        gc.sa_mask = sa_mask; gc.ca_mask = ca_mask; gc.output = output;
+        gc.T = T; gc.N = N; gc.enc_S = enc_S; gc.H_enc = in.H_enc;
+        gc.has_sa = has_sa; gc.has_ca = has_ca;
     }
 
     ggml_backend_tensor_set(input, in.input_latents, 0, (size_t) c.in_channels * T * N * sizeof(float));
@@ -742,16 +796,12 @@ bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<fl
 
     int rc = ggml_backend_graph_compute(m->backend, gf);
     if (rc != GGML_STATUS_SUCCESS) {
-        ggml_gallocr_free(ga);
-        ggml_free(ctx);
+        gc.release();
         return false;
     }
 
     velocity_out.resize((size_t) c.out_channels * T * N);
     ggml_backend_tensor_get(output, velocity_out.data(), 0, ggml_nbytes(output));
-
-    ggml_gallocr_free(ga);
-    ggml_free(ctx);
     return true;
 }
 

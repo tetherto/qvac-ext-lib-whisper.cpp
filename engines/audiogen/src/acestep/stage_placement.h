@@ -42,6 +42,12 @@ inline bool backend_name_is_cuda(const char * name) {
     return name && std::strcmp(name, "CUDA") == 0;
 }
 
+// Per-device Vulkan LM allowlist: Mesa RADV is validated against the
+// F32-dequantized reference (README "Backends"); other devices stay on CPU.
+inline bool vulkan_device_lm_validated(const char * device_desc) {
+    return device_desc && std::strstr(device_desc, "RADV") != nullptr;
+}
+
 // Environment escape hatches, read once at create(). Presence is what counts:
 // ACESTEP_LM_CPU=0 still forces the LM to the CPU, matching the getenv() checks
 // this replaced.
@@ -61,22 +67,15 @@ struct StagePlacement {
     bool detok_on_gpu = true;
 };
 
-// Allowlist, then the overrides. Only meaningful when a GPU backend actually
-// initialised -- Engine::create() does not consult it on the CPU-only path.
-//
-// The LM and the detokenizer are allowlisted rather than denylisted: a backend
-// nobody has measured keeps the CPU placement and cannot silently regress
-// generated audio. Vulkan is validated for the detokenizer but not for the
-// autoregressive LM: on Mali-G715 the LM collapses to repeated codes and may
-// terminate far short of the requested duration. Keep that stage on CPU while
-// the encoders, detokenizer, DiT and VAE remain GPU-accelerated.
-// OpenCL is validated for both stages on Adreno 740. CUDA keeps the Vulkan
-// placement -- detokenizer on the GPU, LM on the CPU until the parity
-// measurement is taken; README "Backends" records the rationale.
-inline StagePlacement resolve_stage_placement(const char * reg_name, const PlacementOverrides & ov) {
+// Allowlist, then the overrides; an unmeasured backend keeps the CPU placement
+// (README "Backends"). Only consulted when a GPU backend actually initialised.
+inline StagePlacement resolve_stage_placement(const char * reg_name, const char * device_desc,
+                                              const PlacementOverrides & ov) {
     StagePlacement p;
 
-    if (backend_name_is_vulkan(reg_name) || backend_name_is_cuda(reg_name)) {
+    if (backend_name_is_vulkan(reg_name)) {
+        p.lm_on_gpu = vulkan_device_lm_validated(device_desc);
+    } else if (backend_name_is_cuda(reg_name)) {
         p.lm_on_gpu = false;
     } else if (!backend_name_is_metal(reg_name) && !backend_name_is_opencl(reg_name)) {
         p.lm_on_gpu    = false;
