@@ -26,6 +26,7 @@
 //     proc-address fetched from the backend's registry entry (the same pattern
 //     llama.cpp uses for multi-variant CPU backends).
 
+#include "audiogen-cpp/gpu_fallback.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
@@ -120,13 +121,20 @@ inline bool backend_dev_prefers_opencl(ggml_backend_dev_t dev) {
 //
 // Try every matching device so one adapter failing to initialise does not hide
 // another usable one.
-inline ggml_backend_t backend_gpu_init() {
+// `reason`, when given, receives why no backend was returned, so a caller can
+// tell "no GPU device was enumerated" from "a device was found and refused to
+// initialise" instead of inferring from a null.
+inline ggml_backend_t backend_gpu_init(GpuFallbackReason * reason = nullptr) {
+    bool saw_device = false;
+
     const size_t n_dev_opencl = ggml_backend_dev_count();
     for (size_t i = 0; i < n_dev_opencl; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (!dev || !backend_device_type_is_gpu(ggml_backend_dev_type(dev))) continue;
         if (!backend_dev_prefers_opencl(dev)) continue;
+        saw_device = true;
         if (ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr)) {
+            if (reason) *reason = GpuFallbackReason::none;
             return backend;
         }
     }
@@ -145,11 +153,17 @@ inline ggml_backend_t backend_gpu_init() {
                 const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
                 if (backend_reg_name_is_validated_gpu(reg_name) != require_validated) continue;
 
+                saw_device = true;
                 if (ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr)) {
+                    if (reason) *reason = GpuFallbackReason::none;
                     return backend;
                 }
             }
         }
+    }
+
+    if (reason) {
+        *reason = saw_device ? GpuFallbackReason::init_failed : GpuFallbackReason::no_devices;
     }
     return nullptr;
 }

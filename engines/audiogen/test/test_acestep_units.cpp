@@ -16,6 +16,7 @@
 //   7. GPU device types    — discrete and integrated GPUs are selectable.
 //   8. stage placement     — which backend the LM / detokenizer / encoders run on.
 //   9. parallel_load       — weight-load row/chunk decomposition parity.
+//  10. GPU fallback reason — why a GPU request resolved to the CPU.
 
 #include "backend_registry.h"
 #include "parallel_load.h"
@@ -336,6 +337,30 @@ void test_backend_device_types() {
     CHECK(parse_adreno_version("Apple M1 Pro") == -1);
     CHECK(parse_adreno_version("") == -1);
     CHECK(parse_adreno_version(nullptr) == -1);
+}
+
+// 6b. GPU fallback reason -----------------------------------------------------
+// A CPU run after a GPU request is the symptom users report, so the reason must
+// never disagree with what the registry actually returned.
+void test_gpu_fallback_reason() {
+    using tts_cpp::GpuFallbackReason;
+    using tts_cpp::gpu_fallback_reason_name;
+
+    CHECK(std::strcmp(gpu_fallback_reason_name(GpuFallbackReason::none), "none") == 0);
+    CHECK(std::strcmp(gpu_fallback_reason_name(GpuFallbackReason::not_requested), "not-requested") == 0);
+    CHECK(std::strcmp(gpu_fallback_reason_name(GpuFallbackReason::no_devices), "no-devices") == 0);
+    CHECK(std::strcmp(gpu_fallback_reason_name(GpuFallbackReason::init_failed), "init-failed") == 0);
+
+    // Holds on any machine: with a GPU the reason is `none`, without one it
+    // names which half of the acquisition failed.
+    GpuFallbackReason reason  = GpuFallbackReason::not_requested;
+    ggml_backend_t    backend = tts_cpp::acestep::backend_gpu_init(&reason);
+    if (backend) {
+        CHECK(reason == GpuFallbackReason::none);
+        ggml_backend_free(backend);
+    } else {
+        CHECK(reason == GpuFallbackReason::no_devices || reason == GpuFallbackReason::init_failed);
+    }
 }
 
 // 7. stage placement ---------------------------------------------------------
@@ -1239,6 +1264,7 @@ int main() {
     test_vae_progress();
     test_vae_window_core();
     test_backend_device_types();
+    test_gpu_fallback_reason();
     test_stage_placement();
     test_placement_env();
     test_parallel_rows();

@@ -38,6 +38,7 @@
 // Deferred: DiT CFG/APG (guidance>1, base/sft only).
 
 #include "audiogen-cpp/export.h"
+#include "audiogen-cpp/gpu_fallback.h"
 
 #include <functional>
 #include <memory>
@@ -227,6 +228,10 @@ public:
 
     int         sample_rate() const;  // 48000
     std::string backend_name() const;
+
+    // Why a run asked for a GPU and got the CPU. `not_requested` when
+    // n_gpu_layers <= 0, `none` when a GPU backend was acquired.
+    GpuFallbackReason gpu_fallback_reason() const;
 
 private:
     Engine();
