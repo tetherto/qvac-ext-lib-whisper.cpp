@@ -27,6 +27,7 @@
 #include "generation_conditioning.h"
 #include "generation_plan.h"
 #include "lm_pipeline.h"
+#include "metadata_fsm.h"
 #include "philox.h"
 #include "stage_placement.h"
 #include "vae_encode_windows.h"
@@ -243,6 +244,82 @@ void test_sampler_compact_equivalence() {
         CHECK(tf == ts);
         CHECK(r_full == r_slice);
     }
+}
+
+// lm_consume_forced must be indistinguishable from masking all but one token
+// and running the full sampler: same pick, same RNG consumption.
+void test_sampler_forced_fast_path() {
+    using tts_cpp::acestep::lm_consume_forced;
+    using tts_cpp::acestep::sample_top_k_p;
+
+    const int V = 500;
+    for (int trial = 0; trial < 12; ++trial) {
+        const int   live = 37 + trial * 13;
+        const float temp = (trial % 4 == 0) ? 0.0f : 0.85f;
+
+        std::vector<float> l(V, -1e9f);
+        l[live] = 1.5f;
+        std::mt19937 r_full(trial), r_fast(trial);
+        int tf = sample_top_k_p(l.data(), V, temp, 0.9f, 0, r_full);
+        int tc = lm_consume_forced(live, temp, r_fast);
+        CHECK(tf == tc);
+        CHECK(r_full == r_fast);
+    }
+}
+
+// MetadataFSM::forced_token must agree with apply_mask: it returns exactly the
+// single surviving token when one exists, -1 when the LM still has a choice.
+void test_fsm_forced_token() {
+    using tts_cpp::acestep::MetadataFSM;
+
+    const int V         = 64;
+    auto      survivors = [&](MetadataFSM & f) {
+        std::vector<float> l(V, 1.0f);
+        f.apply_mask(l.data());
+        std::vector<int> alive;
+        for (int v = 0; v < V; ++v)
+            if (l[v] > -1e8f) alive.push_back(v);
+        return alive;
+    };
+    auto agree = [&](MetadataFSM & f) {
+        MetadataFSM probe = f;  // forced_token may seed inject_queue; probe a copy
+        int         t     = probe.forced_token();
+        auto        alive = survivors(f);
+        if (alive.size() == 1) CHECK(t == alive[0]);
+        else CHECK(t == -1);
+    };
+
+    MetadataFSM fsm;
+    fsm.enabled    = true;
+    fsm.vocab_size = V;
+
+    fsm.state    = MetadataFSM::BPM_NAME;  // name tokens force one token at a time
+    fsm.bpm_name = { 5, 7 };
+    fsm.name_pos = 0;
+    agree(fsm);
+    fsm.name_pos = 1;
+    agree(fsm);
+
+    fsm.inject_queue = { 9 };  // injected value: forced
+    agree(fsm);
+    fsm.inject_queue.clear();
+
+    fsm.state         = MetadataFSM::THINK_END;  // </think> is forced
+    fsm.think_end_tok = 20;                      // keep it inside the synthetic vocab
+    agree(fsm);
+
+    fsm.state       = MetadataFSM::BPM_VALUE;  // value tree: forced only when 1 child
+    fsm.name_pos    = (int) fsm.bpm_name.size();
+    fsm.newline_tok = 3;
+    fsm.bpm_tree.add({ 11, 12 });
+    fsm.value_acc.clear();
+    agree(fsm);  // single child {11}
+    fsm.bpm_tree.add({ 13, 12 });
+    agree(fsm);  // two children {11,13} -> free choice
+    fsm.value_acc = { 11 };
+    agree(fsm);  // single child {12}
+    fsm.value_acc = { 40 };
+    agree(fsm);  // unknown prefix -> forced newline
 }
 
 // 5. vae_progress_pct --------------------------------------------------------
@@ -1266,6 +1343,8 @@ int main() {
     test_fsq();
     test_sampler();
     test_sampler_compact_equivalence();
+    test_sampler_forced_fast_path();
+    test_fsm_forced_token();
     test_vae_progress();
     test_vae_window_core();
     test_backend_device_types();

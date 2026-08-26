@@ -34,6 +34,18 @@ static bool lm_timing_enabled(bool verbose) {
     return verbose || std::getenv("ACESTEP_LM_TIMING") != nullptr;
 }
 
+// Forced-token fast path: with a single live logit the masked sampler's softmax
+// sum is exactly 1.0 (exp(0)=1, exp(-inf/-1e9)=0), so it draws from dist(0,1)
+// and returns the live token - except the r==0 edge, where its acc-walk stops
+// at index 0. Consume one draw to keep the RNG stream identical.
+int lm_consume_forced(int token, float temperature, std::mt19937 & rng) {
+    if (temperature <= 0.0f) return token;  // argmax path draws nothing
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    const float r = dist(rng);
+    if (r == 0.0f && token != 0) return 0;
+    return token;
+}
+
 int sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng) {
     if (temperature <= 0.0f) {
         return (int) (std::max_element(logits, logits + V) - logits);
@@ -380,9 +392,14 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     bool codes_phase = false;
     int  tok;
     {
-        auto t_sample = std::chrono::steady_clock::now();
-        if (use_fsm && fsm.enabled) fsm.apply_mask(lg.data());
-        tok = sample_top_k_p(lg.data(), V, params.temperature, params.top_p, params.top_k, rng);
+        auto      t_sample = std::chrono::steady_clock::now();
+        const int forced   = (use_fsm && fsm.enabled) ? fsm.forced_token() : -1;
+        if (forced >= 0) {
+            tok = lm_consume_forced(forced, params.temperature, rng);
+        } else {
+            if (use_fsm && fsm.enabled) fsm.apply_mask(lg.data());
+            tok = sample_top_k_p(lg.data(), V, params.temperature, params.top_p, params.top_k, rng);
+        }
         sampler_ms += lm_ms_since(t_sample);
         if (tok != TOKEN_IM_END) {
             if (use_fsm && fsm.enabled) fsm.update(tok);
@@ -402,18 +419,18 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
         }
         decode_ms += lm_ms_since(t_decode);
         decode_steps++;
-        auto    t_sample = std::chrono::steady_clock::now();
-        float * lc = lg.data();
-        if (use_fsm && fsm.enabled && !codes_phase) fsm.apply_mask(lc);
-        if (codes_phase && !lyrics_mode) {
+        auto      t_sample = std::chrono::steady_clock::now();
+        float *   lc       = lg.data();
+        const int forced   = (use_fsm && fsm.enabled && !codes_phase) ? fsm.forced_token() : -1;
+        if (forced >= 0) {
+            tok = lm_consume_forced(forced, params.temperature, rng);
+        } else if (codes_phase && !lyrics_mode) {
             for (int v = TOKEN_IM_END + 1; v < AUDIO_CODE_BASE; v++) lc[v] = -1e9f;
-        }
-
-        if (codes_phase && !lyrics_mode) {
             int V_eff = V - TOKEN_IM_END;
             tok       = sample_top_k_p(lc + TOKEN_IM_END, V_eff, params.temperature, params.top_p, params.top_k, rng) +
                   TOKEN_IM_END;
         } else {
+            if (use_fsm && fsm.enabled && !codes_phase) fsm.apply_mask(lc);
             tok = sample_top_k_p(lc, V, params.temperature, params.top_p, params.top_k, rng);
         }
         sampler_ms += lm_ms_since(t_sample);

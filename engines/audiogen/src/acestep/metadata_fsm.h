@@ -267,6 +267,47 @@ struct MetadataFSM {
         }
     }
 
+    // Move a force_field()-pinned value into inject_queue. Returns true when the
+    // current state is a *_VALUE with a forced value (queue seeded).
+    bool resolve_forced_inject() {
+        const char *        prefix = nullptr;
+        const std::string * forced = nullptr;
+        switch (state) {
+            case BPM_VALUE:      prefix = "bpm:";           forced = &forced_bpm;      break;
+            case DURATION_VALUE: prefix = "duration:";      forced = &forced_duration; break;
+            case KEYSCALE_VALUE: prefix = "keyscale:";      forced = &forced_keyscale; break;
+            case LANGUAGE_VALUE: prefix = "language:";      forced = &forced_language; break;
+            case TIMESIG_VALUE:  prefix = "timesignature:"; forced = &forced_timesig;  break;
+            default:             break;
+        }
+        if (!prefix || !forced || forced->empty() || !bpe_ptr) return false;
+        std::string      text  = std::string(prefix) + *forced + "\n";
+        std::vector<int> vtoks = tokenize_strip(*bpe_ptr, text, prefix);
+        if (vtoks.empty()) return false;
+        inject_queue = vtoks;
+        return true;
+    }
+
+    // Single fully-determined next token for the current state, or -1 when the
+    // LM may choose. Mirrors apply_mask (including inject_queue seeding) so the
+    // sampler can skip the full-vocab mask + softmax on forced steps.
+    int forced_token() {
+        if (!enabled || state == CODES || state == DISABLED) return -1;
+        if (!inject_queue.empty()) return inject_queue[0];
+        const std::vector<int> * name = current_name_tokens();
+        if (name && name_pos < (int) name->size()) return (*name)[name_pos];
+        if (resolve_forced_inject()) return inject_queue[0];
+        const PrefixTree * tree = current_value_tree();
+        if (tree) {
+            const std::vector<int> * allowed = tree->get(value_acc);
+            if (allowed && allowed->size() == 1) return (*allowed)[0];
+            if ((!allowed || allowed->empty()) && newline_tok >= 0) return newline_tok;
+            return -1;
+        }
+        if (state == THINK_END) return think_end_tok;
+        return -1;
+    }
+
     void apply_mask(float * logits) {
         if (!enabled || state == CODES || state == DISABLED) {
             return;
@@ -287,26 +328,11 @@ struct MetadataFSM {
             return;
         }
 
-        const char *        prefix = nullptr;
-        const std::string * forced = nullptr;
-        switch (state) {
-            case BPM_VALUE:      prefix = "bpm:";           forced = &forced_bpm;      break;
-            case DURATION_VALUE: prefix = "duration:";      forced = &forced_duration; break;
-            case KEYSCALE_VALUE: prefix = "keyscale:";      forced = &forced_keyscale; break;
-            case LANGUAGE_VALUE: prefix = "language:";      forced = &forced_language; break;
-            case TIMESIG_VALUE:  prefix = "timesignature:"; forced = &forced_timesig;  break;
-            default:             break;
-        }
-        if (prefix && forced && !forced->empty() && bpe_ptr) {
-            std::string      text  = std::string(prefix) + *forced + "\n";
-            std::vector<int> vtoks = tokenize_strip(*bpe_ptr, text, prefix);
-            if (!vtoks.empty()) {
-                inject_queue = vtoks;
-                int ftok     = inject_queue[0];
-                for (int v = 0; v < vocab_size; v++)
-                    if (v != ftok) logits[v] = -1e9f;
-                return;
-            }
+        if (resolve_forced_inject()) {
+            int ftok = inject_queue[0];
+            for (int v = 0; v < vocab_size; v++)
+                if (v != ftok) logits[v] = -1e9f;
+            return;
         }
 
         const PrefixTree * tree = current_value_tree();

@@ -51,6 +51,10 @@ struct LmSampleParams {
 // Ported verbatim from acestep.cpp/src/sampling.h.
 int sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng);
 
+// FSM forced-token fast path: equivalent to masking all but `token` to -1e9 and
+// running sample_top_k_p, including its RNG consumption and r==0 edge case.
+int lm_consume_forced(int token, float temperature, std::mt19937 & rng);
+
 // Build the Qwen3 chat prompt with an injected CoT metadata block (Phase 2).
 // The assistant turn stays open so the LM emits audio codes then <|im_end|>.
 std::vector<int> build_lm_prompt_with_cot(const BpeTokenizer & bpe, const AcePrompt & prompt);
