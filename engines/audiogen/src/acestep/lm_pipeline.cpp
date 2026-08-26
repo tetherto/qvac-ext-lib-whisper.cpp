@@ -3,6 +3,7 @@
 #include "metadata_fsm.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,15 @@ struct TokenProb {
     int   id;
     float prob;
 };
+
+static double lm_ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// Phase timing prints: on with verbose or ACESTEP_LM_TIMING=1.
+static bool lm_timing_enabled(bool verbose) {
+    return verbose || std::getenv("ACESTEP_LM_TIMING") != nullptr;
+}
 
 int sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng) {
     if (temperature <= 0.0f) {
@@ -350,11 +360,19 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     std::vector<int>   gen_tokens;
     std::vector<float> lg;
 
+    const bool timing       = lm_timing_enabled(params.verbose);
+    double     prefill_ms   = 0.0;
+    double     decode_ms    = 0.0;
+    double     sampler_ms   = 0.0;
+    int        decode_steps = 0;
+
+    auto t_prefill = std::chrono::steady_clock::now();
     lm_reset(m, 0);
     if (!lm_model_forward(m, prompt_tokens.data(), (int) prompt_tokens.size(), lg, 0)) {
         fprintf(stderr, "[lm-phase1] prefill failed\n");
         return false;
     }
+    prefill_ms = lm_ms_since(t_prefill);
     if (params.verbose)
         fprintf(stderr, "[lm-phase1] prefill %zu tokens, fsm=%d inspire=%d gen_lyrics=%d\n", prompt_tokens.size(),
                 (int) use_fsm, (int) inspire, (int) gen_lyrics);
@@ -362,8 +380,10 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     bool codes_phase = false;
     int  tok;
     {
+        auto t_sample = std::chrono::steady_clock::now();
         if (use_fsm && fsm.enabled) fsm.apply_mask(lg.data());
         tok = sample_top_k_p(lg.data(), V, params.temperature, params.top_p, params.top_k, rng);
+        sampler_ms += lm_ms_since(t_sample);
         if (tok != TOKEN_IM_END) {
             if (use_fsm && fsm.enabled) fsm.update(tok);
             if (tok == TOKEN_THINK_END) codes_phase = true;
@@ -374,11 +394,15 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     const int max_new = params.max_new_tokens > 0 ? params.max_new_tokens : 2048;
     for (int step = 0; step < max_new && tok != TOKEN_IM_END; step++) {
         if (codes_phase && stop_at_reasoning) break;
-        int32_t t = (int32_t) tok;
+        int32_t t        = (int32_t) tok;
+        auto    t_decode = std::chrono::steady_clock::now();
         if (!lm_model_forward(m, &t, 1, lg, 0)) {
             fprintf(stderr, "[lm-phase1] decode step %d failed\n", step);
             return false;
         }
+        decode_ms += lm_ms_since(t_decode);
+        decode_steps++;
+        auto    t_sample = std::chrono::steady_clock::now();
         float * lc = lg.data();
         if (use_fsm && fsm.enabled && !codes_phase) fsm.apply_mask(lc);
         if (codes_phase && !lyrics_mode) {
@@ -392,6 +416,7 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
         } else {
             tok = sample_top_k_p(lc, V, params.temperature, params.top_p, params.top_k, rng);
         }
+        sampler_ms += lm_ms_since(t_sample);
 
         if (tok == TOKEN_IM_END) break;
         if (use_fsm && fsm.enabled && !codes_phase) fsm.update(tok);
@@ -403,6 +428,10 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
         }
         gen_tokens.push_back(tok);
     }
+
+    if (timing)
+        fprintf(stderr, "[lm-timing] phase1 prefill=%.1f decode=%.1f sampler=%.1f steps=%d\n", prefill_ms, decode_ms,
+                sampler_ms, decode_steps);
 
     std::string text = bpe_decode(bpe, gen_tokens);
     if (params.verbose)
@@ -460,6 +489,13 @@ bool lm_generate_codes(LMModel *              m,
 
     std::vector<float> lc, lu;  // cond / uncond logits
 
+    const bool timing          = lm_timing_enabled(params.verbose);
+    double     prefill_cond_ms   = 0.0;
+    double     prefill_uncond_ms = 0.0;
+    double     decode_ms         = 0.0;
+    double     sampler_ms        = 0.0;
+    int        decode_steps      = 0;
+
     // CFG combine (cond + w*(cond-uncond)) then restrict to EOS + audio codes,
     // then sample. When CFG is off, `lu` is unused.
     auto combine_mask_sample = [&]() -> int {
@@ -477,12 +513,14 @@ bool lm_generate_codes(LMModel *              m,
     const char *       dump_layers_path = std::getenv("ACESTEP_LM_DUMP_LAYERS");
     std::vector<float> layer_states;
 
+    auto t_prefill = std::chrono::steady_clock::now();
     lm_reset(m, 0);
     if (!lm_model_forward(m, tokens.data(), (int) tokens.size(), lc, 0,
                           dump_layers_path ? &layer_states : nullptr)) {
         fprintf(stderr, "[lm-pipeline] cond prefill failed\n");
         return false;
     }
+    prefill_cond_ms = lm_ms_since(t_prefill);
     if (const char * path = std::getenv("ACESTEP_LM_DUMP_LOGITS")) {
         if (FILE * f = fopen(path, "wb")) {
             fwrite(lc.data(), sizeof(float), lc.size(), f);
@@ -503,11 +541,13 @@ bool lm_generate_codes(LMModel *              m,
         }
     }
     if (use_cfg) {
+        t_prefill = std::chrono::steady_clock::now();
         lm_reset(m, 1);
         if (!lm_model_forward(m, uncond.data(), (int) uncond.size(), lu, 1)) {
             fprintf(stderr, "[lm-pipeline] uncond prefill failed\n");
             return false;
         }
+        prefill_uncond_ms = lm_ms_since(t_prefill);
     }
     const bool batch_cfg = use_cfg && lm_model_supports_batched_decode(m);
     if (params.verbose)
@@ -517,13 +557,16 @@ bool lm_generate_codes(LMModel *              m,
                 use_cfg ? params.cfg_scale : 1.0f, use_cfg ? "" : " (CFG off)",
                 batch_cfg ? " (batched decode)" : "");
 
-    int tok = combine_mask_sample();
+    auto t_sample = std::chrono::steady_clock::now();
+    int  tok      = combine_mask_sample();
+    sampler_ms += lm_ms_since(t_sample);
     if (tok != TOKEN_IM_END && tok >= AUDIO_CODE_BASE && tok < AUDIO_CODE_BASE + AUDIO_CODE_COUNT) {
         codes_out.push_back(tok - AUDIO_CODE_BASE);
     }
 
     for (int step = 0; step < max_tokens && tok != TOKEN_IM_END; step++) {
-        int32_t t = (int32_t) tok;
+        int32_t t        = (int32_t) tok;
+        auto    t_decode = std::chrono::steady_clock::now();
         if (batch_cfg) {
             const int32_t ids[2] = { t, t };
             const int     sets[2] = { 0, 1 };
@@ -532,6 +575,8 @@ bool lm_generate_codes(LMModel *              m,
                 fprintf(stderr, "[lm-pipeline] batched CFG decode step %d failed\n", step);
                 return false;
             }
+            decode_ms += lm_ms_since(t_decode);
+            t_sample = std::chrono::steady_clock::now();
             const int out_v = V - TOKEN_IM_END;
             lc.assign((size_t) V, -1e9f);
             lu.assign((size_t) V, -1e9f);
@@ -546,8 +591,12 @@ bool lm_generate_codes(LMModel *              m,
                 fprintf(stderr, "[lm-pipeline] uncond decode step %d failed\n", step);
                 return false;
             }
+            decode_ms += lm_ms_since(t_decode);
+            t_sample = std::chrono::steady_clock::now();
         }
+        decode_steps++;
         tok = combine_mask_sample();
+        sampler_ms += lm_ms_since(t_sample);
         if (tok == TOKEN_IM_END) break;
         if (tok >= AUDIO_CODE_BASE && tok < AUDIO_CODE_BASE + AUDIO_CODE_COUNT) {
             codes_out.push_back(tok - AUDIO_CODE_BASE);
@@ -561,6 +610,10 @@ bool lm_generate_codes(LMModel *              m,
             params.on_step(step + 1, max_tokens);
         }
     }
+
+    if (timing)
+        fprintf(stderr, "[lm-timing] phase2 prefill-cond=%.1f prefill-uncond=%.1f decode=%.1f sampler=%.1f steps=%d\n",
+                prefill_cond_ms, prefill_uncond_ms, decode_ms, sampler_ms, decode_steps);
 
     if (params.verbose) {
         fprintf(stderr, "[lm-pipeline] generated %zu audio codes\n", codes_out.size());

@@ -6,8 +6,10 @@
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -153,10 +155,15 @@ static bool lm_build_partial_head(LMModel * m, int offset) {
         return false;
     }
     const size_t nbytes = (size_t) count * row_bytes;
+    const auto   t0     = std::chrono::steady_clock::now();
     std::vector<uint8_t> tmp(nbytes);
     ggml_backend_tensor_get(m->embed_tokens, tmp.data(), (size_t) offset * row_bytes, nbytes);
     ggml_backend_tensor_set(m->lm_head_partial, tmp.data(), 0, nbytes);
     m->lm_head_offset = offset;
+    if (std::getenv("ACESTEP_LM_TIMING"))
+        fprintf(stderr, "[lm-timing] partial-head build %.1f ms (%d rows, %.1f MB)\n",
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), count,
+                nbytes / 1048576.0);
     return true;
 }
 
@@ -284,7 +291,14 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
         delete m;
         return nullptr;
     }
-    ggml_backend_buffer_clear(m->kv_buf, 0);
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        ggml_backend_buffer_clear(m->kv_buf, 0);
+        if (std::getenv("ACESTEP_LM_TIMING"))
+            fprintf(stderr, "[lm-timing] kv-clear %.1f ms (%.1f MB)\n",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                    ggml_backend_buffer_get_size(m->kv_buf) / 1048576.0);
+    }
     m->kv_pos.assign(NS, 0);
 
     if (verbose) {
