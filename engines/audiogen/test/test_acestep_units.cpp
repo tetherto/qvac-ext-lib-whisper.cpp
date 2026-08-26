@@ -426,8 +426,8 @@ void test_stage_placement() {
     CHECK(!vulkan_device_lm_validated(""));
     CHECK(!vulkan_device_lm_validated(nullptr));
 
-    // -- allowlist: Metal and OpenCL keep LM + detokenizer on GPU ---------------
-    for (const char * allowed : { "MTL", "Metal", "OpenCL" }) {
+    // -- allowlist: Metal, OpenCL, and CUDA keep LM + detokenizer on GPU --------
+    for (const char * allowed : { "MTL", "Metal", "OpenCL", "CUDA" }) {
         StagePlacement p = resolve_stage_placement(allowed, "", none);
         CHECK(p.lm_on_gpu);
         CHECK(p.detok_on_gpu);
@@ -443,15 +443,11 @@ void test_stage_placement() {
         CHECK(p.enc_on_gpu);
     }
 
-    // Vulkan on any other device, and CUDA everywhere, keep the LM on the CPU
-    // (README "Backends" records the per-backend rationale).
+    // Vulkan on any other device keeps the LM on the CPU (README "Backends"
+    // records the per-backend rationale).
     check_gpu_backend_keeps_lm_on_cpu("Vulkan", "Mali-G715");
     check_gpu_backend_keeps_lm_on_cpu("Vulkan", "Samsung Xclipse 920");
     check_gpu_backend_keeps_lm_on_cpu("Vulkan", "");
-    check_gpu_backend_keeps_lm_on_cpu("CUDA", "");
-    // The device predicate is consulted only for Vulkan: a RADV description
-    // must not lift the LM on any other backend name.
-    check_gpu_backend_keeps_lm_on_cpu("CUDA", radv_desc);
 
     // -- fallback: everything else keeps the shipping CPU placement -----------
     // Unmeasured backends must not silently pick up the GPU path. "MTL0" is in
@@ -538,7 +534,8 @@ void test_stage_placement() {
         ov.encoders_cpu  = true;
         StagePlacement p = resolve_stage_placement(name, "", ov);
         CHECK(!p.enc_on_gpu);
-        CHECK(p.lm_on_gpu == (backend_name_is_metal(name) || backend_name_is_opencl(name)));
+        CHECK(p.lm_on_gpu == (backend_name_is_metal(name) || backend_name_is_opencl(name) ||
+                              backend_name_is_cuda(name)));
     }
 }
 

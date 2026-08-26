@@ -75,9 +75,8 @@ inline StagePlacement resolve_stage_placement(const char * reg_name, const char 
 
     if (backend_name_is_vulkan(reg_name)) {
         p.lm_on_gpu = vulkan_device_lm_validated(device_desc);
-    } else if (backend_name_is_cuda(reg_name)) {
-        p.lm_on_gpu = false;
-    } else if (!backend_name_is_metal(reg_name) && !backend_name_is_opencl(reg_name)) {
+    } else if (!backend_name_is_metal(reg_name) && !backend_name_is_opencl(reg_name) &&
+               !backend_name_is_cuda(reg_name)) {
         p.lm_on_gpu    = false;
         p.detok_on_gpu = false;
     }
