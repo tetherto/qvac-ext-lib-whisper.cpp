@@ -237,32 +237,35 @@ static bool lm_create_layer_fused(ggml_context * ctx, const DitGGUF & g, const s
     return true;
 }
 
-static void lm_load_row_block(ggml_tensor * dst, size_t & off, const DitGGUF & g, const std::string & name) {
+bool lm_load_row_block(ggml_tensor * dst, size_t & off, const DitGGUF & g, const std::string & name) {
     const void *  src = dit_gdata(g, name);
     ggml_tensor * mt  = dit_gmeta(g, name);
     if (!src || !mt) {
         fprintf(stderr, "[acestep-lm] cannot load %s\n", name.c_str());
-        return;
+        return false;
     }
     ggml_backend_tensor_set(dst, src, off, ggml_nbytes(mt));
     off += ggml_nbytes(mt);
+    return true;
 }
 
-static void lm_load_layer_fused(const DitGGUF & g, const std::string & prefix, Qwen3Layer & ly, ggml_tensor * qkv,
-                                ggml_tensor * gateup) {
+bool lm_load_layer_fused(const DitGGUF & g, const std::string & prefix, Qwen3Layer & ly, ggml_tensor * qkv,
+                         ggml_tensor * gateup) {
     q3_load_f32(ly.input_norm, g, prefix + ".input_layernorm.weight");
     q3_load_f32(ly.post_norm, g, prefix + ".post_attention_layernorm.weight");
     q3_load_f32(ly.q_norm, g, prefix + ".self_attn.q_norm.weight");
     q3_load_f32(ly.k_norm, g, prefix + ".self_attn.k_norm.weight");
     q3_load_raw(ly.o_proj, g, prefix + ".self_attn.o_proj.weight");
     q3_load_raw(ly.down_proj, g, prefix + ".mlp.down_proj.weight");
+    // A skipped block would byte-shift every later block in the fused tensor,
+    // so a missing tensor must fail the whole layer, not fall through.
     size_t off = 0;
-    lm_load_row_block(qkv, off, g, prefix + ".self_attn.q_proj.weight");
-    lm_load_row_block(qkv, off, g, prefix + ".self_attn.k_proj.weight");
-    lm_load_row_block(qkv, off, g, prefix + ".self_attn.v_proj.weight");
+    bool   ok  = lm_load_row_block(qkv, off, g, prefix + ".self_attn.q_proj.weight") &&
+              lm_load_row_block(qkv, off, g, prefix + ".self_attn.k_proj.weight") &&
+              lm_load_row_block(qkv, off, g, prefix + ".self_attn.v_proj.weight");
     off = 0;
-    lm_load_row_block(gateup, off, g, prefix + ".mlp.gate_proj.weight");
-    lm_load_row_block(gateup, off, g, prefix + ".mlp.up_proj.weight");
+    return ok && lm_load_row_block(gateup, off, g, prefix + ".mlp.gate_proj.weight") &&
+           lm_load_row_block(gateup, off, g, prefix + ".mlp.up_proj.weight");
 }
 
 LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int max_seq_len, bool verbose,
@@ -344,7 +347,14 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
     for (int i = 0; i < c.n_layers; i++) {
         const std::string prefix = "model.layers." + std::to_string(i);
         if (fuse) {
-            lm_create_layer_fused(ctx, g, prefix, m->layers[i], &m->qkv_fused[i], &m->gateup_fused[i]);
+            if (!lm_create_layer_fused(ctx, g, prefix, m->layers[i], &m->qkv_fused[i], &m->gateup_fused[i])) {
+                fprintf(stderr, "[acestep-lm] fused layer create failed (layer %d)\n", i);
+                if (map_buf) ggml_backend_buffer_free(map_buf);
+                ggml_free(ctx);
+                dit_gguf_close(g);
+                delete m;
+                return nullptr;
+            }
         } else {
             q3_create_layer(ctx, g, prefix, m->layers[i], map_buf);
         }
@@ -369,7 +379,15 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
     for (int i = 0; i < c.n_layers; i++) {
         const std::string prefix = "model.layers." + std::to_string(i);
         if (fuse) {
-            lm_load_layer_fused(g, prefix, m->layers[i], m->qkv_fused[i], m->gateup_fused[i]);
+            if (!lm_load_layer_fused(g, prefix, m->layers[i], m->qkv_fused[i], m->gateup_fused[i])) {
+                fprintf(stderr, "[acestep-lm] fused weight load failed (layer %d)\n", i);
+                if (map_buf) ggml_backend_buffer_free(map_buf);
+                ggml_backend_buffer_free(m->weight_buf);  // ggml_free(ctx) drops descriptors, not the buffer
+                ggml_free(ctx);
+                dit_gguf_close(g);
+                delete m;
+                return nullptr;
+            }
         } else {
             q3_load_layer(g, prefix, m->layers[i]);
         }

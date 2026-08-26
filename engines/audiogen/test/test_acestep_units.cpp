@@ -16,23 +16,30 @@
 //   7. GPU device types    — discrete and integrated GPUs are selectable.
 //   8. stage placement     — which backend the LM / detokenizer / encoders run on.
 //   9. parallel_load       — weight-load row/chunk decomposition parity.
+//   9b. fused load         — LM q|k|v / gate|up row blocks fail closed.
 
 #include "backend_registry.h"
 #include "parallel_load.h"
 #include "audio_edit.h"
 #include "cover_noise.h"
 #include "dit_ggml.h"
+#include "dit_gguf.h"
 #include "detok_ggml.h"
 #include "generate_task.h"
 #include "generation_conditioning.h"
 #include "generation_plan.h"
+#include "lm_ggml.h"
 #include "lm_pipeline.h"
 #include "metadata_fsm.h"
 #include "philox.h"
+#include "qwen3_block.h"
 #include "stage_placement.h"
 #include "vae_encode_windows.h"
 #include "vae_ggml.h"
 #include "wav_reader.h"
+
+#include "ggml-alloc.h"
+#include "gguf.h"
 
 #include <atomic>
 #include <cmath>
@@ -43,6 +50,7 @@
 #include <limits>
 #include <random>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -903,6 +911,102 @@ void test_convert_f32_to_f16_rows() {
     }
 }
 
+// 9b. fused-load fail-closed -------------------------------------------------
+// lm_load_row_block copies one GGUF tensor into a row-concatenated fused tensor
+// at a running byte offset; lm_load_layer_fused chains q|k|v and gate|up. A
+// missing tensor must fail the load (false, offset untouched): skipping a block
+// would byte-shift every later one into silently wrong weights. The tiny GGUF
+// is written by the test itself; CPU buffers only.
+std::string write_fused_test_gguf(const std::vector<std::pair<std::string, std::vector<float>>> & tensors, int ne0) {
+    const char *      tmp  = std::getenv("TMPDIR");
+    const std::string path = std::string(tmp ? tmp : "/tmp") + "/qvac-acestep-fused-load-test.gguf";
+
+    ggml_init_params ip{ 1024 * 1024, nullptr, /*no_alloc=*/false };
+    ggml_context *   ctx = ggml_init(ip);
+    gguf_context *   gc  = gguf_init_empty();
+    for (const auto & [name, vals] : tensors) {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, (int64_t) vals.size() / ne0);
+        ggml_set_name(t, name.c_str());
+        std::memcpy(t->data, vals.data(), vals.size() * sizeof(float));
+        gguf_add_tensor(gc, t);
+    }
+    CHECK(gguf_write_to_file(gc, path.c_str(), /*only_meta=*/false));
+    gguf_free(gc);
+    ggml_free(ctx);
+    return path;
+}
+
+void test_fused_load_fail_closed() {
+    using tts_cpp::acestep::DitGGUF;
+    using tts_cpp::acestep::Qwen3Layer;
+    using tts_cpp::acestep::dit_gguf_close;
+    using tts_cpp::acestep::dit_gguf_open;
+    using tts_cpp::acestep::lm_load_layer_fused;
+    using tts_cpp::acestep::lm_load_row_block;
+
+    const int ne0 = 4;
+    auto      seq = [](int n, float base) {
+        std::vector<float> v((size_t) n);
+        for (int i = 0; i < n; ++i) v[(size_t) i] = base + (float) i;
+        return v;
+    };
+    const std::string p = "model.layers.0";
+    const auto q = seq(8, 0), k = seq(4, 100), v = seq(4, 200), gate = seq(8, 300), up = seq(8, 400);
+
+    const std::string path = write_fused_test_gguf(
+        { { p + ".self_attn.q_proj.weight", q },
+          { p + ".self_attn.k_proj.weight", k },
+          { p + ".self_attn.v_proj.weight", v },
+          { p + ".mlp.gate_proj.weight", gate },
+          { p + ".mlp.up_proj.weight", up } },
+        ne0);
+
+    DitGGUF g;
+    CHECK(dit_gguf_open(g, path));
+
+    ggml_init_params      ip{ 8 * ggml_tensor_overhead(), nullptr, /*no_alloc=*/true };
+    ggml_context *        ctx = ggml_init(ip);
+    ggml_tensor *         qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, 4);  // q(2) + k(1) + v(1) rows
+    ggml_tensor *         gu  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, 4);  // gate(2) + up(2) rows
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    CHECK(buf != nullptr);
+
+    // Happy path: all five blocks land back to back, in declaration order.
+    Qwen3Layer ly{};  // norms/o/down stay null; q3_load_* skip a null dst
+    CHECK(lm_load_layer_fused(g, p, ly, qkv, gu));
+    std::vector<float> qkv_want(q);
+    qkv_want.insert(qkv_want.end(), k.begin(), k.end());
+    qkv_want.insert(qkv_want.end(), v.begin(), v.end());
+    std::vector<float> gu_want(gate);
+    gu_want.insert(gu_want.end(), up.begin(), up.end());
+    CHECK(std::memcmp(qkv->data, qkv_want.data(), qkv_want.size() * sizeof(float)) == 0);
+    CHECK(std::memcmp(gu->data, gu_want.data(), gu_want.size() * sizeof(float)) == 0);
+
+    // Missing tensor: false, and the offset must not advance.
+    size_t off = 0;
+    CHECK(lm_load_row_block(qkv, off, g, p + ".self_attn.q_proj.weight"));
+    const size_t after_q = off;
+    CHECK(!lm_load_row_block(qkv, off, g, p + ".self_attn.absent.weight"));
+    CHECK(off == after_q);
+    dit_gguf_close(g);
+
+    // v_proj absent -> the whole fused layer load fails.
+    const std::string path2 = write_fused_test_gguf(
+        { { p + ".self_attn.q_proj.weight", q },
+          { p + ".self_attn.k_proj.weight", k },
+          { p + ".mlp.gate_proj.weight", gate },
+          { p + ".mlp.up_proj.weight", up } },
+        ne0);
+    DitGGUF g2;
+    CHECK(dit_gguf_open(g2, path2));
+    CHECK(!lm_load_layer_fused(g2, p, ly, qkv, gu));
+    dit_gguf_close(g2);
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    std::remove(path.c_str());
+}
+
 void test_generate_task_kinds() {
     using tts_cpp::acestep::TASK_COVER;
     using tts_cpp::acestep::TASK_COVER_NOFSQ;
@@ -1521,6 +1625,7 @@ int main() {
     test_placement_env();
     test_parallel_rows();
     test_convert_f32_to_f16_rows();
+    test_fused_load_fail_closed();
     test_generate_task_kinds();
     test_generate_task_defaults();
     test_generate_task_audio_layout();

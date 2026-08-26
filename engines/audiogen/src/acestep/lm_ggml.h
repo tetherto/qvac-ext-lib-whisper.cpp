@@ -35,6 +35,16 @@ struct LMConfig {
 };
 
 struct LMModel;  // opaque
+struct DitGGUF;
+struct Qwen3Layer;
+
+// Fused-load internals, exposed for unit tests: copy one GGUF tensor into the
+// row-concatenated dst at byte offset `off` (advancing it), and load one
+// layer's q|k|v + gate|up blocks. Both return false on a missing tensor so a
+// corrupt GGUF fails the load instead of leaving misaligned fused weights.
+bool lm_load_row_block(ggml_tensor * dst, size_t & off, const DitGGUF & g, const std::string & name);
+bool lm_load_layer_fused(const DitGGUF & g, const std::string & prefix, Qwen3Layer & ly, ggml_tensor * qkv,
+                         ggml_tensor * gateup);
 
 // Load ace-lm GGUF onto `backend` (borrowed). Config is derived from tensor
 // shapes (H, V, layer count, head counts). `n_kv_sets` independent KV caches are
