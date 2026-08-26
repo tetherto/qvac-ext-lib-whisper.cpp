@@ -73,6 +73,10 @@ struct DitForwardInputs {
     // Attention masks (F16), row-major [KV, Q, 1, N]; null = unmasked.
     const void * sa_mask_sw = nullptr;  // [S, S, 1, N] self-attn sliding window
     const void * ca_mask    = nullptr;  // [enc_S, S, 1, N] cross-attn encoder padding
+
+    // false = enc_hidden/positions/masks are unchanged since the previous call
+    // on this model, so their uploads are skipped (their graph slots persist).
+    bool constants_dirty = true;
 };
 
 // Run one forward pass. Writes velocity [out_channels, T, N] (channel-major per
