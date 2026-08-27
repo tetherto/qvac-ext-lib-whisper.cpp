@@ -19,7 +19,6 @@
 // window-size resolver, and the seam trim + append) so they can be unit-tested
 // without loading a model (see test/test_long_form_windows.cpp).
 
-#include <cstddef>
 #include <vector>
 
 namespace parakeet {
