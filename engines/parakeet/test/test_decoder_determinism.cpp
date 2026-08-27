@@ -257,6 +257,14 @@ int run_transcribe_path(const Opts & o,
                 r.token_ids.size(),
                 r.text.size() > 60 ? (r.text.substr(0, 60) + "…").c_str() : r.text.c_str());
         }
+        if (r.text.empty() || r.token_ids.empty()) {
+            std::fprintf(stderr,
+                "[determinism] FAIL: run %d/%d returned a successful empty transcription "
+                "(tokens=%zu chars=%zu backend=%s)\n",
+                k + 1, o.n_runs, r.token_ids.size(), r.text.size(),
+                eng.backend_name().c_str());
+            return 1;
+        }
         ids_per_run.push_back(std::move(r.token_ids));
         text_per_run.push_back(std::move(r.text));
         enc_ms_per_run.push_back(r.encoder_ms);

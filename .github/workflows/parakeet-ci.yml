@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       run_gpu:
-        description: 'Also run the GPU ctest lane (needs a [self-hosted, gpu] runner)'
+        description: 'Run the TDT Vulkan context-loss soak on the Linux GPU runner'
         type: boolean
         default: false
 
@@ -135,21 +135,51 @@ jobs:
           bash engines/parakeet/scripts/test-package-consumption.sh \
             --ggml-prefix "$PWD/ggml-install"
 
-  # GPU lane stub: opt-in until self-hosted GPU runners exist. Trial note:
-  # hosted macos-14 exposes Metal, so moving `-L gpu` into the macOS
-  # build-test job is a cheap first experiment.
   gpu:
     if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
-    runs-on: [self-hosted, gpu]
+    runs-on: qvac-ubuntu2204-x64-gpu
     timeout-minutes: 90
     steps:
+      - name: Manual Workspace Cleanup
+        run: |
+          rm -rf "$GITHUB_WORKSPACE"
+          mkdir -p "$GITHUB_WORKSPACE"
+        shell: bash
+        working-directory: .
       - uses: actions/checkout@v4
-      # GGML_VULKAN=ON is the backend the -L gpu suites primarily target
-      # (test_vk_vs_cpu et al); Metal is on by default on Apple hosts.
-      # Revisit the flag set (OpenCL? CUDA?) when the GPU runner fleet is
-      # provisioned — a CPU-only ggml here would skip or falsely pass the
-      # GPU suites.
-      - name: Build ggml + engine (native backends) and run GPU suites
+
+      - name: Cache TDT GPU test model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: engines/parakeet/models
+          key: parakeet-tdt-vulkan-${{ hashFiles('engines/parakeet/test/gpu-ci-fixtures.sha256') }}
+
+      - name: Create GPU fixture directories
+        run: |
+          mkdir -p engines/parakeet/models
+          mkdir -p engines/parakeet/test/samples
+
+      - name: Download pinned TDT model
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          curl --fail --location \
+            --output engines/parakeet/models/parakeet-tdt-0.6b-v3.q8_0.gguf \
+            "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/99ccd7c1e77bac349d1c5ad2e7a018bc0733990a/parakeet-tdt-0.6b-v3.q8_0.gguf"
+
+      - name: Download pinned speech sample
+        run: |
+          curl --fail --location \
+            --output engines/parakeet/test/samples/jfk.wav \
+            "https://raw.githubusercontent.com/ggml-org/whisper.cpp/978113305b2ead22249b881deafa131dc8884911/samples/jfk.wav"
+
+      - name: Verify GPU test fixtures
+        run: sha256sum --check engines/parakeet/test/gpu-ci-fixtures.sha256
+
+      - name: Show Vulkan devices
+        run: vulkaninfo --summary
+
+      - name: Build ggml and Parakeet with Vulkan
         run: |
           git clone --depth 1 --branch "$GGML_BRANCH" "$GGML_REPO" ggml-src
           cmake -S ggml-src -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
@@ -160,4 +190,12 @@ jobs:
             -DPARAKEET_USE_SYSTEM_GGML=ON -DPARAKEET_BUILD_TESTS=ON \
             -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
           cmake --build build -j
-          ctest --test-dir build -L gpu --output-on-failure --timeout 1200
+
+      - name: Run TDT Vulkan context-loss soak
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+        run: >-
+          ctest --test-dir build
+          --tests-regex '^test-decoder-determinism-tdt-vulkan-soak$'
+          --output-on-failure
+          --timeout 1200

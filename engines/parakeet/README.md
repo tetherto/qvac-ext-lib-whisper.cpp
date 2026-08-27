@@ -433,11 +433,23 @@ include `unit`, `fixture`, `cpu`, `gpu`, and `perf`; for example:
 
 ```bash
 ctest --test-dir build-parakeet -L cpu --output-on-failure
+ctest --test-dir build-parakeet -R test-decoder-determinism-tdt-vulkan-soak \
+  --output-on-failure
 ```
 
 Fixture roots are configurable with `PARAKEET_TEST_MODEL_DIR`,
 `PARAKEET_TEST_AUDIO_DIR`, and `PARAKEET_TEST_REF_DIR`. `test-gpu-vs-cpu`
 (formerly `test-vk-vs-cpu`) is available when Vulkan or Metal is configured.
+The TDT Vulkan soak runs 20 transcriptions through one engine and fails on an
+empty transcript or token sequence, including a successful empty result after
+a lost GPU context.
+
+To run it in GitHub Actions, manually trigger `.github/workflows/parakeet-ci.yml`
+(`parakeet CI`) with **Run the TDT Vulkan context-loss soak on the Linux GPU
+runner** enabled. The GPU job downloads checksum-pinned model and audio
+fixtures, builds the `speech` branch of qvac-ext-ggml with Vulkan, and runs only
+`test-decoder-determinism-tdt-vulkan-soak`.
+
 `verify-gguf-roundtrip.py`,
 `ref-encoder-from-gguf.py`, and `streaming-reference.py` support converter and
 parity investigation.
