@@ -1,4 +1,4 @@
-# qvac-ext-lib-whisper.cpp
+# qvac-fabric-speech.cpp
 
 On-device speech and audio AI in pure C++ on [ggml](https://github.com/tetherto/qvac-ext-ggml): speech-to-text, speaker diarization, end-of-utterance detection, text-to-speech, voice cloning, speech enhancement, and music generation.
 

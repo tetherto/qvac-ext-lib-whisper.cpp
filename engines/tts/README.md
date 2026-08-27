@@ -12,7 +12,7 @@ installed public headers under `include/tts-cpp/`; the two Chatterbox families
 share one engine API, while the Supertonic generations share another.
 
 This directory is the in-tree `engines/tts` package in
-[`qvac-ext-lib-whisper.cpp`](../../README.md). It consumes the system
+[`qvac-fabric-speech.cpp`](../../README.md). It consumes the system
 `ggml-speech` package built from
 [`qvac-ext-ggml@speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech).
 The checkout intentionally starts without a local `ggml/`, `patches/`, or
