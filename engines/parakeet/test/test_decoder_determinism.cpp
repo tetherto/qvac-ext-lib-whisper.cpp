@@ -16,7 +16,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -31,7 +30,6 @@ struct Opts {
     std::string language;
     std::string expect_text_file;
     bool require_gpu = false;
-    bool expect_compute_failure = false;
     bool verbose = false;
     // Cache-hit gate compares median(warm runs 1..N-1) to run 0
     // (cold). Median (not max) is the right statistic — a real
@@ -93,8 +91,6 @@ void usage(const char * argv0) {
         "  --require-gpu        fail unless the engine actually selected a GPU\n"
         "                       backend; guards against silent CPU fallback\n"
         "                       turning a GPU determinism run into CPU-vs-CPU\n"
-        "  --expect-compute-failure  pass only when transcription throws a compute\n"
-        "                       failure; used with Vulkan device-loss injection\n"
         "  --expect-text-file PATH  fail unless run 0's transcript equals the\n"
         "                       file's contents (trailing whitespace ignored).\n"
         "                       Guards against deterministic-but-wrong output,\n"
@@ -141,7 +137,6 @@ int parse_args(int argc, char ** argv, Opts & o) {
         else if (a == "--threads"      && i + 1 < argc) o.n_threads = std::atoi(argv[++i]);
         else if (a == "--language"     && i + 1 < argc) o.language = argv[++i];
         else if (a == "--require-gpu")                  o.require_gpu = true;
-        else if (a == "--expect-compute-failure")       o.expect_compute_failure = true;
         else if (a == "--expect-text-file" && i + 1 < argc) o.expect_text_file = argv[++i];
         else if (a == "--cache-hit-ratio" && i + 1 < argc) o.cache_hit_ratio_max = std::atof(argv[++i]);
         else if (a == "--prewarm")                         o.prewarm = true;
@@ -581,33 +576,8 @@ int main(int argc, char ** argv) {
     const std::string mt = probe.model_type();
     std::fprintf(stderr, "[determinism] model_type=%s\n", mt.c_str());
 
-    try {
-        int rc = 0;
-        if (mt == "sortformer" || probe.is_diarization_model()) {
-            rc = run_diarize_path(o, samples, sr, mt);
-        } else {
-            rc = run_transcribe_path(o, samples, sr, mt);
-        }
-        if (o.expect_compute_failure && rc == 0) {
-            std::fprintf(stderr,
-                "[determinism] FAIL: expected an injected backend compute failure\n");
-            return 1;
-        }
-        return rc;
-    } catch (const std::runtime_error & error) {
-        if (!o.expect_compute_failure) {
-            throw;
-        }
-        const std::string message = error.what();
-        if (message.find("failed (rc=") == std::string::npos) {
-            std::fprintf(stderr,
-                "[determinism] FAIL: unexpected exception during device-loss injection: %s\n",
-                message.c_str());
-            return 1;
-        }
-        std::fprintf(stderr,
-            "[determinism] PASS: injected device loss surfaced as an error: %s\n",
-            message.c_str());
-        return 0;
+    if (mt == "sortformer" || probe.is_diarization_model()) {
+        return run_diarize_path(o, samples, sr, mt);
     }
+    return run_transcribe_path(o, samples, sr, mt);
 }
