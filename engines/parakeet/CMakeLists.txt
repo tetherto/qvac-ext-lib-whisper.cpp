@@ -1145,6 +1145,15 @@ if (PARAKEET_BUILD_TESTS)
                      "--runs" "20" "--threads" "4" "--n-gpu-layers" "1"
                      "--require-gpu" "--verbose"
             REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+        parakeet_register_test(test-tdt-vulkan-device-loss-propagation
+            LABEL    "gpu"
+            EXE      test-decoder-determinism
+            ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+                     "--runs" "2" "--threads" "4" "--n-gpu-layers" "1"
+                     "--require-gpu" "--expect-compute-failure" "--verbose"
+            REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+        set_property(TEST test-tdt-vulkan-device-loss-propagation PROPERTY
+            ENVIRONMENT "GGML_VK_TEST_DEVICE_LOST_AFTER_GRAPH=1")
         parakeet_register_test(test-streaming-rnnt-vulkan
             LABEL    "gpu"
             EXE      test-parakeet-streaming

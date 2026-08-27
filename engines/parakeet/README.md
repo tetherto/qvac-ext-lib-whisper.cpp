@@ -435,6 +435,8 @@ include `unit`, `fixture`, `cpu`, `gpu`, and `perf`; for example:
 ctest --test-dir build-parakeet -L cpu --output-on-failure
 ctest --test-dir build-parakeet -R test-decoder-determinism-tdt-vulkan-soak \
   --output-on-failure
+ctest --test-dir build-parakeet -R test-tdt-vulkan-device-loss-propagation \
+  --output-on-failure
 ```
 
 Fixture roots are configurable with `PARAKEET_TEST_MODEL_DIR`,
@@ -442,7 +444,9 @@ Fixture roots are configurable with `PARAKEET_TEST_MODEL_DIR`,
 (formerly `test-vk-vs-cpu`) is available when Vulkan or Metal is configured.
 The TDT Vulkan soak runs 20 transcriptions through one engine and fails on an
 empty transcript or token sequence, including a successful empty result after
-a lost GPU context.
+a lost GPU context. The device-loss propagation test uses
+`GGML_VK_TEST_DEVICE_LOST_AFTER_GRAPH` to inject a failed Vulkan context after
+the selected graph and requires the failure to surface as an engine error.
 
 To run it in GitHub Actions, manually trigger `.github/workflows/parakeet-ci.yml`
 (`parakeet CI`) with **Run the TDT Vulkan context-loss soak on the Linux GPU
