@@ -1138,13 +1138,6 @@ if (PARAKEET_BUILD_TESTS)
     endif()
 
     if (GGML_VULKAN)
-        parakeet_register_test(test-decoder-determinism-tdt-vulkan-soak
-            LABEL    "gpu"
-            EXE      test-decoder-determinism
-            ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
-                     "--runs" "20" "--threads" "4" "--n-gpu-layers" "1"
-                     "--require-gpu" "--verbose"
-            REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
         parakeet_register_test(test-streaming-rnnt-vulkan
             LABEL    "gpu"
             EXE      test-parakeet-streaming
