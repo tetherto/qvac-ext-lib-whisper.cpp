@@ -21,28 +21,29 @@
 namespace tts_cpp::acestep {
 
 struct QuantVariant {
-    const char *   name;
-    enum ggml_type base;
-    enum ggml_type bump;   // type for important tensors (COUNT = no bump)
-    enum ggml_type embed;  // type for embed_tokens (COUNT = same as base)
+    const char *    name;
+    enum ggml_type  base;
+    enum ggml_type  bump;   // type for important tensors (COUNT = no bump)
+    enum ggml_type  embed;  // type for embed_tokens (COUNT = same as base)
     // 0 = none, 1 = first bump_layer_count layers, 2 = first + last + every
     // 3rd layer (M variants), 3 = every important tensor (L variants)
-    int            bump_mode;
-    int            bump_layer_count;
+    int             bump_mode;
+    int             bump_layer_count;
+    enum ggml_ftype ftype;  // written to general.file_type (u32, GGUF convention)
 };
 
 inline const QuantVariant * quant_variants(size_t & count) {
     static const QuantVariant variants[] = {
-        { "Q2_K",   GGML_TYPE_Q2_K, GGML_TYPE_Q4_K,  GGML_TYPE_Q6_K, 1, 4 },
-        { "Q3_K_S", GGML_TYPE_Q3_K, GGML_TYPE_COUNT, GGML_TYPE_Q6_K, 0, 0 },
-        { "Q3_K_M", GGML_TYPE_Q3_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K, 2, 0 },
-        { "Q3_K_L", GGML_TYPE_Q3_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K, 3, 0 },
-        { "Q4_K_S", GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K, 1, 4 },
-        { "Q4_K_M", GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,  GGML_TYPE_Q6_K, 2, 0 },
-        { "Q5_K_S", GGML_TYPE_Q5_K, GGML_TYPE_COUNT, GGML_TYPE_Q6_K, 0, 0 },
-        { "Q5_K_M", GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,  GGML_TYPE_Q6_K, 2, 0 },
-        { "Q6_K",   GGML_TYPE_Q6_K, GGML_TYPE_COUNT, GGML_TYPE_Q6_K, 0, 0 },
-        { "Q8_0",   GGML_TYPE_Q8_0, GGML_TYPE_COUNT, GGML_TYPE_Q8_0, 0, 0 },
+        { "Q2_K",   GGML_TYPE_Q2_K, GGML_TYPE_Q4_K,  GGML_TYPE_Q6_K, 1, 4, GGML_FTYPE_MOSTLY_Q2_K },
+        { "Q3_K_S", GGML_TYPE_Q3_K, GGML_TYPE_COUNT, GGML_TYPE_Q6_K, 0, 0, GGML_FTYPE_MOSTLY_Q3_K },
+        { "Q3_K_M", GGML_TYPE_Q3_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K, 2, 0, GGML_FTYPE_MOSTLY_Q3_K },
+        { "Q3_K_L", GGML_TYPE_Q3_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K, 3, 0, GGML_FTYPE_MOSTLY_Q3_K },
+        { "Q4_K_S", GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K, 1, 4, GGML_FTYPE_MOSTLY_Q4_K },
+        { "Q4_K_M", GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,  GGML_TYPE_Q6_K, 2, 0, GGML_FTYPE_MOSTLY_Q4_K },
+        { "Q5_K_S", GGML_TYPE_Q5_K, GGML_TYPE_COUNT, GGML_TYPE_Q6_K, 0, 0, GGML_FTYPE_MOSTLY_Q5_K },
+        { "Q5_K_M", GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,  GGML_TYPE_Q6_K, 2, 0, GGML_FTYPE_MOSTLY_Q5_K },
+        { "Q6_K",   GGML_TYPE_Q6_K, GGML_TYPE_COUNT, GGML_TYPE_Q6_K, 0, 0, GGML_FTYPE_MOSTLY_Q6_K },
+        { "Q8_0",   GGML_TYPE_Q8_0, GGML_TYPE_COUNT, GGML_TYPE_Q8_0, 0, 0, GGML_FTYPE_MOSTLY_Q8_0 },
     };
     count = sizeof(variants) / sizeof(variants[0]);
     return variants;

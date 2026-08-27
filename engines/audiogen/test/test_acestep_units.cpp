@@ -18,6 +18,7 @@
 //   9. parallel_load       — weight-load row/chunk decomposition parity.
 //   9b. fused load         — LM q|k|v / gate|up row blocks fail closed.
 //   10. quantize policy    — acestep-quantize per-tensor type selection.
+//   11. quantize roundtrip — synthetic GGUF through plan/stream/padding, read back.
 
 #include "backend_registry.h"
 #include "parallel_load.h"
@@ -33,6 +34,7 @@
 #include "lm_pipeline.h"
 #include "metadata_fsm.h"
 #include "philox.h"
+#include "quantize_gguf.h"
 #include "quantize_policy.h"
 #include "qwen3_block.h"
 #include "stage_placement.h"
@@ -919,9 +921,20 @@ void test_convert_f32_to_f16_rows() {
 // missing tensor must fail the load (false, offset untouched): skipping a block
 // would byte-shift every later one into silently wrong weights. The tiny GGUF
 // is written by the test itself; CPU buffers only.
+// POSIX runners set TMPDIR; Windows runners set TEMP/TMP and have no /tmp, so
+// a plain TMPDIR-or-/tmp fallback makes every file-writing test fail there.
+std::string test_temp_dir() {
+    for (const char * var : { "TMPDIR", "TEMP", "TMP" }) {
+        const char * val = std::getenv(var);
+        if (val && *val) {
+            return val;
+        }
+    }
+    return "/tmp";
+}
+
 std::string write_fused_test_gguf(const std::vector<std::pair<std::string, std::vector<float>>> & tensors, int ne0) {
-    const char *      tmp  = std::getenv("TMPDIR");
-    const std::string path = std::string(tmp ? tmp : "/tmp") + "/qvac-acestep-fused-load-test.gguf";
+    const std::string path = test_temp_dir() + "/qvac-acestep-fused-load-test.gguf";
 
     ggml_init_params ip{ 1024 * 1024, nullptr, /*no_alloc=*/false };
     ggml_context *   ctx = ggml_init(ip);
@@ -1662,6 +1675,127 @@ void test_quantize_policy() {
     CHECK(!quant_should_promote_f32(2));
 }
 
+// End-to-end guard on the offset/padding planning and the streaming writer: a
+// regression there emits a byte-shifted GGUF that only fails at engine load.
+// Quantizes a synthetic BF16-era file and reads the result back through the
+// gguf loader (which validates offsets and alignment structurally), then
+// checks every tensor's type and dequantized values against the source.
+void test_quantize_gguf_roundtrip() {
+    using namespace tts_cpp::acestep;
+
+    const std::string in_path  = test_temp_dir() + "/qvac-acestep-quantize-in.gguf";
+    const std::string out_path = test_temp_dir() + "/qvac-acestep-quantize-out.gguf";
+
+    // 32-wide rows quantize under Q8_0 (block size 32); the 24-wide tensor is
+    // unaligned and must be kept as stored; the BF16 1-D norm must be promoted
+    // to F32. Q8_0 row size is 34 bytes, so quantized tensors end misaligned
+    // and the writer's padding path is exercised between every pair.
+    std::vector<float> wide(32 * 4);
+    for (size_t i = 0; i < wide.size(); ++i) {
+        wide[i] = ((float) i - 64.0f) / 32.0f;
+    }
+    std::vector<float> narrow(24 * 2);
+    for (size_t i = 0; i < narrow.size(); ++i) {
+        narrow[i] = ((float) i - 24.0f) / 8.0f;
+    }
+    std::vector<float> norm(32);
+    for (size_t i = 0; i < norm.size(); ++i) {
+        norm[i] = 1.0f + (float) i / 100.0f;
+    }
+
+    ggml_init_params ip{ 4 * 1024 * 1024, nullptr, /*no_alloc=*/false };
+    ggml_context *   ctx = ggml_init(ip);
+    gguf_context *   gc  = gguf_init_empty();
+    gguf_set_val_str(gc, "general.architecture", "acestep-lm");
+    gguf_set_val_u32(gc, "acestep-lm.block_count", 1);
+
+    ggml_tensor * embed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 4);
+    ggml_set_name(embed, "model.embed_tokens.weight");
+    std::memcpy(embed->data, wide.data(), wide.size() * sizeof(float));
+    gguf_add_tensor(gc, embed);
+
+    ggml_tensor * vproj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 4);
+    ggml_set_name(vproj, "model.layers.0.self_attn.v_proj.weight");
+    std::memcpy(vproj->data, wide.data(), wide.size() * sizeof(float));
+    gguf_add_tensor(gc, vproj);
+
+    ggml_tensor * ln = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, 32);
+    ggml_set_name(ln, "model.layers.0.input_layernorm.weight");
+    ggml_fp32_to_bf16_row(norm.data(), (ggml_bf16_t *) ln->data, (int64_t) norm.size());
+    gguf_add_tensor(gc, ln);
+
+    std::vector<float> norm_bf16(norm.size());
+    ggml_bf16_to_fp32_row((const ggml_bf16_t *) ln->data, norm_bf16.data(), (int64_t) norm.size());
+
+    ggml_tensor * odd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 24, 2);
+    ggml_set_name(odd, "model.layers.0.mlp.gate_proj.weight");
+    std::memcpy(odd->data, narrow.data(), narrow.size() * sizeof(float));
+    gguf_add_tensor(gc, odd);
+
+    CHECK(gguf_write_to_file(gc, in_path.c_str(), /*only_meta=*/false));
+    gguf_free(gc);
+    ggml_free(ctx);
+
+    const QuantVariant * q80 = find_quant_variant("Q8_0");
+    QuantizeStats        stats;
+    std::string          error;
+    CHECK(quantize_gguf_file(in_path, out_path, *q80, stats, error));
+    CHECK(error.empty());
+    CHECK(stats.n_tensors == 4);
+    CHECK(stats.n_quantized == 2);
+    CHECK(stats.n_promoted == 1);
+
+    ggml_context *   out_meta   = nullptr;
+    gguf_init_params out_params = { /*no_alloc=*/false, /*ctx=*/&out_meta };
+    gguf_context *   out        = gguf_init_from_file(out_path.c_str(), out_params);
+    CHECK(out != nullptr);
+    if (out) {
+        const int64_t ft_idx = gguf_find_key(out, "general.file_type");
+        CHECK(ft_idx >= 0 && gguf_get_kv_type(out, ft_idx) == GGUF_TYPE_UINT32);
+        CHECK(gguf_get_val_u32(out, ft_idx) == (uint32_t) GGML_FTYPE_MOSTLY_Q8_0);
+
+        const size_t alignment = gguf_get_alignment(out);
+        for (int64_t i = 0; i < gguf_get_n_tensors(out); ++i) {
+            CHECK(gguf_get_tensor_offset(out, i) % alignment == 0);
+        }
+
+        ggml_tensor * q_vproj = ggml_get_tensor(out_meta, "model.layers.0.self_attn.v_proj.weight");
+        CHECK(q_vproj && q_vproj->type == GGML_TYPE_Q8_0);
+        if (q_vproj) {
+            std::vector<float> back(wide.size());
+            ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(q_vproj->data, back.data(),
+                                                           (int64_t) back.size());
+            for (size_t i = 0; i < back.size(); ++i) {
+                CHECK(std::fabs(back[i] - wide[i]) < 0.02f);
+            }
+        }
+
+        ggml_tensor * q_embed = ggml_get_tensor(out_meta, "model.embed_tokens.weight");
+        CHECK(q_embed && q_embed->type == GGML_TYPE_Q8_0);
+
+        ggml_tensor * q_ln = ggml_get_tensor(out_meta, "model.layers.0.input_layernorm.weight");
+        CHECK(q_ln && q_ln->type == GGML_TYPE_F32);
+        if (q_ln) {
+            const float * vals = (const float *) q_ln->data;
+            for (size_t i = 0; i < norm_bf16.size(); ++i) {
+                CHECK(vals[i] == norm_bf16[i]);
+            }
+        }
+
+        ggml_tensor * q_odd = ggml_get_tensor(out_meta, "model.layers.0.mlp.gate_proj.weight");
+        CHECK(q_odd && q_odd->type == GGML_TYPE_F32);
+        if (q_odd) {
+            CHECK(std::memcmp(q_odd->data, narrow.data(), narrow.size() * sizeof(float)) == 0);
+        }
+
+        gguf_free(out);
+        ggml_free(out_meta);
+    }
+
+    std::remove(in_path.c_str());
+    std::remove(out_path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -1702,6 +1836,7 @@ int main() {
     test_wav_reader_mono_and_stereo();
     test_wav_reader_rejects_multichannel();
     test_quantize_policy();
+    test_quantize_gguf_roundtrip();
 
     std::fprintf(stderr, "[test-acestep-units] %d/%d checks passed\n", g_checks - g_failures, g_checks);
     return g_failures == 0 ? 0 : 1;

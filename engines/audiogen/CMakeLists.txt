@@ -330,7 +330,6 @@ if (AUDIOGEN_INSTALL AND AUDIOGEN_BUILD_LIBRARY)
     install(FILES
         scripts/convert-acestep-to-gguf.py
         scripts/download-acestep-checkpoints.sh
-        scripts/download-minimax-music3.sh
         DESTINATION ${CMAKE_INSTALL_DATADIR}/audiogen-cpp/scripts
     )
     if (AUDIOGEN_BUILD_MINIMAX)
@@ -338,7 +337,9 @@ if (AUDIOGEN_INSTALL AND AUDIOGEN_BUILD_LIBRARY)
             DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/audiogen-cpp
             FILES_MATCHING PATTERN "*.h"
         )
-        install(FILES scripts/convert-minimax-music3-to-gguf.py
+        install(FILES
+            scripts/convert-minimax-music3-to-gguf.py
+            scripts/download-minimax-music3.sh
             DESTINATION ${CMAKE_INSTALL_DATADIR}/audiogen-cpp/scripts
         )
     endif()

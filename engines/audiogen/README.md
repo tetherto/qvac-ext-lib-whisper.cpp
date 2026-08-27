@@ -88,9 +88,9 @@ model license with converted weights.
 parity harness:
 
 ```sh
-./build/audiogen/mm3-replay --models models/minimax --out mm3-out --mode full \
-                            --caption "warm lo-fi beat with vinyl crackle" \
-                            --lyrics "[Instrumental]" --max-frames 300
+./build/engines/audiogen/mm3-replay --models models/minimax --out mm3-out --mode full \
+                                    --caption "warm lo-fi beat with vinyl crackle" \
+                                    --lyrics "[Instrumental]" --max-frames 300
 ```
 
 `--mode full` runs the pipeline from a caption/lyrics pair, `--mode
