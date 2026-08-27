@@ -17,6 +17,7 @@
 //   8. stage placement     — which backend the LM / detokenizer / encoders run on.
 //   9. parallel_load       — weight-load row/chunk decomposition parity.
 //   9b. fused load         — LM q|k|v / gate|up row blocks fail closed.
+//   10. quantize policy    — acestep-quantize per-tensor type selection.
 
 #include "backend_registry.h"
 #include "parallel_load.h"
@@ -32,6 +33,7 @@
 #include "lm_pipeline.h"
 #include "metadata_fsm.h"
 #include "philox.h"
+#include "quantize_policy.h"
 #include "qwen3_block.h"
 #include "stage_placement.h"
 #include "vae_encode_windows.h"
@@ -1605,6 +1607,61 @@ void test_wav_reader_rejects_multichannel() {
     CHECK(result.pcm.empty());
 }
 
+void test_quantize_policy() {
+    using namespace tts_cpp::acestep;
+
+    const QuantVariant * q4km = find_quant_variant("q4_k_m");
+    const QuantVariant * q80  = find_quant_variant("Q8_0");
+    const QuantVariant * q2k  = find_quant_variant("Q2_K");
+    const QuantVariant * q3kl = find_quant_variant("Q3_K_L");
+    CHECK(q4km != nullptr && q4km->base == GGML_TYPE_Q4_K);
+    CHECK(q80 != nullptr && q2k != nullptr && q3kl != nullptr);
+    CHECK(find_quant_variant("Q4_K") == nullptr);
+
+    CHECK(quant_layer_index("model.layers.12.self_attn.v_proj.weight") == 12);
+    CHECK(quant_layer_index("model.embed_tokens.weight") == -1);
+
+    // The deny-list: VAE files, 1-D tensors, the text encoder's embedding, and
+    // the DiT's quality-critical extras are never quantized.
+    CHECK(quant_pick_type("decoder.conv1.weight", 3, "acestep-vae", *q4km, 0) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("model.norm.weight", 1, "acestep-lm", *q4km, 24) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("embed_tokens.weight", 2, "acestep-text-enc", *q4km, 28) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("silence_latent", 2, "acestep-dit", *q4km, 24) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("decoder.scale_shift_table", 2, "acestep-dit", *q4km, 24) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("null_condition_emb", 2, "acestep-dit", *q4km, 24) == GGML_TYPE_COUNT);
+
+    // The LM embedding takes the variant's embed type, everything ordinary the base.
+    CHECK(quant_pick_type("model.embed_tokens.weight", 2, "acestep-lm", *q4km, 24) == GGML_TYPE_Q6_K);
+    CHECK(quant_pick_type("model.embed_tokens.weight", 2, "acestep-lm", *q80, 24) == GGML_TYPE_Q8_0);
+    CHECK(quant_pick_type("model.layers.4.self_attn.q_proj.weight", 2, "acestep-lm", *q4km, 24) ==
+          GGML_TYPE_Q4_K);
+
+    // M-variant bump: first n/9, last n/7, and every 3rd layer of v_proj/down_proj.
+    CHECK(quant_pick_type("model.layers.0.self_attn.v_proj.weight", 2, "acestep-lm", *q4km, 24) ==
+          GGML_TYPE_Q6_K);
+    CHECK(quant_pick_type("model.layers.3.mlp.down_proj.weight", 2, "acestep-lm", *q4km, 24) ==
+          GGML_TYPE_Q6_K);
+    CHECK(quant_pick_type("model.layers.22.self_attn.v_proj.weight", 2, "acestep-lm", *q4km, 24) ==
+          GGML_TYPE_Q6_K);
+    CHECK(quant_pick_type("model.layers.4.self_attn.v_proj.weight", 2, "acestep-lm", *q4km, 24) ==
+          GGML_TYPE_Q4_K);
+
+    // S-variant bump: only the first bump_layer_count layers.
+    CHECK(quant_pick_type("model.layers.3.self_attn.v_proj.weight", 2, "acestep-lm", *q2k, 24) ==
+          GGML_TYPE_Q4_K);
+    CHECK(quant_pick_type("model.layers.4.self_attn.v_proj.weight", 2, "acestep-lm", *q2k, 24) ==
+          GGML_TYPE_Q2_K);
+
+    // L-variant bump: o_proj joins the important set, at every layer.
+    CHECK(quant_pick_type("model.layers.10.self_attn.o_proj.weight", 2, "acestep-lm", *q3kl, 24) ==
+          GGML_TYPE_Q5_K);
+    CHECK(quant_pick_type("model.layers.10.self_attn.o_proj.weight", 2, "acestep-lm", *q4km, 24) ==
+          GGML_TYPE_Q4_K);
+
+    CHECK(quant_should_promote_f32(1));
+    CHECK(!quant_should_promote_f32(2));
+}
+
 }  // namespace
 
 int main() {
@@ -1644,6 +1701,7 @@ int main() {
     test_vae_encode_window_parity();
     test_wav_reader_mono_and_stereo();
     test_wav_reader_rejects_multichannel();
+    test_quantize_policy();
 
     std::fprintf(stderr, "[test-acestep-units] %d/%d checks passed\n", g_checks - g_failures, g_checks);
     return g_failures == 0 ? 0 : 1;

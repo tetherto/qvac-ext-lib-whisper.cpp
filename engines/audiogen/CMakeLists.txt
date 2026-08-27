@@ -209,6 +209,7 @@ if (AUDIOGEN_BUILD_EXECUTABLES)
              bpe_smoke:bpe-smoke
              lmgen_smoke:lmgen-smoke
              detok_smoke:detok-smoke
+             quantize_cli:acestep-quantize
              music_cli:music-cli)
         string(REPLACE ":" ";" _pair ${_tool})
         list(GET _pair 0 _src)
@@ -259,6 +260,15 @@ if (AUDIOGEN_BUILD_TESTS)
     audiogen_link_in_tree_binary(test-acestep-integration)
     audiogen_register_test(test-acestep-integration LABEL "integration")
     set_property(TEST test-acestep-integration PROPERTY SKIP_RETURN_CODE 77)
+
+    find_package(Python3 COMPONENTS Interpreter)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME test-acestep-converter
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_convert_acestep.py
+        )
+        set_property(TEST test-acestep-converter PROPERTY LABELS "unit")
+        set_property(TEST test-acestep-converter PROPERTY ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+    endif()
 
     if (AUDIOGEN_BUILD_MINIMAX)
         add_executable(test-minimax-units test/test_minimax_units.cpp)
@@ -316,6 +326,12 @@ if (AUDIOGEN_INSTALL AND AUDIOGEN_BUILD_LIBRARY)
     )
     install(FILES LICENSE NOTICE
         DESTINATION ${CMAKE_INSTALL_DATADIR}/audiogen-cpp
+    )
+    install(FILES
+        scripts/convert-acestep-to-gguf.py
+        scripts/download-acestep-checkpoints.sh
+        scripts/download-minimax-music3.sh
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/audiogen-cpp/scripts
     )
     if (AUDIOGEN_BUILD_MINIMAX)
         install(DIRECTORY include/audiogen-cpp/minimax

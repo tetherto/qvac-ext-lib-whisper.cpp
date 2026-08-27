@@ -209,6 +209,8 @@ The per-engine `whisper-cpp`, `parakeet-cpp`, `tts-cpp` and `audiogen-cpp` ports
 | `audio8-cli` | tts | Audio8 synthesis and zero-shot voice cloning |
 | `music-cli` | audiogen | end-to-end text-to-music |
 | `acestep-cli` | audiogen | Oobleck VAE decode and roundtrip harness |
+| `acestep-quantize` | audiogen | requantize converted ACE-Step stage GGUFs |
+| `mm3-replay` | audiogen | MiniMax-Music3 generation and parity harness |
 | `lavasr-bench` | tts | denoiser and enhancer benchmark |
 | `mel2wav` | tts | HiFT mel to wav |
 
@@ -297,8 +299,9 @@ See [Voice conditioning](engines/tts/README.md#voice-conditioning-cross-engine).
 
 AudioGen uses four GGUF files for six runtime weight sets. The DiT file also
 contains the FSQ detokenizer and condition encoder; see the
-[AudioGen model setup](engines/audiogen/README.md#model-setup) for validated
-file combinations and registry download instructions.
+[AudioGen model setup](engines/audiogen/README.md#model-setup) for the
+validated file combinations and the download, conversion, and quantization
+steps that produce them.
 
 ```sh
 ./build/engines/audiogen/music-cli --models models/acestep \
@@ -362,7 +365,7 @@ On-device Android and iOS performance is tracked by the benchmark lanes in [QVAC
 
 ## Use in QVAC
 
-These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons, which consume the `speech-cpp` vcpkg port built from this repo. The CLIs here are development and validation entry points: for anything beyond them, such as the JavaScript and TypeScript APIs on the Bare runtime, model download and registry, and desktop plus mobile app integration, see QVAC.
+These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons, which consume the `speech-cpp` vcpkg port built from this repo. The CLIs here are development and validation entry points: for anything beyond them, such as the JavaScript and TypeScript APIs on the Bare runtime and desktop plus mobile app integration, see QVAC.
 
 | QVAC addon | Wraps | `speech-cpp` features consumed |
 |---|---|---|
