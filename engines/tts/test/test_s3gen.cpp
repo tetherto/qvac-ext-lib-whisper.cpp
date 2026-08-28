@@ -13,11 +13,14 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+#include "backend_selection.h"
+
 #include "npy.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -38,7 +41,63 @@ struct model_ctx {
 };
 } // namespace
 
-static model_ctx load_s3gen_gguf(const std::string & path) {
+static ggml_backend_t init_backend(int n_gpu_layers) {
+    if (n_gpu_layers > 0) {
+        ggml_backend_t gpu = ::tts_cpp::detail::init_gpu_backend(
+            n_gpu_layers, /*verbose=*/true, "s3gen");
+        if (!gpu) {
+            // A GPU arm that quietly runs on the CPU reports a pass for a
+            // backend it never touched.
+            throw std::runtime_error(
+                "--n-gpu-layers > 0 but no GPU backend was selected");
+        }
+        return gpu;
+    }
+    return ggml_backend_cpu_init();
+}
+
+static int g_failures = 0;
+
+// Worst relative error observed across CPU, CUDA and Vulkan on the reference
+// dump, with headroom. Comparisons absent from the table take STAGE_TOLERANCE.
+struct stage_tolerance {
+    const char * name;
+    double       rel;
+};
+
+static constexpr double STAGE_TOLERANCE = 2e-3;
+
+static constexpr stage_tolerance STAGE_TOLERANCES[] = {
+    { "f0",             5e-2 },
+    { "stft",           2e-2 },
+    { "ups1",           1e-2 },
+    { "ups2",           1e-2 },
+    { "cfm_step0_dxdt", 5e-3 },
+};
+
+static double tolerance_for(const char * name) {
+    for (const stage_tolerance & entry : STAGE_TOLERANCES) {
+        if (std::strcmp(entry.name, name) == 0) {
+            return entry.rel;
+        }
+    }
+    return STAGE_TOLERANCE;
+}
+
+// The harness used to report every number and exit 0, so a corrupt, truncated
+// or non-finite stage read as a pass.
+static void record_comparison(const char * name, const compare_stats & stats) {
+    print_compare(name, stats);
+    const double tolerance = tolerance_for(name);
+    if (compare_within(stats, tolerance)) {
+        return;
+    }
+    fprintf(stderr, "  [%s] FAIL rel=%.3e tolerance=%.3e compared=%zu non_finite=%zu\n",
+            name, stats.rel_err, tolerance, stats.n, stats.non_finite);
+    ++g_failures;
+}
+
+static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers) {
     model_ctx m;
 
     ggml_context * tmp_ctx = nullptr;
@@ -46,7 +105,7 @@ static model_ctx load_s3gen_gguf(const std::string & path) {
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) throw std::runtime_error("gguf_init_from_file failed: " + path);
 
-    m.backend = ggml_backend_cpu_init();
+    m.backend = init_backend(n_gpu_layers);
     int64_t n_tensors = gguf_get_n_tensors(g);
 
     ggml_init_params p = { ggml_tensor_overhead() * (size_t)n_tensors, nullptr, true };
@@ -157,7 +216,7 @@ static void stage_A(const model_ctx & m, const std::string & ref_dir) {
     ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
 
     auto stats = compare_f32(out.data(), npy_as_f32(expect), std::min(out.size(), expect.n_elements()));
-    print_compare("speaker_emb_affine", stats);
+    record_comparison("speaker_emb_affine", stats);
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
 }
@@ -197,7 +256,7 @@ static void stage_B(const model_ctx & m, const std::string & ref_dir) {
     ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
 
     auto stats = compare_f32(out.data(), npy_as_f32(expect), std::min(out.size(), expect.n_elements()));
-    print_compare("input_embedded", stats);
+    record_comparison("input_embedded", stats);
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
 }
@@ -263,7 +322,7 @@ static void stage_C(const model_ctx & m, const std::string & ref_dir) {
 
     // Verify pe against expected first
     auto pe_stats = compare_f32(pe.data(), npy_as_f32(exp_p), pe.size());
-    print_compare("pos_emb", pe_stats);
+    record_comparison("pos_emb", pe_stats);
 
     // Now compute x' = LayerNorm(Linear(x)) * sqrt(D)
     static size_t buf_size = ggml_tensor_overhead()*64 + ggml_graph_overhead();
@@ -304,7 +363,7 @@ static void stage_C(const model_ctx & m, const std::string & ref_dir) {
     ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
 
     auto xs = compare_f32(out.data(), npy_as_f32(exp_x), std::min(out.size(), exp_x.n_elements()));
-    print_compare("encoder_embed_x", xs);
+    record_comparison("encoder_embed_x", xs);
 
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
@@ -380,7 +439,7 @@ static void stage_D(const model_ctx & m, const std::string & ref_dir) {
     ggml_backend_tensor_get(out, out_data.data(), 0, ggml_nbytes(out));
 
     auto s = compare_f32(out_data.data(), npy_as_f32(exp_npy), std::min(out_data.size(), exp_npy.n_elements()));
-    print_compare("pre_lookahead", s);
+    record_comparison("pre_lookahead", s);
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
 }
@@ -572,7 +631,7 @@ static void stage_E0(const model_ctx & m, const std::string & ref_dir) {
 
         npy_array exp = npy_load(ref_dir + "/" + exp_file);
         auto s = compare_f32(out.data(), npy_as_f32(exp), std::min(out.size(), exp.n_elements()));
-        print_compare(name.c_str(), s);
+        record_comparison(name.c_str(), s);
         ggml_gallocr_free(allocr);
         ggml_free(ctx);
     };
@@ -639,7 +698,7 @@ static void stage_E(const model_ctx & m, const std::string & ref_dir) {
     ggml_backend_tensor_get(out, out_data.data(), 0, ggml_nbytes(out));
 
     auto s = compare_f32(out_data.data(), npy_as_f32(expect_npy), std::min(out_data.size(), expect_npy.n_elements()));
-    print_compare("enc_block0_out", s);
+    record_comparison("enc_block0_out", s);
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
 }
@@ -825,18 +884,18 @@ static void stage_F(const model_ctx & m, const std::string & ref_dir) {
         ggml_backend_tensor_get(b5, b5d.data(), 0, ggml_nbytes(b5));
         npy_array exp5 = npy_load(ref_dir + "/enc_block5_tup0.npy");
         auto s5 = compare_f32(b5d.data(), npy_as_f32(exp5), std::min(b5d.size(), exp5.n_elements()));
-        print_compare("enc_block5", s5);
+        record_comparison("enc_block5", s5);
     }
 
     std::vector<float> enc_out_data(ggml_nelements(x));
     ggml_backend_tensor_get(x, enc_out_data.data(), 0, ggml_nbytes(x));
     auto s1 = compare_f32(enc_out_data.data(), npy_as_f32(expect_out), std::min(enc_out_data.size(), expect_out.n_elements()));
-    print_compare("encoder_out (after_norm)", s1);
+    record_comparison("encoder_out (after_norm)", s1);
 
     std::vector<float> mu_data(ggml_nelements(mu));
     ggml_backend_tensor_get(mu, mu_data.data(), 0, ggml_nbytes(mu));
     auto s2 = compare_f32(mu_data.data(), npy_as_f32(expect_proj), std::min(mu_data.size(), expect_proj.n_elements()));
-    print_compare("encoder_proj (mu)", s2);
+    record_comparison("encoder_proj (mu)", s2);
 
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
@@ -882,9 +941,9 @@ static void stage_G1(const model_ctx & m, const std::string & ref_dir) {
     compute_t_sin_emb(r_val, TDIM, 1000.0f, r_sin);
 
     auto s1 = compare_f32(t_sin.data(), npy_as_f32(t_sin_exp), t_sin.size());
-    print_compare("t_sinemb", s1);
+    record_comparison("t_sinemb", s1);
     auto s2 = compare_f32(r_sin.data(), npy_as_f32(r_sin_exp), r_sin.size());
-    print_compare("r_sinemb", s2);
+    record_comparison("r_sinemb", s2);
 
     // Build a tiny graph: sin_in -> Linear -> SiLU -> Linear. Do it for t and r, concat, then mixer linear.
     static size_t buf_size = ggml_tensor_overhead()*64 + ggml_graph_overhead();
@@ -934,17 +993,17 @@ static void stage_G1(const model_ctx & m, const std::string & ref_dir) {
     std::vector<float> t_mlp_out_data(ggml_nelements(t_mlp_out));
     ggml_backend_tensor_get(t_mlp_out, t_mlp_out_data.data(), 0, ggml_nbytes(t_mlp_out));
     auto s3 = compare_f32(t_mlp_out_data.data(), npy_as_f32(t_mlp_exp), t_mlp_out_data.size());
-    print_compare("t_mlp", s3);
+    record_comparison("t_mlp", s3);
 
     std::vector<float> r_mlp_out_data(ggml_nelements(r_mlp_out));
     ggml_backend_tensor_get(r_mlp_out, r_mlp_out_data.data(), 0, ggml_nbytes(r_mlp_out));
     auto s4 = compare_f32(r_mlp_out_data.data(), npy_as_f32(r_mlp_exp), r_mlp_out_data.size());
-    print_compare("r_mlp", s4);
+    record_comparison("r_mlp", s4);
 
     std::vector<float> mix_data(ggml_nelements(mixed));
     ggml_backend_tensor_get(mixed, mix_data.data(), 0, ggml_nbytes(mixed));
     auto s5 = compare_f32(mix_data.data(), npy_as_f32(t_mix_exp), std::min(mix_data.size(), t_mix_exp.n_elements()));
-    print_compare("time_mixer", s5);
+    record_comparison("time_mixer", s5);
 
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
@@ -1168,7 +1227,7 @@ static void stage_G2(const model_ctx & m, const std::string & ref_dir) {
         std::vector<float> data(ggml_nelements(t));
         ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
         auto s = compare_f32(data.data(), npy_as_f32(exp), std::min(data.size(), exp.n_elements()));
-        print_compare(name, s);
+        record_comparison(name, s);
     };
     {
         npy_array exp = npy_load(ref_dir + "/cfm_concat.npy");
@@ -1191,7 +1250,7 @@ static void stage_G2(const model_ctx & m, const std::string & ref_dir) {
             fprintf(stderr, "    got: %.4f  ref: %.4f\n", data[mismatch_at], ref[mismatch_at]);
         }
         auto s = compare_f32(data.data(), ref, std::min(data.size(), exp.n_elements()));
-        print_compare("xc", s);
+        record_comparison("xc", s);
     }
     check_stage("h_conv", h_conv, "cfm_h_conv.npy");
     {
@@ -1208,7 +1267,7 @@ static void stage_G2(const model_ctx & m, const std::string & ref_dir) {
         fprintf(stderr, "  ref h_ln[T..T+4]: %.4f %.4f %.4f %.4f %.4f\n",
                 ref[T], ref[T+1], ref[T+2], ref[T+3], ref[T+4]);
         auto s = compare_f32(data.data(), ref, std::min(data.size(), exp.n_elements()));
-        print_compare("h_ln", s);
+        record_comparison("h_ln", s);
     }
     check_stage("h_b1", h_b1, "cfm_d0_rn_b1_call0.npy");
     check_stage("t_proj", t_proj, "cfm_d0_rn_mlp_call0.npy");
@@ -1360,7 +1419,7 @@ static void stage_G3(const model_ctx & m, const std::string & ref_dir) {
         std::vector<float> data(ggml_nelements(t));
         ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
         auto s = compare_f32(data.data(), npy_as_f32(exp), std::min(data.size(), exp.n_elements()));
-        print_compare(name, s);
+        record_comparison(name, s);
     };
     check_stage("nx (norm1)", nx, "cfm_d0_t0_n1_call0.npy");
     check_stage("attn_out", attn, "cfm_d0_t0_attn_call0.npy");
@@ -1521,7 +1580,7 @@ static void stage_G4(const model_ctx & m, const std::string & ref_dir) {
     std::vector<float> out_data(ggml_nelements(out));
     ggml_backend_tensor_get(out, out_data.data(), 0, ggml_nbytes(out));
     auto s = compare_f32(out_data.data(), npy_as_f32(dxdt_exp), std::min(out_data.size(), dxdt_exp.n_elements()));
-    print_compare("cfm_step0_dxdt", s);
+    record_comparison("cfm_step0_dxdt", s);
 
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
@@ -1634,7 +1693,7 @@ static void stage_H1(const model_ctx & m, const std::string & ref_dir) {
     std::vector<float> out_data(ggml_nelements(y));
     ggml_backend_tensor_get(y, out_data.data(), 0, ggml_nbytes(y));
     auto s = compare_f32(out_data.data(), npy_as_f32(exp_npy), std::min(out_data.size(), exp_npy.n_elements()));
-    print_compare("f0", s);
+    record_comparison("f0", s);
 
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
@@ -1931,7 +1990,7 @@ static void stage_H3(const model_ctx & m, const std::string & ref_dir) {
                 name, (long long)t->ne[0], (long long)t->ne[1],
                 (long long)exp.shape[0], (long long)exp.shape[1]);
         auto ss = compare_f32(data.data(), npy_as_f32(exp), std::min(data.size(), exp.n_elements()));
-        print_compare(name, ss);
+        record_comparison(name, ss);
     };
     check("conv_pre", "conv_pre_out", "hift_conv_pre.npy");
     check("ups0",     "ups0_out",     "hift_ups0.npy");
@@ -1942,7 +2001,7 @@ static void stage_H3(const model_ctx & m, const std::string & ref_dir) {
     check("ups2",     "ups2_out",     "hift_ups2.npy");
 
     auto s = compare_f32(out_data.data(), npy_as_f32(exp_npy), std::min(out_data.size(), exp_npy.n_elements()));
-    print_compare("conv_post", s);
+    record_comparison("conv_post", s);
 
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
@@ -2013,7 +2072,6 @@ static ggml_tensor * reflect_pad_1d(ggml_context * ctx, ggml_tensor * x, int p_l
 //   Input: source signal (65280,)
 //   Output: spec (18, 16321) = concat(real(9, T_stft), imag(9, T_stft))
 static void stage_H4(const model_ctx & m, const std::string & ref_dir) {
-    (void)m;
     fprintf(stderr, "\n=== Stage H4: STFT ===\n");
     npy_array src_npy = npy_load(ref_dir + "/hift_msource_tup0.npy");
     npy_array exp_npy = npy_load(ref_dir + "/hift_s_stft.npy");
@@ -2045,14 +2103,13 @@ static void stage_H4(const model_ctx & m, const std::string & ref_dir) {
     ggml_set_name(spec, "spec"); ggml_set_output(spec);
     ggml_build_forward_expand(gf, spec);
 
-    ggml_backend_t cpu = ggml_backend_cpu_init();
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "src"), npy_as_f32(src_npy), 0, src_npy.data.size());
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "kernel"), kernel_data.data(), 0, kernel_data.size() * sizeof(float));
-    ggml_backend_graph_compute(cpu, gf);
+    ggml_backend_graph_compute(m.backend, gf);
 
     std::vector<float> out_data(ggml_nelements(spec));
     ggml_backend_tensor_get(spec, out_data.data(), 0, ggml_nbytes(spec));
@@ -2062,10 +2119,9 @@ static void stage_H4(const model_ctx & m, const std::string & ref_dir) {
             (long long)exp_npy.shape[0], (long long)exp_npy.shape[1]);
 
     auto s = compare_f32(out_data.data(), npy_as_f32(exp_npy), std::min(out_data.size(), exp_npy.n_elements()));
-    print_compare("stft", s);
+    record_comparison("stft", s);
 
     ggml_gallocr_free(allocr);
-    ggml_backend_free(cpu);
     ggml_free(ctx);
 }
 
@@ -2111,7 +2167,6 @@ static std::vector<float> build_window_sum(int T_stft, int n_fft, int hop, const
 
 // Stage H5: ISTFT of conv_post output -> waveform
 static void stage_H5(const model_ctx & m, const std::string & ref_dir) {
-    (void)m;
     fprintf(stderr, "\n=== Stage H5: ISTFT (conv_post -> waveform) ===\n");
     npy_array cp_npy  = npy_load(ref_dir + "/hift_conv_post.npy");  // (18, 16321)
     npy_array wav_npy = npy_load(ref_dir + "/waveform.npy");         // (65280,)
@@ -2203,8 +2258,7 @@ static void stage_H5(const model_ctx & m, const std::string & ref_dir) {
     ggml_set_name(y_trim, "wav"); ggml_set_output(y_trim);
     ggml_build_forward_expand(gf, y_trim);
 
-    ggml_backend_t cpu = ggml_backend_cpu_init();
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
 
@@ -2212,7 +2266,7 @@ static void stage_H5(const model_ctx & m, const std::string & ref_dir) {
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "kernel"), istft_kernel.data(),       0, istft_kernel.size() * sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "w_sum"),  w_sum.data(),              0, w_sum.size() * sizeof(float));
 
-    ggml_backend_graph_compute(cpu, gf);
+    ggml_backend_graph_compute(m.backend, gf);
 
     std::vector<float> out_data(ggml_nelements(y_trim));
     ggml_backend_tensor_get(y_trim, out_data.data(), 0, ggml_nbytes(y_trim));
@@ -2221,24 +2275,31 @@ static void stage_H5(const model_ctx & m, const std::string & ref_dir) {
             (long long)y_trim->ne[0], (long long)y_trim->ne[1], (long long)wav_npy.shape[0]);
 
     auto s = compare_f32(out_data.data(), npy_as_f32(wav_npy), std::min(out_data.size(), wav_npy.n_elements()));
-    print_compare("waveform", s);
+    record_comparison("waveform", s);
 
     ggml_gallocr_free(allocr);
-    ggml_backend_free(cpu);
     ggml_free(ctx);
 }
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s S3GEN_GGUF REFERENCE_DIR [stage=A|B|C|D|E|E0|F|G1|G2|G3|G4|H1|H3|H4|H5|ALL]\n", argv[0]);
+        fprintf(stderr, "usage: %s S3GEN_GGUF REFERENCE_DIR "
+                        "[stage=A|B|C|D|E|E0|F|G1|G2|G3|G4|H1|H3|H4|H5|ALL] "
+                        "[--n-gpu-layers N]\n", argv[0]);
         return 1;
     }
     const std::string gguf_path = argv[1];
     const std::string ref_dir   = argv[2];
-    const std::string stage     = argc > 3 ? argv[3] : "ALL";
+    std::string stage = "ALL";
+    int n_gpu_layers  = 0;
+    for (int i = 3; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--n-gpu-layers" && i + 1 < argc) n_gpu_layers = atoi(argv[++i]);
+        else                                       stage        = a;
+    }
 
-    fprintf(stderr, "Loading %s\n", gguf_path.c_str());
-    model_ctx m = load_s3gen_gguf(gguf_path);
+    fprintf(stderr, "Loading %s (gpu_layers=%d)\n", gguf_path.c_str(), n_gpu_layers);
+    model_ctx m = load_s3gen_gguf(gguf_path, n_gpu_layers);
     fprintf(stderr, "  %zu tensors loaded, backend=%s\n", m.tensors.size(),
             ggml_backend_name(m.backend));
 
@@ -2266,5 +2327,10 @@ int main(int argc, char ** argv) {
     ggml_backend_buffer_free(m.buffer_w);
     ggml_backend_free(m.backend);
     ggml_free(m.ctx_w);
+
+    if (g_failures) {
+        fprintf(stderr, "\n%d stage comparison(s) outside tolerance\n", g_failures);
+        return 1;
+    }
     return 0;
 }

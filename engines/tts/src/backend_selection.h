@@ -40,13 +40,20 @@ namespace tts_cpp::detail {
 // post-selection) matters on multi-backend hosts: with a post-selection
 // gate, a Vulkan device sorting first would knock out an available Metal
 // device instead of yielding to it.
-enum class GpuBackendRequirement {
-    Any,
-    Vulkan,
-    VulkanOrMetal,
-    MetalOrOpenCL,
-    MetalOrOpenCLOrVulkan,
+// Bit flags, so an engine names the backends it validated by OR-ing them
+// together rather than the enum growing one value per combination.
+enum class GpuBackendRequirement : unsigned {
+    Vulkan = 1u << 0,
+    Metal  = 1u << 1,
+    OpenCL = 1u << 2,
+    CUDA   = 1u << 3,
+    // Every registered GPU, including any backend with no flag of its own.
+    Any    = ~0u,
 };
+
+constexpr GpuBackendRequirement operator|(GpuBackendRequirement a, GpuBackendRequirement b) {
+    return static_cast<GpuBackendRequirement>(static_cast<unsigned>(a) | static_cast<unsigned>(b));
+}
 
 bool gpu_backend_satisfies_requirement(const char * backend_name,
                                        GpuBackendRequirement requirement);

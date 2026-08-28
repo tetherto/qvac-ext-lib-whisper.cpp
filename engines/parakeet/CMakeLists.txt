@@ -549,6 +549,7 @@ if (PARAKEET_BUILD_TESTS)
     # tests at the f16 GGUFs and leave q8_0 in place for everything else.
     set(_qvp_ctc_q8_gguf   "${PARAKEET_TEST_MODEL_DIR}/parakeet-ctc-0.6b.q8_0.gguf")
     set(_qvp_ctc_f16_gguf  "${PARAKEET_TEST_MODEL_DIR}/parakeet-ctc-0.6b.f16.gguf")
+    set(_qvp_rnnt_q8_gguf  "${PARAKEET_TEST_MODEL_DIR}/parakeet-unified-en-0.6b.q8_0.gguf")
     set(_qvp_tdt_q8_gguf   "${PARAKEET_TEST_MODEL_DIR}/parakeet-tdt-0.6b-v3.q8_0.gguf")
     set(_qvp_tdt_f16_gguf  "${PARAKEET_TEST_MODEL_DIR}/parakeet-tdt-0.6b-v3.f16.gguf")
     set(_qvp_eou_q8_gguf   "${PARAKEET_TEST_MODEL_DIR}/parakeet_realtime_eou_120m-v1.q8_0.gguf")
@@ -556,9 +557,14 @@ if (PARAKEET_BUILD_TESTS)
     set(_qvp_sf_f16_gguf   "${PARAKEET_TEST_MODEL_DIR}/diar_sortformer_4spk-v1.f16.gguf")
     set(_qvp_sfs_q8_gguf   "${PARAKEET_TEST_MODEL_DIR}/diar_streaming_sortformer_4spk-v2.q8_0.gguf")
     set(_qvp_sfsv21_q8_gguf "${PARAKEET_TEST_MODEL_DIR}/diar_streaming_sortformer_4spk-v2.1.q8_0.gguf")
+    set(_qvp_indic_q8_gguf "${PARAKEET_TEST_MODEL_DIR}/indic-conformer-600m-multilingual.q8_0.gguf")
+    set(_qvp_indic_q4_gguf "${PARAKEET_TEST_MODEL_DIR}/indic-conformer-600m-multilingual.q4_0.gguf")
+    set(_qvp_indic_f16_gguf "${PARAKEET_TEST_MODEL_DIR}/indic-conformer-600m-multilingual.f16.gguf")
     set(_qvp_jfk_wav       "${PARAKEET_TEST_AUDIO_DIR}/jfk.wav")
     set(_qvp_diar_wav      "${PARAKEET_TEST_AUDIO_DIR}/diarization-sample-16k.wav")
     set(_qvp_fr_multipiece_wav "${PARAKEET_TEST_AUDIO_DIR}/fr-multipiece-16k.wav")
+    set(_qvp_hi_wav        "${PARAKEET_TEST_AUDIO_DIR}/hi-16k.wav")
+    set(_qvp_hi_expected   "${PARAKEET_TEST_AUDIO_DIR}/hi-16k.expected.txt")
     set(_qvp_abcba_wav     "${PARAKEET_TEST_AUDIO_DIR}/abcba.wav")
     set(_qvp_abcba_rttm    "${PARAKEET_TEST_AUDIO_DIR}/abcba.rttm")
     set(_qvp_abcdba_wav    "${PARAKEET_TEST_AUDIO_DIR}/abcdba.wav")
@@ -629,6 +635,11 @@ if (PARAKEET_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "--model" "${_qvp_ctc_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
+    parakeet_register_test(test-streaming-rnnt
+        LABEL    "fixture"
+        EXE      test-parakeet-streaming
+        ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
 
     add_executable(test-eou-streaming test/test_eou_streaming.cpp)
     target_link_libraries(test-eou-streaming PRIVATE qvac-parakeet)
@@ -638,6 +649,13 @@ if (PARAKEET_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "--model" "${_qvp_eou_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_eou_q8_gguf}" "${_qvp_jfk_wav}")
+
+    # Model-independent finalization state regression. This runs on every
+    # checkout even when the streaming Sortformer v2.1 fixture is not staged.
+    add_executable(test-sortformer-finalize test/test_sortformer_finalize.cpp)
+    target_include_directories(test-sortformer-finalize PRIVATE src)
+    parakeet_apply_ccache(test-sortformer-finalize)
+    parakeet_register_test(test-sortformer-finalize LABEL "unit")
 
     add_executable(test-sortformer-streaming test/test_sortformer_streaming.cpp)
     target_link_libraries(test-sortformer-streaming PRIVATE qvac-parakeet)
@@ -702,6 +720,35 @@ if (PARAKEET_BUILD_TESTS)
     parakeet_apply_backend_defs(test-mel-fft-parity)
     parakeet_register_test(test-mel-fft-parity LABEL "unit")
 
+    # test_rnnt.cpp exercises internal decoder entry points
+    # (rnnt_decode_window, build_transducer_argmax_outputs) that are not
+    # exported from the shared library (CXX_VISIBILITY_PRESET hidden), so
+    # compile the sources in directly like test-tdt-decoder-parity.
+    add_executable(test-rnnt
+        test/test_rnnt.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-rnnt PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-rnnt PRIVATE src include ggml/include)
+    parakeet_apply_backend_defs(test-rnnt)
+    parakeet_register_test(test-rnnt LABEL "unit")
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(
+            NAME test-converter-rnnt
+            COMMAND ${Python3_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/test/test_convert_nemo_to_gguf.py")
+        set_property(TEST test-converter-rnnt PROPERTY LABELS unit)
+    endif()
+
     # Regression gate for the round-1 capture_intermediates flag.
     # Asserts run_encoder(capture=true) and (capture=false) produce
     # bit-equal encoder_out + logits on a CTC GGUF.
@@ -727,6 +774,11 @@ if (PARAKEET_BUILD_TESTS)
         EXE      test-encoder-capture-parity
         ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+    parakeet_register_test(test-encoder-capture-parity-rnnt
+        LABEL    "fixture"
+        EXE      test-encoder-capture-parity
+        ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
     parakeet_register_test(test-encoder-capture-parity-eou
         LABEL    "fixture"
         EXE      test-encoder-capture-parity
@@ -982,6 +1034,11 @@ if (PARAKEET_BUILD_TESTS)
         EXE      test-decoder-determinism
         ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+    parakeet_register_test(test-decoder-determinism-rnnt
+        LABEL    "fixture"
+        EXE      test-decoder-determinism
+        ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}" "--threads" "4"
+        REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
     parakeet_register_test(test-decoder-determinism-eou
         LABEL    "fixture"
         EXE      test-decoder-determinism
@@ -992,6 +1049,24 @@ if (PARAKEET_BUILD_TESTS)
         EXE      test-decoder-determinism
         ARGS     "--model" "${_qvp_sf_q8_gguf}" "--wav" "${_qvp_diar_wav}"
         REQUIRES "${_qvp_sf_q8_gguf}" "${_qvp_diar_wav}")
+    parakeet_register_test(test-decoder-determinism-indic
+        LABEL    "fixture"
+        EXE      test-decoder-determinism
+        ARGS     "--model" "${_qvp_indic_q8_gguf}" "--wav" "${_qvp_hi_wav}"
+                 "--language" "hi" "--expect-text-file" "${_qvp_hi_expected}"
+        REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}" "${_qvp_hi_expected}")
+    parakeet_register_test(test-decoder-determinism-indic-q4
+        LABEL    "fixture"
+        EXE      test-decoder-determinism
+        ARGS     "--model" "${_qvp_indic_q4_gguf}" "--wav" "${_qvp_hi_wav}"
+                 "--language" "hi" "--expect-text-file" "${_qvp_hi_expected}"
+        REQUIRES "${_qvp_indic_q4_gguf}" "${_qvp_hi_wav}" "${_qvp_hi_expected}")
+    parakeet_register_test(test-decoder-determinism-indic-f16
+        LABEL    "fixture"
+        EXE      test-decoder-determinism
+        ARGS     "--model" "${_qvp_indic_f16_gguf}" "--wav" "${_qvp_hi_wav}"
+                 "--language" "hi" "--expect-text-file" "${_qvp_hi_expected}"
+        REQUIRES "${_qvp_indic_f16_gguf}" "${_qvp_hi_wav}" "${_qvp_hi_expected}")
 
     # Long-form encoder windowing. The model-free unit test (planner + resolver
     # + seam trim/append) runs on every checkout; the parity test is
@@ -1015,20 +1090,84 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
 
-    if (GGML_VULKAN)
-        add_executable(test-vk-vs-cpu
-            test/test_vk_vs_cpu.cpp
+    if (GGML_VULKAN OR GGML_METAL)
+        add_executable(test-gpu-vs-cpu
+            test/test_gpu_vs_cpu.cpp
             src/parakeet_ctc.cpp
             src/parakeet_log.cpp
             src/mel_preprocess.cpp
             src/sentencepiece_bpe.cpp)
-        target_link_libraries(test-vk-vs-cpu PRIVATE ggml parakeet-backend-defs)
-        target_include_directories(test-vk-vs-cpu PRIVATE ggml/include src include)
-        parakeet_apply_backend_defs(test-vk-vs-cpu)
-        parakeet_register_test(test-vk-vs-cpu
+        target_link_libraries(test-gpu-vs-cpu PRIVATE ggml parakeet-backend-defs)
+        target_include_directories(test-gpu-vs-cpu PRIVATE ggml/include src include)
+        parakeet_apply_backend_defs(test-gpu-vs-cpu)
+        parakeet_register_test(test-gpu-vs-cpu
             LABEL    "gpu"
             ARGS     "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}"
             REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
+        parakeet_register_test(test-gpu-vs-cpu-indic
+            LABEL    "gpu"
+            EXE      test-gpu-vs-cpu
+            ARGS     "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}" "hi"
+            REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}")
+        parakeet_register_test(test-gpu-vs-cpu-indic-f16
+            LABEL    "gpu"
+            EXE      test-gpu-vs-cpu
+            ARGS     "${_qvp_indic_f16_gguf}" "${_qvp_hi_wav}" "hi"
+            REQUIRES "${_qvp_indic_f16_gguf}" "${_qvp_hi_wav}")
+        parakeet_register_test(test-decoder-determinism-indic-gpu
+            LABEL    "gpu"
+            EXE      test-decoder-determinism
+            ARGS     "--model" "${_qvp_indic_q8_gguf}" "--wav" "${_qvp_hi_wav}"
+                     "--language" "hi" "--n-gpu-layers" "1" "--require-gpu"
+                     "--expect-text-file" "${_qvp_hi_expected}"
+            REQUIRES "${_qvp_indic_q8_gguf}" "${_qvp_hi_wav}" "${_qvp_hi_expected}")
+        parakeet_register_test(test-decoder-determinism-indic-f16-gpu
+            LABEL    "gpu"
+            EXE      test-decoder-determinism
+            ARGS     "--model" "${_qvp_indic_f16_gguf}" "--wav" "${_qvp_hi_wav}"
+                     "--language" "hi" "--n-gpu-layers" "1" "--require-gpu"
+                     "--expect-text-file" "${_qvp_hi_expected}"
+            REQUIRES "${_qvp_indic_f16_gguf}" "${_qvp_hi_wav}" "${_qvp_hi_expected}")
+        parakeet_register_test(test-decoder-determinism-indic-q4-gpu
+            LABEL    "gpu"
+            EXE      test-decoder-determinism
+            ARGS     "--model" "${_qvp_indic_q4_gguf}" "--wav" "${_qvp_hi_wav}"
+                     "--language" "hi" "--n-gpu-layers" "1" "--require-gpu"
+                     "--expect-text-file" "${_qvp_hi_expected}"
+            REQUIRES "${_qvp_indic_q4_gguf}" "${_qvp_hi_wav}" "${_qvp_hi_expected}")
+    endif()
+
+    if (GGML_VULKAN)
+        parakeet_register_test(test-streaming-rnnt-vulkan
+            LABEL    "gpu"
+            EXE      test-parakeet-streaming
+            ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+                     "--threads" "4" "--n-gpu-layers" "1"
+            REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
+        parakeet_register_test(test-decoder-determinism-rnnt-vulkan
+            LABEL    "gpu"
+            EXE      test-decoder-determinism
+            ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+                     "--threads" "4" "--n-gpu-layers" "1" "--require-gpu"
+            REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
+    endif()
+
+    # Metal GPU-path instances of the Unified RNN-T fixtures (mirrors the
+    # GGML_VULKAN block above; --n-gpu-layers 1 moves the encoder + graph
+    # decoder to the registered GPU, which is Metal on Apple builds).
+    if (GGML_METAL)
+        parakeet_register_test(test-streaming-rnnt-metal
+            LABEL    "gpu"
+            EXE      test-parakeet-streaming
+            ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+                     "--threads" "4" "--n-gpu-layers" "1"
+            REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
+        parakeet_register_test(test-decoder-determinism-rnnt-metal
+            LABEL    "gpu"
+            EXE      test-decoder-determinism
+            ARGS     "--model" "${_qvp_rnnt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+                     "--threads" "4" "--n-gpu-layers" "1" "--require-gpu"
+            REQUIRES "${_qvp_rnnt_q8_gguf}" "${_qvp_jfk_wav}")
     endif()
 endif()
 

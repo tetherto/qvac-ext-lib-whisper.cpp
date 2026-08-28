@@ -1,7 +1,7 @@
 #pragma once
 
 // Which backend a GPU arm asked for. ctest names it in AUDIO8_TEST_GPU
-// ("metal", "vulkan"); a CPU arm leaves the variable unset.
+// ("cuda", "metal", "vulkan", "opencl"); a CPU arm leaves the variable unset.
 //
 // Both GPU arms run the same binaries and backend selection picks on its own
 // preference order, so an arm that does not check its backend passes on
@@ -22,6 +22,8 @@ namespace audio8_test {
 
 constexpr const char * METAL_ARM = "metal";
 constexpr const char * VULKAN_ARM = "vulkan";
+constexpr const char * OPENCL_ARM = "opencl";
+constexpr const char * CUDA_ARM = "cuda";
 
 inline std::string requested_gpu() {
     const char * name = std::getenv("AUDIO8_TEST_GPU");
@@ -44,6 +46,8 @@ inline bool registry_is_requested(const char * registry) {
     const std::string want = requested_gpu();
     if (want == METAL_ARM) return tts_cpp::detail::reg_name_is_metal(registry);
     if (want == VULKAN_ARM) return tts_cpp::detail::reg_name_is_vulkan(registry);
+    if (want == OPENCL_ARM) return tts_cpp::detail::reg_name_is_opencl(registry);
+    if (want == CUDA_ARM) return tts_cpp::detail::reg_name_is_cuda(registry);
     return false;
 }
 

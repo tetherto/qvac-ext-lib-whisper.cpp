@@ -169,7 +169,9 @@ int main(int argc, char ** argv) {
     }
 
     do     {
-        const bool is_tdt = (engine.model_type() == "tdt");
+        const std::string model_type = engine.model_type();
+        const bool is_tdt = model_type == "tdt";
+        const bool is_rnnt = model_type == "rnnt";
         std::vector<float> pcm;
         {
             FILE * f = std::fopen(opts.wav_path.c_str(), "rb");
@@ -185,10 +187,10 @@ int main(int argc, char ** argv) {
             for (size_t i = 0; i < i16.size(); ++i) pcm[i] = i16[i] * inv;
         }
 
-        const struct ModeCfg { int chunk_ms; int left_ms; int right_ms; int max_rel_wer_pct; int max_rel_wer_pct_tdt; } configs[] = {
-            {1000, 2000,  500,  5, 40},
-            {2000, 2000, 1000,  5,  5},
-            {2000, 5000, 2000,  5,  5},
+        const struct ModeCfg { int chunk_ms; int left_ms; int right_ms; int max_rel_wer_pct; int max_rel_wer_pct_tdt; int max_rel_wer_pct_rnnt; } configs[] = {
+            {1000, 2000,  500,  5, 40, 10},
+            {2000, 2000, 1000,  5,  5, 10},
+            {2000, 5000, 2000,  5,  5,  5},
         };
 
         for (const auto & c : configs) {
@@ -245,7 +247,11 @@ int main(int argc, char ** argv) {
             double wer = ref_words.empty() ? 0.0 :
                          100.0 * d[ref_words.size()][hyp_words.size()] / (double) ref_words.size();
 
-            const int tol = is_tdt ? c.max_rel_wer_pct_tdt : c.max_rel_wer_pct;
+            const int tol = is_tdt
+                              ? c.max_rel_wer_pct_tdt
+                              : (is_rnnt
+                                   ? c.max_rel_wer_pct_rnnt
+                                   : c.max_rel_wer_pct);
             if (!ordering_ok) {
                 std::fprintf(stderr, "[test-streaming] FAIL Mode 3 chunk=%d left=%d right=%d: "
                                      "callback ordering / timestamps broken\n",
@@ -257,7 +263,7 @@ int main(int argc, char ** argv) {
                                      "  ref:    \"%.200s%s\"\n"
                                      "  stream: \"%.200s%s\"\n",
                              c.chunk_ms, c.left_ms, c.right_ms, wer, tol,
-                             is_tdt ? "tdt" : "ctc",
+                             model_type.c_str(),
                              ref.text.c_str(), ref.text.size() > 200 ? "..." : "",
                              concat_text.c_str(), concat_text.size() > 200 ? "..." : "");
                 ++failures;
@@ -267,7 +273,7 @@ int main(int argc, char ** argv) {
                     "%3d segments, end_s=%.2f audio=%.2fs, WER=%.2f%% (tol %d%% %s)\n",
                     c.chunk_ms, c.left_ms, c.right_ms,
                     n_segments, last_end_s, audio_s, wer, tol,
-                    is_tdt ? "tdt" : "ctc");
+                    model_type.c_str());
             }
         }
 

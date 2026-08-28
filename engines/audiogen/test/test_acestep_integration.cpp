@@ -1,5 +1,6 @@
 #include "audiogen-cpp/acestep/engine.h"
 
+#include "audio_edit.h"
 #include "cover_noise.h"
 #include "dit_ggml.h"
 #include "generate_task.h"
@@ -27,6 +28,25 @@ constexpr float TEST_NOISE_STRENGTH = 0.5f;
 constexpr long long TEST_SEED = 22886;
 constexpr float TEST_FREQUENCY = 220.0f;
 constexpr float PI = 3.14159265358979323846f;
+constexpr int TEST_LATENT_CHANNELS = tts_cpp::acestep::AUDIO_EDIT_LATENT_CHANNELS;
+constexpr int TEST_CONTEXT_BANKS = 2;
+constexpr int TEST_CONTEXT_CHANNELS = TEST_LATENT_CHANNELS * TEST_CONTEXT_BANKS;
+constexpr float TEST_CONTEXT_ACTIVE_VALUE = 1.0f;
+constexpr float TEST_REPAINT_START_SECONDS = 0.5f;
+constexpr float TEST_REPAINT_END_SECONDS = 1.5f;
+constexpr float TEST_PRESERVED_LEFT_SECONDS = 0.4f;
+constexpr float TEST_PRESERVED_RIGHT_SECONDS = 1.6f;
+constexpr float TEST_FLOW_MAX_RATIO = 0.5f;
+constexpr char TEST_CONTEXT_DUMP[] = "03_context.bin";
+constexpr char TEST_SOURCE_DUMP[] = "00_source_latent.bin";
+constexpr char TEST_REPAINT_CAPTION[] = "Replace the middle with bright synth guitar";
+constexpr char TEST_FLOW_SOURCE_CAPTION[] = "A plain sine tone";
+constexpr char TEST_FLOW_TARGET_CAPTION[] = "A warm evolving synth pad";
+constexpr char TEST_UNKNOWN_LANGUAGE[] = "unknown";
+constexpr char TEST_LM_STAGE[] = "lm";
+constexpr char TEST_TURBO_ERROR[] = "turbo DiT only";
+constexpr char TEST_FLOW_SKIP_FORMAT[] =
+    "[test-acestep-integration] flow-edit skipped: supplied model is not turbo\n";
 
 int failures = 0;
 
@@ -40,14 +60,27 @@ void check(bool condition, const char * expression) {
 
 struct StageLog {
     std::vector<std::string> names;
+    struct Event {
+      std::string name;
+      int step;
+      int total;
+    };
+    std::vector<Event> events;
 
-    bool record(const std::string & stage, int, int) {
-        names.push_back(stage);
-        return true;
+    bool record(const std::string &stage, int step, int total) {
+      names.push_back(stage);
+      events.push_back({stage, step, total});
+      return true;
     }
 
     bool contains(const char * stage) const {
         return std::find(names.begin(), names.end(), stage) != names.end();
+    }
+
+    bool contains_detailed_progress(const char *stage) const {
+      return std::any_of(events.begin(), events.end(), [&](const Event &event) {
+        return event.name == stage && event.total > 1 && event.step > 0;
+      });
     }
 };
 
@@ -156,6 +189,267 @@ void verify_stage_dumps(const fs::path & dump_dir) {
     verify_cover_noise(dump_dir);
 }
 
+void inspect_flow_context_channels(const TensorDump & context, const TensorDump & source,
+                                   int frame, bool & differs_from_source, bool & varies_over_time) {
+    for (int channel = 0; channel < TEST_LATENT_CHANNELS; ++channel) {
+        const size_t context_index = (size_t) frame * TEST_CONTEXT_CHANNELS + channel;
+        if (context.values[context_index] != context.values[(size_t) channel]) {
+            varies_over_time = true;
+        }
+        if (frame < source.rows &&
+            source.values[(size_t) frame * source.columns + channel] != context.values[context_index]) {
+            differs_from_source = true;
+        }
+        CHECK(context.values[context_index + TEST_LATENT_CHANNELS] == TEST_CONTEXT_ACTIVE_VALUE);
+    }
+}
+
+void inspect_flow_context_frames(const TensorDump & context, const TensorDump & source,
+                                 bool & differs_from_source, bool & varies_over_time) {
+    for (int frame = 0; frame < context.rows; ++frame) {
+        inspect_flow_context_channels(context, source, frame, differs_from_source, varies_over_time);
+    }
+}
+
+void verify_flow_silence_context(const fs::path & dump_dir) {
+    const TensorDump context = read_tensor_dump(dump_dir / TEST_CONTEXT_DUMP);
+    const TensorDump source = read_tensor_dump(dump_dir / TEST_SOURCE_DUMP);
+    CHECK(!context.values.empty());
+    CHECK(context.columns == TEST_CONTEXT_CHANNELS);
+    CHECK(context.rows > 1);
+    CHECK(!source.values.empty());
+    CHECK(source.columns == TEST_LATENT_CHANNELS);
+    if (context.values.empty() || context.columns != TEST_CONTEXT_CHANNELS || context.rows <= 1 ||
+        source.values.empty() || source.columns != TEST_LATENT_CHANNELS) {
+        return;
+    }
+    bool differs_from_source = false;
+    bool varies_over_time = false;
+    inspect_flow_context_frames(context, source, differs_from_source, varies_over_time);
+    CHECK(differs_from_source);
+    CHECK(varies_over_time);
+}
+
+bool repaint_rows_differ(const float * left, const float * right) {
+    for (int channel = 0; channel < TEST_LATENT_CHANNELS; ++channel) {
+        if (left[channel] != right[channel]) return true;
+    }
+    return false;
+}
+
+void inspect_repaint_context_frames(const TensorDump & context, const float *& first_repaint_frame,
+                                    bool & found_repaint_frame, bool & varies_over_time) {
+    for (int frame = 0; frame < context.rows; ++frame) {
+        const float * row = context.values.data() + (size_t) frame * context.columns;
+        if (row[TEST_LATENT_CHANNELS] != TEST_CONTEXT_ACTIVE_VALUE) continue;
+        found_repaint_frame = true;
+        if (!first_repaint_frame) {
+            first_repaint_frame = row;
+            continue;
+        }
+        if (repaint_rows_differ(row, first_repaint_frame)) varies_over_time = true;
+    }
+}
+
+void verify_repaint_silence_context(const fs::path & dump_dir) {
+    const TensorDump context = read_tensor_dump(dump_dir / TEST_CONTEXT_DUMP);
+    CHECK(!context.values.empty());
+    CHECK(context.columns == TEST_CONTEXT_CHANNELS);
+    if (context.values.empty() || context.columns != TEST_CONTEXT_CHANNELS) return;
+    const float * first_repaint_frame = nullptr;
+    bool found_repaint_frame = false;
+    bool varies_over_time = false;
+    inspect_repaint_context_frames(context, first_repaint_frame, found_repaint_frame, varies_over_time);
+    CHECK(found_repaint_frame);
+    CHECK(varies_over_time);
+}
+
+struct EditFixture {
+    tts_cpp::acestep::GenerateParams params;
+    tts_cpp::acestep::RepaintParams repaint;
+};
+
+tts_cpp::acestep::GenerateResult generate_with_stage_log(tts_cpp::acestep::Engine & engine,
+                                                         tts_cpp::acestep::GenerateParams & params,
+                                                         StageLog & stages) {
+    return engine.generate(params, [&](const std::string & stage, int step, int total) {
+        return stages.record(stage, step, total);
+    });
+}
+
+EditFixture make_edit_fixture() {
+    using namespace tts_cpp::acestep;
+    EditFixture fixture;
+    fixture.params.caption = TEST_REPAINT_CAPTION;
+    fixture.params.lyrics = AUDIO_EDIT_DEFAULT_LYRICS;
+    fixture.params.source_audio = make_test_pcm();
+    fixture.params.reference_audio = fixture.params.source_audio;
+    fixture.params.inference_steps = TEST_STEPS;
+    fixture.params.shift = TEST_SHIFT;
+    fixture.params.seed = TEST_SEED;
+    fixture.params.lm_phase1 = false;
+    fixture.repaint.start_seconds = TEST_REPAINT_START_SECONDS;
+    fixture.repaint.end_seconds = TEST_REPAINT_END_SECONDS;
+    fixture.repaint.mode = RepaintMode::Balanced;
+    fixture.repaint.strength = REPAINT_DEFAULT_STRENGTH;
+    fixture.params.edit_plan.emplace_back(fixture.repaint);
+    return fixture;
+}
+
+void check_preserved_pcm_range(const std::vector<float> & actual, const std::vector<float> & expected,
+                               int first_frame, int last_frame) {
+    for (int frame = first_frame; frame < last_frame; ++frame) {
+        for (int channel = 0; channel < TEST_CHANNELS; ++channel) {
+            const size_t index = (size_t) frame * TEST_CHANNELS + channel;
+            CHECK(actual[index] == expected[index]);
+        }
+    }
+}
+
+void verify_repaint_preservation(const tts_cpp::acestep::GenerateResult & result,
+                                 const tts_cpp::acestep::GenerateParams & params) {
+    const int preserved_left_frames = (int) (TEST_PRESERVED_LEFT_SECONDS * TEST_SAMPLE_RATE);
+    const int preserved_right_start = (int) (TEST_PRESERVED_RIGHT_SECONDS * TEST_SAMPLE_RATE);
+    const int total_frames = TEST_SECONDS * TEST_SAMPLE_RATE;
+    check_preserved_pcm_range(result.pcm, params.source_audio, 0, preserved_left_frames);
+    check_preserved_pcm_range(result.pcm, params.source_audio, preserved_right_start, total_frames);
+}
+
+void run_repaint_scenario(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir,
+                          EditFixture & fixture) {
+    using namespace tts_cpp::acestep;
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, fixture.params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(stages.contains(AUDIO_EDIT_REPAINT_STAGE));
+    CHECK(!stages.contains(TEST_LM_STAGE));
+    CHECK(stages.contains_detailed_progress("vae"));
+    CHECK(result.metadata.vocal_language == TEST_UNKNOWN_LANGUAGE);
+    verify_repaint_silence_context(dump_dir);
+    verify_repaint_preservation(result, fixture.params);
+}
+
+tts_cpp::acestep::GenerateParams make_flow_params(
+    const tts_cpp::acestep::GenerateParams & repaint_params) {
+    using namespace tts_cpp::acestep;
+    GenerateParams params = repaint_params;
+    params.edit_plan.clear();
+    FlowEditParams flow;
+    flow.source_caption = TEST_FLOW_SOURCE_CAPTION;
+    flow.source_lyrics = AUDIO_EDIT_DEFAULT_LYRICS;
+    flow.target_caption = TEST_FLOW_TARGET_CAPTION;
+    flow.target_lyrics = AUDIO_EDIT_DEFAULT_LYRICS;
+    flow.n_min = AUDIO_EDIT_MIN_RATIO;
+    flow.n_max = TEST_FLOW_MAX_RATIO;
+    flow.n_avg = FLOW_EDIT_DEFAULT_AVERAGES;
+    params.edit_plan.emplace_back(flow);
+    return params;
+}
+
+void verify_composed_stage_order(const StageLog & stages) {
+    using namespace tts_cpp::acestep;
+    const auto flow_position =
+        std::find(stages.names.begin(), stages.names.end(), AUDIO_EDIT_FLOW_STAGE);
+    const auto repaint_position =
+        std::find(stages.names.begin(), stages.names.end(), AUDIO_EDIT_REPAINT_STAGE);
+    CHECK(flow_position != stages.names.end());
+    CHECK(repaint_position != stages.names.end());
+    CHECK(flow_position < repaint_position);
+}
+
+void run_composed_scenario(tts_cpp::acestep::Engine & engine,
+                           tts_cpp::acestep::GenerateParams & params,
+                           const tts_cpp::acestep::RepaintParams & repaint) {
+    params.edit_plan.emplace_back(repaint);
+    StageLog stages;
+    const tts_cpp::acestep::GenerateResult result =
+        generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    verify_composed_stage_order(stages);
+}
+
+void run_flow_scenario(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir,
+                       const EditFixture & fixture) {
+    using namespace tts_cpp::acestep;
+    GenerateParams params = make_flow_params(fixture.params);
+    StageLog stages;
+    try {
+        const GenerateResult result = generate_with_stage_log(engine, params, stages);
+        CHECK(!result.pcm.empty());
+        CHECK(stages.contains(AUDIO_EDIT_FLOW_STAGE));
+        CHECK(!stages.contains(TEST_LM_STAGE));
+        verify_flow_silence_context(dump_dir);
+        run_composed_scenario(engine, params, fixture.repaint);
+    } catch (const std::invalid_argument & error) {
+        if (std::string(error.what()).find(TEST_TURBO_ERROR) == std::string::npos) throw;
+        std::fprintf(stderr, TEST_FLOW_SKIP_FORMAT);
+    }
+}
+
+void run_edit_vae_cancel_scenario(tts_cpp::acestep::Engine &engine,
+                                  const EditFixture &fixture) {
+  bool cancelled_during_vae = false;
+  const tts_cpp::acestep::GenerateResult result = engine.generate(
+      fixture.params, [&](const std::string &stage, int step, int total) {
+        if (stage == "vae" && total > 1 && step > 0) {
+          cancelled_during_vae = true;
+          return false;
+        }
+        return true;
+      });
+  CHECK(cancelled_during_vae);
+  CHECK(result.pcm.empty());
+}
+
+void run_edit_scenarios(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir) {
+    EditFixture fixture = make_edit_fixture();
+    run_repaint_scenario(engine, dump_dir, fixture);
+    run_flow_scenario(engine, dump_dir, fixture);
+    run_edit_vae_cancel_scenario(engine, fixture);
+}
+
+// Runs the autoregressive LM for real (phase-2 code generation) twice with one
+// seed: covers the LM decode graph reuse paths and pins cross-run determinism.
+void run_lm_generation_scenario(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir) {
+    using namespace tts_cpp::acestep;
+
+    GenerateParams params;
+    params.caption         = "integration lm scenario";
+    params.lyrics          = "[Instrumental]";
+    params.duration        = 1.0f;
+    params.inference_steps = TEST_STEPS;
+    params.shift           = TEST_SHIFT;
+    params.seed            = TEST_SEED;
+    params.lm_phase1       = false;
+
+    StageLog first_stages;
+    const GenerateResult first = generate_with_stage_log(engine, params, first_stages);
+    CHECK(!first.pcm.empty());
+    CHECK(first.metadata.n_codes > 0);
+    CHECK(first_stages.contains(TEST_LM_STAGE));
+    const TensorDump first_codes = read_tensor_dump(dump_dir / "01_lm_codes.bin");
+    CHECK(!first_codes.values.empty());
+
+    StageLog second_stages;
+    const GenerateResult second = generate_with_stage_log(engine, params, second_stages);
+    const TensorDump second_codes = read_tensor_dump(dump_dir / "01_lm_codes.bin");
+    CHECK(vectors_match(first_codes.values, second_codes.values));
+    CHECK(second.pcm == first.pcm);
+}
+
+void run_cover_strength_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+    GenerateParams params = make_generate_params();
+    params.audio_cover_strength = 0.5f;
+    params.cover_noise_strength = 0.0f;
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(result.sample_rate == TEST_SAMPLE_RATE);
+    CHECK(stages.contains("source"));
+    CHECK(!stages.contains(TEST_LM_STAGE));
+}
+
 int run_integration(const char * models_dir) {
     using namespace tts_cpp::acestep;
 
@@ -177,6 +471,9 @@ int run_integration(const char * models_dir) {
         CHECK(stages.contains("reference"));
         CHECK(!stages.contains("lm"));
         verify_stage_dumps(dump_dir);
+        run_cover_strength_scenario(*engine);
+        run_edit_scenarios(*engine, dump_dir);
+        run_lm_generation_scenario(*engine, dump_dir);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "FAIL integration exception: %s\n", error.what());
         ++failures;

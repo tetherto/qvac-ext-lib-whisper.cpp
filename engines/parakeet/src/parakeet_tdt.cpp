@@ -20,6 +20,30 @@
 
 namespace parakeet {
 
+constexpr int kWrongTransducerModel = 10;
+
+TransducerGraphOutputs build_transducer_argmax_outputs(ggml_context * ctx,
+                                                       ggml_tensor * logits,
+                                                       int token_count,
+                                                       int duration_count) {
+    ggml_tensor * token_logits = ggml_view_2d(
+        ctx, logits, token_count, 1,
+        static_cast<size_t>(token_count) * sizeof(float), 0);
+    token_logits = ggml_cont(ctx, token_logits);
+
+    TransducerGraphOutputs outputs;
+    outputs.token = ggml_argmax(ctx, token_logits);
+    if (duration_count <= 0) return outputs;
+
+    ggml_tensor * duration_logits = ggml_view_2d(
+        ctx, logits, duration_count, 1,
+        static_cast<size_t>(duration_count) * sizeof(float),
+        static_cast<size_t>(token_count) * sizeof(float));
+    duration_logits = ggml_cont(ctx, duration_logits);
+    outputs.duration = ggml_argmax(ctx, duration_logits);
+    return outputs;
+}
+
 namespace {
 
 int argmax_f32(const float * data, int n) {
@@ -273,14 +297,10 @@ LstmBodyOuts build_lstm_body(TdtRuntimeWeights & rt,
 // = 8198).  On Apple unified memory the difference is small (the 32 KB
 // readback is ~17 us); on a discrete GPU PCIe bus it's an
 // order-of-magnitude saving per emission step (~250 / call).
-struct JointBodyOuts {
-    ggml_tensor * token_out;  // argmax i32[1] (argmax_on_gpu) OR token logits f32[V_plus_1]
-    ggml_tensor * dur_out;    // argmax i32[1] (argmax_on_gpu) OR dur logits f32[num_durations]
-};
-JointBodyOuts build_joint_body(TdtRuntimeWeights & rt,
-                               ggml_context * gctx,
-                               ggml_tensor * pred_src,
-                               ggml_tensor * frame_idx_in) {
+TransducerGraphOutputs build_joint_body(TdtRuntimeWeights & rt,
+                                        ggml_context * gctx,
+                                        ggml_tensor * pred_src,
+                                        ggml_tensor * frame_idx_in) {
     const int H_joint = rt.H_joint;
     const int V_p1    = rt.V_plus_1;
     const int D_n     = rt.num_durations;
@@ -312,27 +332,26 @@ JointBodyOuts build_joint_body(TdtRuntimeWeights & rt,
                                             V_p1, 1,
                                             (size_t) V_p1 * sizeof(float),
                                             (size_t) 0);
-    ggml_tensor * dur_logits = ggml_view_2d(gctx, logits,
-                                            D_n, 1,
-                                            (size_t) D_n * sizeof(float),
-                                            (size_t) V_p1 * sizeof(float));
     tok_logits = ggml_cont(gctx, tok_logits);
-    dur_logits = ggml_cont(gctx, dur_logits);
 
-    // ggml-opencl has no ARGMAX kernel (graph_compute would abort), so gate the
-    // on-device argmax on backend support and fall back to a host argmax of the
-    // logit slices otherwise. tok_am is unused on that path (never expanded).
-    ggml_tensor * tok_am = ggml_argmax(gctx, tok_logits);  // i32[1]
-    rt.argmax_on_gpu = ggml_backend_supports_op(rt.backend, tok_am);
+    TransducerGraphOutputs argmax_outputs =
+        build_transducer_argmax_outputs(gctx, logits, V_p1, D_n);
+    rt.argmax_on_gpu =
+        ggml_backend_supports_op(rt.backend, argmax_outputs.token);
 
-    JointBodyOuts outs{};
     if (rt.argmax_on_gpu) {
-        outs.token_out = tok_am;
-        outs.dur_out   = ggml_argmax(gctx, dur_logits);  // i32[1]
-    } else {
-        outs.token_out = tok_logits;
-        outs.dur_out   = dur_logits;
+        return argmax_outputs;
     }
+
+    TransducerGraphOutputs outs;
+    outs.token = tok_logits;
+    if (D_n <= 0) return outs;
+
+    ggml_tensor * dur_logits = ggml_view_2d(
+        gctx, logits, D_n, 1,
+        static_cast<size_t>(D_n) * sizeof(float),
+        static_cast<size_t>(V_p1) * sizeof(float));
+    outs.duration = ggml_cont(gctx, dur_logits);
     return outs;
 }
 
@@ -378,17 +397,22 @@ void build_joint_graph(TdtRuntimeWeights & rt) {
     ggml_set_name(rt.joint_frame_idx_in, "joint.frame_idx_in");
     ggml_set_input(rt.joint_frame_idx_in);
 
-    JointBodyOuts outs = build_joint_body(rt, gctx, rt.pred_persist, rt.joint_frame_idx_in);
-    rt.joint_token_out = outs.token_out;
-    rt.joint_dur_out   = outs.dur_out;
+    TransducerGraphOutputs outs =
+        build_joint_body(rt, gctx, rt.pred_persist, rt.joint_frame_idx_in);
+    rt.joint_token_out = outs.token;
+    rt.joint_dur_out   = outs.duration;
     ggml_set_name(rt.joint_token_out, rt.argmax_on_gpu ? "joint.token_argmax" : "joint.token_logits");
-    ggml_set_name(rt.joint_dur_out,   rt.argmax_on_gpu ? "joint.dur_argmax"   : "joint.dur_logits");
     ggml_set_output(rt.joint_token_out);
-    ggml_set_output(rt.joint_dur_out);
+    if (rt.joint_dur_out) {
+        ggml_set_name(rt.joint_dur_out, rt.argmax_on_gpu ? "joint.dur_argmax" : "joint.dur_logits");
+        ggml_set_output(rt.joint_dur_out);
+    }
 
     rt.g_joint = ggml_new_graph_custom(gctx, /*size*/ 96, /*grads*/ false);
     ggml_build_forward_expand(rt.g_joint, rt.joint_token_out);
-    ggml_build_forward_expand(rt.g_joint, rt.joint_dur_out);
+    if (rt.joint_dur_out) {
+        ggml_build_forward_expand(rt.g_joint, rt.joint_dur_out);
+    }
 }
 
 // (3) Fused LSTM + joint graph. Used after a non-blank emission.
@@ -417,13 +441,16 @@ void build_lstm_joint_graph(TdtRuntimeWeights & rt) {
     LstmBodyOuts lstm_outs = build_lstm_body(rt, gctx, rt.lj_token_in);
     // Use the pred_cpy node (not pred_persist directly) so the joint mat_muls
     // depend on the LSTM update finishing first.
-    JointBodyOuts joint_outs = build_joint_body(rt, gctx, lstm_outs.pred_cpy, rt.lj_frame_idx_in);
-    rt.lj_token_out = joint_outs.token_out;
-    rt.lj_dur_out   = joint_outs.dur_out;
+    TransducerGraphOutputs joint_outs =
+        build_joint_body(rt, gctx, lstm_outs.pred_cpy, rt.lj_frame_idx_in);
+    rt.lj_token_out = joint_outs.token;
+    rt.lj_dur_out   = joint_outs.duration;
     ggml_set_name(rt.lj_token_out, rt.argmax_on_gpu ? "lstm_joint.token_argmax" : "lstm_joint.token_logits");
-    ggml_set_name(rt.lj_dur_out,   rt.argmax_on_gpu ? "lstm_joint.dur_argmax"   : "lstm_joint.dur_logits");
     ggml_set_output(rt.lj_token_out);
-    ggml_set_output(rt.lj_dur_out);
+    if (rt.lj_dur_out) {
+        ggml_set_name(rt.lj_dur_out, rt.argmax_on_gpu ? "lstm_joint.dur_argmax" : "lstm_joint.dur_logits");
+        ggml_set_output(rt.lj_dur_out);
+    }
     // Mark EVERY layer's h/c state write as an output so gallocr keeps them alive
     // (their memory IS h_persist / c_persist). Without this, forward_expand prunes
     // the dead-end intermediate writes for all but the last layer, so those layers'
@@ -433,7 +460,9 @@ void build_lstm_joint_graph(TdtRuntimeWeights & rt) {
 
     rt.g_lstm_joint = ggml_new_graph_custom(gctx, /*size*/ 384, /*grads*/ false);
     ggml_build_forward_expand(rt.g_lstm_joint, rt.lj_token_out);
-    ggml_build_forward_expand(rt.g_lstm_joint, rt.lj_dur_out);
+    if (rt.lj_dur_out) {
+        ggml_build_forward_expand(rt.g_lstm_joint, rt.lj_dur_out);
+    }
     for (ggml_tensor * n : lstm_outs.state_cpy) ggml_build_forward_expand(rt.g_lstm_joint, n);
 }
 
@@ -604,15 +633,26 @@ TdtRuntimeWeights::~TdtRuntimeWeights() {
 int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
     W = TdtRuntimeWeights{};
 
-    W.H_pred        = model.encoder_cfg.tdt_pred_hidden;
-    W.H_joint       = model.encoder_cfg.tdt_joint_hidden;
+    const bool is_rnnt = model.model_type == ParakeetModelType::RNNT;
+    if (!is_rnnt && model.model_type != ParakeetModelType::TDT) {
+        std::fprintf(stderr, "tdt_prepare_runtime: expected RNNT or TDT model\n");
+        return 1;
+    }
+    W.H_pred        = is_rnnt
+                        ? model.encoder_cfg.rnnt_pred_hidden
+                        : model.encoder_cfg.tdt_pred_hidden;
+    W.H_joint       = is_rnnt
+                        ? model.encoder_cfg.rnnt_joint_hidden
+                        : model.encoder_cfg.tdt_joint_hidden;
     W.D_enc         = model.encoder_cfg.d_model;
-    W.L             = model.encoder_cfg.tdt_pred_rnn_layers;
-    W.num_durations = model.encoder_cfg.tdt_num_durations;
+    W.L             = is_rnnt
+                        ? model.encoder_cfg.rnnt_pred_rnn_layers
+                        : model.encoder_cfg.tdt_pred_rnn_layers;
+    W.num_durations = is_rnnt ? 0 : model.encoder_cfg.tdt_num_durations;
     W.V_plus_1      = (int) model.vocab_size + 1;
     W.V_out         = W.V_plus_1 + W.num_durations;
 
-    W.weights = &model.tdt;
+    W.weights = is_rnnt ? &model.rnnt : &model.tdt;
     W.backend = model.backend_active();
     if (!W.backend) {
         std::fprintf(stderr, "tdt_prepare_runtime: model has no active backend (call load_from_gguf first)\n");
@@ -626,8 +666,9 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
         W.n_threads = hc > 0 ? (int) hc : 4;
     }
 
-    if (!model.tdt.predict_embed || model.tdt.lstm.empty() || !model.tdt.joint_out_w) {
-        std::fprintf(stderr, "tdt_prepare_runtime: GGUF is missing TDT tensors\n");
+    if (!W.weights->predict_embed || W.weights->lstm.empty() ||
+        !W.weights->joint_out_w) {
+        std::fprintf(stderr, "tdt_prepare_runtime: GGUF is missing transducer tensors\n");
         return 2;
     }
 
@@ -649,21 +690,21 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
 
     if (!W.use_graphs) {
         // ---- CPU fallback: dequantise weights to host f32 ----
-        dequantize_to_f32(model.tdt.predict_embed, W.embed);
+        dequantize_to_f32(W.weights->predict_embed, W.embed);
         W.host_lstm.clear();
         W.host_lstm.resize(W.L);
         for (int l = 0; l < W.L; ++l) {
-            dequantize_to_f32(model.tdt.lstm[l].w_ih, W.host_lstm[l].w_ih);
-            dequantize_to_f32(model.tdt.lstm[l].w_hh, W.host_lstm[l].w_hh);
-            dequantize_to_f32(model.tdt.lstm[l].b_ih, W.host_lstm[l].b_ih);
-            dequantize_to_f32(model.tdt.lstm[l].b_hh, W.host_lstm[l].b_hh);
+            dequantize_to_f32(W.weights->lstm[l].w_ih, W.host_lstm[l].w_ih);
+            dequantize_to_f32(W.weights->lstm[l].w_hh, W.host_lstm[l].w_hh);
+            dequantize_to_f32(W.weights->lstm[l].b_ih, W.host_lstm[l].b_ih);
+            dequantize_to_f32(W.weights->lstm[l].b_hh, W.host_lstm[l].b_hh);
         }
-        dequantize_to_f32(model.tdt.joint_enc_w,  W.host_joint_enc_w);
-        dequantize_to_f32(model.tdt.joint_enc_b,  W.host_joint_enc_b);
-        dequantize_to_f32(model.tdt.joint_pred_w, W.host_joint_pred_w);
-        dequantize_to_f32(model.tdt.joint_pred_b, W.host_joint_pred_b);
-        dequantize_to_f32(model.tdt.joint_out_w,  W.host_joint_out_w);
-        dequantize_to_f32(model.tdt.joint_out_b,  W.host_joint_out_b);
+        dequantize_to_f32(W.weights->joint_enc_w,  W.host_joint_enc_w);
+        dequantize_to_f32(W.weights->joint_enc_b,  W.host_joint_enc_b);
+        dequantize_to_f32(W.weights->joint_pred_w, W.host_joint_pred_w);
+        dequantize_to_f32(W.weights->joint_pred_b, W.host_joint_pred_b);
+        dequantize_to_f32(W.weights->joint_out_w,  W.host_joint_out_w);
+        dequantize_to_f32(W.weights->joint_out_b,  W.host_joint_out_b);
         return 0;
     }
 
@@ -769,7 +810,9 @@ void resolve_joint_step(TdtRuntimeWeights & rt,
     if (rt.argmax_on_gpu) {
         int32_t tok_val = 0, dur_val = 0;
         ggml_backend_tensor_get(tok_t, &tok_val, 0, sizeof(int32_t));
-        ggml_backend_tensor_get(dur_t, &dur_val, 0, sizeof(int32_t));
+        if (dur_t) {
+            ggml_backend_tensor_get(dur_t, &dur_val, 0, sizeof(int32_t));
+        }
         *tok_out = (int) tok_val;
         *dur_out = (int) dur_val;
         return;
@@ -777,11 +820,16 @@ void resolve_joint_step(TdtRuntimeWeights & rt,
     static thread_local std::vector<float> tok_logits;
     static thread_local std::vector<float> dur_logits;
     tok_logits.resize((size_t) rt.V_plus_1);
-    dur_logits.resize((size_t) rt.num_durations);
     ggml_backend_tensor_get(tok_t, tok_logits.data(), 0, (size_t) rt.V_plus_1 * sizeof(float));
-    ggml_backend_tensor_get(dur_t, dur_logits.data(), 0, (size_t) rt.num_durations * sizeof(float));
     *tok_out = argmax_f32(tok_logits.data(), rt.V_plus_1);
-    *dur_out = argmax_f32(dur_logits.data(), rt.num_durations);
+    *dur_out = 0;
+    if (dur_t && rt.num_durations > 0) {
+        dur_logits.resize((size_t) rt.num_durations);
+        ggml_backend_tensor_get(
+            dur_t, dur_logits.data(), 0,
+            (size_t) rt.num_durations * sizeof(float));
+        *dur_out = argmax_f32(dur_logits.data(), rt.num_durations);
+    }
 }
 
 // Joint-only step (used after a blank emission). pred_persist is unchanged
@@ -932,6 +980,7 @@ int tdt_decode_window(const ParakeetCtcModel & model,
     const int L       = W.L;
     const int blank   = (int) model.blank_id;
     const int V_out   = W.V_out;
+    const bool is_rnnt = model.model_type == ParakeetModelType::RNNT;
 
     // GPU path: stash the full-window encoder-side projection into
     // enc_proj_persist on-device once at the top of the window so per-step
@@ -948,7 +997,7 @@ int tdt_decode_window(const ParakeetCtcModel & model,
     std::vector<float> scratch_joint_hidden;
 
     int t = 0;
-    if (state.carry_frames > 0) {
+    if (!is_rnnt && state.carry_frames > 0) {
         t = std::min(state.carry_frames, n_frames);
         state.carry_frames -= t;
     }
@@ -975,16 +1024,20 @@ int tdt_decode_window(const ParakeetCtcModel & model,
             host_joint_step(W, enc_frame, state.pred_out.data(),
                             scratch_joint_hidden, logits, scratch_joint_tmp);
             best_token   = argmax_f32(logits.data(), V_p1);
-            best_dur_idx = argmax_f32(logits.data() + V_p1, D_n);
+            if (!is_rnnt) {
+                best_dur_idx = argmax_f32(logits.data() + V_p1, D_n);
+            }
         }
         ++out_steps;
 
-        const int best_dur     = model.tdt_durations.empty()
-                                   ? best_dur_idx
-                                   : model.tdt_durations[best_dur_idx];
+        const int best_dur = is_rnnt
+                               ? 0
+                               : (model.tdt_durations.empty()
+                                    ? best_dur_idx
+                                    : model.tdt_durations[best_dur_idx]);
 
         if (best_token == blank) {
-            t += std::max(1, best_dur);
+            t += is_rnnt ? 1 : std::max(1, best_dur);
             state.symbols_this_step = 0;
             continue;
         }
@@ -1005,8 +1058,10 @@ int tdt_decode_window(const ParakeetCtcModel & model,
         }
 
         ++state.symbols_this_step;
-        if (best_dur > 0 || state.symbols_this_step >= opts.max_symbols_per_step) {
-            t += std::max(1, best_dur);
+        const bool force_advance =
+            state.symbols_this_step >= opts.max_symbols_per_step;
+        if ((!is_rnnt && best_dur > 0) || force_advance) {
+            t += is_rnnt ? 1 : std::max(1, best_dur);
             state.symbols_this_step = 0;
         }
     }
@@ -1020,7 +1075,7 @@ int tdt_decode_window(const ParakeetCtcModel & model,
         if (!run_lstm_init_step(W, pending_lstm_token)) return 9;
     }
 
-    state.carry_frames = std::max(0, t - n_frames);
+    state.carry_frames = is_rnnt ? 0 : std::max(0, t - n_frames);
     return 0;
 }
 
@@ -1046,6 +1101,38 @@ int tdt_greedy_decode(const ParakeetCtcModel & model,
     const auto t1 = std::chrono::steady_clock::now();
     result.decode_ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
     return 0;
+}
+
+int rnnt_decode_window(const ParakeetCtcModel & model,
+                       RnntRuntimeWeights & weights,
+                       const float * encoder_out_window,
+                       int n_frames,
+                       int encoder_dim,
+                       const RnntDecodeOptions & options,
+                       RnntDecodeState & state,
+                       std::vector<int32_t> & out_tokens,
+                       int & out_steps) {
+    if (model.model_type != ParakeetModelType::RNNT) {
+        return kWrongTransducerModel;
+    }
+    return tdt_decode_window(
+        model, weights, encoder_out_window, n_frames, encoder_dim,
+        options, state, out_tokens, out_steps);
+}
+
+int rnnt_greedy_decode(const ParakeetCtcModel & model,
+                       RnntRuntimeWeights & weights,
+                       const float * encoder_out,
+                       int encoder_frames,
+                       int encoder_dim,
+                       const RnntDecodeOptions & options,
+                       RnntDecodeResult & result) {
+    if (model.model_type != ParakeetModelType::RNNT) {
+        return kWrongTransducerModel;
+    }
+    return tdt_greedy_decode(
+        model, weights, encoder_out, encoder_frames, encoder_dim,
+        options, result);
 }
 
 }

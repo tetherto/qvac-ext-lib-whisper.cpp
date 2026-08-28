@@ -6,7 +6,7 @@
 //   <parakeet/cli.h>         - parakeet_cli_main C entry point
 //   <parakeet/log.h>         - parakeet_log_set host log sink
 //   <parakeet/engine.h>      - Engine + EngineOptions / EngineResult
-//                                   (CTC, TDT, EOU, Sortformer behind one
+//                                   (CTC, RNN-T, TDT, EOU, Sortformer behind one
 //                                   class)
 //   <parakeet/streaming.h>   - StreamingOptions / StreamingSegment /
 //                                   StreamSession + cross-engine

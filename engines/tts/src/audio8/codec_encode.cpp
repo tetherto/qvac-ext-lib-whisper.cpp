@@ -98,7 +98,8 @@ ggml_tensor * run_conv_stack(ggml_context * ctx, const codec_model & model,
 
 ggml_tensor * run_encoder_tail(ggml_context * ctx, const codec_model & model,
                                ggml_tensor * signal, ggml_tensor * mask) {
-    signal = window_forward(ctx, transformer_stage(model)->transformer, signal, mask);
+    signal = window_forward(ctx, transformer_stage(model)->transformer, signal, mask,
+                            model.precise_outputs);
     signal = snake(ctx, signal, model.enc_out_alpha, model.hp.snake_epsilon);
     return causal_conv(ctx, model.enc_out, signal, /*stride=*/1, /*dilation=*/1);
 }
@@ -159,11 +160,6 @@ ggml_tensor * quantize_bank(ggml_context * ctx, const std::vector<quantizer_weig
     return residual;
 }
 
-ggml_tensor * build_conv_stack(ggml_context * ctx, const codec_model & model,
-                               int n_samples) {
-    return run_conv_stack(ctx, model, input_f32(ctx, AUDIO_INPUT, /*ne0=*/1, n_samples));
-}
-
 analysis_graph build_analysis(ggml_context * ctx, const codec_model & model, int positions,
                               int n_frames) {
     ggml_tensor * features = input_f32(ctx, FEATURE_INPUT, feature_width(model), positions);
@@ -172,10 +168,11 @@ analysis_graph build_analysis(ggml_context * ctx, const codec_model & model, int
 
     analysis_graph built;
     built.encoded = run_encoder_tail(ctx, model, features, enc_mask);
-    built.downsampled = window_forward(
-        ctx, model.pre,
-        run_downsample(ctx, model.downsample, built.encoded, model.hp.convnext_norm_eps),
-        pre_mask);
+    built.downsampled =
+        window_forward(ctx, model.pre,
+                       run_downsample(ctx, model.downsample, built.encoded,
+                                      model.hp.convnext_norm_eps),
+                       pre_mask, model.precise_outputs);
 
     ggml_tensor * residual = quantize_bank(ctx, model.semantic_quantizers,
                                            built.downsampled, built.codes);
@@ -336,6 +333,11 @@ bool check_encodable(const codec_model & model, int n_frames, std::string * erro
 }
 
 }  // namespace
+
+ggml_tensor * build_conv_stack(ggml_context * ctx, const codec_model & model,
+                               int n_samples) {
+    return run_conv_stack(ctx, model, input_f32(ctx, AUDIO_INPUT, /*ne0=*/1, n_samples));
+}
 
 bool encode_audio(codec_model & model, const float * pcm, int n_samples, int n_threads,
                   const cancel_hook & cancel, std::vector<int32_t> & codes_out,

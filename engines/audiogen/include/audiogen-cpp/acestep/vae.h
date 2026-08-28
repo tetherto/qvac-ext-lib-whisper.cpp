@@ -68,8 +68,11 @@ public:
 
     // Encode interleaved stereo 48 kHz PCM (frames*2 samples) into the 64-channel
     // mean latent (time-major) in one full graph. Sets *T_latent_out. Empty on
-    // failure or if the encoder was not loaded (see VaeOptions::with_encoder).
-    std::vector<float> encode(const std::vector<float> & pcm_interleaved, int frames, int * T_latent_out) const;
+    // failure, cancellation, or if the encoder was not loaded (see
+    // VaeOptions::with_encoder).
+    std::vector<float> encode(const std::vector<float> & pcm_interleaved, int frames,
+                              int * T_latent_out,
+                              const ProgressCb & on_progress = {}) const;
 
     bool        has_encoder() const;
     int         sample_rate() const;   // 48000

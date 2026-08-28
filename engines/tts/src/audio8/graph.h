@@ -64,11 +64,9 @@ rope_planes rope_window(ggml_context * ctx, ggml_tensor * cos_table,
 // x is [head_dim, n_head, count].
 ggml_tensor * apply_rope(ggml_context * ctx, ggml_tensor * x, const rope_planes & rope);
 
-// ggml_mul_mat with F32 arithmetic requested. GPU backends may otherwise stage
-// f32 operands at reduced precision -- on Metal an f32 x f32 product is
-// multiplied in fp16 -- which would leave the f32 tier unusable as the parity
-// ground truth there. A no-op for quantized weights and on the CPU backend.
 ggml_tensor * precise_mul_mat(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b);
+ggml_tensor * multiply_mat(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b,
+                           bool precise);
 
 ggml_tensor * rms_norm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * weight, float eps);
 
@@ -86,6 +84,7 @@ struct attention_shape {
     int width = 0;
     int n_past = 0;
     int layer = 0;
+    bool precise_values = false;
 };
 
 // Projects x, rotates, appends to the cache and reads the whole prefix back.

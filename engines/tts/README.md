@@ -12,7 +12,7 @@ installed public headers under `include/tts-cpp/`; the two Chatterbox families
 share one engine API, while the Supertonic generations share another.
 
 This directory is the in-tree `engines/tts` package in
-[`qvac-ext-lib-whisper.cpp`](../../README.md). It consumes the system
+[`qvac-fabric-speech.cpp`](../../README.md). It consumes the system
 `ggml-speech` package built from
 [`qvac-ext-ggml@speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech).
 The checkout intentionally starts without a local `ggml/`, `patches/`, or
@@ -49,11 +49,104 @@ engine, not every backend ggml can compile.
 | Supertonic 1 | English | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Supertonic 2 | `en`, `ko`, `es`, `pt`, `fr` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
 | Supertonic 3 | 31 languages plus `na` | preset or external style tensors/JSON | 44.1 kHz | yes | yes | yes | yes | yes |
-| Parler-TTS mini/large/Indic | English or 21 Indic languages | natural-language description | 44.1 kHz | yes | yes | yes | yes | no |
-| Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice; instruct controls | 24 kHz | yes | yes | yes | yes | no |
-| Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | yes | yes | no | no |
+| Parler-TTS mini/large/Indic | English or 21 Indic languages | natural-language description | 44.1 kHz | yes | yes | yes | yes | yes |
+| Fun-CosyVoice3-0.5B | model-advertised multilingual text | baked voice or zero-shot/cross-lingual reference WAV; instruct controls | 24 kHz | yes | yes | yes | yes | yes |
+| Audio8-TTS-Preview-0.6B | multilingual checkpoint vocabulary | model voice or zero-shot reference WAV + transcript | 44.1 kHz | yes | yes | yes | yes | yes |
 | LavaSR denoiser | language agnostic | input PCM | rate preserving | yes | yes | yes | yes | yes |
 | LavaSR enhancer | language agnostic | input PCM | 48 kHz | yes | yes | yes | yes | yes |
+
+Chatterbox on CUDA depends on two ggml-cuda fixes carried by
+[`qvac-ext-ggml@speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech).
+Without the first (`im2col` / `pad` striding the grid Y and Z axes, which are
+capped at 65535) a chunk past roughly ten seconds aborts the launch; Chatterbox
+splits on sentences but readily emits a thirty-second chunk from ordinary
+prose, so long-form input reaches it. Without the second (`conv_transpose_1d`
+bounded to the kernel taps that reach each output) the HiFT vocoder is slower
+on CUDA than on CPU and dominates the pipeline. With both, Chatterbox Turbo
+runs at RTF 0.05 against 0.72 on CPU, and Multilingual at 0.08 against 3.23 --
+CPU cannot keep up with real time on Multilingual and CUDA is comfortably
+ahead of it.
+
+What that row is based on: `test-s3gen` compares every S3Gen and HiFT stage to
+the Python reference dump under an explicit per-stage tolerance and returns
+non-zero when one is exceeded. It is registered per backend (`test-s3gen-cuda`,
+`test-s3gen-vulkan`), each arm pinning its backend through
+`TTS_CPP_GPU_BACKEND` and failing rather than falling back to the CPU.
+
+T3 carries a weaker claim, and the shape of it matters. Its `t3-mtl-ref`
+fixture cannot be regenerated -- the dump script pins no conditioning, so a
+fresh dump disagrees with the C++ by about 4e-2 on CPU and CUDA alike -- so
+there is no reference parity for T3 on any backend. Nor do CPU and GPU agree
+token for token: T3 decodes autoregressively, so a single differing argmax
+re-rolls the remainder and the two emit different counts for the same input
+(55 against 56, 64 against 68, 63 against 69 on the three phrases the arm
+uses). `test-chatterbox-parity-mtl-{cuda,vulkan}` therefore asserts what does
+hold -- both backends produce audio, and within 1.35x of each other's duration,
+which truncation, runaway generation and silent failure all break. T3 on CUDA
+is gated at that strength and no more.
+
+Parler on CUDA is covered by the same per-stage reference harnesses as the
+other GPU backends, registered per backend as `test-parler-dac-{cuda,vulkan}`
+and run with the full Parler suite pinned to each: 15/15 on CUDA and on
+Vulkan against the mini-v1 fixtures. The Indic checkpoint remains hub-gated,
+so its arm carries the mini/large result, as it always has. The DAC
+range-equivalence check now states its real contract: bit-identity on the
+CPU, and a measured tolerance on GPU backends, where a ranged decode near a
+sequence edge builds a shorter graph than the full decode and a GEMM over a
+different shape legitimately reduces in a different order (worst observed:
+5.12e-4 on CUDA, under 1e-5 on Vulkan, against a 2e-3 bar; the window
+arithmetic errors the check exists to catch are hop-scale).
+
+Audio8 on CUDA required one ggml-cuda fix and a rethink of what its
+harnesses measure. The fix: the transpose fast path of the CUDA copy kernel
+ignores destination strides, so the V-cache append -- a transposed source
+into a strided cache view -- corrupted attention from the first prefill step;
+with the guarded kernel the LM's per-step numerics match the Vulkan-vs-CPU
+baseline node for node. The rethink: Audio8's networks are expansive enough
+that sub-ulp cross-backend rounding grows into large per-element differences,
+and its rollouts are free-running, so one differing argmax re-rolls the rest.
+The harnesses now gate on observables that are stable across backends -- a
+teacher-forced LM trace with per-step numeric bounds and a token-agreement
+rate (CPU exact, CUDA 96.9 percent, Vulkan 100), codec codes agreement with
+energy-level latent bounds, and rollout audio sanity with correlation
+reported for information -- with every bar measured on all three backends.
+The same redesign is what fixed test-audio8-codec and test-audio8-lm-vulkan,
+which had been failing on unmodified master since the speech ggml moved past
+their calibration.
+
+CosyVoice3 on CUDA is covered by the same per-stage reference harnesses as
+its other GPU backends, each registered per backend --
+`test-cosyvoice-{flow,llm,hift,conv1d,frontend,clone}-{cuda,vulkan}` and
+`test-s3tokenizer-v3-{cuda,vulkan}[-q8_0]` -- so both desktop backends stay
+pinned rather than whichever selection prefers: the full CosyVoice and
+s3tokenizer suite passes 27/27 pinned to CUDA and to Vulkan. Greedy long-form
+synthesis (67 s of audio, well past the launch-abort threshold the
+grid-striding fix removed) produces the identical sample count (1617600) on
+CUDA, Vulkan and the CPU -- each measured -- at roughly 12 s wall on either
+GPU against 526 s on the CPU. The CUDA column here is engine-level validation; the consumer path --
+the published `speech-cpp[cuda]` port and the addon behind it -- ships with
+the registry bump that closes this model series, which is when that port and
+the qvac workflows exercise it end to end.
+
+Supertonic on CUDA rests on a backend-capability distinction the F16-weight
+auto policy now probes: the conv-via-im2col lowerings put the weight in
+mul_mat's second operand, and ggml-cuda (and ggml-cpu) accept an F16 weight as
+the first operand while rejecting it as the second, where ggml-vulkan accepts
+both. Materialising F16 weights on such a backend left the scheduler with a
+node no backend claims and aborted the first synthesis. The auto policy
+requires both orientations, so CUDA and any future backend in its position
+keep F32 weights -- slower but correct, the same trade the policy already
+makes on CPU and OpenCL -- while Vulkan and Metal keep the F16 roster. With
+that in place all three Supertonic generations synthesize on CUDA at every
+shipped tier (f32, f16, q8_0, q4_0), the direct and scheduler paths are
+bit-identical per backend (`test-supertonic-sched-equivalence-{cuda,vulkan}`),
+and CUDA matches the CPU's output length exactly on the reference sentences.
+
+Where a build carries both CUDA and Vulkan, selection prefers CUDA on NVIDIA:
+measured on one binary on an RTX 3090, Chatterbox Turbo is 8.6x faster on CUDA
+than on that card's Vulkan adapter. Set `TTS_CPP_GPU_BACKEND` to `cuda`,
+`vulkan`, `metal` or `opencl` to pin one for a test arm or a comparison; an
+unrecognised value is rejected rather than silently dropping to the CPU.
 
 Chatterbox Multilingual's native tokenizer covers `en, es, fr, de, it, pt, nl,
 pl, tr, sv, da, fi, no, el, ms, sw, ar, ko`; `ja`, `he`, `ru`, `zh`, and `hi`
@@ -570,6 +663,42 @@ the callback shape but does not reduce first-audio latency.
   --text "Hello from CosyVoice3." --out out.wav
 ```
 
+### Voice cloning
+
+With no reference audio the engine speaks with the baked default voice
+(`voice.gguf`). Zero-shot / cross-lingual cloning runs fully natively — the
+reference wav is tokenized by a ggml port of `speech_tokenizer_v3` (12-block
+FSMN encoder + FSQ, converted by `scripts/convert-s3tokenizer-v3-to-gguf.py`),
+the 192-d speaker embedding comes from the CAM++ port
+(`scripts/convert-campplus-to-gguf.py`; the same 3D-Speaker checkpoint
+CosyVoice ships as `campplus.onnx`), and the prompt mel from the shared
+matcha-compatible mel extractor. Both GGUFs are required whenever
+`reference_audio` is set (`cosyvoice3-s3tok*.gguf`,
+`cosyvoice3-campplus*.gguf`, auto-resolved from the model dir); a missing
+model, an unreadable wav, or an out-of-range duration (0.5-30 s hard limits,
+5-15 s recommended) fails construction rather than silently keeping the baked
+voice.
+
+The reference transcript selects the mode, mirroring the upstream frontends:
+
+```bash
+# zero-shot: transcript given, LM prompted with the reference speech tokens
+# (best fidelity when synthesizing the reference's own language)
+./build/cosyvoice-cli --model-dir models/cosyvoice3-0.5b \
+  --reference-audio me.wav --prompt-text "verbatim transcript of me.wav" \
+  --text "Same language as the reference." --out out.wav
+
+# cross-lingual: no transcript, timbre-only conditioning through the flow
+./build/cosyvoice-cli --model-dir models/cosyvoice3-0.5b \
+  --reference-audio me.wav --text "Any other language." --out out.wav
+```
+
+The bake runs once at engine construction (roughly a second of CPU for the
+tokenizer + CAM++ + mel on a short clip; the tokenizer graph rides the
+engine's GPU backend when one is selected). Instruct mode composes with a
+cloned voice: the instruction drives dialect/style while the cloned tensors
+supply the timbre.
+
 ## Audio8
 
 [Audio8](https://github.com/Audio8-AI/Audio8_TTS) is a DualAR zero-shot TTS
@@ -581,15 +710,41 @@ frame.  Cloning needs no speaker encoder: the codec *encoder* turns a reference
 wav into codes, and those codes plus the reference transcript are prepended to
 the prompt.
 
-**Status — CPU, Metal, and desktop Vulkan, validated against the reference.**
-Text-to-speech and voice cloning both run in-process on macOS and iOS Metal and
-on Linux and Windows Vulkan.  Pass `--n-gpu-layers 99` to offload every stage;
-omit it for CPU.  On Metal that is **4.2x** CPU at q4_0 and **3.2x** at q8_0 on
-an iPhone 17, measured on device with both arms in one launch.  At F32 the GPU
-reproduces the CPU code trajectory exactly, frame for frame, which is the
-strongest available statement that the graphs compute the same function;
-quantised tiers fork their trajectories under either backend and are judged by
-WER instead.
+**Status — CPU, Metal, OpenCL, and desktop Vulkan, validated against the
+reference.**  Text-to-speech and voice cloning both run in-process on macOS and
+iOS Metal, on Android/Adreno OpenCL, and on Linux and Windows Vulkan.  Pass
+`--n-gpu-layers 99` to offload every stage; omit it for CPU.  On Metal that is
+**4.2x** CPU at q4_0 and **3.2x** at q8_0 on an iPhone 17, measured on device
+with both arms in one launch.  At F32 the GPU reproduces the CPU code trajectory
+exactly, frame for frame, which is the strongest available statement that the
+graphs compute the same function; quantised tiers fork their trajectories under
+either backend and are judged by WER instead.
+
+On OpenCL the two halves of the model behave differently and are reported
+separately, because a single overall number is not reproducible on that device.
+**Codec synthesis is 3.5-4.7x faster than CPU** and is stable run to run.  The
+autoregressive loop is not GPU-bound at all: it is bound by the host issuing
+roughly one dispatch every 24 us, so its wall time follows which CPU core the
+issuing thread is scheduled onto.  Pinning that thread to the big cluster took a
+q4_0 utterance from 30952/22011 ms across two runs to 17197/17201 ms — a 41%
+spread collapsing to 0.02% — while codec synthesis did not move.
+
+| backend | device | tier | codec synth | overall, same cores | overall, unpinned |
+|---|---|---|---:|---:|---:|
+| Metal | iPhone 17 | q8_0 | — | 3.2x | — |
+| Metal | iPhone 17 | q4_0 | — | 4.2x | — |
+| OpenCL | Adreno 740 | q8_0 | 4.7x | 1.9x | 1.1x |
+| OpenCL | Adreno 740 | q4_0 | 5.1x | 2.3x | 1.3x |
+
+Read the two overall columns as a range, not as one number with a caveat.  "Same
+cores" pins both arms to the big cluster, which makes the GPU arm reproducible
+(2.9% spread) but costs the CPU arm, whose five threads then contend for four
+cores.  "Unpinned" is the median of every interleaved, thermally gated run, and
+is what an application that does not set affinity should expect; its GPU arm
+ranged 126-245 ms/frame at q8_0 for the same binary.  Both were measured on a
+cold device with a 50 °C gate between arms.  Real-time factors are quoted
+elsewhere in this file as wall-clock seconds per second of audio, so **lower is
+faster** and a value above 1 means slower than real time.
 
 ### Convert
 
@@ -864,10 +1019,10 @@ ctest -R audio8 --output-on-failure
 no models; every other target needs the dumps.
 
 On a build with a GPU backend compiled in, the `lm`, `codec` and `engine`
-suites are registered a second time per backend as `test-audio8-<suite>-metal`
-and `-vulkan`. Each arm names its backend in `AUDIO8_TEST_GPU` and asserts it
-before reading a number, so an arm that fell back to CPU, or that was handed the
-other arm's GPU, fails rather than passing on someone else's result.
+suites are registered a second time per backend as `test-audio8-<suite>-metal`,
+`-vulkan` and `-opencl`. Each arm names its backend in `AUDIO8_TEST_GPU` and
+asserts it before reading a number, so an arm that fell back to CPU, or that was
+handed the other arm's GPU, fails rather than passing on someone else's result.
 
 The engine test hands the cloning path a wav rather than pre-computed codes, so
 it exercises the codec encoder the way a caller would.

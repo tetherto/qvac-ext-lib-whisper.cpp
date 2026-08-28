@@ -1,4 +1,4 @@
-# qvac-ext-lib-whisper.cpp
+# qvac-fabric-speech.cpp
 
 On-device speech and audio AI in pure C++ on [ggml](https://github.com/tetherto/qvac-ext-ggml): speech-to-text, speaker diarization, end-of-utterance detection, text-to-speech, voice cloning, speech enhancement, and music generation.
 
@@ -49,6 +49,8 @@ tts       text -> LM (T3 / Llama / Qwen2.5) -> acoustic tokens -> CFM or flow ->
 audiogen  caption + lyrics -> ACE-Step LM -> FSQ detokenizer -> text encoder
                            -> condition encoder -> DiT flow matching
                            -> Oobleck VAE -> 48 kHz stereo
+          caption + lyrics -> MiniMax Qwen3 LM -> RVQ depth decoder
+                           -> condition encoder -> flow DiT -> vocoder -> stereo
 ```
 
 ## Repo layout
@@ -61,7 +63,7 @@ third_party/whisper.cpp/    upstream whisper.cpp, vendored as a git subtree,
 engines/
   parakeet/                 ASR + diarization + end-of-utterance (NVIDIA Parakeet family)
   tts/                      text-to-speech, voice cloning, speech enhancement
-  audiogen/                 music generation (ACE-Step)
+  audiogen/                 music generation (ACE-Step, MiniMax-Music3)
 docs/UPSTREAM-SYNC.md       how to sync the whisper subtree
 ```
 
@@ -87,7 +89,7 @@ engine-specific guides qualify model-level validation.
 | `silero-v6.2.0` | whisper | language agnostic | 2 M | `f16` | CPU | voice activity detection |
 | `nvidia/parakeet-ctc-0.6b` | parakeet | English | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA | offline + streaming + long-form |
 | `nvidia/parakeet-ctc-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | offline + streaming + long-form |
-| `ai4bharat/indic-conformer-600m-multilingual` | parakeet | 22 Indic (CTC-only export) | 600 M | `f16`, `q8_0`, `q4_0` | CPU | GPU backends share the CTC path but remain unvalidated; requires `--language` / `EngineOptions::language` |
+| `ai4bharat/indic-conformer-600m-multilingual` | parakeet | 22 Indic (CTC-only export) | 600 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan | OpenCL/CUDA share the CTC path but remain unvalidated; requires `--language` / `EngineOptions::language` |
 | `nvidia/parakeet-tdt-0.6b-v3` | parakeet | ~25 + punctuation and capitalization | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA; Core ML offline encoder | graph decoder on Metal/Vulkan/CUDA; scalar on CPU/OpenCL |
 | `nvidia/parakeet-tdt-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA; Core ML offline encoder | no punctuation; graph decoder on Metal/Vulkan/CUDA |
 
@@ -114,11 +116,17 @@ Pair any CTC, TDT, or EOU GGUF with a Sortformer GGUF via `--diarization-model` 
 | Supertonic v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming |
 | Supertonic v2 | tts | 5 (`en`, `ko`, `es`, `pt`, `fr`) | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming |
 | Supertonic v3 | tts | 31 + `na` | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming, `na` for unknown source language |
-| Parler-TTS mini-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | description-conditioned voice, no cloning |
-| Parler-TTS large-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | description-conditioned voice |
-| Indic Parler-TTS | tts | 21 Indic | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | Indic prompt BPE tokenizer |
-| Fun-CosyVoice3-0.5B | tts | model-advertised multilingual text | 24 kHz | `f32` | CPU, Metal, Vulkan, OpenCL | Qwen2.5 LM + DiT flow + CausalHiFT; Metal, desktop Vulkan, and OpenCL are the validated GPU paths |
-| Audio8-TTS-Preview-0.6B | tts | multilingual | 44.1 kHz | `f32`, `f16`, `q8_0`; LM also `q4_0` | CPU, Metal, Vulkan | DualAR + DAC codec, zero-shot cloning from reference audio and transcript |
+| Parler-TTS mini-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL, CUDA | description-conditioned voice, no cloning |
+| Parler-TTS large-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL, CUDA | description-conditioned voice |
+| Indic Parler-TTS | tts | 21 Indic | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL, CUDA | Indic prompt BPE tokenizer |
+| Fun-CosyVoice3-0.5B | tts | model-advertised multilingual text | 24 kHz | `f32` | CPU, Metal, Vulkan, OpenCL, CUDA | Qwen2.5 LM + DiT flow + CausalHiFT; zero-shot/cross-lingual cloning from a reference WAV (native speech_tokenizer_v3 + CAM++); Metal, desktop Vulkan, desktop CUDA, and OpenCL are the validated GPU paths |
+| Audio8-TTS-Preview-0.6B | tts | multilingual | 44.1 kHz | `f32`, `f16`, `q8_0`; LM also `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA | DualAR + DAC codec, zero-shot cloning from reference audio and transcript |
+
+When a TTS build carries both CUDA and Vulkan, backend selection prefers CUDA
+on NVIDIA hardware; `TTS_CPP_GPU_BACKEND=cuda|vulkan|metal|opencl` pins one
+backend for a test arm or comparison and rejects a value that selects no usable
+device. The per-model validation each backend column rests on is documented in
+the [TTS capability table](engines/tts/README.md#capabilities).
 
 ### Speech enhancement
 
@@ -131,8 +139,9 @@ Pair any CTC, TDT, or EOU GGUF with a Sortformer GGUF via `--diarization-model` 
 
 | Model | Engine | Task | Rate | Quantization | Backends | Notes |
 |---|---|---|---|---|---|---|
-| ACE-Step v15 turbo | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0`, `q4_k_m` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 8 diffusion steps by default |
-| ACE-Step v15 sft | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 50 diffusion steps by default |
+| ACE-Step v15 turbo | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0`, `q4_k_m` | CPU, Vulkan, Metal, OpenCL (Adreno 700+), CUDA | 8 diffusion steps by default |
+| ACE-Step v15 sft | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal, OpenCL (Adreno 700+), CUDA | 50 diffusion steps by default |
+| MiniMax-Music3 | audiogen | text-to-music | 44.1 kHz stereo | `f16`, `q8_0` | desktop CPU + GPU (CUDA, Vulkan, Metal via `EngineOptions::device`) | 25 fps, 30 flow steps, two GGUF files; `test-minimax-metal-ops` checks Metal condition/vocoder parity on an Apple7+ GPU |
 
 ## Build
 
@@ -151,6 +160,11 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$PWD/ggml-ins
 cmake --build build -j
 ```
 
+Stage 1 installs a **shared** ggml. Stage 2 follows `BUILD_SHARED_LIBS` (whisper
+defaults it `ON` for the umbrella). `audiogen-cpp` can be shared; its CLIs and
+tests link an object library so they still see hidden internals. Consumers keep
+`audiogen-cpp::audiogen-cpp`.
+
 ### CMake options
 
 | Option | Default | Effect |
@@ -159,23 +173,28 @@ cmake --build build -j
 | `SPEECH_BUILD_PARAKEET` | `ON` | build `engines/parakeet` |
 | `SPEECH_BUILD_TTS` | `ON` | build `engines/tts` |
 | `SPEECH_BUILD_AUDIOGEN` | `ON` | build `engines/audiogen` |
+| `AUDIOGEN_BUILD_MINIMAX` | desktop `ON`, mobile `OFF` | build the desktop MiniMax-Music3 engine (CPU by default, GPU via `EngineOptions::device`) |
 | `SPEECH_BUILD_EXECUTABLES` | `ON` | build the CLIs; set `OFF` for library-only builds |
 | `SPEECH_BUILD_TESTS` | `OFF` | build the engine test harnesses |
 | `SPEECH_BUILD_WHISPER_TESTS` | `OFF` | also build whisper's tests (transcription tests need downloaded models) |
 
-GPU backends come from the ggml build: `-DGGML_VULKAN=ON`, `-DGGML_OPENCL=ON`, `-DGGML_CUDA=ON`; Metal is on by default on Apple. Core ML is gated per engine and defaults to off on both, so add `-DWHISPER_COREML=ON -DPARAKEET_COREML=ON` on Apple for the Whisper encoder and Parakeet offline TDT encoder sidecars. For tests, configure with `-DSPEECH_BUILD_TESTS=ON`, then run the non-GPU suite with `ctest --test-dir build -LE 'gpu|perf'`.
+GPU backends come from the ggml build: `-DGGML_VULKAN=ON`, `-DGGML_OPENCL=ON`, `-DGGML_CUDA=ON`; Metal is on by default on Apple. Core ML is gated per engine and defaults to off on both, so add `-DWHISPER_COREML=ON -DPARAKEET_COREML=ON` on Apple for the Whisper encoder and Parakeet offline TDT encoder sidecars. For tests, configure with `-DSPEECH_BUILD_TESTS=ON`, then run the non-GPU suite with `ctest --test-dir build -LE 'gpu|perf'`. A Metal build also exposes `test-minimax-metal-ops`, the model-free AudioGen CPU/Metal parity regression; it skips unless the Metal device supports `MUL_MAT` (simdgroup reduction, `MTLGPUFamilyApple7`+), which rules out the virtualized GPUs on hosted macOS runners.
 
-Each engine also configures standalone (`cmake -S engines/parakeet`, and so on), which is what the per-engine vcpkg ports and CI lanes use.
+Each engine also configures standalone (`cmake -S engines/parakeet`, and so on), which is what the CI lanes use.
 
 ### Consumable packages
 
-| vcpkg port | `find_package` | Imported target |
+One vcpkg port, [`speech-cpp`](https://github.com/tetherto/qvac-registry-vcpkg/tree/main/ports/speech-cpp), builds this repo through the umbrella `CMakeLists.txt` above: engine features select what gets built, and every enabled engine links the single `ggml-speech` ggml. Consumers depend on the engines they need, for example `speech-cpp[whisper,parakeet,vulkan]`, and the backend features (`metal`, `vulkan`, `opencl`) fan out to the matching `ggml-speech` features so the whole stack resolves one ggml.
+
+| Feature | `find_package` | Imported target |
 |---|---|---|
-| `ggml-speech` | `ggml` | `ggml::ggml` |
-| `whisper-cpp` | `whisper` | `whisper::whisper` |
-| `parakeet-cpp` | `qvac-parakeet` | `qvac::parakeet` |
-| `tts-cpp` | `tts-cpp` | `tts-cpp::tts-cpp` |
-| `audiogen-cpp` | `audiogen-cpp` | `audiogen-cpp::audiogen-cpp` |
+| (always) | `ggml` | `ggml::ggml` |
+| `speech-cpp[whisper]` | `whisper` | `whisper::whisper` |
+| `speech-cpp[parakeet]` | `qvac-parakeet` | `qvac::parakeet` |
+| `speech-cpp[tts]` | `tts-cpp` | `tts-cpp::tts-cpp` |
+| `speech-cpp[audiogen]` | `audiogen-cpp` | `audiogen-cpp::audiogen-cpp` |
+
+The per-engine `whisper-cpp`, `parakeet-cpp`, `tts-cpp` and `audiogen-cpp` ports that predate `speech-cpp` are superseded: they pinned this repo at four different commits, and `speech-cpp` replaces them with one pin for the whole stack.
 
 ## Command line tools
 
@@ -190,6 +209,8 @@ Each engine also configures standalone (`cmake -S engines/parakeet`, and so on),
 | `audio8-cli` | tts | Audio8 synthesis and zero-shot voice cloning |
 | `music-cli` | audiogen | end-to-end text-to-music |
 | `acestep-cli` | audiogen | Oobleck VAE decode and roundtrip harness |
+| `acestep-quantize` | audiogen | requantize converted ACE-Step stage GGUFs |
+| `mm3-replay` | audiogen | MiniMax-Music3 generation and parity harness |
 | `lavasr-bench` | tts | denoiser and enhancer benchmark |
 | `mel2wav` | tts | HiFT mel to wav |
 
@@ -278,8 +299,9 @@ See [Voice conditioning](engines/tts/README.md#voice-conditioning-cross-engine).
 
 AudioGen uses four GGUF files for six runtime weight sets. The DiT file also
 contains the FSQ detokenizer and condition encoder; see the
-[AudioGen model setup](engines/audiogen/README.md#model-setup) for validated
-file combinations and registry download instructions.
+[AudioGen model setup](engines/audiogen/README.md#model-setup) for the
+validated file combinations and the download, conversion, and quantization
+steps that produce them.
 
 ```sh
 ./build/engines/audiogen/music-cli --models models/acestep \
@@ -289,7 +311,12 @@ file combinations and registry download instructions.
 
 ## Performance
 
-`RTF = inference_time / audio_duration`, lower is better. The parakeet and tts READMEs carry the full tables, methodology, and reproduction steps; audiogen has no benchmark suite yet and reports per-stage wall clock on stderr.
+`RTF = inference_time / audio_duration`, lower is better. The parakeet and tts
+READMEs carry their full tables, methodology, and reproduction steps. AudioGen
+has a reproducible
+[engine comparison harness](engines/audiogen/benchmarks/comparison/README.md)
+for CPU, Metal, Vulkan, and CUDA; `music-cli` also reports per-stage wall clock
+on stderr.
 
 ### ASR, end-of-utterance, diarization
 
@@ -355,14 +382,14 @@ On-device Android and iOS performance is tracked by the benchmark lanes in [QVAC
 
 ## Use in QVAC
 
-These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons, which consume the vcpkg ports built from this repo. The CLIs here are development and validation entry points: for anything beyond them, such as the JavaScript and TypeScript APIs on the Bare runtime, model download and registry, and desktop plus mobile app integration, see QVAC.
+These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons, which consume the `speech-cpp` vcpkg port built from this repo. The CLIs here are development and validation entry points: for anything beyond them, such as the JavaScript and TypeScript APIs on the Bare runtime and desktop plus mobile app integration, see QVAC.
 
-| QVAC addon | Wraps | vcpkg ports consumed |
+| QVAC addon | Wraps | `speech-cpp` features consumed |
 |---|---|---|
-| `@qvac/asr-ggml` | speech-to-text, diarization, end-of-utterance | `whisper-cpp`, `parakeet-cpp` |
-| `@qvac/tts-ggml` | text-to-speech, voice cloning, speech enhancement | `tts-cpp` |
-| `@qvac/audiogen-ggml` | music generation | `audiogen-cpp` |
-| `@qvac/bci-whispercpp` | brain-computer interface transcription | `whisper-cpp` |
+| `@qvac/asr-ggml` | speech-to-text, diarization, end-of-utterance | `whisper`, `parakeet` |
+| `@qvac/tts-ggml` | text-to-speech, voice cloning, speech enhancement | `tts` |
+| `@qvac/audiogen-ggml` | music generation | `audiogen` |
+| `@qvac/bci-whispercpp` | brain-computer interface transcription | `whisper` |
 
 ## Licenses
 
@@ -371,7 +398,7 @@ These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons
 | `third_party/whisper.cpp` | MIT | MIT (OpenAI Whisper), Silero VAD models under their own terms |
 | `engines/parakeet` | Apache-2.0 | CC-BY-4.0, except `parakeet_realtime_eou_120m-v1` under the NVIDIA Open Model License |
 | `engines/tts` | MIT | Chatterbox MIT; Parler, CosyVoice3, Audio8, and LavaSR Apache-2.0; Supertonic OpenRAIL-M |
-| `engines/audiogen` | MIT | ACE-Step 1.5 MIT, Qwen3-Embedding Apache-2.0 |
+| `engines/audiogen` | MIT | ACE-Step 1.5 MIT, Qwen3-Embedding Apache-2.0, MiniMax-Music3 Community License |
 
 Per-engine `NOTICE` files list every third-party dependency and its license.
 

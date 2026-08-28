@@ -52,7 +52,7 @@ void print_usage(const char * argv0) {
         "usage: %s --model <parakeet.gguf | sortformer.gguf> [options]\n"
         "\n"
         "Captures the default input device at 16 kHz mono. If --model is a\n"
-        "transcription (CTC/TDT) GGUF, runs live transcription. If --model is\n"
+        "transcription (CTC/RNN-T/TDT/EOU) GGUF, runs live transcription. If --model is\n"
         "a Sortformer GGUF, runs live speaker diarization (segments labeled\n"
         "speaker_0..speaker_3).\n"
         "Press Ctrl-C to stop; the final partial chunk is flushed before exit.\n"

@@ -1267,6 +1267,29 @@ bool supertonic_backend_supports_f16_kv_flash_attn(ggml_backend_t backend);
 // materialisation.
 bool supertonic_backend_supports_f16_mul_mat(ggml_backend_t backend);
 
+// Companion probe for the other operand order: the conv-via-im2col
+// lowerings put the weight in mul_mat's second operand, and a backend can
+// accept an F16 weight as src0 while rejecting it as src1 (ggml-cuda and
+// ggml-cpu both do). The auto policy requires both probes, so a backend
+// that cannot run either orientation keeps F32 weights.
+bool supertonic_backend_supports_f16_src1_mul_mat(ggml_backend_t backend);
+
+// Pure-logic resolver for the F16-weight auto policy (EngineOptions::
+// f16_weights < 0). Materialisation requires every hand to be safe: not the
+// CPU (its custom-op fast paths read raw F32), not OpenCL (its supports_op
+// reports the src1 orientation as fine and then asserts at compute, so no
+// probe can clear it), not a padded-mulmat device (the st_mul_mat output pad
+// only covers F32 operands), and a backend that accepts an F16 weight in
+// both mul_mat orientations.
+inline bool supertonic_f16_weights_auto_policy(bool backend_is_cpu,
+                                               bool backend_is_opencl,
+                                               bool mulmat_needs_pad,
+                                               bool f16_mul_mat,
+                                               bool f16_src1_mul_mat) {
+    return !backend_is_cpu && !backend_is_opencl && !mulmat_needs_pad &&
+           f16_mul_mat && f16_src1_mul_mat;
+}
+
 // follow-up — load-time backend-capability probe for
 // the Q8_0 K/V `FLASH_ATTN_EXT` variant.  Forward-compat: returns
 // `true` when the backend would accept a Supertonic-shaped

@@ -20,6 +20,7 @@ namespace tts_cpp::acestep {
 
 static constexpr int COND_H  = 2048;  // encoder hidden size
 static constexpr int COND_W  = 128;   // bidirectional sliding window
+static constexpr int COND_LATENT_CHANNELS = 64;
 
 static Qwen3Config lyric_config() {
     Qwen3Config c;
@@ -40,6 +41,7 @@ struct CondModel {
     ggml_backend_t        backend    = nullptr;  // borrowed
     ggml_context *        weight_ctx = nullptr;
     ggml_backend_buffer_t weight_buf = nullptr;
+    bool                  use_flash_attn = false;
 
     Qwen3Config lyric_cfg;
     Qwen3Config timbre_cfg;
@@ -60,6 +62,8 @@ struct CondModel {
 
     std::vector<float> null_emb;       // [2048] dequantized
     std::vector<float> silence_frame;  // [64] first frame of silence_latent (text2music timbre)
+    std::vector<float> silence_latent;
+    int                silence_frames = 0;
 
     // CPU map-in-place: verbatim weights backed by `gguf`'s mmap via `map_buf`.
     DitGGUF               gguf;
@@ -67,6 +71,16 @@ struct CondModel {
     bool                  mapped  = false;
     size_t                mapped_bytes = 0;  // sum of mmapped weight nbytes
 };
+
+static void load_silence_latent(CondModel * model, const ggml_tensor * metadata, const void * data) {
+    const size_t count = (size_t) ggml_nelements(metadata);
+    model->silence_latent.resize(count);
+    std::memcpy(model->silence_latent.data(), data, count * sizeof(float));
+    model->silence_frames = (int) (count / COND_LATENT_CHANNELS);
+    model->silence_frame.resize(COND_LATENT_CHANNELS);
+    std::memcpy(model->silence_frame.data(), model->silence_latent.data(),
+                COND_LATENT_CHANNELS * sizeof(float));
+}
 
 static void dequant_to_f32(const DitGGUF & g, const std::string & name, std::vector<float> & out) {
     ggml_tensor * mt = dit_gmeta(g, name);
@@ -95,9 +109,12 @@ CondModel * cond_model_load(const std::string & path, ggml_backend_t backend, bo
     }
 
     CondModel * m   = new CondModel();
-    m->backend      = backend;
+    m->backend = backend;
     m->lyric_cfg    = lyric_config();
     m->timbre_cfg   = timbre_config();
+    m->use_flash_attn =
+        m->lyric_cfg.prec != GGML_PREC_F32 &&
+        q3_backend_supports_flash_attention(backend, m->lyric_cfg);
     // acestep.cpp gates the CLS prepend on acestep.encoder_hidden_size > 0 (XL
     // models), not merely on the special_token tensor being present (the
     // converter may still emit it). Match that rule to keep the timbre token
@@ -181,9 +198,9 @@ CondModel * cond_model_load(const std::string & path, ggml_backend_t backend, bo
     {
         ggml_tensor * sm = dit_gmeta(g, "silence_latent");
         const void *  sd = dit_gdata(g, "silence_latent");
-        if (sm && sd && sm->type == GGML_TYPE_F32 && ggml_nelements(sm) >= 64) {
-            m->silence_frame.resize(64);
-            std::memcpy(m->silence_frame.data(), sd, 64 * sizeof(float));
+        if (sm && sd && sm->type == GGML_TYPE_F32 &&
+            ggml_nelements(sm) >= COND_LATENT_CHANNELS) {
+            load_silence_latent(m, sm, sd);
         } else {
             fprintf(stderr, "[acestep-cond] WARNING: silence_latent unavailable; timbre token disabled\n");
         }
@@ -224,6 +241,12 @@ const std::vector<float> & cond_model_null_emb(const CondModel * m) { return m->
 
 const std::vector<float> & cond_model_silence_frame(const CondModel * m) { return m->silence_frame; }
 
+const std::vector<float> & cond_model_silence_latent(const CondModel * m) {
+    return m->silence_latent;
+}
+
+int cond_model_silence_frames(const CondModel * m) { return m->silence_frames; }
+
 // Bidirectional sliding-window mask [S, S] F16: 0 if |i-j| <= W else -inf.
 static void fill_slide_mask(std::vector<uint16_t> & md, int S, int W) {
     md.resize((size_t) S * S);
@@ -255,7 +278,8 @@ bool cond_model_forward(CondModel * m, const float * text_hidden, int S_text, co
     ggml_tensor * lyric_h = q3_linear_bias(ctx, m->lyric_embed_w, m->lyric_embed_b, lyric_in);
     for (int i = 0; i < m->lyric_cfg.n_layers; i++) {
         ggml_tensor * mask = (i % 2 == 0) ? lyric_slide : nullptr;
-        lyric_h = q3_build_layer(ctx, m->lyric_cfg, &m->lyric_layers[i], lyric_h, lyric_pos, mask, S_lyric);
+        lyric_h = q3_build_layer(ctx, m->lyric_cfg, &m->lyric_layers[i], lyric_h, lyric_pos, mask, S_lyric,
+                                 m->use_flash_attn);
     }
     lyric_h = q3_rms_norm_w(ctx, lyric_h, m->lyric_norm, m->lyric_cfg.rms_norm_eps);
     ggml_set_output(lyric_h);
@@ -286,7 +310,8 @@ bool cond_model_forward(CondModel * m, const float * text_hidden, int S_text, co
         }
         for (int i = 0; i < m->timbre_cfg.n_layers; i++) {
             ggml_tensor * mask = (i % 2 == 0) ? timbre_slide : nullptr;
-            timbre_h = q3_build_layer(ctx, m->timbre_cfg, &m->timbre_layers[i], timbre_h, timbre_pos, mask, S_timbre);
+            timbre_h = q3_build_layer(ctx, m->timbre_cfg, &m->timbre_layers[i], timbre_h, timbre_pos, mask, S_timbre,
+                                     m->use_flash_attn);
         }
         timbre_h   = q3_rms_norm_w(ctx, timbre_h, m->timbre_norm, m->timbre_cfg.rms_norm_eps);
         timbre_out = ggml_cont(ctx, ggml_view_2d(ctx, timbre_h, H, 1, timbre_h->nb[1], 0));  // frame[0] / CLS

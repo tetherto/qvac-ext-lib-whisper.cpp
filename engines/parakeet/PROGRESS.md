@@ -2076,15 +2076,14 @@ Algorithm (per chunk):
 5. `finalize()` semantics:
    - if `>= 1` sample of new audio sits past the last emitted chunk,
      run one final `process_chunk` over `[max(ring_origin, end -
-     history_samples), end]`, emit each overlapping segment with
-     `is_final = true`. Consumers see real segments tagged final.
-   - if the audio ended exactly on a chunk boundary (no tail), emit a
-     single synthetic terminator with `speaker_id = -1`,
-     `start_s == end_s == emitted_samples / sample_rate`,
+     history_samples), end]` and emit overlapping real segments with
+     `is_final = false`.
+   - after either the tail-present or chunk-aligned path, emit exactly
+     one synthetic terminator with `speaker_id = -1`,
+     `start_s == end_s == emitted_samples / sample_rate`, and
      `is_final = true`. Consumers should treat negative speaker IDs as
-     "session done, no new segment". This avoids the round-1 bug
-     where the last chunk's segments were re-emitted as duplicates
-     with `is_final = true` flipped on.
+     "session done, no new segment". This became unconditional after the
+     tail path was found to return before emitting it.
 6. `cancel()` short-circuits; subsequent `feed_*` calls are no-ops.
 
 Trade-offs (vs the planned full Phase 11.11.2 NeMo-style streaming):
@@ -2157,13 +2156,15 @@ Testing: `test/test_sortformer_streaming.cpp` (built as
 the multi-speaker sample in random burst sizes (1-5000 samples per
 `feed_pcm_f32()` call) and asserts:
 - `>= 1` real segment callback received (`speaker_id >= 0`),
-- exactly one `is_final = true` callback received after `finalize()`
-  (real segment for the tail case, synthetic terminator with
-  `speaker_id = -1` for the chunk-aligned case),
+- exactly one `is_final = true` synthetic terminator with
+  `speaker_id = -1` received after `finalize()`,
+- dedicated chunk-aligned and tail-present sessions both satisfy the
+  same final-marker contract, and a second `finalize()` emits nothing,
 - `max_end` is within the audio duration,
 - no two consecutive callbacks duplicate each other's
   `(speaker_id, start_s, end_s)`,
-- `cancel()` on a half-fed session is idempotent.
+- `cancel()` on a half-fed session is idempotent and suppresses the
+  final terminator.
 
 Verified end-to-end on `diarization-sample-16k.wav`:
 ```
@@ -3470,3 +3471,226 @@ doesn't flake the test.
   binary. Surfacing it through downstream addon wrappers
   (e.g. `transcription-parakeet`'s `runStreaming()` JS API) requires
   separate plumbing work on those wrappers — not in this phase.
+
+## Phase 18 — IndicConformer multilingual CTC on Metal  _(done)_
+
+The `ai4bharat/indic-conformer-600m-multilingual` CTC-only hybrid export
+(Phase-13-era CTC path + per-language token masks) previously shipped with
+CPU smoke validation only. This phase validates and enables it on the Metal
+backend. No engine code changes were required: the encoder + CTC head run
+as ggml graphs on the GPU, and the language-masked greedy argmax already
+executes on the host from copied-back logits, so the masking path is
+backend-independent by construction.
+
+### 18.1 — validation (Apple M5, macOS arm64)
+
+- Transcript parity, CPU vs Metal, on 16 kHz synthesized speech across
+  f16 / q8_0 / q4_0 × hi / kn / te / bn (12 combinations): byte-identical
+  transcripts in all 12.
+- Long-form 46 s Hindi input: transcripts differ by 1-2 subwords in
+  ~150 words, with flips in BOTH directions across quants (f16 keeps a
+  nasalized form on CPU that Metal drops; q8_0 the reverse). This is
+  knife-edge greedy-argmax jitter at ambiguous frames from ordinary
+  backend numeric drift, not the deferred-LSTM class of bug fixed in
+  Phase 15 (CTC has no recurrent decoder state).
+- Per-stage encoder bisect (`test-gpu-vs-cpu`, q8_0, 7.3 s hi clip):
+  all stages within the 5e-2 gate; `encoder_out` rel L2 = 2.9e-2,
+  `logits` rel L2 = 1.6e-2.
+- FLEURS test-split spot check (32 clips, 8 each of hi/ta/gu/kn,
+  references from the dataset): f16 CPU vs Metal transcripts are
+  byte-identical on all 32 clips (WER 19.73% both). q8_0 differs on
+  3 of 32 clips by one subword each with flips in both directions
+  (on one, Metal emits the correct word where CPU misspells);
+  aggregate WER is identical to the word: 19.57% both backends.
+  The hi transcripts also reproduce the CPU hypotheses recorded in
+  the original multilingual-CTC bring-up, character for character.
+
+### 18.2 — throughput (46 s input, 3 timed runs, median)
+
+| quant | Metal RTF | CPU RTF | Metal speedup |
+|---|---:|---:|---:|
+| f16  | 0.008 (133x realtime) | 0.057 | 8.2x |
+| q8_0 | 0.008 (120x realtime) | 0.036 | 4.3x |
+| q4_0 | 0.008 (119x realtime) | 0.066 | 7.9x |
+
+Encoder dominates (~370 ms of ~385 ms inference at q8_0); host-side
+masked CTC decode is ~0.2 ms.
+
+### 18.3 — changes
+
+- `CMakeLists.txt` — the Phase-16 `test-vk-vs-cpu` harness is renamed
+  `test-gpu-vs-cpu` (it was never Vulkan-specific) and now builds under
+  `GGML_VULKAN OR GGML_METAL` instead of Vulkan only; the
+  Vulkan-specific RNNT registrations stay Vulkan-gated. New fixture
+  shorthands `_qvp_indic_q8_gguf` / `_qvp_hi_wav` / `_qvp_hi_expected`
+  and three registrations, all auto-disabled when the fixtures are
+  missing: `test-decoder-determinism-indic` (CPU, `--language hi`),
+  `test-decoder-determinism-indic-gpu` (`--n-gpu-layers 1`,
+  `--require-gpu`) — both anchored to the expected transcript so the
+  `gpu` label alone cannot pass on a shared wrong output — and
+  `test-gpu-vs-cpu-indic` (per-stage encoder parity + hi-masked greedy
+  decode equality).
+- `test/test_decoder_determinism.cpp` — `--language` pass-through to
+  `EngineOptions::language` so the harness can drive multilingual CTC
+  GGUFs that require a language id; `--require-gpu` so GPU
+  registrations fail loudly instead of silently passing CPU-vs-CPU when
+  backend init falls back to CPU (used by the indic-gpu and
+  rnnt-vulkan determinism registrations); and `--expect-text-file` so
+  repeatability runs can anchor run 0 to a known-good transcript —
+  determinism alone would also pass deterministic-but-wrong output,
+  e.g. a GGUF that lost its language ranges silently decoding the full
+  aggregate vocab.
+- `test/test_gpu_vs_cpu.cpp` — refuses to run when the second load did
+  not actually select a GPU backend; per-stage parity fails on output
+  size mismatch instead of comparing the shared prefix; and
+  `compare_greedy_decode()` requires both logit sets to decode (with
+  the language mask applied when the GGUF carries ranges) to the exact
+  same token sequence, since rel-L2 gates cannot catch a consistent
+  argmax flip.
+- `test/samples/hi-16k.expected.txt` — known-good CPU q8_0 transcript
+  of the hi fixture, consumed by `--expect-text-file`.
+- `test/samples/hi-16k.wav` — 7.3 s synthesized Hindi fixture
+  (16 kHz mono PCM16, canonical 44-byte RIFF header for the test's
+  minimal reader).
+- `README.md` — support-matrix row updated from "CPU smoke only" to the
+  measured Metal RTF.
+
+### 18.4 — reproduction
+
+The GGUF is converted locally (no registry hosting yet):
+
+```bash
+curl -LO https://objectstore.e2enetworks.net/indicconformer/models/indicconformer_stt_multi_hybrid_rnnt_600m.nemo
+python scripts/convert-nemo-to-gguf.py \
+  --ckpt indicconformer_stt_multi_hybrid_rnnt_600m.nemo \
+  --out models/indic-conformer-600m-multilingual.q8_0.gguf --quant q8_0
+build-metal/parakeet --model models/indic-conformer-600m-multilingual.q8_0.gguf \
+  --wav test/samples/hi-16k.wav --language hi --n-gpu-layers 99
+```
+
+## Phase 19 — IndicConformer multilingual CTC on Vulkan  _(done)_
+
+Phase 18 validated `ai4bharat/indic-conformer-600m-multilingual` on Metal and
+left Vulkan/OpenCL/CUDA marked "share the CTC path but remain unvalidated".
+This phase validates and enables Vulkan. As with Metal, no engine code changes
+were required: Phase 16 already brought the CTC encoder to correctness on
+Vulkan, and the per-language masked greedy argmax runs on the host from
+copied-back logits, so it is backend-independent by construction.
+
+### 19.1 — validation (NVIDIA RTX 3090, Ubuntu x86-64, Vulkan 1.4, KHR_coopmat)
+
+- Transcript parity, CPU vs Vulkan, across f16 / q8_0 / q4_0 × hi / kn / te / bn
+  (12 combinations): 11 byte-identical. The one difference (q8_0 te) is a
+  single subword where Vulkan emits `డైఆక్సైడ్` and CPU emits `డైయాక్సైడ్`;
+  Vulkan matches what both backends produce at f16, so the CPU q8_0 result is
+  the outlier. Same knife-edge greedy-argmax class as Phase 18, not a decode
+  bug — CTC carries no recurrent decoder state.
+- Per-stage encoder bisect (`test-gpu-vs-cpu`, 7.3 s hi clip): f16 and q8_0
+  pass every stage inside the 5e-2 gate (q8_0 `encoder_out` rel L2 2.7e-2,
+  `logits` 1.4e-2); greedy decode is token-identical at all three quants.
+- FLEURS test-split spot check (32 clips, 8 each of hi/ta/gu/kn): f16 differs
+  on 1 of 32 clips by one subword, aggregate WER identical at 19.73% both
+  backends. q8_0 differs on 2 of 32, and on both Vulkan produces the correct
+  word where CPU does not, so Vulkan scores slightly better in aggregate:
+  19.57% vs 19.73%. The hi hypotheses reproduce the Phase 18 transcripts.
+- All fixture-present `-L gpu` registrations pass on this host.
+
+### 19.2 — q4_0 and the cooperative-matrix matmul path
+
+q4_0 is the quantization the mobile packages ship for this model, and it is the
+one case where the per-stage gate is informative about Vulkan specifically:
+
+| matmul path | q8_0 `encoder_out` rel L2 | q4_0 `encoder_out` rel L2 |
+|---|---:|---:|
+| KHR_coopmat (default on this host) | 2.70e-2 | 6.49e-2 |
+| `GGML_VK_DISABLE_COOPMAT2=1`       | 2.70e-2 | 6.49e-2 |
+| `GGML_VK_DISABLE_COOPMAT=1` (scalar) | 2.31e-2 | 2.54e-2 |
+
+ggml-vulkan accumulates in f16 for quantized weights on cooperative-matrix
+hardware, which is what lifts q4_0 above the harness's 5e-2 gate; the scalar
+path more than halves it. Greedy decode is token-identical in every row, and
+the fixture transcript is byte-identical to CPU at all three quants, so the
+extra encoder noise does not reach the output. `ggml_mul_mat_set_prec` /
+`GGML_PREC_F32` would close the numeric gap the way the CosyVoice LM does, but
+that fix exists there because greedy speech-token decode turns one argmax flip
+into a divergent trajectory; frame-wise CTC argmax has no such amplification,
+so paying f32 accumulation throughput here buys nothing measurable.
+
+Consequently q4_0 GPU coverage is registered on the transcript assertion rather
+than on the rel-L2 harness — see 19.3.
+
+Note for mobile: the Android defaults block in `CMakeLists.txt` sets
+`GGML_VULKAN_DISABLE_COOPMAT` / `GGML_VULKAN_DISABLE_COOPMAT2`, but the pinned
+`qvac-ext-ggml@speech` exposes no such CMake options — it gates cooperative
+matrix at runtime through `GGML_VK_DISABLE_COOPMAT` / `..._COOPMAT2`. Those two
+cache entries are therefore inert today. Left as-is here because the fix
+affects every engine and model on Android, not just this one.
+
+### 19.3 — changes
+
+- `CMakeLists.txt` — new `_qvp_indic_q4_gguf` and `_qvp_indic_f16_gguf` fixture
+  shorthands, so that every quantization the support matrix advertises has GPU
+  regression coverage rather than q8_0 alone. All five new registrations
+  auto-disable when their GGUF is absent:
+  - `test-decoder-determinism-indic-q4` / `-f16` (CPU) and
+    `test-decoder-determinism-indic-q4-gpu` / `-f16-gpu` (`--n-gpu-layers 1`,
+    `--require-gpu`). All four anchor to the existing
+    `test/samples/hi-16k.expected.txt`, which both quantizations reproduce
+    byte-for-byte on CPU and on GPU, so no new fixture was needed.
+  - `test-gpu-vs-cpu-indic-f16`, per-stage encoder parity on the f16 weights.
+    This follows the convention recorded above for the other parity harnesses:
+    f16 keeps quantization noise out of the comparison, so the rel-L2 gates
+    stay sensitive to real operator bugs. q4_0 deliberately gets no
+    `test-gpu-vs-cpu` registration — see 19.2.
+- `README.md` (root) — Indic support-matrix row moves from `CPU, Metal` to
+  `CPU, Metal, Vulkan`; the caveat narrows to OpenCL/CUDA.
+- `engines/parakeet/README.md` — recorded RTF for the Indic row gains the
+  measured Vulkan figure.
+
+No engine sources changed, and every `CMakeLists.txt` hunk is inside
+`if (PARAKEET_BUILD_TESTS)`, so the installed artifact is unaffected.
+
+### 19.4 — throughput (46 s Hindi input, 1 warmup + 3 timed runs, median)
+
+| quant | Vulkan RTF | vs real-time | CPU RTF | Vulkan speedup |
+|---|---:|---:|---:|---:|
+| f16  | 0.0019 | 533x | 0.050 | 26.5x |
+| q8_0 | 0.0019 | 515x | 0.045 | 23.2x |
+| q4_0 | 0.0019 | 516x | 0.033 | 16.7x |
+
+Encoder dominates: 66-69 ms of the 86-89 ms inference, against 1460-2239 ms on
+the host CPU (AMD Ryzen 9 5900, 12 cores / 24 threads, ggml default thread
+count). Host-side masked CTC decode is ~0.15 ms and does not vary by backend. RTF is flat across quantizations because the encoder
+is launch- and bandwidth-bound at this sequence length rather than
+weight-decode-bound.
+
+### 19.5 — reproduction
+
+Conversion is unchanged from 18.4, but it has to happen *before* configuring:
+`REQUIRES` is evaluated at configure time, so a GGUF that appears afterwards
+leaves its registrations `DISABLED` until cmake runs again. All paths below are
+relative to the repository root.
+
+```bash
+engines/parakeet/scripts/setup-ggml.sh
+
+curl -LO https://objectstore.e2enetworks.net/indicconformer/models/indicconformer_stt_multi_hybrid_rnnt_600m.nemo
+for q in f16 q8_0 q4_0; do
+  python engines/parakeet/scripts/convert-nemo-to-gguf.py \
+    --ckpt indicconformer_stt_multi_hybrid_rnnt_600m.nemo \
+    --out "engines/parakeet/models/indic-conformer-600m-multilingual.$q.gguf" \
+    --quant "$q"
+done
+
+cmake -S engines/parakeet -B build-vk -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+cmake --build build-vk -j
+ctest --test-dir build-vk -R indic --output-on-failure
+
+build-vk/parakeet \
+  --model engines/parakeet/models/indic-conformer-600m-multilingual.q8_0.gguf \
+  --wav engines/parakeet/test/samples/hi-16k.wav --language hi --n-gpu-layers 99
+```
+
+The converter needs python >= 3.10. To reproduce the 19.2 table, re-run
+`build-vk/test-gpu-vs-cpu` under `GGML_VK_DISABLE_COOPMAT=1` and
+`GGML_VK_DISABLE_COOPMAT2=1`.

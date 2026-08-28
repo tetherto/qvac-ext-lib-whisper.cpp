@@ -13,6 +13,7 @@
 #include "acestep/textenc_ggml.h"
 
 #include "acestep/backend_registry.h"
+#include "acestep/audio_edit.h"
 #include "acestep/cover_noise.h"
 #include "acestep/generate_task.h"
 #include "acestep/generation_conditioning.h"
@@ -89,8 +90,9 @@ const char * dbg_env(const char * k) {
 }  // namespace
 #endif  // ACESTEP_PARITY_DEBUG
 
-// DiT instruction headers (task-types.h). COVER is used whenever LM codes exist.
-static const char * DIT_INSTR_COVER = "Generate audio semantic tokens based on the given conditions:";
+static const char * DIT_INSTR_TEXT2MUSIC = "Fill the audio semantic mask based on the given conditions:";
+static const char * DIT_INSTR_COVER      = "Generate audio semantic tokens based on the given conditions:";
+static const char * DIT_INSTR_REPAINT    = "Repaint the mask area based on the given conditions:";
 
 namespace fs = std::filesystem;
 
@@ -298,7 +300,8 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     ggml_backend_t detok_backend = m->backend;
     if (on_gpu) {
         const StagePlacement place =
-            resolve_stage_placement(backend_reg_name(m->backend), placement_overrides_from_env());
+            resolve_stage_placement(backend_reg_name(m->backend), backend_dev_description(m->backend),
+                                    placement_overrides_from_env());
         if (!place.enc_on_gpu)   enc_backend   = m->backend_cpu;
         if (!place.lm_on_gpu)    lm_backend    = m->backend_cpu;
         if (!place.detok_on_gpu) detok_backend = m->backend_cpu;
@@ -482,6 +485,65 @@ static constexpr int TURBO_STEPS            = 8;
 static constexpr int STANDARD_STEPS         = 50;
 static constexpr float TURBO_SHIFT          = 3.0f;
 static constexpr float STANDARD_SHIFT       = 1.0f;
+static constexpr int DIT_BATCH_SIZE         = 1;
+static constexpr int EDIT_CONTEXT_PLANES    = 2;
+static constexpr int EDIT_NO_SOURCE_FRAMES  = 0;
+static constexpr int EDIT_PROGRESS_START    = 0;
+static constexpr int EDIT_PROGRESS_COMPLETE = 1;
+static constexpr int EDIT_PROGRESS_TOTAL    = 1;
+static constexpr float EDIT_EMPTY_LATENT    = 0.0f;
+static constexpr float REPAINT_MIN_STRENGTH = 0.0f;
+static constexpr float REPAINT_MAX_STRENGTH = 1.0f;
+static constexpr float REPAINT_MASKED_FRAME = 1.0f;
+static constexpr int TEMPO_SLOW_BPM_MAX     = 80;
+static constexpr int TEMPO_MODERATE_BPM_MAX = 120;
+static constexpr int TEMPO_FAST_BPM_MAX     = 160;
+
+static constexpr const char * DEFAULT_VOCAL_LANGUAGE = "en";
+static constexpr const char * EDIT_VOCAL_LANGUAGE    = "unknown";
+static constexpr const char * INSTRUMENTAL_LYRICS    = "[Instrumental]";
+static constexpr const char * EDIT_STAGE_SOURCE    = "source";
+static constexpr const char * EDIT_STAGE_REFERENCE = "reference";
+static constexpr const char * EDIT_STAGE_REPAINT   = "repaint";
+static constexpr const char * EDIT_STAGE_FLOW      = "flow-edit";
+static constexpr const char * EDIT_STAGE_VAE       = "vae";
+
+static constexpr const char * EDIT_DUMP_SOURCE_LATENT    = "00_source_latent";
+static constexpr const char * EDIT_DUMP_REFERENCE_LATENT = "00_reference_latent";
+static constexpr const char * EDIT_DUMP_NOISE            = "07_noise";
+static constexpr const char * EDIT_DUMP_DIT_LATENT       = "08_dit_latent";
+static constexpr const char * EDIT_DUMP_VAE_AUDIO        = "09_vae_audio";
+
+static constexpr const char * EDIT_ERROR_TASK_TYPE =
+    "acestep engine: edit_plan cannot be combined with task_type '";
+static constexpr const char * EDIT_ERROR_SOURCE_REQUIRED =
+    "acestep engine: edit_plan requires source_audio";
+static constexpr const char * EDIT_ERROR_SOURCE_STEREO =
+    "acestep engine: source_audio must be interleaved stereo";
+static constexpr const char * EDIT_ERROR_AUDIO_CODES =
+    "acestep engine: edit_plan bypasses LM and cannot use audio_codes";
+static constexpr const char * EDIT_ERROR_INTERMEDIATE_DECODE =
+    "acestep engine: intermediate edit VAE decode failed";
+static constexpr const char * EDIT_ERROR_INTERMEDIATE_ENCODE =
+    "acestep engine: intermediate edit VAE re-encode failed";
+static constexpr const char * EDIT_ERROR_REPAINT_STRENGTH =
+    "acestep engine: repaint strength must be between 0 and 1";
+static constexpr const char * EDIT_ERROR_REPAINT_CONTEXT =
+    "acestep engine: repaint expects 64 latent + 64 mask context channels";
+static constexpr const char * EDIT_ERROR_REPAINT_SILENCE =
+    "acestep engine: repaint silence latent is unavailable";
+static constexpr const char * EDIT_ERROR_FLOW_SILENCE =
+    "acestep engine: flow-edit silence latent is unavailable";
+static constexpr const char * EDIT_ERROR_REPAINT_SAMPLE =
+    "acestep engine: repaint DiT sample failed";
+static constexpr const char * EDIT_ERROR_FLOW_TURBO =
+    "acestep engine: flow-edit v1 is validated for turbo DiT only";
+static constexpr const char * EDIT_ERROR_FLOW_SAMPLE =
+    "acestep engine: flow-edit DiT sample failed";
+static constexpr const char * EDIT_ERROR_FINAL_DECODE =
+    "acestep engine: edit plan VAE decode failed";
+static constexpr const char * ENGINE_ERROR_PREFIX = "acestep engine: ";
+static constexpr const char * EDIT_TASK_TYPE_SUFFIX = "'";
 
 using StageReporter = std::function<bool(const char *, int, int)>;
 
@@ -491,10 +553,48 @@ static long long resolve_seed(long long seed) {
     return (long long) random();
 }
 
+static const char * tempo_label(int bpm) {
+    if (bpm < TEMPO_SLOW_BPM_MAX) return "slow";
+    if (bpm < TEMPO_MODERATE_BPM_MAX) return "moderate";
+    if (bpm < TEMPO_FAST_BPM_MAX) return "fast";
+    return "very fast";
+}
+
+static std::string build_conditioning_caption(const std::string & caption, int bpm,
+                                              const std::string & timesignature,
+                                              const std::string & keyscale) {
+    std::string result = caption;
+    if (bpm > 0 && result.find("Target tempo:") == std::string::npos) {
+        if (!result.empty() && result.back() != '.' && result.back() != '!' && result.back() != '?') {
+            result += '.';
+        }
+        result += "\nTarget tempo: " + std::to_string(bpm) + " BPM (" + tempo_label(bpm) + ").";
+        if (bpm < TEMPO_SLOW_BPM_MAX) {
+            result += " Use a clearly perceptible slow, spacious pulse.";
+        } else if (bpm < TEMPO_MODERATE_BPM_MAX) {
+            result += " Use a clearly perceptible steady mid-tempo pulse.";
+        } else if (bpm < TEMPO_FAST_BPM_MAX) {
+            result += " Use a clearly perceptible fast, energetic pulse.";
+        } else {
+            result += " Use a clearly perceptible very-fast full-time pulse; avoid half-time interpretation.";
+        }
+    }
+    if (!timesignature.empty() && result.find("Target time signature:") == std::string::npos) {
+        result += "\nTarget time signature: " + timesignature + ".";
+    }
+    if (!keyscale.empty() && result.find("Target key:") == std::string::npos) {
+        result += "\nTarget key: " + keyscale + ".";
+    }
+    return result;
+}
+
 static AcePrompt make_prompt(const GenerateParams & params, const std::string & language) {
     AcePrompt prompt;
-    prompt.caption        = params.caption;
-    prompt.lyrics         = params.lyrics.empty() ? "[Instrumental]" : params.lyrics;
+    prompt.caption        = params.augment_caption_with_metadata
+                                ? build_conditioning_caption(
+                                      params.caption, params.bpm, params.timesignature, params.keyscale)
+                                : params.caption;
+    prompt.lyrics         = params.lyrics.empty() ? INSTRUMENTAL_LYRICS : params.lyrics;
     prompt.duration       = params.duration;
     prompt.bpm            = params.bpm;
     prompt.keyscale       = params.keyscale;
@@ -534,15 +634,18 @@ static void fill_dit_context_mask(float * frame, int output_channels) {
 }
 
 static void fill_dit_context_frames(std::vector<float> & context, const std::vector<float> & latent,
-                                    const float * silence, int frames, int latent_frames,
+                                    const std::vector<float> & silence, int frames, int latent_frames,
                                     int context_channels, int output_channels) {
+    const int silence_frames = (int) (silence.size() / (size_t) output_channels);
     for (int frame_index = 0; frame_index < frames; ++frame_index) {
         float * frame = context.data() + (size_t) frame_index * context_channels;
         if (frame_index < latent_frames) {
             memcpy(frame, latent.data() + (size_t) frame_index * output_channels,
                    (size_t) output_channels * sizeof(float));
-        } else if (silence) {
-            memcpy(frame, silence, (size_t) output_channels * sizeof(float));
+        } else if (silence_frames > 0) {
+            const int silence_index = (frame_index - latent_frames) % silence_frames;
+            memcpy(frame, silence.data() + (size_t) silence_index * output_channels,
+                   (size_t) output_channels * sizeof(float));
         }
         fill_dit_context_mask(frame, output_channels);
     }
@@ -553,8 +656,8 @@ static std::vector<float> make_dit_context(const std::vector<float> & latent,
                                            int latent_frames, int context_channels,
                                            int output_channels) {
     std::vector<float> context((size_t) context_channels * frames, 0.0f);
-    fill_dit_context_frames(context, latent, silence.empty() ? nullptr : silence.data(),
-                            frames, latent_frames, context_channels, output_channels);
+    fill_dit_context_frames(context, latent, silence, frames, latent_frames,
+                            context_channels, output_channels);
     return context;
 }
 
@@ -563,6 +666,7 @@ struct GenerationState {
     GenerationPlan plan;
     long long seed = 0;
     std::string language;
+    std::string original_caption;
     AcePrompt prompt;
     GenerationConditioning conditioning;
     std::vector<float> context_latents;
@@ -585,7 +689,21 @@ struct EncoderConditioning {
     int context_channels = 0;
     int sequence = 0;
     int hidden_size = 0;
+
+    // Post-switch conditioning (empty unless audio_cover_strength < 1); both
+    // hidden buffers share the padded row count, sequence_switch is the real one.
+    std::vector<float> context_switch;
+    std::vector<float> hidden_switch;
+    int sequence_switch = 0;
 };
+
+static int padded_conditioning_rows(const EncoderConditioning & conditioning) {
+    return std::max(conditioning.sequence, conditioning.sequence_switch);
+}
+
+static void pad_hidden_rows(std::vector<float> & hidden, int max_rows, int width) {
+    hidden.resize((size_t) max_rows * width, 0.0f);
+}
 
 struct NoiseSchedule {
     std::vector<float> noise;
@@ -601,7 +719,13 @@ static GenerationState make_generation_state(const GenerateParams & params, bool
     }
     state.plan = make_generation_plan(params, state.task);
     state.seed = resolve_seed(params.seed);
-    state.language = params.vocal_language.empty() ? "en" : params.vocal_language;
+    state.language = params.vocal_language.empty()
+                         ? (params.edit_plan.empty() ? DEFAULT_VOCAL_LANGUAGE
+                                                     : EDIT_VOCAL_LANGUAGE)
+                         : params.vocal_language;
+    if (params.augment_caption_with_metadata) {
+        state.original_caption = params.caption;
+    }
     state.prompt = make_prompt(params, state.language);
     state.low_memory = !keep_stages;
     return state;
@@ -756,10 +880,10 @@ static void print_prompt_tokens(const std::vector<int> & text, const std::vector
 #endif
 
 static PromptTokens tokenize_prompt(const BpeTokenizer & tokenizer, const AcePrompt & prompt,
-                                    const std::string & language) {
+                                    const std::string & language, const char * instruction) {
     const std::string metadata =
         build_metas(prompt.bpm, prompt.timesignature, prompt.keyscale, prompt.duration);
-    const std::string text = std::string("# Instruction\n") + DIT_INSTR_COVER +
+    const std::string text = std::string("# Instruction\n") + instruction +
                              "\n\n# Caption\n" + prompt.caption + "\n\n# Metas\n" +
                              metadata + "<|endoftext|>\n";
     const std::string lyrics = std::string("# Languages\n") + language +
@@ -779,7 +903,8 @@ static PromptTokens tokenize_prompt(const BpeTokenizer & tokenizer, const AcePro
 
 template <typename EngineImpl>
 static PromptEncoding encode_prompt(EngineImpl & engine, const PromptTokens & tokens,
-                                    GenerationState & state, StageDump & dump, StageTimes & timing) {
+                                    GenerationState & state, StageDump & dump, StageTimes & timing,
+                                    bool release_stage = true) {
     engine.ensure_textenc();
     PromptEncoding encoding;
     encoding.text_tokens = (int) tokens.text.size();
@@ -798,7 +923,7 @@ static PromptEncoding encode_prompt(EngineImpl & engine, const PromptTokens & to
     dump.write("05_lyric_embed", encoding.lyric_embedding, encoding.lyric_tokens,
                (int) (encoding.lyric_embedding.size() / (size_t) encoding.lyric_tokens));
 
-    if (state.low_memory) {
+    if (state.low_memory && release_stage) {
         if (engine.textenc && engine.opts.verbose) {
             fprintf(stderr, "[acestep-engine] freeing text-encoder (low-mem)\n");
         }
@@ -810,7 +935,8 @@ static PromptEncoding encode_prompt(EngineImpl & engine, const PromptTokens & to
 template <typename EngineImpl>
 static void encode_cross_attention(EngineImpl & engine, const PromptEncoding & prompt,
                                    const GenerationState & state, EncoderConditioning & output,
-                                   StageDump & dump, StageTimes & timing) {
+                                   StageDump & dump, StageTimes & timing,
+                                   bool release_stage = true) {
     const TimbreInput timbre = resolve_timbre_input(
         state.plan, state.conditioning.reference, state.context_latents,
         state.latent_frames, cond_model_silence_frame(engine.cond));
@@ -821,7 +947,7 @@ static void encode_cross_attention(EngineImpl & engine, const PromptEncoding & p
     }
     output.hidden_size = (int) (output.hidden.size() / (size_t) output.sequence);
 
-    if (state.low_memory) {
+    if (state.low_memory && release_stage) {
         if (engine.cond && engine.opts.verbose) {
             fprintf(stderr, "[acestep-engine] freeing cond-encoder (low-mem)\n");
         }
@@ -830,6 +956,26 @@ static void encode_cross_attention(EngineImpl & engine, const PromptEncoding & p
     timing.mark("cond");
     dump.write("03_context", output.context, output.frames, output.context_channels);
     dump.write("06_enc_hidden", output.hidden, output.sequence, output.hidden_size);
+}
+
+template <typename EngineImpl>
+static void encode_switch_hidden(EngineImpl & engine, const PromptEncoding & prompt,
+                                 const GenerationState & state, EncoderConditioning & output) {
+    const TimbreInput timbre = resolve_timbre_input(
+        state.plan, state.conditioning.reference, state.context_latents,
+        state.latent_frames, cond_model_silence_frame(engine.cond));
+    if (!cond_model_forward(engine.cond, prompt.text_hidden.data(), prompt.text_tokens,
+                            prompt.lyric_embedding.data(), prompt.lyric_tokens,
+                            timbre.data, timbre.frames, output.hidden_switch,
+                            &output.sequence_switch)) {
+        throw std::runtime_error("acestep engine: cond-encoder switch forward failed");
+    }
+    if (state.low_memory) {
+        if (engine.cond && engine.opts.verbose) {
+            fprintf(stderr, "[acestep-engine] freeing cond-encoder (low-mem)\n");
+        }
+        engine.free_cond();
+    }
 }
 
 template <typename EngineImpl>
@@ -844,11 +990,27 @@ static EncoderConditioning prepare_encoder_conditioning(EngineImpl & engine,
 
     engine.ensure_cond();
     output.context = make_dit_context(
-        state.context_latents, cond_model_silence_frame(engine.cond), output.frames,
+        state.context_latents, cond_model_silence_latent(engine.cond), output.frames,
         state.latent_frames, output.context_channels, config.out_channels);
-    const PromptTokens tokens = tokenize_prompt(engine.bpe_text, state.prompt, state.language);
-    const PromptEncoding prompt = encode_prompt(engine, tokens, state, dump, timing);
-    encode_cross_attention(engine, prompt, state, output, dump, timing);
+    const bool needs_switch = needs_cover_conditioning_switch(state.task);
+    if (needs_switch) {
+        output.context_switch = make_dit_context(
+            state.context_latents, cond_model_silence_latent(engine.cond), output.frames,
+            0, output.context_channels, config.out_channels);
+    }
+    const PromptTokens tokens = tokenize_prompt(
+        engine.bpe_text, state.prompt, state.language, DIT_INSTR_COVER);
+    const PromptEncoding prompt = encode_prompt(engine, tokens, state, dump, timing, !needs_switch);
+    encode_cross_attention(engine, prompt, state, output, dump, timing, !needs_switch);
+    if (needs_switch) {
+        const PromptTokens tokens_switch = tokenize_prompt(
+            engine.bpe_text, state.prompt, state.language, DIT_INSTR_TEXT2MUSIC);
+        const PromptEncoding prompt_switch = encode_prompt(engine, tokens_switch, state, dump, timing);
+        encode_switch_hidden(engine, prompt_switch, state, output);
+        const int rows = padded_conditioning_rows(output);
+        pad_hidden_rows(output.hidden, rows, output.hidden_size);
+        pad_hidden_rows(output.hidden_switch, rows, output.hidden_size);
+    }
     return output;
 }
 
@@ -909,25 +1071,33 @@ static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params
                               NoiseSchedule & noise, const StageReporter & report,
                               StageDump & dump, StageTimes & timing, std::vector<float> & latent) {
     const DitConfig & config = engine.dit_cfg;
+    const int cover_switch_step = resolve_cover_switch_step(state.task, noise.steps);
     if (engine.opts.verbose) {
-        fprintf(stderr, "[acestep-engine] DiT: turbo=%d steps=%d shift=%.2f T=%d task=%s\n",
+        fprintf(stderr, "[acestep-engine] DiT: turbo=%d steps=%d shift=%.2f T=%d task=%s cover_switch=%d\n",
                 (int) config.is_turbo, noise.steps, noise.shift,
-                conditioning.frames, state.task.type.c_str());
+                conditioning.frames, state.task.type.c_str(), cover_switch_step);
     }
     engine.ensure_dit();
     if (!report("dit", 0, noise.steps)) return false;
 
+    const bool has_switch = cover_switch_step >= 0 && !conditioning.context_switch.empty();
     DitSampleParams sample;
     sample.noise = noise.noise.data();
     sample.context_latents = conditioning.context.data();
     sample.enc_hidden = conditioning.hidden.data();
-    sample.enc_S = conditioning.sequence;
+    sample.enc_S = has_switch ? padded_conditioning_rows(conditioning) : conditioning.sequence;
     sample.H_enc = conditioning.hidden_size;
     sample.T = conditioning.frames;
     sample.N = 1;
     sample.schedule = noise.schedule.data();
     sample.num_steps = noise.steps;
     sample.real_enc_S = &conditioning.sequence;
+    if (has_switch) {
+        sample.context_switch = conditioning.context_switch.data();
+        sample.enc_hidden_switch = conditioning.hidden_switch.data();
+        sample.real_enc_S_switch = &conditioning.sequence_switch;
+        sample.cover_switch_step = cover_switch_step;
+    }
     sample.dcw_enabled = params.dcw_enabled;
     sample.dcw_scaler = params.dcw_scaler;
     sample.dcw_high_scaler = params.dcw_high_scaler;
@@ -964,7 +1134,10 @@ static bool decode_audio(EngineImpl & engine, const std::vector<float> & latent,
         completed = report("vae", done, total);
         return completed;
     });
-    if (!completed) return false;
+    if (!completed) {
+        result.pcm.clear();
+        return false;
+    }
     if (result.pcm.empty()) throw std::runtime_error("acestep engine: VAE decode failed");
     report("vae", 1, 1);
     timing.mark("vae");
@@ -978,8 +1151,634 @@ static bool decode_audio(EngineImpl & engine, const std::vector<float> & latent,
     return true;
 }
 
+static AcePrompt make_edit_prompt(const GenerateParams & params, const std::string & caption,
+                                  const std::string & lyrics, float duration,
+                                  const std::string & language) {
+    AcePrompt prompt = make_prompt(params, language);
+    if (!caption.empty() && params.augment_caption_with_metadata) {
+        prompt.caption =
+            build_conditioning_caption(caption, prompt.bpm, prompt.timesignature, prompt.keyscale);
+    } else if (!caption.empty()) {
+        prompt.caption = caption;
+    }
+    prompt.lyrics = lyrics.empty() ? params.lyrics : lyrics;
+    if (prompt.lyrics.empty()) prompt.lyrics = INSTRUMENTAL_LYRICS;
+    prompt.duration = duration;
+    return prompt;
+}
+
+static float audio_duration_seconds(int samples) {
+    return (float) samples / AUDIO_SAMPLE_RATE;
+}
+
+static int round_edit_frames(int latent_frames, int patch_size) {
+    return ((latent_frames + patch_size - 1) / patch_size) * patch_size;
+}
+
+static void fill_padded_edit_source_frames(
+    std::vector<float> & padded, const std::vector<float> & latent,
+    int source_frames, int target_frames, const std::vector<float> & silence,
+    int silence_frames) {
+    for (int frame = 0; frame < target_frames; ++frame) {
+        const float * source = nullptr;
+        if (frame < source_frames) {
+            source = latent.data() + (size_t) frame * AUDIO_LATENT_CHANNELS;
+        } else if (silence_frames > 0) {
+            const int silence_index = (frame - source_frames) % silence_frames;
+            source = silence.data() + (size_t) silence_index * AUDIO_LATENT_CHANNELS;
+        }
+        if (source) {
+            memcpy(padded.data() + (size_t) frame * AUDIO_LATENT_CHANNELS,
+                   source, AUDIO_LATENT_CHANNELS * sizeof(float));
+        }
+    }
+}
+
+static std::vector<float> pad_edit_source(const std::vector<float> & latent,
+                                          int source_frames, int target_frames,
+                                          const std::vector<float> & silence) {
+    std::vector<float> padded(
+        (size_t) target_frames * AUDIO_LATENT_CHANNELS, EDIT_EMPTY_LATENT);
+    const int silence_frames =
+        (int) (silence.size() / (size_t) AUDIO_LATENT_CHANNELS);
+    fill_padded_edit_source_frames(
+        padded, latent, source_frames, target_frames, silence, silence_frames);
+    return padded;
+}
+
+static void fill_repaint_context_frames(std::vector<float> & context,
+                                        const std::vector<float> & clean_source,
+                                        const std::vector<float> & silence,
+                                        const std::vector<float> & mask,
+                                        int context_channels, int silence_frames) {
+    for (size_t frame = 0; frame < mask.size(); ++frame) {
+        float * destination = context.data() + frame * context_channels;
+        const float * acoustic =
+            mask[frame] == REPAINT_MASKED_FRAME
+                ? silence.data() + (frame % (size_t) silence_frames) * AUDIO_LATENT_CHANNELS
+                : clean_source.data() + frame * AUDIO_LATENT_CHANNELS;
+        memcpy(destination, acoustic, AUDIO_LATENT_CHANNELS * sizeof(float));
+        std::fill(destination + AUDIO_LATENT_CHANNELS,
+                  destination + context_channels, mask[frame]);
+    }
+}
+
+static std::vector<float> make_repaint_context(const std::vector<float> & clean_source,
+                                               const std::vector<float> & silence,
+                                               const std::vector<float> & mask,
+                                               int context_channels) {
+    if (context_channels != AUDIO_LATENT_CHANNELS * EDIT_CONTEXT_PLANES) {
+        throw std::runtime_error(EDIT_ERROR_REPAINT_CONTEXT);
+    }
+    const int silence_frames =
+        (int) (silence.size() / (size_t) AUDIO_LATENT_CHANNELS);
+    if (silence_frames <= 0) {
+        throw std::runtime_error(EDIT_ERROR_REPAINT_SILENCE);
+    }
+    std::vector<float> context(mask.size() * (size_t) context_channels);
+    fill_repaint_context_frames(
+        context, clean_source, silence, mask, context_channels, silence_frames);
+    return context;
+}
+
+template <typename EngineImpl>
+static EncoderConditioning prepare_edit_encoder_conditioning(
+    EngineImpl & engine, GenerationState & state, std::vector<float> context,
+    int frames, const char * instruction, StageDump & dump, StageTimes & timing) {
+    EncoderConditioning output;
+    output.frames = frames;
+    output.context_channels = engine.dit_cfg.in_channels - engine.dit_cfg.out_channels;
+    output.context = std::move(context);
+
+    engine.ensure_cond();
+    const PromptTokens tokens =
+        tokenize_prompt(engine.bpe_text, state.prompt, state.language, instruction);
+    const PromptEncoding prompt = encode_prompt(engine, tokens, state, dump, timing);
+    encode_cross_attention(engine, prompt, state, output, dump, timing);
+    return output;
+}
+
+static NoiseSchedule make_edit_schedule(const GenerateParams & params,
+                                        const DitConfig & config) {
+    NoiseSchedule noise;
+    noise.steps = params.inference_steps > 0
+                      ? params.inference_steps
+                      : (config.is_turbo ? TURBO_STEPS : STANDARD_STEPS);
+    noise.shift = params.shift > 0.0f
+                      ? params.shift
+                      : (config.is_turbo ? TURBO_SHIFT : STANDARD_SHIFT);
+    dit_build_schedule(noise.shift, noise.steps, noise.schedule);
+    return noise;
+}
+
+static NoiseSchedule make_edit_noise(const GenerateParams & params, long long seed,
+                                     const DitConfig & config, int frames) {
+    NoiseSchedule noise = make_edit_schedule(params, config);
+    noise.noise.resize((size_t) config.out_channels * frames);
+    philox_randn(seed, noise.noise.data(), (int) noise.noise.size(), true);
+    return noise;
+}
+
+struct EditPlanState {
+    GenerationState generation;
+    int output_samples = 0;
+    long long operation_seed = 0;
+};
+
+struct RepaintOperationState {
+    RepaintRange range;
+    RepaintConfig config;
+    int frames = 0;
+    std::vector<float> clean_source;
+    std::vector<float> mask;
+    EncoderConditioning conditioning;
+    NoiseSchedule noise;
+};
+
+struct FlowOperationState {
+    int frames = 0;
+    uint64_t seed = 0;
+    std::vector<float> source;
+    EncoderConditioning source_conditioning;
+    EncoderConditioning target_conditioning;
+    NoiseSchedule schedule;
+};
+
+static void populate_metadata(const GenerationState & state, GenerateResult & result);
+
+static void validate_edit_plan_request(const GenerateParams & params) {
+    if (params.task_type != TASK_TEXT2MUSIC) {
+        throw std::invalid_argument(
+            std::string(EDIT_ERROR_TASK_TYPE) + params.task_type +
+            EDIT_TASK_TYPE_SUFFIX);
+    }
+    if (params.source_audio.empty()) {
+        throw std::invalid_argument(EDIT_ERROR_SOURCE_REQUIRED);
+    }
+    if (params.source_audio.size() % AUDIO_CHANNELS != 0) {
+        throw std::invalid_argument(EDIT_ERROR_SOURCE_STEREO);
+    }
+    if (!params.audio_codes.empty()) {
+        throw std::invalid_argument(EDIT_ERROR_AUDIO_CODES);
+    }
+}
+
+static EditPlanState make_edit_plan_state(const GenerateParams & params, bool keep_stages) {
+    EditPlanState state;
+    state.generation = make_generation_state(params, keep_stages);
+    state.output_samples = (int) (params.source_audio.size() / AUDIO_CHANNELS);
+    state.operation_seed = state.generation.seed;
+    state.generation.prompt.duration = audio_duration_seconds(state.output_samples);
+    state.generation.plan.run_lm = false;
+    state.generation.plan.run_detokenizer = false;
+    return state;
+}
+
+template <typename EngineImpl>
+static bool encode_edit_plan_inputs(EngineImpl & engine, const GenerateParams & params,
+                                    EditPlanState & state, const StageReporter & report,
+                                    StageDump & dump, StageTimes & timing,
+                                    AudioEditArtifact & artifact) {
+    engine.ensure_vae(true);
+    EncodedAudio source;
+    if (!encode_audio(*engine.vae, params.source_audio, EDIT_STAGE_SOURCE,
+                      EDIT_DUMP_SOURCE_LATENT, report, engine.opts.verbose,
+                      dump, timing, source)) {
+        return false;
+    }
+    if (!params.reference_audio.empty() &&
+        !encode_audio(*engine.vae, params.reference_audio, EDIT_STAGE_REFERENCE,
+                      EDIT_DUMP_REFERENCE_LATENT, report, engine.opts.verbose,
+                      dump, timing, state.generation.conditioning.reference)) {
+        return false;
+    }
+    if (state.generation.low_memory) engine.free_vae();
+    artifact.latent = std::move(source.latent);
+    artifact.latent_frames = source.frames;
+    artifact.pcm = params.source_audio;
+    artifact.pcm_is_current = true;
+    return true;
+}
+
+template <typename EngineImpl>
+static void materialize_repaint_source(EngineImpl & engine, const EditPlanState & state,
+                                       AudioEditArtifact & artifact,
+                                       const StageReporter & report) {
+    engine.ensure_vae(true);
+    bool completed = true;
+    std::vector<float> materialized = engine.vae->decode(
+        artifact.latent, artifact.latent_frames, [&](int done, int total) {
+            completed = report(EDIT_STAGE_VAE, done, total);
+            return completed;
+        });
+    if (!completed) return;
+    if (materialized.empty()) {
+        throw std::runtime_error(EDIT_ERROR_INTERMEDIATE_DECODE);
+    }
+    materialized.resize(std::min(
+        materialized.size(), (size_t) state.output_samples * AUDIO_CHANNELS));
+    if (artifact.pending_waveform_splice) {
+        repaint_splice_waveform(
+            materialized, artifact.pcm, artifact.pending_range.sample_start,
+            artifact.pending_range.sample_end, artifact.pending_crossfade_samples);
+    }
+    artifact.pcm = std::move(materialized);
+    artifact.pcm_is_current = true;
+    artifact.pending_waveform_splice = false;
+    artifact.latent = engine.vae->encode(
+        artifact.pcm, (int) artifact.pcm.size() / AUDIO_CHANNELS,
+        &artifact.latent_frames, [&](int done, int total) {
+            completed = report(EDIT_STAGE_VAE, done, total);
+            return completed;
+        });
+    if (!completed) return;
+    if (artifact.latent.empty() || artifact.latent_frames <= 0) {
+        throw std::runtime_error(EDIT_ERROR_INTERMEDIATE_ENCODE);
+    }
+    if (state.generation.low_memory) engine.free_vae();
+}
+
+static RepaintRange resolve_repaint_operation_range(const RepaintParams & edit,
+                                                    const AudioEditArtifact & artifact) {
+    if (edit.mode == RepaintMode::Balanced &&
+        (!std::isfinite(edit.strength) ||
+         edit.strength < REPAINT_MIN_STRENGTH ||
+         edit.strength > REPAINT_MAX_STRENGTH)) {
+        throw std::invalid_argument(EDIT_ERROR_REPAINT_STRENGTH);
+    }
+    RepaintRange range;
+    const std::string error = resolve_repaint_range(
+        edit.start_seconds, edit.end_seconds,
+        (int) artifact.pcm.size() / AUDIO_CHANNELS,
+        artifact.latent_frames, range);
+    if (!error.empty()) {
+        throw std::invalid_argument(std::string(ENGINE_ERROR_PREFIX) + error);
+    }
+    return range;
+}
+
+static GenerationState make_edit_generation_state(
+    const EditPlanState & base, const GenerateParams & params,
+    const std::string & caption, const std::string & lyrics, float duration,
+    const std::vector<float> & context_latents, int frames) {
+    GenerationState state = base.generation;
+    state.prompt = make_edit_prompt(
+        params, caption, lyrics, duration, base.generation.language);
+    state.context_latents = context_latents;
+    state.latent_frames = frames;
+    state.plan.reuse_source_reference = false;
+    return state;
+}
+
+template <typename EngineImpl>
+static RepaintOperationState prepare_repaint_operation(
+    EngineImpl & engine, const GenerateParams & params, EditPlanState & base,
+    const RepaintParams & edit, const AudioEditArtifact & artifact,
+    StageDump & dump, StageTimes & timing) {
+    RepaintOperationState operation;
+    operation.range = resolve_repaint_operation_range(edit, artifact);
+    operation.config = resolve_repaint_config(edit.mode, edit.strength);
+    operation.frames =
+        round_edit_frames(artifact.latent_frames, engine.dit_cfg.patch_size);
+    engine.ensure_cond();
+    const std::vector<float> & silence = cond_model_silence_latent(engine.cond);
+    operation.clean_source = pad_edit_source(
+        artifact.latent, artifact.latent_frames, operation.frames, silence);
+    operation.mask = make_repaint_mask(
+        operation.frames, operation.range.latent_start, operation.range.latent_end);
+    std::vector<float> context = make_repaint_context(
+        operation.clean_source, silence, operation.mask,
+        engine.dit_cfg.in_channels - engine.dit_cfg.out_channels);
+    GenerationState state = make_edit_generation_state(
+        base, params, edit.caption, edit.lyrics,
+        audio_duration_seconds((int) artifact.pcm.size() / AUDIO_CHANNELS),
+        operation.clean_source, operation.frames);
+    operation.conditioning = prepare_edit_encoder_conditioning(
+        engine, state, std::move(context), operation.frames,
+        DIT_INSTR_REPAINT, dump, timing);
+    operation.noise = make_edit_noise(
+        params, base.operation_seed++, engine.dit_cfg, operation.frames);
+    dump.write(EDIT_DUMP_NOISE, operation.noise.noise,
+               operation.frames, engine.dit_cfg.out_channels);
+#ifdef ACESTEP_PARITY_DEBUG
+    inject_parity_inputs(operation.noise, operation.conditioning);
+#endif
+    return operation;
+}
+
+static DitSampleParams make_repaint_sample(
+    const GenerateParams & params, RepaintOperationState & operation,
+    const StageReporter & report) {
+    DitSampleParams sample;
+    sample.noise = operation.noise.noise.data();
+    sample.context_latents = operation.conditioning.context.data();
+    sample.enc_hidden = operation.conditioning.hidden.data();
+    sample.enc_S = operation.conditioning.sequence;
+    sample.H_enc = operation.conditioning.hidden_size;
+    sample.T = operation.frames;
+    sample.N = DIT_BATCH_SIZE;
+    sample.schedule = operation.noise.schedule.data();
+    sample.num_steps = operation.noise.steps;
+    sample.real_enc_S = &operation.conditioning.sequence;
+    sample.dcw_enabled = params.dcw_enabled;
+    sample.dcw_scaler = params.dcw_scaler;
+    sample.dcw_high_scaler = params.dcw_high_scaler;
+    sample.repaint_mask = operation.mask.data();
+    sample.clean_source_latents = operation.clean_source.data();
+    sample.repaint_injection_ratio = operation.config.injection_ratio;
+    sample.repaint_crossfade_frames = operation.config.latent_blend_frames;
+    sample.repaint_preserve_latent = operation.config.preserve_waveform;
+    sample.on_step = [&report](int step, int total) {
+        return report(EDIT_STAGE_REPAINT, step, total);
+    };
+    return sample;
+}
+
+template <typename EngineImpl>
+static bool sample_repaint_operation(
+    EngineImpl & engine, const GenerateParams & params,
+    RepaintOperationState & operation, const StageReporter & report,
+    StageDump & dump, std::vector<float> & generated) {
+    engine.ensure_dit();
+    if (!report(EDIT_STAGE_REPAINT, EDIT_PROGRESS_START, operation.noise.steps)) {
+        return false;
+    }
+    DitSampleParams sample = make_repaint_sample(params, operation, report);
+    if (!dit_sample(engine.dit, sample, generated)) {
+        if (engine.cancel_flag.load()) return false;
+        throw std::runtime_error(EDIT_ERROR_REPAINT_SAMPLE);
+    }
+    dump.write(EDIT_DUMP_DIT_LATENT, generated,
+               operation.frames, engine.dit_cfg.out_channels);
+#ifdef ACESTEP_PARITY_DEBUG
+    dump_parity_inputs(generated, operation.noise, operation.conditioning,
+                       engine.dit_cfg.out_channels);
+#endif
+    report(EDIT_STAGE_REPAINT, operation.noise.steps, operation.noise.steps);
+    return true;
+}
+
+static void apply_repaint_result(AudioEditArtifact & artifact,
+                                 const RepaintOperationState & operation,
+                                 std::vector<float> generated) {
+    artifact.latent = std::move(generated);
+    artifact.latent_frames = operation.frames;
+    artifact.pcm_is_current = false;
+    artifact.pending_waveform_splice = operation.config.preserve_waveform;
+    artifact.pending_range = operation.range;
+    artifact.pending_crossfade_samples =
+        (int) (operation.config.waveform_fade_sec * AUDIO_SAMPLE_RATE);
+}
+
+template <typename EngineImpl>
+static void run_repaint_operation(
+    EngineImpl & engine, const GenerateParams & params, EditPlanState & state,
+    const RepaintParams & edit, AudioEditArtifact & artifact,
+    const StageReporter & report, StageDump & dump, StageTimes & timing) {
+    RepaintOperationState operation = prepare_repaint_operation(
+        engine, params, state, edit, artifact, dump, timing);
+    std::vector<float> generated;
+    if (!sample_repaint_operation(
+            engine, params, operation, report, dump, generated)) {
+        return;
+    }
+    if (state.generation.low_memory) engine.free_dit();
+    apply_repaint_result(artifact, operation, std::move(generated));
+}
+
+static void validate_flow_operation(const FlowEditParams & edit,
+                                    const DitConfig & config) {
+    const std::string error = validate_flow_edit_params(edit);
+    if (!error.empty()) {
+        throw std::invalid_argument(std::string(ENGINE_ERROR_PREFIX) + error);
+    }
+    if (!config.is_turbo) {
+        throw std::invalid_argument(EDIT_ERROR_FLOW_TURBO);
+    }
+}
+
+template <typename EngineImpl>
+static EncoderConditioning prepare_flow_conditioning(
+    EngineImpl & engine, const GenerateParams & params,
+    const EditPlanState & base, const std::string & caption,
+    const std::string & lyrics, const std::vector<float> & silence_source,
+    std::vector<float> context, int frames, StageDump & dump,
+    StageTimes & timing) {
+    GenerationState state = make_edit_generation_state(
+        base, params, caption, lyrics,
+        audio_duration_seconds(base.output_samples), silence_source, frames);
+    return prepare_edit_encoder_conditioning(
+        engine, state, std::move(context), frames,
+        DIT_INSTR_TEXT2MUSIC, dump, timing);
+}
+
+template <typename EngineImpl>
+static FlowOperationState prepare_flow_operation(
+    EngineImpl & engine, const GenerateParams & params, EditPlanState & base,
+    const FlowEditParams & edit, const AudioEditArtifact & artifact,
+    StageDump & dump, StageTimes & timing) {
+    validate_flow_operation(edit, engine.dit_cfg);
+    FlowOperationState operation;
+    operation.frames =
+        round_edit_frames(artifact.latent_frames, engine.dit_cfg.patch_size);
+    engine.ensure_cond();
+    const std::vector<float> & silence = cond_model_silence_latent(engine.cond);
+    if (silence.empty()) {
+        throw std::runtime_error(EDIT_ERROR_FLOW_SILENCE);
+    }
+    operation.source = pad_edit_source(
+        artifact.latent, artifact.latent_frames, operation.frames, silence);
+    std::vector<float> silence_source =
+        pad_edit_source({}, EDIT_NO_SOURCE_FRAMES, operation.frames, silence);
+    std::vector<float> context = make_dit_context(
+        silence_source, silence, operation.frames, operation.frames,
+        engine.dit_cfg.in_channels - engine.dit_cfg.out_channels,
+        engine.dit_cfg.out_channels);
+    operation.source_conditioning = prepare_flow_conditioning(
+        engine, params, base, edit.source_caption, edit.source_lyrics,
+        silence_source, context, operation.frames, dump, timing);
+    operation.target_conditioning = prepare_flow_conditioning(
+        engine, params, base, edit.target_caption, edit.target_lyrics,
+        silence_source, std::move(context), operation.frames, dump, timing);
+    operation.seed = (uint64_t) base.operation_seed++;
+    operation.schedule = make_edit_schedule(params, engine.dit_cfg);
+    return operation;
+}
+
+static DitFlowEditParams make_flow_sample(
+    const FlowEditParams & edit, FlowOperationState & operation,
+    const StageReporter & report) {
+    DitFlowEditParams sample;
+    sample.source_latents = operation.source.data();
+    sample.T = operation.frames;
+    sample.schedule = operation.schedule.schedule.data();
+    sample.num_steps = operation.schedule.steps;
+    sample.n_min = edit.n_min;
+    sample.n_max = edit.n_max;
+    sample.n_avg = edit.n_avg;
+    sample.seed = operation.seed;
+    sample.source = {
+        operation.source_conditioning.context.data(),
+        operation.source_conditioning.hidden.data(),
+        operation.source_conditioning.sequence,
+        operation.source_conditioning.hidden_size,
+        operation.source_conditioning.sequence,
+    };
+    sample.target = {
+        operation.target_conditioning.context.data(),
+        operation.target_conditioning.hidden.data(),
+        operation.target_conditioning.sequence,
+        operation.target_conditioning.hidden_size,
+        operation.target_conditioning.sequence,
+    };
+    sample.on_step = [&report](int step, int total) {
+        return report(EDIT_STAGE_FLOW, step, total);
+    };
+    return sample;
+}
+
+template <typename EngineImpl>
+static bool sample_flow_operation(
+    EngineImpl & engine, const FlowEditParams & edit,
+    FlowOperationState & operation, const StageReporter & report,
+    std::vector<float> & generated) {
+    engine.ensure_dit();
+    DitFlowEditParams sample = make_flow_sample(edit, operation, report);
+    if (dit_flow_edit(engine.dit, sample, generated)) return true;
+    if (engine.cancel_flag.load()) return false;
+    throw std::runtime_error(EDIT_ERROR_FLOW_SAMPLE);
+}
+
+static void apply_flow_result(AudioEditArtifact & artifact,
+                              const FlowOperationState & operation,
+                              std::vector<float> generated) {
+    artifact.latent = std::move(generated);
+    artifact.latent_frames = operation.frames;
+    artifact.pcm_is_current = false;
+    artifact.pending_waveform_splice = false;
+}
+
+template <typename EngineImpl>
+static void run_flow_operation(
+    EngineImpl & engine, const GenerateParams & params, EditPlanState & state,
+    const FlowEditParams & edit, AudioEditArtifact & artifact,
+    const StageReporter & report, StageDump & dump, StageTimes & timing) {
+    FlowOperationState operation = prepare_flow_operation(
+        engine, params, state, edit, artifact, dump, timing);
+    std::vector<float> generated;
+    if (!sample_flow_operation(engine, edit, operation, report, generated)) return;
+    if (state.generation.low_memory) engine.free_dit();
+    apply_flow_result(artifact, operation, std::move(generated));
+}
+
+template <typename EngineImpl>
+static AudioEditCapabilities make_edit_capabilities(
+    EngineImpl & engine, const GenerateParams & params, EditPlanState & state,
+    const StageReporter & report, StageDump & dump, StageTimes & timing) {
+    EngineImpl * engine_ptr = &engine;
+    const GenerateParams * params_ptr = &params;
+    EditPlanState * state_ptr = &state;
+    const StageReporter * report_ptr = &report;
+    StageDump * dump_ptr = &dump;
+    StageTimes * timing_ptr = &timing;
+    AudioEditCapabilities capabilities;
+    capabilities.cancelled = [engine_ptr] {
+        return engine_ptr->cancel_flag.load();
+    };
+    capabilities.prepare_repaint_source = [engine_ptr, state_ptr, report_ptr](
+                                                AudioEditArtifact & artifact) {
+        materialize_repaint_source(
+            *engine_ptr, *state_ptr, artifact, *report_ptr);
+    };
+    capabilities.repaint = [engine_ptr, params_ptr, state_ptr, report_ptr,
+                            dump_ptr, timing_ptr](
+                               const RepaintParams & edit,
+                               AudioEditArtifact & artifact) {
+        run_repaint_operation(
+            *engine_ptr, *params_ptr, *state_ptr, edit, artifact,
+            *report_ptr, *dump_ptr, *timing_ptr);
+    };
+    capabilities.flow_edit = [engine_ptr, params_ptr, state_ptr, report_ptr,
+                              dump_ptr, timing_ptr](
+                                 const FlowEditParams & edit,
+                                 AudioEditArtifact & artifact) {
+        run_flow_operation(
+            *engine_ptr, *params_ptr, *state_ptr, edit, artifact,
+            *report_ptr, *dump_ptr, *timing_ptr);
+    };
+    return capabilities;
+}
+
+static void apply_pending_waveform_splice(const AudioEditArtifact & artifact,
+                                          std::vector<float> & pcm) {
+    if (!artifact.pending_waveform_splice) return;
+    repaint_splice_waveform(
+        pcm, artifact.pcm, artifact.pending_range.sample_start,
+        artifact.pending_range.sample_end, artifact.pending_crossfade_samples);
+}
+
+template <typename EngineImpl>
+static GenerateResult decode_edit_plan_result(
+    EngineImpl & engine, const EditPlanState & state,
+    const AudioEditArtifact & artifact, const StageReporter & report,
+    StageDump & dump) {
+    GenerateResult result;
+    result.sample_rate = engine.sr;
+    result.channels = AUDIO_CHANNELS;
+    engine.ensure_vae();
+    if (!report(EDIT_STAGE_VAE, EDIT_PROGRESS_START, EDIT_PROGRESS_TOTAL)) {
+        return result;
+    }
+    bool completed = true;
+    result.pcm = engine.vae->decode(
+        artifact.latent, artifact.latent_frames, [&](int done, int total) {
+          completed = report(EDIT_STAGE_VAE, done, total);
+          return completed;
+        });
+    if (!completed) {
+        result.pcm.clear();
+        return result;
+    }
+    if (result.pcm.empty()) {
+        throw std::runtime_error(EDIT_ERROR_FINAL_DECODE);
+    }
+    dump.write(EDIT_DUMP_VAE_AUDIO, result.pcm,
+               (int) (result.pcm.size() / AUDIO_CHANNELS), AUDIO_CHANNELS);
+    result.pcm.resize(std::min(
+        result.pcm.size(), (size_t) state.output_samples * AUDIO_CHANNELS));
+    apply_pending_waveform_splice(artifact, result.pcm);
+    report(EDIT_STAGE_VAE, EDIT_PROGRESS_COMPLETE, EDIT_PROGRESS_TOTAL);
+    if (state.generation.low_memory) engine.free_vae();
+    populate_metadata(state.generation, result);
+    return result;
+}
+
+template <typename EngineImpl>
+static GenerateResult run_audio_edit_plan(EngineImpl & engine,
+                                          const GenerateParams & params,
+                                          const StageReporter & report,
+                                          StageDump & dump, StageTimes & timing) {
+    GenerateResult result;
+    result.sample_rate = engine.sr;
+    result.channels = AUDIO_CHANNELS;
+    validate_edit_plan_request(params);
+    EditPlanState state = make_edit_plan_state(params, engine.keep_stages);
+    AudioEditArtifact artifact;
+    if (!encode_edit_plan_inputs(
+            engine, params, state, report, dump, timing, artifact)) {
+        return result;
+    }
+    const AudioEditPipeline pipeline = make_audio_edit_pipeline(params.edit_plan);
+    const AudioEditCapabilities capabilities = make_edit_capabilities(
+        engine, params, state, report, dump, timing);
+    pipeline.execute(artifact, capabilities);
+    if (engine.cancel_flag.load()) return result;
+    return decode_edit_plan_result(engine, state, artifact, report, dump);
+}
+
 static void populate_metadata(const GenerationState & state, GenerateResult & result) {
-    result.metadata.caption = state.prompt.caption;
+    result.metadata.caption =
+        state.original_caption.empty() ? state.prompt.caption : state.original_caption;
     result.metadata.lyrics = state.prompt.lyrics;
     result.metadata.keyscale = state.prompt.keyscale;
     result.metadata.vocal_language = state.prompt.vocal_language;
@@ -998,7 +1797,6 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
     result.sample_rate = engine.sr;
     result.channels = AUDIO_CHANNELS;
 
-    GenerationState state = make_generation_state(params, engine.keep_stages);
     const StageReporter report = [&](const char * stage, int step, int total) {
         if (progress && !progress(stage, step, total)) {
             engine.cancel_flag.store(true);
@@ -1008,7 +1806,11 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
     };
     StageTimes timing;
     StageDump dump(engine.opts.dump_stages_dir, engine.opts.verbose);
+    if (!params.edit_plan.empty()) {
+        return run_audio_edit_plan(engine, params, report, dump, timing);
+    }
 
+    GenerationState state = make_generation_state(params, engine.keep_stages);
     if (!prepare_audio_conditioning(engine, params, state, report, dump, timing)) return result;
     if (!prepare_context_latents(engine, params, state, report, dump, timing)) return result;
 

@@ -35,6 +35,16 @@ struct LMConfig {
 };
 
 struct LMModel;  // opaque
+struct DitGGUF;
+struct Qwen3Layer;
+
+// Fused-load internals, exposed for unit tests: copy one GGUF tensor into the
+// row-concatenated dst at byte offset `off` (advancing it), and load one
+// layer's q|k|v + gate|up blocks. Both return false on a missing tensor so a
+// corrupt GGUF fails the load instead of leaving misaligned fused weights.
+bool lm_load_row_block(ggml_tensor * dst, size_t & off, const DitGGUF & g, const std::string & name);
+bool lm_load_layer_fused(const DitGGUF & g, const std::string & prefix, Qwen3Layer & ly, ggml_tensor * qkv,
+                         ggml_tensor * gateup);
 
 // Load ace-lm GGUF onto `backend` (borrowed). Config is derived from tensor
 // shapes (H, V, layer count, head counts). `n_kv_sets` independent KV caches are
@@ -59,8 +69,11 @@ int  lm_kv_pos(const LMModel * m, int set = 0);
 // [hidden_size * n_tokens] concatenated in layer order, for CPU/GPU parity
 // debugging. It forces those tensors to stay resident, so leave it null in
 // production paths.
+// logit_limit > 0 projects only the tied-head prefix rows [0, logit_limit) and
+// returns that many logits - valid only when the caller can never select a
+// token past the limit (FSM-constrained Phase 1).
 bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std::vector<float> & logits_out,
-                      int set = 0, std::vector<float> * layer_states_out = nullptr);
+                      int set = 0, std::vector<float> * layer_states_out = nullptr, int logit_limit = 0);
 
 // Decode one token for each KV set in a single batched graph. `sets` must name
 // consecutive caches and `logit_offset` optionally projects only the tied-head

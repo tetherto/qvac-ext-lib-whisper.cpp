@@ -36,19 +36,22 @@ constexpr int kCosyvoiceNativeSampleRate = 24000;
 
 // GPU admission policy shared by the engine and the per-stage parity
 // harnesses (test-cosyvoice-{flow,llm,hift}), so the backends a test
-// validates are exactly the backends the engine will select. Vulkan is
-// admitted positively on Windows and non-Android Linux -- the platforms
-// its reference runs cover -- rather than "everywhere but Android":
+// validates are exactly the backends the engine will select. Vulkan and
+// CUDA share one platform gate: both are admitted positively on Windows
+// and non-Android Linux -- the platforms their reference runs cover --
+// rather than "everywhere but Android":
 // on Apple a MoltenVK registration with Metal unavailable must not let
 // Vulkan win, and on Android an always-vendor-allowed Samsung Xclipse
 // device must keep declining to CPU instead of offloading through a
 // backend no reference run covers. TTS_CPP_COSYVOICE_GPU in
 // CMakeLists.txt mirrors this condition for gpu test registration.
 inline ::tts_cpp::detail::GpuBackendRequirement cosyvoice_gpu_requirement() {
+    using ::tts_cpp::detail::GpuBackendRequirement;
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
-    return ::tts_cpp::detail::GpuBackendRequirement::MetalOrOpenCLOrVulkan;
+    return GpuBackendRequirement::Metal | GpuBackendRequirement::OpenCL |
+           GpuBackendRequirement::Vulkan | GpuBackendRequirement::CUDA;
 #else
-    return ::tts_cpp::detail::GpuBackendRequirement::MetalOrOpenCL;
+    return GpuBackendRequirement::Metal | GpuBackendRequirement::OpenCL;
 #endif
 }
 
@@ -164,6 +167,12 @@ struct cosyvoice_timings {
     int n_speech_tokens = 0;   // tokens the LM emitted
     int tm              = 0;   // flow frames in  (prompt + generated)
     int mel_len         = 0;   // mel frames out  (after the prompt trim)
+
+    // LM prefill composition (filled by the engine even when a pinned
+    // trajectory skips the LM): template + transcript + text ids, and the
+    // reference/baked prompt speech tokens the LM continues from.
+    int n_text_ids             = 0;
+    int n_prompt_speech_tokens = 0;
 };
 
 // ---- high-level engine stages (in-memory, no file I/O) --------------------

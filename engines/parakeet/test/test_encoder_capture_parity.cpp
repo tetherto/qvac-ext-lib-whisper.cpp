@@ -86,12 +86,7 @@ int main(int argc, char ** argv) {
     // we keep it in the assertion path so any future change that
     // accidentally starts populating logits on a TDT/EOU/Sortformer
     // path will be caught.
-    const char * mt_name =
-        model.model_type == ParakeetModelType::CTC        ? "ctc"
-      : model.model_type == ParakeetModelType::TDT        ? "tdt"
-      : model.model_type == ParakeetModelType::EOU        ? "eou"
-      : model.model_type == ParakeetModelType::SORTFORMER ? "sortformer"
-      : "unknown";
+    const char * mt_name = model_type_name(model.model_type);
     std::fprintf(stderr, "[test-encoder-capture-parity] model_type=%s\n", mt_name);
 
     std::vector<float> samples;

@@ -1,0 +1,274 @@
+#include "minimax/mm3-lm-graph.h"
+
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <limits>
+#include <string>
+#include <vector>
+
+namespace {
+
+int failures = 0;
+int checks = 0;
+
+#define CHECK(condition)                                                                      \
+    do {                                                                                      \
+        ++checks;                                                                             \
+        if (!(condition)) {                                                                   \
+            ++failures;                                                                       \
+            std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #condition);          \
+        }                                                                                     \
+    } while (0)
+
+bool contains_error(const std::vector<std::string> & errors, const std::string & expected) {
+    for (const std::string & error : errors) {
+        if (error.find(expected) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void test_typed_metadata_getters() {
+    GGUFModel model = {};
+    model.gguf = gguf_init_empty();
+
+    const uint32_t array_value = 9;
+    gguf_set_val_u32(model.gguf, "correct.u32", 42);
+    gguf_set_val_f32(model.gguf, "correct.f32", 1.25f);
+    gguf_set_val_str(model.gguf, "correct.string", "value");
+    gguf_set_val_bool(model.gguf, "correct.bool", true);
+
+    gguf_set_val_i32(model.gguf, "wrong-scalar.u32", 42);
+    gguf_set_val_u32(model.gguf, "wrong-scalar.f32", 1);
+    gguf_set_val_bool(model.gguf, "wrong-scalar.string", true);
+    gguf_set_val_str(model.gguf, "wrong-scalar.bool", "true");
+
+    gguf_set_arr_data(model.gguf, "wrong-array.u32", GGUF_TYPE_UINT32, &array_value, 1);
+    gguf_set_arr_data(model.gguf, "wrong-array.f32", GGUF_TYPE_UINT32, &array_value, 1);
+    gguf_set_arr_data(model.gguf, "wrong-array.string", GGUF_TYPE_UINT32, &array_value, 1);
+    gguf_set_arr_data(model.gguf, "wrong-array.bool", GGUF_TYPE_UINT32, &array_value, 1);
+
+    CHECK(gf_get_u32(model, "correct.u32") == 42);
+    CHECK(gf_get_f32(model, "correct.f32") == 1.25f);
+    CHECK(std::string(gf_get_str(model, "correct.string")) == "value");
+    CHECK(gf_get_bool(model, "correct.bool"));
+
+    CHECK(gf_get_u32(model, "missing") == 0);
+    CHECK(gf_get_f32(model, "missing") == 0.0f);
+    CHECK(std::string(gf_get_str(model, "missing")).empty());
+    CHECK(!gf_get_bool(model, "missing"));
+
+    CHECK(gf_get_u32(model, "wrong-scalar.u32") == 0);
+    CHECK(gf_get_f32(model, "wrong-scalar.f32") == 0.0f);
+    CHECK(std::string(gf_get_str(model, "wrong-scalar.string")).empty());
+    CHECK(!gf_get_bool(model, "wrong-scalar.bool"));
+
+    CHECK(gf_get_u32(model, "wrong-array.u32") == 0);
+    CHECK(gf_get_f32(model, "wrong-array.f32") == 0.0f);
+    CHECK(std::string(gf_get_str(model, "wrong-array.string")).empty());
+    CHECK(!gf_get_bool(model, "wrong-array.bool"));
+
+    gguf_free(model.gguf);
+}
+
+void test_tensor_range_validation() {
+    const size_t maximum = std::numeric_limits<size_t>::max();
+
+    CHECK(gf_tensor_range_fits(100, 20, 30, 50));
+    CHECK(gf_tensor_range_fits(100, 100, 0, 0));
+    CHECK(!gf_tensor_range_fits(100, 101, 0, 0));
+    CHECK(!gf_tensor_range_fits(100, 20, 81, 0));
+    CHECK(!gf_tensor_range_fits(100, 20, 80, 1));
+    CHECK(!gf_tensor_range_fits(maximum, maximum - 4, 10, 0));
+    CHECK(!gf_tensor_range_fits(maximum, maximum - 4, 4, 2));
+    CHECK(gf_tensor_range_fits(maximum, maximum - 4, 4, 0));
+    CHECK(gf_tensor_range_fits(maximum, 0, maximum, 0));
+}
+
+std::filesystem::path tiny_gguf_path() {
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    return std::filesystem::path("/tmp/tether") /
+           ("minimax-loading-safety-" + std::to_string(unique) + ".gguf");
+}
+
+bool write_tiny_gguf(const std::filesystem::path & path) {
+    constexpr size_t kContextBytes = 4096;
+    constexpr int64_t kTensorElements = 4;
+
+    ggml_init_params params = { kContextBytes, nullptr, false };
+    ggml_context * context = ggml_init(params);
+    if (!context) {
+        return false;
+    }
+    gguf_context * gguf = gguf_init_empty();
+    ggml_tensor * tensor = ggml_new_tensor_1d(context, GGML_TYPE_F32, kTensorElements);
+    ggml_set_name(tensor, "tiny.weight");
+    float * data = static_cast<float *>(tensor->data);
+    data[0] = 1.0f;
+    data[1] = 2.0f;
+    data[2] = 3.0f;
+    data[3] = 4.0f;
+    gguf_add_tensor(gguf, tensor);
+    const bool written = gguf_write_to_file(gguf, path.string().c_str(), false);
+    gguf_free(gguf);
+    ggml_free(context);
+    return written;
+}
+
+void test_truncated_tiny_gguf() {
+    const std::filesystem::path path = tiny_gguf_path();
+    std::filesystem::create_directories(path.parent_path());
+    CHECK(write_tiny_gguf(path));
+
+    GGUFModel complete = {};
+    CHECK(gf_load(&complete, path.string().c_str()));
+    size_t tensor_end = 0;
+    if (complete.gguf) {
+        const int64_t tensor_index = gguf_find_tensor(complete.gguf, "tiny.weight");
+        CHECK(tensor_index >= 0);
+        if (tensor_index >= 0) {
+            const size_t tensor_offset = gguf_get_tensor_offset(complete.gguf, tensor_index);
+            const size_t tensor_size = gguf_get_tensor_size(complete.gguf, tensor_index);
+            const bool fits =
+                gf_tensor_range_fits(complete.file_size, complete.data_offset, tensor_offset, tensor_size);
+            CHECK(fits);
+            if (fits) {
+                const size_t data_size = complete.file_size - complete.data_offset;
+                const size_t trailing_size = data_size - tensor_offset - tensor_size;
+                tensor_end = complete.file_size - trailing_size;
+            }
+        }
+    }
+    gf_close(&complete);
+
+    CHECK(tensor_end > 0);
+    std::filesystem::resize_file(path, tensor_end - 1);
+
+    GGUFModel truncated = {};
+    CHECK(!gf_load(&truncated, path.string().c_str()));
+    std::filesystem::remove(path);
+}
+
+MM3LmConfig valid_lm_config() {
+    MM3LmConfig config;
+    config.block_count = 1;
+    config.context_length = 10240;
+    config.embedding_length = 4;
+    config.head_count = 1;
+    config.head_count_kv = 1;
+    config.key_length = 4;
+    config.value_length = 4;
+    config.vocab_size = 100;
+    config.semantic_vocab_offset = 10;
+    config.semantic_vocab_size = 20;
+    config.num_codebooks = 2;
+    config.eos_audio = 1;
+    config.frame_rate = 25;
+    config.max_audio_frames = 9000;
+    config.max_prompt_tokens = 5000;
+    return config;
+}
+
+void test_context_metadata_validation() {
+    std::vector<std::string> errors;
+    MM3LmConfig config = valid_lm_config();
+    mm3_validate_lm_config(config, &errors);
+    CHECK(errors.empty());
+
+    errors.clear();
+    config.context_length = 0;
+    mm3_validate_lm_config(config, &errors);
+    CHECK(contains_error(errors, "qwen3.context_length is 0 or missing"));
+
+    errors.clear();
+    config = valid_lm_config();
+    config.context_length = 8999;
+    mm3_validate_lm_config(config, &errors);
+    CHECK(contains_error(errors, "max_audio_frames exceeds qwen3.context_length"));
+
+    errors.clear();
+    config = valid_lm_config();
+    config.max_prompt_tokens = 10241;
+    mm3_validate_lm_config(config, &errors);
+    CHECK(contains_error(errors, "max_prompt_tokens exceeds qwen3.context_length"));
+}
+
+void test_context_position_validation() {
+    const int64_t maximum = std::numeric_limits<int64_t>::max();
+
+    CHECK(mm3_lm_positions_fit(14000, 5000, 9000));
+    CHECK(!mm3_lm_positions_fit(13999, 5000, 9000));
+    CHECK(!mm3_lm_positions_fit(14000, 5000, 9001));
+    CHECK(!mm3_lm_positions_fit(14000, 14001, 0));
+    CHECK(!mm3_lm_positions_fit(0, 0, 0));
+    CHECK(!mm3_lm_positions_fit(14000, -1, 1));
+    CHECK(mm3_lm_positions_fit(maximum, maximum, 0));
+    CHECK(!mm3_lm_positions_fit(maximum, maximum, 1));
+}
+
+void test_context_bucket_validation() {
+    int64_t bucket = 0;
+    CHECK(mm3_lm_bucket_for_context(512, 1000, &bucket));
+    CHECK(bucket == 512);
+    CHECK(mm3_lm_bucket_for_context(513, 1000, &bucket));
+    CHECK(bucket == 768);
+    CHECK(mm3_lm_bucket_for_context(900, 1000, &bucket));
+    CHECK(bucket == 1000);
+    CHECK(mm3_lm_bucket_for_context(1000, 1000, &bucket));
+    CHECK(bucket == 1000);
+    CHECK(!mm3_lm_bucket_for_context(1001, 1000, &bucket));
+    CHECK(!mm3_lm_bucket_for_context(1, 0, &bucket));
+    CHECK(!mm3_lm_bucket_for_context(1, 1, nullptr));
+    CHECK(mm3_lm_bucket_for_context(std::numeric_limits<int64_t>::max(),
+                                    std::numeric_limits<int64_t>::max(), &bucket));
+    CHECK(bucket == std::numeric_limits<int64_t>::max());
+}
+
+void test_backend_release_after_post_probe_failure() {
+    const std::filesystem::path missing =
+        std::filesystem::path("/tmp/tether") / "minimax-loading-safety-missing.gguf";
+    std::filesystem::remove(missing);
+
+    MM3Model model;
+    model.lm_file.found = true;
+    model.lm_file.probe_ok = true;
+    model.lm_file.path = missing.string();
+    model.synth_file.found = true;
+    model.synth_file.probe_ok = true;
+    model.synth_file.path = missing.string();
+
+    CHECK(g_backend_refs == 0);
+    std::string error;
+    CHECK(!mm3_load(&model, &error));
+    CHECK(!error.empty());
+    CHECK(!model.loaded);
+    CHECK(!model.backend_ref);
+    CHECK(model.backend == nullptr);
+    CHECK(model.cpu_backend == nullptr);
+    CHECK(g_backend_refs == 0);
+    CHECK(g_backend_cache.backend == nullptr);
+    CHECK(g_backend_cache.cpu_backend == nullptr);
+
+    mm3_unload(&model);
+    mm3_unload(&model);
+    CHECK(!model.backend_ref);
+    CHECK(model.backend == nullptr);
+    CHECK(model.cpu_backend == nullptr);
+    CHECK(g_backend_refs == 0);
+}
+
+}
+
+int main() {
+    test_typed_metadata_getters();
+    test_tensor_range_validation();
+    test_truncated_tiny_gguf();
+    test_context_metadata_validation();
+    test_context_position_validation();
+    test_context_bucket_validation();
+    test_backend_release_after_post_probe_failure();
+    std::fprintf(stderr, "[test-minimax-loading-safety] %d/%d checks passed\n", checks - failures, checks);
+    return failures == 0 ? 0 : 1;
+}

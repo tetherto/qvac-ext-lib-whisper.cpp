@@ -158,9 +158,11 @@ constexpr int PROBE_NODES = 2;
 // validated against, stage by stage, against the F32 reference. Anything else
 // falls back to CPU rather than running unverified kernels.
 ggml_backend_t init_backend(int n_gpu_layers) {
+    using ::tts_cpp::detail::GpuBackendRequirement;
     ggml_backend_t backend = ::tts_cpp::detail::init_gpu_backend(
         n_gpu_layers, true, "audio8", 0, false, nullptr,
-        ::tts_cpp::detail::GpuBackendRequirement::VulkanOrMetal);
+        GpuBackendRequirement::Vulkan | GpuBackendRequirement::Metal |
+            GpuBackendRequirement::OpenCL | GpuBackendRequirement::CUDA);
     return backend ? backend : ::tts_cpp::detail::init_cpu_backend();
 }
 
@@ -514,6 +516,7 @@ bool load_lm(const std::string & path, int n_gpu_layers, lm_model & model,
         if (error) *error = "audio8: failed to init a compute backend";
         return false;
     }
+    model.precise_outputs = ::tts_cpp::detail::backend_is_metal(model.backend);
     if (!load_weights(file, model.backend, &model.ctx_w, &model.buffer_w, error)) {
         return false;
     }
@@ -616,6 +619,7 @@ bool load_codec(const std::string & path, int n_gpu_layers, codec_model & model,
         if (error) *error = "audio8: failed to init a compute backend";
         return false;
     }
+    model.precise_outputs = ::tts_cpp::detail::backend_is_metal(model.backend);
     if (!load_weights(file, model.backend, &model.ctx_w, &model.buffer_w, error)) {
         return false;
     }

@@ -17,6 +17,9 @@ Auto-detects the model flavour from ``cfg['target']``:
   - ``EncDecRNNTBPEModel`` (with TDT durations)
                                          -> TDT (RNN-T + duration head)
                                             (parakeet-tdt-0.6b-v3, -1.1b)
+  - ``EncDecRNNTBPEModel`` (without TDT durations or EOU tokens)
+                                         -> RNN-T
+                                            (parakeet-unified-en-0.6b)
   - ``EncDecRNNTBPEModel`` (no TDT durations, chunked-limited streaming
                             encoder, conv_norm_type=layer_norm,
                             ``<EOU>`` token in vocab)
@@ -44,7 +47,7 @@ src/parakeet_sortformer.h for the consumer structs):
   Metadata:
     general.architecture  = "parakeet-ctc"  (kept for GGUF compat)
     general.name          = "<derived from cfg>"
-    parakeet.model.type   = "ctc", "tdt", "eou", or "sortformer"
+    parakeet.model.type   = "ctc", "rnnt", "tdt", "eou", or "sortformer"
     parakeet.encoder.*    (hyperparameters, incl. use_bias, xscaling,
                            conv_norm_type, att_context_size,
                            causal_downsampling, conv_context_size)
@@ -52,14 +55,16 @@ src/parakeet_sortformer.h for the consumer structs):
     parakeet.ctc.*        (vocab_size, blank_id)                    [CTC only]
     parakeet.tdt.*        (predictor + joint hyperparameters
                            + durations)                              [TDT only]
+    parakeet.rnnt.*       (predictor + joint hyperparameters
+                           + max symbols per step)                    [RNN-T only]
     parakeet.eou.*        (vocab_size, blank_id, eou_id, eob_id,
                            pred_hidden, pred_rnn_layers, joint_hidden,
                            encoder_chunk_mel_frames,
                            cache_lookback_frames, cache_time_steps,
                            max_symbols_per_step)                     [EOU only]
     parakeet.sortformer.* (num_spks, fc/tf dims, tf layer count, ...)[Sortformer only]
-    tokenizer.ggml.model  = "sentencepiece"                          [CTC, TDT, EOU]
-    tokenizer.ggml.sentencepiece_model = <raw tokenizer.model bytes> [CTC, TDT, EOU]
+    tokenizer.ggml.model  = "sentencepiece"                          [CTC, RNN-T, TDT, EOU]
+    tokenizer.ggml.sentencepiece_model = <raw tokenizer.model bytes> [CTC, RNN-T, TDT, EOU]
 
   Tensors:
     preproc.mel_filterbank            (n_mels, 257)   f32
@@ -74,6 +79,10 @@ src/parakeet_sortformer.h for the consumer structs):
     tdt.predict.lstm.{l}.{w_ih,w_hh,b_ih,b_hh}                       [TDT only]
     tdt.joint.{enc,pred}.{weight,bias}                               [TDT only]
     tdt.joint.out.{weight,bias}                                      [TDT only]
+    rnnt.predict.embed.weight                                        [RNN-T only]
+    rnnt.predict.lstm.{l}.{w_ih,w_hh,b_ih,b_hh}                      [RNN-T only]
+    rnnt.joint.{enc,pred}.{weight,bias}                              [RNN-T only]
+    rnnt.joint.out.{weight,bias}                                     [RNN-T only]
     eou.predict.embed.weight                                         [EOU only]
     eou.predict.lstm.0.{w_ih,w_hh,b_ih,b_hh}                         [EOU only]
     eou.joint.{enc,pred}.{weight,bias}                               [EOU only]
@@ -336,8 +345,8 @@ def emit_tokenizer_metadata(writer, tok_bytes: bytes, multilingual_tok: dict, cf
 
 
 def detect_model_type(cfg: dict) -> str:
-    target = cfg.get("target", "")
-    if "Sortformer" in target or "sortformer_modules" in cfg:
+    target = str(cfg.get("target", ""))
+    if "sortformer" in target.lower() or "sortformer_modules" in cfg:
         return "sortformer"
     # Hybrid RNNT+CTC targets contain "RNNT", so resolve them before the
     # generic RNNT branch. Vanilla hybrid (IndicConformer) exports CTC for
@@ -347,7 +356,7 @@ def detect_model_type(cfg: dict) -> str:
         if durations:
             return "tdt"
         return "ctc"
-    is_rnnt = "RNNT" in target or \
+    is_rnnt = "rnnt" in target.lower() or \
               "tdt" in cfg.get("loss", {}).get("loss_name", "").lower()
     if is_rnnt:
         durations = cfg.get("model_defaults", {}).get("tdt_durations")
@@ -357,8 +366,59 @@ def detect_model_type(cfg: dict) -> str:
         has_eou = any(str(lbl) == "<EOU>" for lbl in labels)
         if has_eou:
             return "eou"
-        return "tdt"
+        return "rnnt"
     return "ctc"
+
+
+def write_transducer_metadata(writer, cfg: dict, model_type: str):
+    dec = cfg["decoder"]
+    prefix = f"parakeet.{model_type}"
+    pred_hidden = int(dec["prednet"]["pred_hidden"])
+    pred_rnn_layers = int(dec["prednet"]["pred_rnn_layers"])
+    joint_hidden = int(cfg["joint"]["jointnet"]["joint_hidden"])
+    pred_vocab_size = int(dec["vocab_size"])
+    joint_num_classes = int(cfg["joint"]["num_classes"])
+
+    writer.add_uint32(f"{prefix}.vocab_size", pred_vocab_size)
+    writer.add_uint32(f"{prefix}.blank_id", joint_num_classes)
+    writer.add_uint32(f"{prefix}.pred_hidden", pred_hidden)
+    writer.add_uint32(f"{prefix}.pred_rnn_layers", pred_rnn_layers)
+    writer.add_uint32(f"{prefix}.joint_hidden", joint_hidden)
+
+    if model_type == "rnnt":
+        max_symbols = int(cfg.get("decoding", {}).get("greedy", {}).get("max_symbols", 10))
+        writer.add_uint32(f"{prefix}.max_symbols_per_step", max_symbols)
+        return
+
+    durations = list(cfg["model_defaults"]["tdt_durations"])
+    num_durations = int(cfg["model_defaults"]["num_tdt_durations"])
+    if num_durations != len(durations):
+        raise ValueError(
+            f"num_tdt_durations {num_durations} != len(durations) {len(durations)}"
+        )
+    writer.add_uint32(f"{prefix}.num_durations", num_durations)
+    writer.add_array(f"{prefix}.durations", durations)
+
+
+def write_transducer_tensors(cfg: dict, sd: dict, model_type: str, add_2d, add_f32):
+    prefix = model_type
+    add_2d(f"{prefix}.predict.embed.weight", sd["decoder.prediction.embed.weight"])
+
+    pred_rnn_layers = int(cfg["decoder"]["prednet"]["pred_rnn_layers"])
+    for layer in range(pred_rnn_layers):
+        source = "decoder.prediction.dec_rnn.lstm"
+        target = f"{prefix}.predict.lstm.{layer}"
+        add_2d(f"{target}.w_ih", sd[f"{source}.weight_ih_l{layer}"])
+        add_2d(f"{target}.w_hh", sd[f"{source}.weight_hh_l{layer}"])
+        add_f32(f"{target}.b_ih", sd[f"{source}.bias_ih_l{layer}"])
+        add_f32(f"{target}.b_hh", sd[f"{source}.bias_hh_l{layer}"])
+
+    add_2d(f"{prefix}.joint.enc.weight", sd["joint.enc.weight"])
+    add_f32(f"{prefix}.joint.enc.bias", sd["joint.enc.bias"])
+    add_2d(f"{prefix}.joint.pred.weight", sd["joint.pred.weight"])
+    add_f32(f"{prefix}.joint.pred.bias", sd["joint.pred.bias"])
+    add_2d(f"{prefix}.joint.out.weight", sd["joint.joint_net.2.weight"])
+    add_f32(f"{prefix}.joint.out.bias", sd["joint.joint_net.2.bias"])
 
 
 def ctc_decoder_config(cfg: dict) -> dict:
@@ -462,6 +522,7 @@ def write_gguf(out: Path, ckpt: Path, cfg: dict, sd: dict, tok_bytes: bytes,
 
     model_name = {
         "ctc":         f"parakeet-ctc-{d_model}-{n_layers}l",
+        "rnnt":        f"parakeet-rnnt-{d_model}-{n_layers}l",
         "tdt":         f"parakeet-tdt-{d_model}-{n_layers}l",
         "eou":         f"parakeet-eou-{d_model}-{n_layers}l",
         "sortformer":  f"sortformer-{d_model}-{n_layers}l",
@@ -474,6 +535,7 @@ def write_gguf(out: Path, ckpt: Path, cfg: dict, sd: dict, tok_bytes: bytes,
 
     conv_norm_type   = str(enc.get("conv_norm_type", "batch_norm"))
     conv_context_str = str(enc.get("conv_context_size", "default"))
+    conv_context_style = str(enc.get("conv_context_style", "regular"))
     causal_downsample = bool(enc.get("causal_downsampling", False))
     att_style        = str(enc.get("att_context_style", "regular"))
     att_ctx_raw      = enc.get("att_context_size", [-1, -1])
@@ -497,10 +559,13 @@ def write_gguf(out: Path, ckpt: Path, cfg: dict, sd: dict, tok_bytes: bytes,
     writer.add_uint32("parakeet.encoder.pos_emb_max_len",             pos_max_len)
     writer.add_string("parakeet.encoder.conv_norm_type",              conv_norm_type)
     writer.add_string("parakeet.encoder.conv_context_size",           conv_context_str)
+    writer.add_string("parakeet.encoder.conv_context_style",          conv_context_style)
     writer.add_bool  ("parakeet.encoder.causal_downsampling",         causal_downsample)
     writer.add_string("parakeet.encoder.att_context_style",           att_style)
     writer.add_int32 ("parakeet.encoder.att_context_size_left",       att_ctx_left)
     writer.add_int32 ("parakeet.encoder.att_context_size_right",      att_ctx_right)
+    if model_type == "rnnt":
+        writer.add_bool("parakeet.encoder.streaming.enabled", False)
 
     normalize_str = str(pre.get("normalize", "per_feature"))
 
@@ -568,24 +633,7 @@ def write_gguf(out: Path, ckpt: Path, cfg: dict, sd: dict, tok_bytes: bytes,
         if variant:
             writer.add_string("parakeet.model_variant", variant)
     else:
-        pred_hidden      = int(dec["prednet"]["pred_hidden"])
-        pred_rnn_layers  = int(dec["prednet"]["pred_rnn_layers"])
-        joint_hidden     = int(cfg["joint"]["jointnet"]["joint_hidden"])
-        pred_vocab_size  = int(dec["vocab_size"])                   # label vocab (no blank)
-        joint_num_classes = int(cfg["joint"]["num_classes"])        # label vocab + blank
-        durations        = list(cfg["model_defaults"]["tdt_durations"])
-        num_durations    = int(cfg["model_defaults"]["num_tdt_durations"])
-        assert num_durations == len(durations), \
-            f"num_tdt_durations {num_durations} != len(durations) {len(durations)}"
-        blank_id         = joint_num_classes                         # blank_as_pad at vocab_size
-
-        writer.add_uint32("parakeet.tdt.vocab_size",       pred_vocab_size)
-        writer.add_uint32("parakeet.tdt.blank_id",         blank_id)
-        writer.add_uint32("parakeet.tdt.pred_hidden",      pred_hidden)
-        writer.add_uint32("parakeet.tdt.pred_rnn_layers",  pred_rnn_layers)
-        writer.add_uint32("parakeet.tdt.joint_hidden",     joint_hidden)
-        writer.add_uint32("parakeet.tdt.num_durations",    num_durations)
-        writer.add_array ("parakeet.tdt.durations",        durations)
+        write_transducer_metadata(writer, cfg, model_type)
 
     try:
         n_tok = emit_tokenizer_metadata(writer, tok_bytes, multilingual_tok, cfg)
@@ -767,25 +815,7 @@ def write_gguf(out: Path, ckpt: Path, cfg: dict, sd: dict, tok_bytes: bytes,
         add_f32("sortformer.head.single_hidden_to_spks.bias",
                 sd["sortformer_modules.single_hidden_to_spks.bias"])
     else:
-        add_2d ("tdt.predict.embed.weight", sd["decoder.prediction.embed.weight"])
-
-        pred_rnn_layers = int(cfg["decoder"]["prednet"]["pred_rnn_layers"])
-        for l in range(pred_rnn_layers):
-            add_2d (f"tdt.predict.lstm.{l}.w_ih",
-                    sd[f"decoder.prediction.dec_rnn.lstm.weight_ih_l{l}"])
-            add_2d (f"tdt.predict.lstm.{l}.w_hh",
-                    sd[f"decoder.prediction.dec_rnn.lstm.weight_hh_l{l}"])
-            add_f32(f"tdt.predict.lstm.{l}.b_ih",
-                    sd[f"decoder.prediction.dec_rnn.lstm.bias_ih_l{l}"])
-            add_f32(f"tdt.predict.lstm.{l}.b_hh",
-                    sd[f"decoder.prediction.dec_rnn.lstm.bias_hh_l{l}"])
-
-        add_2d ("tdt.joint.enc.weight",  sd["joint.enc.weight"])
-        add_f32("tdt.joint.enc.bias",    sd["joint.enc.bias"])
-        add_2d ("tdt.joint.pred.weight", sd["joint.pred.weight"])
-        add_f32("tdt.joint.pred.bias",   sd["joint.pred.bias"])
-        add_2d ("tdt.joint.out.weight",  sd["joint.joint_net.2.weight"])
-        add_f32("tdt.joint.out.bias",    sd["joint.joint_net.2.bias"])
+        write_transducer_tensors(cfg, sd, model_type, add_2d, add_f32)
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -806,6 +836,11 @@ def write_gguf(out: Path, ckpt: Path, cfg: dict, sd: dict, tok_bytes: bytes,
                       f"blank_id={int(cfg['joint']['num_classes'])} eou_id={eou_pos} "
                       f"att_ctx=[{att_ctx_left},{att_ctx_right}] "
                       f"conv_norm={conv_norm_type}")
+    elif model_type == "rnnt":
+        vocab_note = (
+            f"rnnt_vocab={int(cfg['decoder']['vocab_size'])} "
+            f"max_symbols={int(cfg.get('decoding', {}).get('greedy', {}).get('max_symbols', 10))}"
+        )
     else:
         vocab_note = f"tdt_vocab={int(cfg['decoder']['vocab_size'])} durations={cfg['model_defaults']['tdt_durations']}"
     print(f"[convert] wrote {out} ({size_mb:.1f} MiB, type={model_type}, quant={quant}, {vocab_note}, layers={n_layers}, use_bias={use_bias})", file=sys.stderr)

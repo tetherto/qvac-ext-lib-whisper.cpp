@@ -2,7 +2,8 @@
 //
 // Usage:
 //   test-decoder-determinism --model <gguf> --wav <wav> [--runs N] [--threads N]
-//       [--n-gpu-layers N] [--cache-hit-ratio R] [--prewarm]
+//       [--n-gpu-layers N] [--language ID] [--require-gpu]
+//       [--expect-text-file PATH] [--cache-hit-ratio R] [--prewarm]
 //       [--prewarm-audio-seconds F] [--cold-overhead-max R] [--verbose]
 //
 // Exit 0 on success; non-zero on failure or invalid arguments.
@@ -26,6 +27,9 @@ struct Opts {
     int  n_runs = 5;
     int  n_gpu_layers = 0;
     int  n_threads = 0;
+    std::string language;
+    std::string expect_text_file;
+    bool require_gpu = false;
     bool verbose = false;
     // Cache-hit gate compares median(warm runs 1..N-1) to run 0
     // (cold). Median (not max) is the right statistic — a real
@@ -82,6 +86,16 @@ void usage(const char * argv0) {
         "  --runs N             number of repeated calls (default 5; min 2)\n"
         "  --n-gpu-layers N     pass-through to Engine (default 0)\n"
         "  --threads N          CPU threads (0 = HW concurrency)\n"
+        "  --language ID        pass-through to Engine (required for multilingual\n"
+        "                       CTC GGUFs that carry language masks, e.g. 'hi')\n"
+        "  --require-gpu        fail unless the engine actually selected a GPU\n"
+        "                       backend; guards against silent CPU fallback\n"
+        "                       turning a GPU determinism run into CPU-vs-CPU\n"
+        "  --expect-text-file PATH  fail unless run 0's transcript equals the\n"
+        "                       file's contents (trailing whitespace ignored).\n"
+        "                       Guards against deterministic-but-wrong output,\n"
+        "                       e.g. a multilingual GGUF that lost its language\n"
+        "                       ranges and silently decodes the full vocab\n"
         "  --cache-hit-ratio F  fail if median(warm enc_ms) exceeds cold\n"
         "                       enc_ms * F. Default 1.10. A real cache MISS\n"
         "                       (graph rebuilt each call) makes EVERY warm\n"
@@ -106,7 +120,7 @@ void usage(const char * argv0) {
         "  --cold-overhead-max F  with --prewarm, fail if run0_enc_ms exceeds\n"
         "                       median(warm) * F. Default 1.30. The 1.30 leaves\n"
         "                       headroom for CPU thermal jitter on a noisy desktop\n"
-        "                       (single-run spikes can lift run0 ~25 % even when\n"
+        "                       (single-run spikes can lift run0 ~25%% even when\n"
         "                       the cache hits). Tighten on a thermally-controlled\n"
         "                       CI box. A real prewarm regression goes 1.5-2.5x.\n"
         "  --verbose            print per-run summary\n",
@@ -121,6 +135,9 @@ int parse_args(int argc, char ** argv, Opts & o) {
         else if (a == "--runs"         && i + 1 < argc) o.n_runs = std::atoi(argv[++i]);
         else if (a == "--n-gpu-layers" && i + 1 < argc) o.n_gpu_layers = std::atoi(argv[++i]);
         else if (a == "--threads"      && i + 1 < argc) o.n_threads = std::atoi(argv[++i]);
+        else if (a == "--language"     && i + 1 < argc) o.language = argv[++i];
+        else if (a == "--require-gpu")                  o.require_gpu = true;
+        else if (a == "--expect-text-file" && i + 1 < argc) o.expect_text_file = argv[++i];
         else if (a == "--cache-hit-ratio" && i + 1 < argc) o.cache_hit_ratio_max = std::atof(argv[++i]);
         else if (a == "--prewarm")                         o.prewarm = true;
         else if (a == "--prewarm-audio-seconds" && i + 1 < argc) o.prewarm_audio_seconds = (float) std::atof(argv[++i]);
@@ -173,6 +190,23 @@ double median(std::vector<double> v) {
     return v.empty() ? 0.0 : v[v.size() / 2];
 }
 
+bool read_text_file(const std::string & path, std::string & out) {
+    FILE * f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    out.resize(n > 0 ? static_cast<size_t>(n) : 0);
+    const size_t got = out.empty() ? 0 : std::fread(&out[0], 1, out.size(), f);
+    std::fclose(f);
+    if (got != out.size()) return false;
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' ||
+                            out.back() == ' '  || out.back() == '\t')) {
+        out.pop_back();
+    }
+    return true;
+}
+
 // ---------- Determinism for CTC / TDT / EOU (transcribe path) ----------
 
 int run_transcribe_path(const Opts & o,
@@ -182,6 +216,7 @@ int run_transcribe_path(const Opts & o,
     eopts.model_gguf_path        = o.model_path;
     eopts.n_threads              = o.n_threads;
     eopts.n_gpu_layers           = o.n_gpu_layers;
+    eopts.language               = o.language;
     eopts.verbose                = false;
     eopts.prewarm                = o.prewarm;
     eopts.prewarm_audio_seconds  = o.prewarm_audio_seconds;
@@ -189,6 +224,13 @@ int run_transcribe_path(const Opts & o,
     parakeet::Engine eng(eopts);
     const double ctor_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                                std::chrono::steady_clock::now() - t_ctor).count() / 1000.0;
+    if (o.require_gpu && eng.backend_device() != parakeet::BackendDevice::GPU) {
+        std::fprintf(stderr,
+            "[determinism] FAIL: --require-gpu but the engine selected backend "
+            "'%s'; a silent CPU fallback would make this run CPU-vs-CPU\n",
+            eng.backend_name().c_str());
+        return 1;
+    }
     std::fprintf(stderr,
         "[determinism] transcribe path: model=%s backend=%s threads=%d gpu_layers=%d runs=%d prewarm=%s ctor=%.2fms\n",
         model_type_str.c_str(),
@@ -243,6 +285,27 @@ int run_transcribe_path(const Opts & o,
                 "[determinism] FAIL: run %d transcript differs from run 0\n"
                 "  run 0: '%s'\n  run %d: '%s'\n",
                 k, text_per_run[0].c_str(), k, text_per_run[k].c_str());
+            ok = false;
+        }
+    }
+
+    // Expected-transcript gate: repeatability alone would also pass
+    // deterministic-but-wrong output (e.g. a multilingual GGUF whose
+    // language ranges were dropped decodes the full aggregate vocab
+    // deterministically). Anchor run 0 to a known-good transcript.
+    if (!o.expect_text_file.empty()) {
+        std::string expected;
+        if (!read_text_file(o.expect_text_file, expected)) {
+            std::fprintf(stderr,
+                "[determinism] FAIL: cannot read --expect-text-file %s\n",
+                o.expect_text_file.c_str());
+            ok = false;
+        } else if (text_per_run[0] != expected) {
+            std::fprintf(stderr,
+                "[determinism] FAIL: transcript does not match %s\n"
+                "  expected: '%s'\n  actual  : '%s'\n",
+                o.expect_text_file.c_str(),
+                expected.c_str(), text_per_run[0].c_str());
             ok = false;
         }
     }
@@ -330,6 +393,7 @@ int run_diarize_path(const Opts & o,
     eopts.model_gguf_path        = o.model_path;
     eopts.n_threads              = o.n_threads;
     eopts.n_gpu_layers           = o.n_gpu_layers;
+    eopts.language               = o.language;
     eopts.verbose                = false;
     eopts.prewarm                = o.prewarm;
     eopts.prewarm_audio_seconds  = o.prewarm_audio_seconds;
@@ -337,6 +401,13 @@ int run_diarize_path(const Opts & o,
     parakeet::Engine eng(eopts);
     const double ctor_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                                std::chrono::steady_clock::now() - t_ctor).count() / 1000.0;
+    if (o.require_gpu && eng.backend_device() != parakeet::BackendDevice::GPU) {
+        std::fprintf(stderr,
+            "[determinism] FAIL: --require-gpu but the engine selected backend "
+            "'%s'; a silent CPU fallback would make this run CPU-vs-CPU\n",
+            eng.backend_name().c_str());
+        return 1;
+    }
     std::fprintf(stderr,
         "[determinism] diarize path: model=%s backend=%s threads=%d gpu_layers=%d runs=%d prewarm=%s ctor=%.2fms\n",
         model_type_str.c_str(),

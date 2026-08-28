@@ -15,27 +15,46 @@
 //   6b. vae_shrink_window_core — chunked-decode window vs the backend alloc cap.
 //   7. GPU device types    — discrete and integrated GPUs are selectable.
 //   8. stage placement     — which backend the LM / detokenizer / encoders run on.
+//   9. parallel_load       — weight-load row/chunk decomposition parity.
+//   9b. fused load         — LM q|k|v / gate|up row blocks fail closed.
+//   10. quantize policy    — acestep-quantize per-tensor type selection.
+//   11. quantize roundtrip — synthetic GGUF through plan/stream/padding, read back.
 
 #include "backend_registry.h"
+#include "parallel_load.h"
+#include "audio_edit.h"
 #include "cover_noise.h"
 #include "dit_ggml.h"
+#include "dit_gguf.h"
 #include "detok_ggml.h"
 #include "generate_task.h"
 #include "generation_conditioning.h"
 #include "generation_plan.h"
+#include "lm_ggml.h"
 #include "lm_pipeline.h"
+#include "metadata_fsm.h"
 #include "philox.h"
+#include "quantize_gguf.h"
+#include "quantize_policy.h"
+#include "qwen3_block.h"
 #include "stage_placement.h"
 #include "vae_encode_windows.h"
 #include "vae_ggml.h"
 #include "wav_reader.h"
 
+#include "ggml-alloc.h"
+#include "gguf.h"
+
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <random>
+#include <sstream>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -108,6 +127,7 @@ void test_haar_dcw() {
 // 3. philox_randn ------------------------------------------------------------
 void test_philox() {
     using tts_cpp::acestep::philox_randn;
+    using tts_cpp::acestep::philox_randn_from;
 
     // Golden vector for seed 42 (bf16-rounded, the mode the engine uses for
     // the DiT initial noise). These values were validated corr=1.0 against
@@ -123,6 +143,16 @@ void test_philox() {
     philox_randn(1234, a, 16, true);
     philox_randn(1234, b, 16, true);
     for (int i = 0; i < 16; ++i) CHECK(a[i] == b[i]);
+
+    // Repeated draws from one generator continue at the next subsequence,
+    // matching one torch.Generator whose state advances across randn calls.
+    float first[7], second[9];
+    philox_randn_from(1234, 0, first, 7, true);
+    philox_randn_from(1234, 7, second, 9, true);
+    for (int i = 0; i < 7; ++i)
+      CHECK(first[i] == a[i]);
+    for (int i = 0; i < 9; ++i)
+      CHECK(second[i] == a[i + 7]);
 
     // Different seeds -> different stream (extremely unlikely to collide).
     float c[16];
@@ -197,6 +227,277 @@ void test_sampler() {
         int tb = sample_top_k_p(b.data(), V, 0.85f, 0.9f, 0, r2);
         CHECK(ta == tb);
         CHECK(ta >= 0 && ta < V);
+    }
+}
+
+// Compact-slice sampling must match the historical full-vocab path exactly:
+// entries below the EOS cut were only ever masked to -1e9, so sampling the
+// [eos, V) slice via index_base is an identity, RNG stream included.
+void test_sampler_compact_equivalence() {
+    using tts_cpp::acestep::sample_top_k_p;
+
+    const int V = 1000, eos = 100, base = 124;  // mirrors TOKEN_IM_END/AUDIO_CODE_BASE layout
+    std::mt19937                          gen(1234);
+    std::uniform_real_distribution<float> ud(-4.0f, 4.0f);
+
+    for (int trial = 0; trial < 20; ++trial) {
+        std::vector<float> raw(V);
+        for (float & v : raw) v = ud(gen);
+
+        std::vector<float> full(raw);
+        for (int v = 0; v < base; ++v)
+            if (v != eos) full[v] = -1e9f;
+        std::vector<float> slice(raw.begin() + eos, raw.end());
+        for (int v = 1; v < base - eos; ++v) slice[v] = -1e9f;
+
+        std::mt19937 r_full(trial), r_slice(trial);
+        const float  temp  = (trial % 5 == 0) ? 0.0f : 0.85f;  // argmax path every 5th trial
+        const float  top_p = (trial % 7 == 0) ? 0.0f : 0.9f;   // also cover the disabled-top_p path
+        int tf = sample_top_k_p(full.data(), V, temp, top_p, 0, r_full);
+        int ts = sample_top_k_p(slice.data(), V - eos, temp, top_p, 0, r_slice, eos);
+        CHECK(tf == ts);
+        CHECK(r_full == r_slice);
+
+        // Prefix form (phase-1 FSM shape): tail [base2, V) masked -> sampling
+        // only [0, base2) is the same identity.
+        const int          base2 = 900;
+        std::vector<float> full2(raw);
+        for (int v = base2; v < V; ++v) full2[v] = -1e9f;
+        std::vector<float> pre(raw.begin(), raw.begin() + base2);
+        std::mt19937       r_f2(trial + 100), r_p2(trial + 100);
+        int tf2 = sample_top_k_p(full2.data(), V, temp, top_p, 0, r_f2);
+        int tp2 = sample_top_k_p(pre.data(), base2, temp, top_p, 0, r_p2);
+        CHECK(tf2 == tp2);
+        CHECK(r_f2 == r_p2);
+    }
+}
+
+// r==0 edge of the compact form. dist(0, sum) yields exactly 0.0f only when
+// the raw 32-bit mt19937 output is 0 (sum >= 1.0, so no underflow path); an
+// all-zero engine state produces that draw deterministically. The historical
+// full-vector walk then lands on absolute index 0, and the index_base form
+// must land on the same spot - NOT on index_base + 0 (= EOS in phase 2).
+std::mt19937 make_zero_draw_rng() {
+    std::stringstream ss;
+    for (int i = 0; i < 624; ++i) ss << 0 << ' ';
+    ss << 0;
+    std::mt19937 rng;
+    ss >> rng;
+    return rng;
+}
+
+void test_sampler_r0_edge() {
+    using tts_cpp::acestep::sample_top_k_p;
+
+    {  // Portability guard: stream format / canonical mapping are stdlib-specific.
+        std::mt19937                          probe = make_zero_draw_rng();
+        std::uniform_real_distribution<float> d01(0.0f, 1.0f);
+        if (d01(probe) != 0.0f) {
+            std::fprintf(stderr, "[test-acestep-units] r==0 rng state not reproducible here, subtest skipped\n");
+            return;
+        }
+    }
+
+    const int                             V = 1000, eos = 100, base = 124;
+    std::mt19937                          gen(4321);
+    std::uniform_real_distribution<float> ud(-4.0f, 4.0f);
+    std::vector<float>                    raw(V);
+    for (float & v : raw) v = ud(gen);
+
+    for (float top_p : { 0.9f, 0.0f }) {  // top_p and disabled-top_p branches
+        std::vector<float> full(raw);
+        for (int v = 0; v < base; ++v)
+            if (v != eos) full[v] = -1e9f;
+        std::vector<float> slice(raw.begin() + eos, raw.end());
+        for (int v = 1; v < base - eos; ++v) slice[v] = -1e9f;
+
+        std::mt19937 r_full = make_zero_draw_rng(), r_slice = make_zero_draw_rng();
+        int tf = sample_top_k_p(full.data(), V, 0.85f, top_p, 0, r_full);
+        int ts = sample_top_k_p(slice.data(), V - eos, 0.85f, top_p, 0, r_slice, eos);
+        CHECK(tf == 0);
+        CHECK(ts == 0);
+        CHECK(r_full == r_slice);
+    }
+}
+
+// lm_consume_forced must be indistinguishable from masking all but one token
+// and running the full sampler: same pick, same RNG consumption.
+void test_sampler_forced_fast_path() {
+    using tts_cpp::acestep::lm_consume_forced;
+    using tts_cpp::acestep::sample_top_k_p;
+
+    const int V = 500;
+    for (int trial = 0; trial < 12; ++trial) {
+        const int   live = 37 + trial * 13;
+        const float temp = (trial % 4 == 0) ? 0.0f : 0.85f;
+
+        std::vector<float> l(V, -1e9f);
+        l[live] = 1.5f;
+        std::mt19937 r_full(trial), r_fast(trial);
+        int tf = sample_top_k_p(l.data(), V, temp, 0.9f, 0, r_full);
+        int tc = lm_consume_forced(live, temp, r_fast);
+        CHECK(tf == tc);
+        CHECK(r_full == r_fast);
+    }
+}
+
+// MetadataFSM::forced_token must agree with apply_mask: it returns exactly the
+// single surviving token when one exists, -1 when the LM still has a choice.
+void test_fsm_forced_token() {
+    using tts_cpp::acestep::MetadataFSM;
+
+    const int V         = 64;
+    auto      survivors = [&](MetadataFSM & f) {
+        std::vector<float> l(V, 1.0f);
+        f.apply_mask(l.data());
+        std::vector<int> alive;
+        for (int v = 0; v < V; ++v)
+            if (l[v] > -1e8f) alive.push_back(v);
+        return alive;
+    };
+    auto agree = [&](MetadataFSM & f) {
+        MetadataFSM probe = f;  // forced_token may seed inject_queue; probe a copy
+        int         t     = probe.forced_token();
+        auto        alive = survivors(f);
+        if (alive.size() == 1) CHECK(t == alive[0]);
+        else CHECK(t == -1);
+    };
+
+    MetadataFSM fsm;
+    fsm.enabled    = true;
+    fsm.vocab_size = V;
+
+    fsm.state    = MetadataFSM::BPM_NAME;  // name tokens force one token at a time
+    fsm.bpm_name = { 5, 7 };
+    fsm.name_pos = 0;
+    agree(fsm);
+    fsm.name_pos = 1;
+    agree(fsm);
+
+    fsm.inject_queue = { 9 };  // injected value: forced
+    agree(fsm);
+    fsm.inject_queue.clear();
+
+    fsm.state         = MetadataFSM::THINK_END;  // </think> is forced
+    fsm.think_end_tok = 20;                      // keep it inside the synthetic vocab
+    agree(fsm);
+
+    fsm.state       = MetadataFSM::BPM_VALUE;  // value tree: forced only when 1 child
+    fsm.name_pos    = (int) fsm.bpm_name.size();
+    fsm.newline_tok = 3;
+    fsm.bpm_tree.add({ 11, 12 });
+    fsm.value_acc.clear();
+    agree(fsm);  // single child {11}
+    fsm.bpm_tree.add({ 13, 12 });
+    agree(fsm);  // two children {11,13} -> free choice
+    fsm.value_acc = { 11 };
+    agree(fsm);  // single child {12}
+    fsm.value_acc = { 40 };
+    agree(fsm);  // unknown prefix -> forced newline
+}
+
+// Verbatim pre-fusion sampler, kept as an oracle: the fused sample_top_k_p must
+// match it token-for-token and draw-for-draw.
+struct RefTokenProb {
+    int   id;
+    float prob;
+};
+
+int reference_sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng) {
+    if (temperature <= 0.0f) {
+        return (int) (std::max_element(logits, logits + V) - logits);
+    }
+
+    float inv_temp = 1.0f / temperature;
+    for (int i = 0; i < V; i++) logits[i] *= inv_temp;
+
+    if (top_k > 0 && top_k < V) {
+        std::vector<float> tmp(logits, logits + V);
+        std::nth_element(tmp.begin(), tmp.begin() + (top_k - 1), tmp.end(), std::greater<float>());
+        float threshold = tmp[top_k - 1];
+        for (int i = 0; i < V; i++) {
+            if (logits[i] < threshold) logits[i] = -INFINITY;
+        }
+    }
+
+    if (top_p > 0.0f && top_p < 1.0f) {
+        float max_logit = -INFINITY;
+        for (int i = 0; i < V; i++) {
+            if (logits[i] > max_logit) max_logit = logits[i];
+        }
+        float sum_exp = 0.0f;
+        for (int i = 0; i < V; i++) sum_exp += expf(logits[i] - max_logit);
+        float inv_sum = 1.0f / sum_exp;
+
+        float                     cutoff = max_logit - 16.0f;
+        std::vector<RefTokenProb> sorted;
+        for (int i = 0; i < V; i++) {
+            if (logits[i] >= cutoff) {
+                sorted.push_back({ i, expf(logits[i] - max_logit) * inv_sum });
+            } else {
+                logits[i] = -INFINITY;
+            }
+        }
+
+        int K = (int) sorted.size();
+        if (K > 0) {
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const RefTokenProb & a, const RefTokenProb & b) { return a.prob > b.prob; });
+            float cum = 0.0f;
+            for (int i = 0; i < K; i++) {
+                if (i > 0 && cum >= top_p) logits[sorted[i].id] = -INFINITY;
+                cum += sorted[i].prob;
+            }
+        }
+    }
+
+    float max_val = -INFINITY;
+    for (int i = 0; i < V; i++) {
+        if (logits[i] > max_val) max_val = logits[i];
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < V; i++) {
+        logits[i] = expf(logits[i] - max_val);
+        sum += logits[i];
+    }
+
+    std::uniform_real_distribution<float> dist(0.0f, sum);
+    float                                 r   = dist(rng);
+    float                                 acc = 0.0f;
+    for (int i = 0; i < V; i++) {
+        acc += logits[i];
+        if (acc >= r) return i;
+    }
+    return 0;
+}
+
+void test_sampler_fusion_oracle() {
+    using tts_cpp::acestep::sample_top_k_p;
+
+    const int                             V = 4096;
+    std::mt19937                          gen(77);
+    std::uniform_real_distribution<float> ud(-6.0f, 6.0f);
+
+    for (int trial = 0; trial < 30; ++trial) {
+        std::vector<float> raw(V);
+        for (float & v : raw) v = ud(gen);
+        // Adversarial shapes: -1e9 masses, -inf islands, exact ties.
+        if (trial % 3 == 0)
+            for (int i = 0; i < V; i += 2) raw[i] = -1e9f;
+        if (trial % 4 == 0)
+            for (int i = 0; i < V / 8; ++i) raw[i] = raw[V - 1 - i];
+        if (trial % 5 == 0)
+            for (int i = 100; i < 200; ++i) raw[i] = -INFINITY;
+        const float temp  = (trial % 6 == 0) ? 0.0f : 0.85f;
+        const float top_p = (trial % 7 == 0) ? 0.0f : 0.9f;  // also cover the disabled-top_p path
+        const int   top_k = (trial % 8 == 0) ? 40 : 0;
+
+        std::vector<float> a = raw, b = raw;
+        std::mt19937       r1(trial), r2(trial);
+        int ta = reference_sample_top_k_p(a.data(), V, temp, top_p, top_k, r1);
+        int tb = sample_top_k_p(b.data(), V, temp, top_p, top_k, r2);
+        CHECK(ta == tb);
+        CHECK(r1 == r2);
     }
 }
 
@@ -297,10 +598,14 @@ void test_backend_device_types() {
     CHECK(backend_reg_name_is_validated_gpu("Vulkan"));
     CHECK(backend_reg_name_is_validated_gpu("MTL"));
     CHECK(backend_reg_name_is_validated_gpu("Metal"));
+    CHECK(backend_reg_name_is_validated_gpu("CUDA"));
     // OpenCL is deliberately absent: it is reached by its own Adreno pass in
-    // backend_gpu_init(), not by this Vulkan/Metal preference.
+    // backend_gpu_init(), not by this validated-backend preference.
     CHECK(!backend_reg_name_is_validated_gpu("OpenCL"));
-    CHECK(!backend_reg_name_is_validated_gpu("CUDA"));
+    // The HIP/MUSA builds of ggml-cuda register under their own names and stay
+    // unvalidated until measured.
+    CHECK(!backend_reg_name_is_validated_gpu("ROCm"));
+    CHECK(!backend_reg_name_is_validated_gpu("MUSA"));
     CHECK(!backend_reg_name_is_validated_gpu(nullptr));
 
     // That Adreno pass gates on the generation parsed out of the device
@@ -324,7 +629,23 @@ void test_backend_device_types() {
 // device lane. Mirrors the three branches Engine::create() relies on: the
 // backend allowlist, the CPU fallback for everything else, and the env
 // overrides layered on top.
+
+// A backend validated for every stage except the autoregressive LM keeps the
+// LM on the CPU while the detokenizer and encoders follow the GPU.
+void check_gpu_backend_keeps_lm_on_cpu(const char * name, const char * device_desc) {
+    using tts_cpp::acestep::PlacementOverrides;
+    using tts_cpp::acestep::resolve_stage_placement;
+    using tts_cpp::acestep::StagePlacement;
+
+    const PlacementOverrides none;
+    StagePlacement p = resolve_stage_placement(name, device_desc, none);
+    CHECK(!p.lm_on_gpu);
+    CHECK(p.detok_on_gpu);
+    CHECK(p.enc_on_gpu);
+}
+
 void test_stage_placement() {
+    using tts_cpp::acestep::backend_name_is_cuda;
     using tts_cpp::acestep::backend_name_is_metal;
     using tts_cpp::acestep::backend_name_is_opencl;
     using tts_cpp::acestep::backend_name_is_vulkan;
@@ -342,12 +663,18 @@ void test_stage_placement() {
     // not what reaches here.
     CHECK(backend_name_is_opencl("OpenCL"));
     CHECK(!backend_name_is_opencl("GPUOpenCL"));
+    // ggml-cuda's REGISTRY name; the HIP/MUSA builds of the same backend
+    // register as "ROCm"/"MUSA" and must not match.
+    CHECK(backend_name_is_cuda("CUDA"));
+    CHECK(!backend_name_is_cuda("ROCm"));
+    CHECK(!backend_name_is_cuda("MUSA"));
 
     // The input is the REGISTRY name, which carries no device-index suffix.
     // ggml_backend_name() would hand over "MTL0" / "Vulkan0" and match nothing.
     CHECK(!backend_name_is_metal("MTL0"));
     CHECK(!backend_name_is_vulkan("Vulkan0"));
     CHECK(!backend_name_is_opencl("OpenCL0"));
+    CHECK(!backend_name_is_cuda("CUDA0"));
 
     // Exact compare: no case folding, no substring match, and null/empty safe.
     CHECK(!backend_name_is_metal("mtl"));
@@ -356,42 +683,68 @@ void test_stage_placement() {
     CHECK(!backend_name_is_vulkan("vulkan"));
     CHECK(!backend_name_is_opencl("opencl"));
     CHECK(!backend_name_is_metal("CUDA"));
+    CHECK(!backend_name_is_cuda("cuda"));
     CHECK(!backend_name_is_vulkan("MTL"));
     CHECK(!backend_name_is_metal("Vulkan"));
     CHECK(!backend_name_is_opencl("Vulkan"));
+    CHECK(!backend_name_is_cuda("Vulkan"));
     CHECK(!backend_name_is_metal(""));
     CHECK(!backend_name_is_vulkan(""));
     CHECK(!backend_name_is_opencl(""));
+    CHECK(!backend_name_is_cuda(""));
     CHECK(!backend_name_is_metal(nullptr));
     CHECK(!backend_name_is_vulkan(nullptr));
     CHECK(!backend_name_is_opencl(nullptr));
+    CHECK(!backend_name_is_cuda(nullptr));
 
     const PlacementOverrides none;
+    const char * const radv_desc = "Radeon 8060S Graphics (RADV GFX1151)";
 
-    // -- allowlist: Metal and OpenCL keep LM + detokenizer on GPU ---------------
-    for (const char * allowed : { "MTL", "Metal", "OpenCL" }) {
-        StagePlacement p = resolve_stage_placement(allowed, none);
+    // -- device predicate: the Vulkan LM allowlist is per-device --------------
+    using tts_cpp::acestep::vulkan_device_lm_validated;
+    CHECK(vulkan_device_lm_validated(radv_desc));
+    CHECK(vulkan_device_lm_validated("AMD Radeon Graphics (RADV GFX1100)"));
+    CHECK(!vulkan_device_lm_validated("Mali-G715"));
+    CHECK(!vulkan_device_lm_validated("Samsung Xclipse 920"));
+    CHECK(!vulkan_device_lm_validated("NVIDIA GeForce RTX 4090"));
+    CHECK(!vulkan_device_lm_validated("AMD Radeon RX 7900 XTX"));  // proprietary driver
+    CHECK(!vulkan_device_lm_validated(""));
+    CHECK(!vulkan_device_lm_validated(nullptr));
+
+    // -- allowlist: Metal, OpenCL, and CUDA keep LM + detokenizer on GPU --------
+    for (const char * allowed : { "MTL", "Metal", "OpenCL", "CUDA" }) {
+        StagePlacement p = resolve_stage_placement(allowed, "", none);
         CHECK(p.lm_on_gpu);
         CHECK(p.detok_on_gpu);
         CHECK(p.enc_on_gpu);  // encoders follow the GPU on every backend
     }
 
-    // Vulkan is validated for every stage except the autoregressive LM. On
-    // Mali-G715, GPU LM logits collapse to repeated codes and truncate songs.
+    // Vulkan on a Mesa RADV device runs every stage on the GPU (measured on
+    // Strix Halo: ~2x faster LM, closer to the F32 reference than the CPU path).
     {
-        StagePlacement p = resolve_stage_placement("Vulkan", none);
-        CHECK(!p.lm_on_gpu);
+        StagePlacement p = resolve_stage_placement("Vulkan", radv_desc, none);
+        CHECK(p.lm_on_gpu);
         CHECK(p.detok_on_gpu);
         CHECK(p.enc_on_gpu);
     }
 
+    // Vulkan on any other device keeps the LM on the CPU (README "Backends"
+    // records the per-backend rationale).
+    check_gpu_backend_keeps_lm_on_cpu("Vulkan", "Mali-G715");
+    check_gpu_backend_keeps_lm_on_cpu("Vulkan", "Samsung Xclipse 920");
+    check_gpu_backend_keeps_lm_on_cpu("Vulkan", "");
+
     // -- fallback: everything else keeps the shipping CPU placement -----------
     // Unmeasured backends must not silently pick up the GPU path. "MTL0" is in
-    // this list on purpose: a suffixed name is NOT the allowlisted one.
-    const char * const others[] = { "CUDA",     "SYCL",     "BLAS", "CPU",  "MTL0",
-                                    "Vulkan0",  "OpenCL0",  "",     nullptr };
+    // this list on purpose: a suffixed name is NOT the allowlisted one. "ROCm"
+    // and "MUSA" are the HIP/MUSA builds of ggml-cuda: same code base, different
+    // silicon, unmeasured.
+    const char * const others[] = { "ROCm",     "MUSA",     "SYCL", "BLAS", "CPU",
+                                    "MTL0",     "Vulkan0",  "OpenCL0", "CUDA0",
+                                    "",         nullptr };
     for (const char * other : others) {
-        StagePlacement p = resolve_stage_placement(other, none);
+        // A RADV description must not rescue a non-Vulkan registry name either.
+        StagePlacement p = resolve_stage_placement(other, radv_desc, none);
         CHECK(!p.lm_on_gpu);
         CHECK(!p.detok_on_gpu);
         CHECK(p.enc_on_gpu);  // only the LM and the detokenizer are allowlisted
@@ -403,30 +756,46 @@ void test_stage_placement() {
     {
         PlacementOverrides ov;
         ov.lm_gpu        = true;
-        StagePlacement p = resolve_stage_placement("CUDA", ov);
+        StagePlacement p = resolve_stage_placement("SYCL", "", ov);
         CHECK(p.lm_on_gpu);
         CHECK(!p.detok_on_gpu);  // the LM hatch must not move the detokenizer
     }
     {
         PlacementOverrides ov;
         ov.detok_gpu     = true;
-        StagePlacement p = resolve_stage_placement("CUDA", ov);
+        StagePlacement p = resolve_stage_placement("SYCL", "", ov);
         CHECK(p.detok_on_gpu);
         CHECK(!p.lm_on_gpu);
+    }
+
+    // GPU hatch also lifts a non-validated Vulkan device (how a new device gets
+    // measured without a rebuild).
+    {
+        PlacementOverrides ov;
+        ov.lm_gpu        = true;
+        StagePlacement p = resolve_stage_placement("Vulkan", "Mali-G715", ov);
+        CHECK(p.lm_on_gpu);
     }
 
     // CPU hatch demotes an allowlisted backend.
     {
         PlacementOverrides ov;
         ov.lm_cpu        = true;
-        StagePlacement p = resolve_stage_placement("MTL", ov);
+        StagePlacement p = resolve_stage_placement("MTL", "", ov);
         CHECK(!p.lm_on_gpu);
         CHECK(p.detok_on_gpu);
     }
     {
         PlacementOverrides ov;
+        ov.lm_cpu        = true;
+        StagePlacement p = resolve_stage_placement("Vulkan", radv_desc, ov);
+        CHECK(!p.lm_on_gpu);  // CPU hatch demotes a validated RADV device too
+        CHECK(p.detok_on_gpu);
+    }
+    {
+        PlacementOverrides ov;
         ov.detok_cpu     = true;
-        StagePlacement p = resolve_stage_placement("Vulkan", ov);
+        StagePlacement p = resolve_stage_placement("Vulkan", "", ov);
         CHECK(!p.detok_on_gpu);
         CHECK(!p.lm_on_gpu);
     }
@@ -439,7 +808,7 @@ void test_stage_placement() {
         ov.lm_cpu        = true;
         ov.detok_gpu     = true;
         ov.detok_cpu     = true;
-        StagePlacement p = resolve_stage_placement(name, ov);
+        StagePlacement p = resolve_stage_placement(name, radv_desc, ov);
         CHECK(!p.lm_on_gpu);
         CHECK(!p.detok_on_gpu);
     }
@@ -448,9 +817,10 @@ void test_stage_placement() {
     for (const char * name : { "MTL", "Vulkan", "OpenCL", "CUDA" }) {
         PlacementOverrides ov;
         ov.encoders_cpu  = true;
-        StagePlacement p = resolve_stage_placement(name, ov);
+        StagePlacement p = resolve_stage_placement(name, "", ov);
         CHECK(!p.enc_on_gpu);
-        CHECK(p.lm_on_gpu == (backend_name_is_metal(name) || backend_name_is_opencl(name)));
+        CHECK(p.lm_on_gpu == (backend_name_is_metal(name) || backend_name_is_opencl(name) ||
+                              backend_name_is_cuda(name)));
     }
 }
 
@@ -499,6 +869,157 @@ void test_placement_env() {
     }
 
     clear_all();  // leave the environment as found
+}
+
+// 9. parallel_load -----------------------------------------------------------
+// Exactly-once row coverage and bit-parity with the single-threaded conversion.
+void test_parallel_rows() {
+    using tts_cpp::acestep::parallel_rows;
+    for (int n : { 0, 1, 127, 128, 129, 255, 4096, 12345 }) {
+        // Workers only touch atomics; every CHECK stays on the main thread.
+        std::vector<std::atomic<int>> hits((size_t) n);
+        std::atomic<bool>             bounds_ok{ true };
+        parallel_rows(n, [&](int begin, int end) {
+            if (begin < 0 || end > n) bounds_ok = false;
+            for (int i = begin; i < end && i >= 0; i++) hits[(size_t) i].fetch_add(1);
+        });
+        CHECK(bounds_ok);
+        bool all_once = true;
+        for (const auto & h : hits) all_once = all_once && h.load() == 1;
+        CHECK(all_once);
+    }
+}
+
+void test_convert_f32_to_f16_rows() {
+    using tts_cpp::acestep::convert_f32_to_f16_rows;
+    using tts_cpp::acestep::F16_CONVERT_CHUNK;
+    using tts_cpp::acestep::LOAD_SERIAL_MIN_ROWS;
+    std::mt19937                          rng(123);
+    std::uniform_real_distribution<float> dist(-8.0f, 8.0f);
+    // The last size crosses LOAD_SERIAL_MIN_ROWS chunks, exercising the
+    // threaded branch with a ragged tail.
+    const size_t threaded = (size_t) LOAD_SERIAL_MIN_ROWS * F16_CONVERT_CHUNK + 7;
+    for (size_t count : { (size_t) 0, (size_t) 1, F16_CONVERT_CHUNK - 1, F16_CONVERT_CHUNK,
+                          F16_CONVERT_CHUNK + 1, 2 * F16_CONVERT_CHUNK, (size_t) 65537, threaded }) {
+        std::vector<float> src(count);
+        for (auto & v : src) v = dist(rng);
+        std::vector<ggml_fp16_t> serial(count);
+        std::vector<ggml_fp16_t> chunked(count);
+        if (count > 0) {
+            ggml_fp32_to_fp16_row(src.data(), serial.data(), (int) count);
+            convert_f32_to_f16_rows(src.data(), chunked.data(), count);
+            CHECK(std::memcmp(serial.data(), chunked.data(), count * sizeof(ggml_fp16_t)) == 0);
+        } else {
+            convert_f32_to_f16_rows(src.data(), chunked.data(), count);
+        }
+    }
+}
+
+// 9b. fused-load fail-closed -------------------------------------------------
+// lm_load_row_block copies one GGUF tensor into a row-concatenated fused tensor
+// at a running byte offset; lm_load_layer_fused chains q|k|v and gate|up. A
+// missing tensor must fail the load (false, offset untouched): skipping a block
+// would byte-shift every later one into silently wrong weights. The tiny GGUF
+// is written by the test itself; CPU buffers only.
+// POSIX runners set TMPDIR; Windows runners set TEMP/TMP and have no /tmp, so
+// a plain TMPDIR-or-/tmp fallback makes every file-writing test fail there.
+std::string test_temp_dir() {
+    for (const char * var : { "TMPDIR", "TEMP", "TMP" }) {
+        const char * val = std::getenv(var);
+        if (val && *val) {
+            return val;
+        }
+    }
+    return "/tmp";
+}
+
+std::string write_fused_test_gguf(const std::vector<std::pair<std::string, std::vector<float>>> & tensors, int ne0) {
+    const std::string path = test_temp_dir() + "/qvac-acestep-fused-load-test.gguf";
+
+    ggml_init_params ip{ 1024 * 1024, nullptr, /*no_alloc=*/false };
+    ggml_context *   ctx = ggml_init(ip);
+    gguf_context *   gc  = gguf_init_empty();
+    for (const auto & [name, vals] : tensors) {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, (int64_t) vals.size() / ne0);
+        ggml_set_name(t, name.c_str());
+        std::memcpy(t->data, vals.data(), vals.size() * sizeof(float));
+        gguf_add_tensor(gc, t);
+    }
+    CHECK(gguf_write_to_file(gc, path.c_str(), /*only_meta=*/false));
+    gguf_free(gc);
+    ggml_free(ctx);
+    return path;
+}
+
+void test_fused_load_fail_closed() {
+    using tts_cpp::acestep::DitGGUF;
+    using tts_cpp::acestep::Qwen3Layer;
+    using tts_cpp::acestep::dit_gguf_close;
+    using tts_cpp::acestep::dit_gguf_open;
+    using tts_cpp::acestep::lm_load_layer_fused;
+    using tts_cpp::acestep::lm_load_row_block;
+
+    const int ne0 = 4;
+    auto      seq = [](int n, float base) {
+        std::vector<float> v((size_t) n);
+        for (int i = 0; i < n; ++i) v[(size_t) i] = base + (float) i;
+        return v;
+    };
+    const std::string p = "model.layers.0";
+    const auto q = seq(8, 0), k = seq(4, 100), v = seq(4, 200), gate = seq(8, 300), up = seq(8, 400);
+
+    const std::string path = write_fused_test_gguf(
+        { { p + ".self_attn.q_proj.weight", q },
+          { p + ".self_attn.k_proj.weight", k },
+          { p + ".self_attn.v_proj.weight", v },
+          { p + ".mlp.gate_proj.weight", gate },
+          { p + ".mlp.up_proj.weight", up } },
+        ne0);
+
+    DitGGUF g;
+    CHECK(dit_gguf_open(g, path));
+
+    ggml_init_params      ip{ 8 * ggml_tensor_overhead(), nullptr, /*no_alloc=*/true };
+    ggml_context *        ctx = ggml_init(ip);
+    ggml_tensor *         qkv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, 4);  // q(2) + k(1) + v(1) rows
+    ggml_tensor *         gu  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, 4);  // gate(2) + up(2) rows
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    CHECK(buf != nullptr);
+
+    // Happy path: all five blocks land back to back, in declaration order.
+    Qwen3Layer ly{};  // norms/o/down stay null; q3_load_* skip a null dst
+    CHECK(lm_load_layer_fused(g, p, ly, qkv, gu));
+    std::vector<float> qkv_want(q);
+    qkv_want.insert(qkv_want.end(), k.begin(), k.end());
+    qkv_want.insert(qkv_want.end(), v.begin(), v.end());
+    std::vector<float> gu_want(gate);
+    gu_want.insert(gu_want.end(), up.begin(), up.end());
+    CHECK(std::memcmp(qkv->data, qkv_want.data(), qkv_want.size() * sizeof(float)) == 0);
+    CHECK(std::memcmp(gu->data, gu_want.data(), gu_want.size() * sizeof(float)) == 0);
+
+    // Missing tensor: false, and the offset must not advance.
+    size_t off = 0;
+    CHECK(lm_load_row_block(qkv, off, g, p + ".self_attn.q_proj.weight"));
+    const size_t after_q = off;
+    CHECK(!lm_load_row_block(qkv, off, g, p + ".self_attn.absent.weight"));
+    CHECK(off == after_q);
+    dit_gguf_close(g);
+
+    // v_proj absent -> the whole fused layer load fails.
+    const std::string path2 = write_fused_test_gguf(
+        { { p + ".self_attn.q_proj.weight", q },
+          { p + ".self_attn.k_proj.weight", k },
+          { p + ".mlp.gate_proj.weight", gate },
+          { p + ".mlp.up_proj.weight", up } },
+        ne0);
+    DitGGUF g2;
+    CHECK(dit_gguf_open(g2, path2));
+    CHECK(!lm_load_layer_fused(g2, p, ly, qkv, gu));
+    dit_gguf_close(g2);
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    std::remove(path.c_str());
 }
 
 void test_generate_task_kinds() {
@@ -575,7 +1096,38 @@ void test_generate_task_errors() {
 
     params.task_type = TASK_COVER_NOFSQ;
     params.audio_cover_strength = 0.5f;
-    CHECK(resolve_generate_task(params, task).find("audio_cover_strength") != std::string::npos);
+    CHECK(resolve_generate_task(params, task).empty());
+    CHECK(approx(task.audio_cover_strength, 0.5f));
+}
+
+void test_cover_conditioning_switch() {
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::TASK_COVER_NOFSQ;
+    using tts_cpp::acestep::TASK_TEXT2MUSIC;
+    using tts_cpp::acestep::needs_cover_conditioning_switch;
+    using tts_cpp::acestep::resolve_cover_switch_step;
+
+    GenerateTask task;
+    task.type = TASK_COVER_NOFSQ;
+    task.audio_cover_strength = 1.0f;
+    CHECK(!needs_cover_conditioning_switch(task));
+    CHECK(resolve_cover_switch_step(task, 50) == -1);
+
+    task.audio_cover_strength = 0.5f;
+    CHECK(needs_cover_conditioning_switch(task));
+    CHECK(resolve_cover_switch_step(task, 50) == 25);
+    CHECK(resolve_cover_switch_step(task, 8) == 4);
+
+    task.audio_cover_strength = 0.75f;
+    CHECK(resolve_cover_switch_step(task, 8) == 6);
+
+    task.audio_cover_strength = 0.0f;
+    CHECK(resolve_cover_switch_step(task, 8) == 0);
+
+    task.type = TASK_TEXT2MUSIC;
+    task.audio_cover_strength = 0.5f;
+    CHECK(!needs_cover_conditioning_switch(task));
+    CHECK(resolve_cover_switch_step(task, 50) == -1);
 }
 
 void test_generate_task_strengths() {
@@ -731,6 +1283,205 @@ void test_cover_noise_blending() {
     CHECK(approx(noise[5], 8.0f));
 }
 
+constexpr float TEST_CONSERVATIVE_STRENGTH = 0.9f;
+constexpr float TEST_BALANCED_STRENGTH = 0.4f;
+constexpr float TEST_BALANCED_HALF_STRENGTH = 0.5f;
+constexpr int TEST_BALANCED_BLEND_FRAMES = 15;
+constexpr int TEST_BALANCED_HALF_BLEND_FRAMES = 12;
+constexpr int TEST_REPAINT_SECONDS = 4;
+constexpr int TEST_REPAINT_LATENT_FRAMES = 100;
+constexpr int TEST_REPAINT_TRAILING_SAMPLES = 321;
+constexpr char TEST_OUTPAINT_ERROR[] = "outpainting";
+constexpr char TEST_RANGE_ORDER_ERROR[] = "greater";
+constexpr char TEST_SOURCE_CAPTION_ERROR[] = "source_caption";
+constexpr char TEST_FLOW_RANGE_ERROR[] = "n_min";
+constexpr char TEST_FLOW_AVERAGE_ERROR[] = "n_avg";
+constexpr char TEST_FLOW_DCW_ERROR[] = "DCW";
+constexpr char TEST_SOURCE_CAPTION[] = "source";
+constexpr char TEST_TARGET_CAPTION[] = "target";
+constexpr char TEST_MATERIALIZE_EVENT[] = "materialize";
+constexpr char TEST_FLOW_EVENT[] = "flow";
+
+void test_repaint_config() {
+    using namespace tts_cpp::acestep;
+
+    const RepaintConfig conservative =
+        resolve_repaint_config(RepaintMode::Conservative, TEST_CONSERVATIVE_STRENGTH);
+    CHECK(approx(conservative.injection_ratio, REPAINT_CONSERVATIVE_INJECTION_RATIO));
+    CHECK(conservative.latent_blend_frames == REPAINT_CONSERVATIVE_BLEND_FRAMES);
+    CHECK(approx(conservative.waveform_fade_sec, REPAINT_CONSERVATIVE_FADE_SECONDS));
+    CHECK(conservative.preserve_waveform);
+
+    const RepaintConfig balanced =
+        resolve_repaint_config(RepaintMode::Balanced, TEST_BALANCED_STRENGTH);
+    CHECK(approx(balanced.injection_ratio, AUDIO_EDIT_MAX_RATIO - TEST_BALANCED_STRENGTH));
+    CHECK(balanced.latent_blend_frames == TEST_BALANCED_BLEND_FRAMES);
+    CHECK(approx(balanced.waveform_fade_sec,
+                 REPAINT_CONSERVATIVE_FADE_SECONDS *
+                     (AUDIO_EDIT_MAX_RATIO - TEST_BALANCED_STRENGTH)));
+    CHECK(resolve_repaint_config(RepaintMode::Balanced, TEST_BALANCED_HALF_STRENGTH)
+              .latent_blend_frames == TEST_BALANCED_HALF_BLEND_FRAMES);
+    CHECK(audio_edit_round_ties_to_even(3.5f) == 4);
+    CHECK(audio_edit_round_ties_to_even(4.5f) == 4);
+
+    const RepaintConfig aggressive =
+        resolve_repaint_config(RepaintMode::Aggressive, AUDIO_EDIT_MIN_RATIO);
+    CHECK(approx(aggressive.injection_ratio, REPAINT_AGGRESSIVE_INJECTION_RATIO));
+    CHECK(aggressive.latent_blend_frames == REPAINT_AGGRESSIVE_BLEND_FRAMES);
+    CHECK(!aggressive.preserve_waveform);
+}
+
+void test_repaint_range() {
+    using namespace tts_cpp::acestep;
+    const int source_samples = AUDIO_EDIT_SAMPLE_RATE * TEST_REPAINT_SECONDS;
+    RepaintRange range;
+    CHECK(resolve_repaint_range(AUDIO_EDIT_MIN_RATIO, REPAINT_SOURCE_END_SECONDS,
+                                source_samples, TEST_REPAINT_LATENT_FRAMES, range).empty());
+    CHECK(range.sample_start == 0);
+    CHECK(range.sample_end == source_samples);
+    CHECK(range.latent_start == 0);
+    CHECK(range.latent_end == TEST_REPAINT_LATENT_FRAMES);
+    const int trailing_source_samples = source_samples + TEST_REPAINT_TRAILING_SAMPLES;
+    const int trailing_latent_frames = TEST_REPAINT_LATENT_FRAMES + 1;
+    CHECK(resolve_repaint_range(AUDIO_EDIT_MIN_RATIO, REPAINT_SOURCE_END_SECONDS,
+                                trailing_source_samples, trailing_latent_frames, range).empty());
+    CHECK(range.sample_end == trailing_source_samples);
+    CHECK(range.latent_end == trailing_latent_frames);
+    CHECK(resolve_repaint_range(-0.1f, 1.0f, source_samples, TEST_REPAINT_LATENT_FRAMES, range)
+              .find(TEST_OUTPAINT_ERROR) != std::string::npos);
+    CHECK(resolve_repaint_range(1.0f, 4.1f, source_samples, TEST_REPAINT_LATENT_FRAMES, range)
+              .find(TEST_OUTPAINT_ERROR) != std::string::npos);
+    CHECK(resolve_repaint_range(2.0f, 2.0f, source_samples, TEST_REPAINT_LATENT_FRAMES, range)
+              .find(TEST_RANGE_ORDER_ERROR) != std::string::npos);
+}
+
+void check_all_samples_equal(const std::vector<float> & samples, float expected) {
+    for (float sample : samples) CHECK(approx(sample, expected));
+}
+
+void test_repaint_mask_injection_blend_and_splice() {
+    using namespace tts_cpp::acestep;
+
+    const std::vector<float> mask = make_repaint_mask(5, 1, 4);
+    CHECK(mask == std::vector<float>({ 0.0f, 1.0f, 1.0f, 1.0f, 0.0f }));
+
+    std::vector<float> current(10, 10.0f);
+    const std::vector<float> clean = { 2, 4, 2, 4, 2, 4, 2, 4, 2, 4 };
+    const std::vector<float> noise(10, 8.0f);
+    repaint_inject_source(
+        current, clean.data(), noise.data(), mask.data(), mask.size(), 0.25f, 2);
+    CHECK(approx(current[0], 3.5f));
+    CHECK(approx(current[1], 5.0f));
+    CHECK(approx(current[2], 10.0f));
+    CHECK(approx(current[8], 3.5f));
+
+    std::vector<float> generated(10, 10.0f);
+    repaint_blend_latent(
+        generated, clean.data(), mask.data(), mask.size(), 0, 2);
+    CHECK(approx(generated[0], 2.0f));
+    CHECK(approx(generated[1], 4.0f));
+    CHECK(approx(generated[2], 10.0f));
+    CHECK(approx(generated[8], 2.0f));
+
+    generated.assign(10, 10.0f);
+    repaint_blend_latent(
+        generated, clean.data(), mask.data(), mask.size(), 1, 2);
+    CHECK(generated[0] > clean[0] && generated[0] < 10.0f);
+    CHECK(generated[8] > clean[8] && generated[8] < 10.0f);
+
+    std::vector<float> wav(12, 1.0f);
+    const std::vector<float> source(12, -1.0f);
+    repaint_splice_waveform(wav, source, 2, 4, 0, 2);
+    CHECK(approx(wav[0], -1.0f));
+    CHECK(approx(wav[2], -1.0f));
+    CHECK(approx(wav[4], 1.0f));
+    CHECK(approx(wav[8], -1.0f));
+
+    wav.assign(12, 1.0f);
+    repaint_splice_waveform(wav, source, 0, 6, 2, 2);
+    check_all_samples_equal(wav, 1.0f);
+}
+
+void test_flow_edit_validation_and_math() {
+    using namespace tts_cpp::acestep;
+
+    FlowEditParams params;
+    CHECK(validate_flow_edit_params(params).find(TEST_SOURCE_CAPTION_ERROR) != std::string::npos);
+    params.source_caption = TEST_SOURCE_CAPTION;
+    params.target_caption = TEST_TARGET_CAPTION;
+    CHECK(validate_flow_edit_params(params).empty());
+    params.n_min = 0.8f;
+    params.n_max = 0.2f;
+    CHECK(validate_flow_edit_params(params).find(TEST_FLOW_RANGE_ERROR) != std::string::npos);
+    params.n_min = AUDIO_EDIT_MIN_RATIO;
+    params.n_max = AUDIO_EDIT_MAX_RATIO;
+    params.n_avg = 0;
+    CHECK(validate_flow_edit_params(params).find(TEST_FLOW_AVERAGE_ERROR) != std::string::npos);
+    params.n_avg = FLOW_EDIT_DEFAULT_AVERAGES;
+    params.dcw_enabled = true;
+    CHECK(validate_flow_edit_params(params).find(TEST_FLOW_DCW_ERROR) != std::string::npos);
+
+    const std::vector<float> source = { 2.0f, 4.0f };
+    const std::vector<float> noise = { 10.0f, 12.0f };
+    std::vector<float> noisy_source;
+    flow_edit_make_source(source, noise, 0.25f, noisy_source);
+    CHECK(approx(noisy_source[0], 4.0f));
+    CHECK(approx(noisy_source[1], 6.0f));
+
+    std::vector<float> edit = { 3.0f, 5.0f };
+    std::vector<float> noisy_target;
+    flow_edit_make_target(edit, noisy_source, source, noisy_target);
+    CHECK(approx(noisy_target[0], 5.0f));
+    CHECK(approx(noisy_target[1], 7.0f));
+    flow_edit_integrate_delta(edit, { 5.0f, 7.0f }, { 1.0f, 2.0f }, -0.1f);
+    CHECK(approx(edit[0], 2.6f));
+    CHECK(approx(edit[1], 4.5f));
+}
+
+void test_audio_edit_factory_and_order() {
+    using namespace tts_cpp::acestep;
+
+    RepaintParams repaint;
+    FlowEditParams flow;
+    flow.source_caption = TEST_SOURCE_CAPTION;
+    flow.target_caption = TEST_TARGET_CAPTION;
+
+    std::unique_ptr<AudioEditOperation> repaint_operation =
+        make_audio_edit_operation(AudioEditParams(repaint));
+    std::unique_ptr<AudioEditOperation> flow_operation =
+        make_audio_edit_operation(AudioEditParams(flow));
+    CHECK(dynamic_cast<RepaintOperation *>(repaint_operation.get()) != nullptr);
+    CHECK(dynamic_cast<FlowEditOperation *>(flow_operation.get()) != nullptr);
+
+    const std::vector<AudioEditParams> plan = { flow, repaint, flow, repaint };
+    AudioEditPipeline pipeline = make_audio_edit_pipeline(plan);
+    CHECK(pipeline.size() == 4);
+    CHECK(std::string(pipeline.at(0).name()) == AUDIO_EDIT_FLOW_STAGE);
+    CHECK(std::string(pipeline.at(1).name()) == AUDIO_EDIT_REPAINT_STAGE);
+
+    AudioEditArtifact artifact;
+    std::vector<std::string> order;
+    AudioEditCapabilities capabilities;
+    capabilities.prepare_repaint_source = [&](AudioEditArtifact & value) {
+        order.push_back(TEST_MATERIALIZE_EVENT);
+        value.pcm_is_current = true;
+    };
+    capabilities.flow_edit = [&](const FlowEditParams &, AudioEditArtifact & value) {
+        order.push_back(TEST_FLOW_EVENT);
+        value.pcm_is_current = false;
+    };
+    capabilities.repaint = [&](const RepaintParams &, AudioEditArtifact & value) {
+        order.push_back(AUDIO_EDIT_REPAINT_STAGE);
+        value.pcm_is_current = false;
+    };
+    pipeline.execute(artifact, capabilities);
+    const std::vector<std::string> expected = {
+        TEST_FLOW_EVENT, TEST_MATERIALIZE_EVENT, AUDIO_EDIT_REPAINT_STAGE,
+        TEST_FLOW_EVENT, TEST_MATERIALIZE_EVENT, AUDIO_EDIT_REPAINT_STAGE,
+    };
+    CHECK(order == expected);
+}
+
 void fill_fake_pcm(std::vector<float> & pcm, int frames) {
     for (int frame = 0; frame < frames; ++frame) {
         pcm[(size_t) frame * 2] = (float) frame;
@@ -869,6 +1620,182 @@ void test_wav_reader_rejects_multichannel() {
     CHECK(result.pcm.empty());
 }
 
+void test_quantize_policy() {
+    using namespace tts_cpp::acestep;
+
+    const QuantVariant * q4km = find_quant_variant("q4_k_m");
+    const QuantVariant * q80  = find_quant_variant("Q8_0");
+    const QuantVariant * q2k  = find_quant_variant("Q2_K");
+    const QuantVariant * q3kl = find_quant_variant("Q3_K_L");
+    CHECK(q4km != nullptr && q4km->base == GGML_TYPE_Q4_K);
+    CHECK(q80 != nullptr && q2k != nullptr && q3kl != nullptr);
+    CHECK(find_quant_variant("Q4_K") == nullptr);
+
+    CHECK(quant_layer_index("model.layers.12.self_attn.v_proj.weight") == 12);
+    CHECK(quant_layer_index("model.embed_tokens.weight") == -1);
+
+    // The deny-list: VAE files, 1-D tensors, the text encoder's embedding, and
+    // the DiT's quality-critical extras are never quantized.
+    CHECK(quant_pick_type("decoder.conv1.weight", 3, "acestep-vae", *q4km, 0) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("model.norm.weight", 1, "acestep-lm", *q4km, 24) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("embed_tokens.weight", 2, "acestep-text-enc", *q4km, 28) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("silence_latent", 2, "acestep-dit", *q4km, 24) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("decoder.scale_shift_table", 2, "acestep-dit", *q4km, 24) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("null_condition_emb", 2, "acestep-dit", *q4km, 24) == GGML_TYPE_COUNT);
+
+    // The LM embedding takes the variant's embed type, everything ordinary the base.
+    CHECK(quant_pick_type("model.embed_tokens.weight", 2, "acestep-lm", *q4km, 24) == GGML_TYPE_Q6_K);
+    CHECK(quant_pick_type("model.embed_tokens.weight", 2, "acestep-lm", *q80, 24) == GGML_TYPE_Q8_0);
+    CHECK(quant_pick_type("model.layers.4.self_attn.q_proj.weight", 2, "acestep-lm", *q4km, 24) ==
+          GGML_TYPE_Q4_K);
+
+    // M-variant bump: first n/9, last n/7, and every 3rd layer of v_proj/down_proj.
+    CHECK(quant_pick_type("model.layers.0.self_attn.v_proj.weight", 2, "acestep-lm", *q4km, 24) ==
+          GGML_TYPE_Q6_K);
+    CHECK(quant_pick_type("model.layers.3.mlp.down_proj.weight", 2, "acestep-lm", *q4km, 24) ==
+          GGML_TYPE_Q6_K);
+    CHECK(quant_pick_type("model.layers.22.self_attn.v_proj.weight", 2, "acestep-lm", *q4km, 24) ==
+          GGML_TYPE_Q6_K);
+    CHECK(quant_pick_type("model.layers.4.self_attn.v_proj.weight", 2, "acestep-lm", *q4km, 24) ==
+          GGML_TYPE_Q4_K);
+
+    // S-variant bump: only the first bump_layer_count layers.
+    CHECK(quant_pick_type("model.layers.3.self_attn.v_proj.weight", 2, "acestep-lm", *q2k, 24) ==
+          GGML_TYPE_Q4_K);
+    CHECK(quant_pick_type("model.layers.4.self_attn.v_proj.weight", 2, "acestep-lm", *q2k, 24) ==
+          GGML_TYPE_Q2_K);
+
+    // L-variant bump: o_proj joins the important set, at every layer.
+    CHECK(quant_pick_type("model.layers.10.self_attn.o_proj.weight", 2, "acestep-lm", *q3kl, 24) ==
+          GGML_TYPE_Q5_K);
+    CHECK(quant_pick_type("model.layers.10.self_attn.o_proj.weight", 2, "acestep-lm", *q4km, 24) ==
+          GGML_TYPE_Q4_K);
+
+    CHECK(quant_should_promote_f32(1));
+    CHECK(!quant_should_promote_f32(2));
+}
+
+// End-to-end guard on the offset/padding planning and the streaming writer: a
+// regression there emits a byte-shifted GGUF that only fails at engine load.
+// Quantizes a synthetic BF16-era file and reads the result back through the
+// gguf loader (which validates offsets and alignment structurally), then
+// checks every tensor's type and dequantized values against the source.
+void test_quantize_gguf_roundtrip() {
+    using namespace tts_cpp::acestep;
+
+    const std::string in_path  = test_temp_dir() + "/qvac-acestep-quantize-in.gguf";
+    const std::string out_path = test_temp_dir() + "/qvac-acestep-quantize-out.gguf";
+
+    // 32-wide rows quantize under Q8_0 (block size 32); the 24-wide tensor is
+    // unaligned and must be kept as stored; the BF16 1-D norm must be promoted
+    // to F32. Q8_0 row size is 34 bytes, so quantized tensors end misaligned
+    // and the writer's padding path is exercised between every pair.
+    std::vector<float> wide(32 * 4);
+    for (size_t i = 0; i < wide.size(); ++i) {
+        wide[i] = ((float) i - 64.0f) / 32.0f;
+    }
+    std::vector<float> narrow(24 * 2);
+    for (size_t i = 0; i < narrow.size(); ++i) {
+        narrow[i] = ((float) i - 24.0f) / 8.0f;
+    }
+    std::vector<float> norm(32);
+    for (size_t i = 0; i < norm.size(); ++i) {
+        norm[i] = 1.0f + (float) i / 100.0f;
+    }
+
+    ggml_init_params ip{ 4 * 1024 * 1024, nullptr, /*no_alloc=*/false };
+    ggml_context *   ctx = ggml_init(ip);
+    gguf_context *   gc  = gguf_init_empty();
+    gguf_set_val_str(gc, "general.architecture", "acestep-lm");
+    gguf_set_val_u32(gc, "acestep-lm.block_count", 1);
+
+    ggml_tensor * embed = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 4);
+    ggml_set_name(embed, "model.embed_tokens.weight");
+    std::memcpy(embed->data, wide.data(), wide.size() * sizeof(float));
+    gguf_add_tensor(gc, embed);
+
+    ggml_tensor * vproj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 4);
+    ggml_set_name(vproj, "model.layers.0.self_attn.v_proj.weight");
+    std::memcpy(vproj->data, wide.data(), wide.size() * sizeof(float));
+    gguf_add_tensor(gc, vproj);
+
+    ggml_tensor * ln = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, 32);
+    ggml_set_name(ln, "model.layers.0.input_layernorm.weight");
+    ggml_fp32_to_bf16_row(norm.data(), (ggml_bf16_t *) ln->data, (int64_t) norm.size());
+    gguf_add_tensor(gc, ln);
+
+    std::vector<float> norm_bf16(norm.size());
+    ggml_bf16_to_fp32_row((const ggml_bf16_t *) ln->data, norm_bf16.data(), (int64_t) norm.size());
+
+    ggml_tensor * odd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 24, 2);
+    ggml_set_name(odd, "model.layers.0.mlp.gate_proj.weight");
+    std::memcpy(odd->data, narrow.data(), narrow.size() * sizeof(float));
+    gguf_add_tensor(gc, odd);
+
+    CHECK(gguf_write_to_file(gc, in_path.c_str(), /*only_meta=*/false));
+    gguf_free(gc);
+    ggml_free(ctx);
+
+    const QuantVariant * q80 = find_quant_variant("Q8_0");
+    QuantizeStats        stats;
+    std::string          error;
+    CHECK(quantize_gguf_file(in_path, out_path, *q80, stats, error));
+    CHECK(error.empty());
+    CHECK(stats.n_tensors == 4);
+    CHECK(stats.n_quantized == 2);
+    CHECK(stats.n_promoted == 1);
+
+    ggml_context *   out_meta   = nullptr;
+    gguf_init_params out_params = { /*no_alloc=*/false, /*ctx=*/&out_meta };
+    gguf_context *   out        = gguf_init_from_file(out_path.c_str(), out_params);
+    CHECK(out != nullptr);
+    if (out) {
+        const int64_t ft_idx = gguf_find_key(out, "general.file_type");
+        CHECK(ft_idx >= 0 && gguf_get_kv_type(out, ft_idx) == GGUF_TYPE_UINT32);
+        CHECK(gguf_get_val_u32(out, ft_idx) == (uint32_t) GGML_FTYPE_MOSTLY_Q8_0);
+
+        const size_t alignment = gguf_get_alignment(out);
+        for (int64_t i = 0; i < gguf_get_n_tensors(out); ++i) {
+            CHECK(gguf_get_tensor_offset(out, i) % alignment == 0);
+        }
+
+        ggml_tensor * q_vproj = ggml_get_tensor(out_meta, "model.layers.0.self_attn.v_proj.weight");
+        CHECK(q_vproj && q_vproj->type == GGML_TYPE_Q8_0);
+        if (q_vproj) {
+            std::vector<float> back(wide.size());
+            ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(q_vproj->data, back.data(),
+                                                           (int64_t) back.size());
+            for (size_t i = 0; i < back.size(); ++i) {
+                CHECK(std::fabs(back[i] - wide[i]) < 0.02f);
+            }
+        }
+
+        ggml_tensor * q_embed = ggml_get_tensor(out_meta, "model.embed_tokens.weight");
+        CHECK(q_embed && q_embed->type == GGML_TYPE_Q8_0);
+
+        ggml_tensor * q_ln = ggml_get_tensor(out_meta, "model.layers.0.input_layernorm.weight");
+        CHECK(q_ln && q_ln->type == GGML_TYPE_F32);
+        if (q_ln) {
+            const float * vals = (const float *) q_ln->data;
+            for (size_t i = 0; i < norm_bf16.size(); ++i) {
+                CHECK(vals[i] == norm_bf16[i]);
+            }
+        }
+
+        ggml_tensor * q_odd = ggml_get_tensor(out_meta, "model.layers.0.mlp.gate_proj.weight");
+        CHECK(q_odd && q_odd->type == GGML_TYPE_F32);
+        if (q_odd) {
+            CHECK(std::memcmp(q_odd->data, narrow.data(), narrow.size() * sizeof(float)) == 0);
+        }
+
+        gguf_free(out);
+        ggml_free(out_meta);
+    }
+
+    std::remove(in_path.c_str());
+    std::remove(out_path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -877,23 +1804,39 @@ int main() {
     test_philox();
     test_fsq();
     test_sampler();
+    test_sampler_compact_equivalence();
+    test_sampler_r0_edge();
+    test_sampler_forced_fast_path();
+    test_fsm_forced_token();
+    test_sampler_fusion_oracle();
     test_vae_progress();
     test_vae_window_core();
     test_backend_device_types();
     test_stage_placement();
     test_placement_env();
+    test_parallel_rows();
+    test_convert_f32_to_f16_rows();
+    test_fused_load_fail_closed();
     test_generate_task_kinds();
     test_generate_task_defaults();
     test_generate_task_audio_layout();
     test_generate_task_errors();
     test_generate_task_strengths();
+    test_cover_conditioning_switch();
     test_generation_plans();
     test_generation_conditioning();
     test_cover_noise_blending();
+    test_repaint_config();
+    test_repaint_range();
+    test_repaint_mask_injection_blend_and_splice();
+    test_flow_edit_validation_and_math();
+    test_audio_edit_factory_and_order();
     test_vae_encode_window_boundaries();
     test_vae_encode_window_parity();
     test_wav_reader_mono_and_stereo();
     test_wav_reader_rejects_multichannel();
+    test_quantize_policy();
+    test_quantize_gguf_roundtrip();
 
     std::fprintf(stderr, "[test-acestep-units] %d/%d checks passed\n", g_checks - g_failures, g_checks);
     return g_failures == 0 ? 0 : 1;

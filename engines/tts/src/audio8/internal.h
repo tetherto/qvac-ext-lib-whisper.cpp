@@ -142,6 +142,7 @@ struct lm_model {
     ggml_gallocr_t frame_allocr = nullptr;
     // Whether this backend can pick codes itself, decided once at load time.
     bool picks_codes = false;
+    bool precise_outputs = false;
 
     TokenizerData tokenizer;
 };
@@ -252,6 +253,7 @@ struct codec_model {
     ggml_context * ctx_w = nullptr;
     ggml_backend_buffer_t buffer_w = nullptr;
     ::tts_cpp::detail::sched_fallback sched;
+    bool precise_outputs = false;
     // Both directions run in two graphs: one over the whole sequence at one
     // column per frame, and one over blocks of the sample-rate stack. They get
     // an arena each, because alternating them through one would resize it on
@@ -322,9 +324,19 @@ struct prompt_frames {
 prompt_frames build_frames(const lm_hparams & hp, const PromptSegments & segments,
                            const std::vector<int32_t> & reference_codes, int reference_len);
 
-// Runs the slow transformer over `width` frames ending at position `n_past`,
-// returning the semantic logits for the last frame ([codebook_size + 1], the
-// codebook rows followed by EOS) and the hidden state the fast head consumes.
+ggml_tensor * build_conv_stack(ggml_context * ctx, const codec_model & model,
+                               int n_samples);
+
+struct scratch;
+struct slow_graph_outputs {
+    ggml_tensor * logits  = nullptr;
+    ggml_tensor * carried = nullptr;
+};
+void build_slow_graph(lm_model & model, scratch & build, int width, int n_past,
+                      slow_graph_outputs & outs);
+void set_slow_graph_inputs(const lm_model & model, ggml_cgraph * graph,
+                           const int32_t * frames, int width, int n_past);
+
 bool slow_step(lm_model & model, const int32_t * frames, int width, int n_past,
                int n_threads, std::vector<float> & sem_logits,
                std::vector<float> & fast_input, std::string * error);

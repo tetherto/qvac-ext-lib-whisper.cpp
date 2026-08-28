@@ -32,7 +32,12 @@ inline bool backend_is_cpu(ggml_backend_t b) {
 }
 
 inline bool backend_is_metal(ggml_backend_t b) {
-    return std::strcmp(backend_reg_name(b), "Metal") == 0;
+    // Upstream ggml registered the Metal backend as "Metal" until mid-2026,
+    // when the registry name changed to "MTL" (GGML_METAL_NAME). The pinned
+    // qvac-ext-ggml@speech carries the new name; accept both so the
+    // Metal-specific gates keep firing across pin bumps.
+    const char * n = backend_reg_name(b);
+    return std::strcmp(n, "Metal") == 0 || std::strcmp(n, "MTL") == 0;
 }
 
 inline void backend_set_n_threads(ggml_backend_t b, int n_threads) {

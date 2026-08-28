@@ -3,7 +3,7 @@
 Parakeet is a pure C++/ggml implementation of NVIDIA FastConformer ASR,
 end-of-turn detection, and Sortformer speaker diarization. Inference requires no
 Python, PyTorch, NeMo, or ONNX Runtime. A single `parakeet::Engine` loads CTC,
-TDT, EOU, or Sortformer GGUFs and selects the implementation from GGUF metadata.
+RNN-T, TDT, EOU, or Sortformer GGUFs and selects the implementation from GGUF metadata.
 
 ## Supported checkpoints
 
@@ -11,7 +11,8 @@ TDT, EOU, or Sortformer GGUFs and selects the implementation from GGUF metadata.
 |---|---|---:|---|---:|---:|---|---|---|
 | `nvidia/parakeet-ctc-0.6b` | CTC | 80 | 1024 × 24 | 1024 | 600 M | 697 MiB q8_0 / 1.3 GiB f16 | 0.014–0.046 Metal | English |
 | `nvidia/parakeet-ctc-1.1b` | CTC | 80 | 1024 × 42 | 1024 | 1.1 B | 1217 MiB q8_0 | 0.026–0.074 Metal | English |
-| `ai4bharat/indic-conformer-600m-multilingual` | CTC-only hybrid export | 80 | 1024 × 24 | 5632 + blank | 600 M | ~701 MiB q8_0 / ~373 MiB q4_0 / 1.3 GiB f16 | CPU smoke only | 22 Indic languages; requires `--language` or `EngineOptions::language` |
+| `ai4bharat/indic-conformer-600m-multilingual` | CTC-only hybrid export | 80 | 1024 × 24 | 5632 + blank | 600 M | ~701 MiB q8_0 / ~373 MiB q4_0 / 1.3 GiB f16 | 0.008 q8_0 Metal / 0.0019 q8_0 Vulkan | 22 Indic languages; requires `--language` or `EngineOptions::language` |
+| `nvidia/parakeet-unified-en-0.6b` | RNN-T | 128 | 1024 × 24 | 1024 | 600 M | 707 MiB q8_0 | 0.004 q8_0 Vulkan / 0.028 q8_0 Metal | English; offline full-context encoder |
 | `nvidia/parakeet-tdt-0.6b-v3` | TDT | 128 | 1024 × 24 | 8192 | 600 M | 715 MiB q8_0 / 1.34 GiB f16 | 0.006 q8_0 Metal | About 25 languages, with punctuation and capitalization |
 | `nvidia/parakeet-tdt-1.1b` | TDT | 80 | 1024 × 42 | 1024 | 1.1 B | 1225 MiB q8_0 | 0.027–0.079 Metal | English only; no punctuation or capitalization |
 | `nvidia/parakeet_realtime_eou_120m-v1` | RNN-T + `<EOU>` | 128 | 512 × 17 | 1027 | 120 M | 246 MiB f16 / 132 MiB q8_0 | 0.0052 Vulkan | English ASR and native end-of-turn token |
@@ -23,6 +24,11 @@ TDT 0.6B-v3 and TDT 1.1B are distinct model contracts: only 0.6B-v3 is
 multilingual and punctuation/capitalization-aware. Encoder topology, including
 causal subsampling, convolution normalization, and chunked-limited attention,
 comes from GGUF metadata.
+
+Unified RNN-T uses standard greedy transducer decoding. Its encoder was trained
+with dynamic chunked convolution and attention, but this implementation runs it
+offline in full-context mode. Mode 2 and `StreamSession` use buffered window
+re-encoding; native NeMo cache-aware encoder state is not implemented.
 
 ## Build modes
 
@@ -285,14 +291,14 @@ Include `<parakeet/parakeet.h>` for the complete surface or individual headers.
 
 | API | Purpose |
 |---|---|
-| `Engine::transcribe` | One-shot WAV transcription for CTC, TDT, or EOU |
+| `Engine::transcribe` | One-shot WAV transcription for CTC, RNN-T, TDT, or EOU |
 | `Engine::transcribe_samples` | One-shot float PCM transcription |
 | `Engine::transcribe_stream` / `transcribe_samples_stream` | Mode 2: encode all audio once, then emit chunked callbacks |
 | `Engine::stream_start` | Mode 3 live session with rolling context and sliding-window re-encoding |
 | `StreamSession::feed_pcm_f32` / `feed_pcm_i16` | Push arbitrary-sized PCM blocks |
 | `Engine::diarize` / `diarize_samples` | Offline Sortformer diarization |
 | `Engine::diarize_start` | Live Sortformer session |
-| `transcribe_with_speakers` / `transcribe_samples_with_speakers` | CTC, TDT, or EOU transcription attributed with Sortformer |
+| `transcribe_with_speakers` / `transcribe_samples_with_speakers` | CTC, RNN-T, TDT, or EOU transcription attributed with Sortformer |
 | `EngineOptions::prewarm` / `prewarm_audio_seconds` | Run a configurable encoder-only synthetic forward during construction |
 | `parakeet_log_set` | Install the host logging sink |
 | `parakeet_cli_main` | Embed the same CLI entry point exported by the library |
@@ -329,7 +335,7 @@ wait for in-flight calls.
 call processing the audio. `StreamingSegment::is_eou_boundary` and
 `StreamEventType::EndOfTurn` mean the EOU model emitted `<EOU>`. They are not
 VAD state changes. Sortformer emits `VadStateChanged` from speaker
-probabilities. CTC/TDT can opt into RMS energy VAD with
+probabilities. CTC/RNN-T/TDT can opt into RMS energy VAD with
 `enable_energy_vad`; configure it with `energy_vad_threshold_db`,
 `energy_vad_window_ms`, and `energy_vad_hangover_ms`.
 
@@ -351,11 +357,11 @@ avoid relying on the heuristic.
 `SortformerStreamSession::aosc_active()` reports whether the session actually
 took the AOSC path.
 
-Known limitation: on long AOSC inputs, final-event signaling is currently
-nondeterministic and the session can emit no `is_final` marker instead of
-exactly one. The diarization output remains valid. Consumers must call
-`finalize()`, but should not yet rely exclusively on the final marker for AOSC
-session completion.
+Every non-cancelled `finalize()` drains any trailing partial chunk and then
+emits exactly one final synthetic terminator (`speaker_id=-1`,
+`is_final=true`, and `start_s == end_s`). Real speaker segments always remain
+non-final. Repeated `finalize()` calls are idempotent, while cancellation
+suppresses the terminator.
 
 ## CLI and microphone examples
 
@@ -387,8 +393,8 @@ build-parakeet/parakeet \
   --wav engines/parakeet/test/samples/diarization-sample-16k.wav
 ```
 
-`live-mic` runs CTC/TDT/EOU transcription or Sortformer diarization.
-`live-mic-attributed` combines a CTC/TDT/EOU ASR model with Sortformer.
+`live-mic` runs CTC/RNN-T/TDT/EOU transcription or Sortformer diarization.
+`live-mic-attributed` combines a CTC/RNN-T/TDT/EOU ASR model with Sortformer.
 Both capture 16 kHz mono through miniaudio, accept independent streaming and
 backend options, and finalize tail audio on Ctrl-C.
 
@@ -430,8 +436,9 @@ ctest --test-dir build-parakeet -L cpu --output-on-failure
 ```
 
 Fixture roots are configurable with `PARAKEET_TEST_MODEL_DIR`,
-`PARAKEET_TEST_AUDIO_DIR`, and `PARAKEET_TEST_REF_DIR`. `test-vk-vs-cpu`
-is available when Vulkan is configured. `verify-gguf-roundtrip.py`,
+`PARAKEET_TEST_AUDIO_DIR`, and `PARAKEET_TEST_REF_DIR`. `test-gpu-vs-cpu`
+(formerly `test-vk-vs-cpu`) is available when Vulkan or Metal is configured.
+`verify-gguf-roundtrip.py`,
 `ref-encoder-from-gguf.py`, and `streaming-reference.py` support converter and
 parity investigation.
 
@@ -475,6 +482,6 @@ Source: [workflow run 31603189415](https://github.com/tetherto/qvac/actions/runs
 
 ## License
 
-Code is Apache-2.0. CTC, TDT, and Sortformer weights are CC-BY-4.0 unless
+Code is Apache-2.0. CTC, RNN-T, TDT, and Sortformer weights are CC-BY-4.0 unless
 their model card says otherwise. `parakeet_realtime_eou_120m-v1` uses the
 NVIDIA Open Model License. No weights are shipped by this repository.

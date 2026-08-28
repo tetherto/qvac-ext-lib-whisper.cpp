@@ -4,9 +4,10 @@
 # as `.nemo` archives, ready for `convert-nemo-to-gguf.py`.
 #
 # Idempotent: skips files that already exist on disk. Re-run any time to top up.
-# Total download budget on a clean machine: ~14.5 GiB at the time of writing
-# (TDT v3 + TDT 1.1b + CTC 0.6b + CTC 1.1b + TDT_CTC hybrid + EOU 120M +
-# Sortformer v1 + streaming Sortformer v2 + streaming Sortformer v2.1).
+# Total download budget on a clean machine: ~16.9 GiB at the time of writing
+# (TDT v3 + TDT 1.1b + Unified 0.6b + CTC 0.6b + CTC 1.1b +
+# TDT_CTC hybrid + EOU 120M + Sortformer v1 + streaming Sortformer v2 +
+# streaming Sortformer v2.1).
 # Already-cached checkpoints are untouched.
 #
 # Usage:
@@ -66,6 +67,11 @@ fetch "https://huggingface.co/nvidia/parakeet-tdt-1.1b/resolve/main/parakeet-tdt
       "$NEMO_DIR/parakeet-tdt-1.1b.nemo"
 
 if [[ "${1:-all}" != "tdt" ]]; then
+  hr
+  echo "== nemo: parakeet-unified-en-0.6b (English RNN-T, ~2.4 GiB)"
+  fetch "https://huggingface.co/nvidia/parakeet-unified-en-0.6b/resolve/main/parakeet-unified-en-0.6b.nemo" \
+        "$NEMO_DIR/parakeet-unified-en-0.6b.nemo"
+
   hr
   echo "== nemo: parakeet-ctc-0.6b (English, ~2.3 GiB)"
   fetch "https://huggingface.co/nvidia/parakeet-ctc-0.6b/resolve/main/parakeet-ctc-0.6b.nemo" \

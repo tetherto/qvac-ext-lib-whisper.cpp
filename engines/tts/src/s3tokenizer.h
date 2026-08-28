@@ -1,17 +1,27 @@
 #pragma once
 
-// Native C++ port of S3TokenizerV2 (FunASR speech-to-token encoder, FSMN-
+// Native C++ port of the FunASR supervised speech tokenizers (FSMN-
 // attention + FSQ codebook).  Takes a 16 kHz mono float waveform and
 // produces a stream of 25 Hz speech tokens — the same tokens that
 // prepare-voice.py's `prompt_token` and `cond_prompt_speech_tokens`
 // tensors carry.
 //
-// Architecture mirrors s3tokenizer.model_v2.S3TokenizerV2:
+// Covers two checkpoints behind one graph (the `s3tokv2_` names refer to
+// the shared storage schema, not the checkpoint):
+//   - S3TokenizerV2 (Chatterbox voice conditioning): 6 blocks, weights ride
+//     inside the chatterbox-s3gen GGUF.
+//   - speech_tokenizer_v3 (CosyVoice3 zero-shot cloning): identical block
+//     structure, 12 layers, standalone GGUF from
+//     scripts/convert-s3tokenizer-v3-to-gguf.py; `s3tokv2.tokenizer_version`
+//     = 3 marks it.  Everything below is layer-count-agnostic.
+//
+// Architecture mirrors s3tokenizer.model_v2.S3TokenizerV2 (model_v3 differs
+// only in n_layer):
 //   log_mel_spectrogram (128 mels @ 16 kHz, n_fft=400, hop=160)
-//   → AudioEncoderV2:
+//   → AudioEncoder:
 //       Conv1d(128 → 1280, k=3, s=2, p=1) + GELU
 //       Conv1d(1280 → 1280, k=3, s=2, p=1) + GELU
-//       6 × ResidualAttentionBlock:
+//       n_layer × ResidualAttentionBlock:
 //           LayerNorm → FSMNMultiHeadAttention (q/k/v + RoPE
 //               + depth-wise Conv1d "fsmn" over v, k=31)
 //           LayerNorm → MLP (Linear 1280→5120 + GELU + Linear 5120→1280)
@@ -54,6 +64,9 @@ struct s3tokv2_weights {
     int sample_rate  = 16000;
     float rope_theta = 10000.0f;
     int rope_max_pos = 2048;
+    // 2 = S3TokenizerV2 (Chatterbox), 3 = speech_tokenizer_v3 (CosyVoice3).
+    // Informational: the graph is identical, only n_layer differs.
+    int version      = 2;
 
     // GGUF file the encoder weights are streamed from at ctx-build time.
     std::string gguf_path;

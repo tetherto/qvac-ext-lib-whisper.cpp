@@ -47,3 +47,12 @@ the optional Python packages used by scripts/.
 
 * Qwen3-Embedding (Apache License 2.0), weights for the text-encoder stage.
   Source: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
+
+* HOT-Step-CPP (MIT License), Copyright (c) 2023-2026 The acestep.cpp authors.
+  The MiniMax-Music3 inference core and GGUF converter are adapted from this
+  implementation.
+  Source: https://github.com/scragnog/HOT-Step-CPP
+
+* MiniMax-Music3 model weights are distributed under the MiniMax-Music3
+  Community License. The full upstream license must accompany converted GGUFs.
+  Source: https://huggingface.co/MiniMaxAI/MiniMax-Music3

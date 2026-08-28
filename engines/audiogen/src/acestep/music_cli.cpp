@@ -13,6 +13,8 @@
 //             --gpu --threads N --dump-stages <existing dir>
 
 #include "audiogen-cpp/acestep/engine.h"
+#include "mini_json.h"
+#include "music_cli_edit.h"
 #include "wav_reader.h"
 
 #include <chrono>
@@ -35,60 +37,9 @@ static bool arg_flag(int argc, char ** argv, const char * key) {
     return false;
 }
 
-// --- tiny JSON field readers (flat object; good enough for a request json) ---
-static std::string read_file(const char * path) {
-    FILE * f = fopen(path, "rb");
-    if (!f) return {};
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    std::string s((size_t) n, '\0');
-    size_t rd = fread(&s[0], 1, (size_t) n, f);
-    fclose(f);
-    s.resize(rd);
-    return s;
-}
-
-// Return the raw value token after "key": . Handles "string" or bareword/number.
-static bool json_field(const std::string & j, const char * key, std::string & out) {
-    std::string needle = std::string("\"") + key + "\"";
-    size_t      p      = j.find(needle);
-    if (p == std::string::npos) return false;
-    p = j.find(':', p + needle.size());
-    if (p == std::string::npos) return false;
-    p++;
-    while (p < j.size() && (j[p] == ' ' || j[p] == '\t' || j[p] == '\n' || j[p] == '\r')) p++;
-    if (p >= j.size()) return false;
-    if (j[p] == '"') {
-        size_t e = ++p;
-        std::string v;
-        while (e < j.size() && j[e] != '"') {
-            if (j[e] == '\\' && e + 1 < j.size()) {
-                switch (j[e + 1]) {
-                    case '"':  v += '"';  break;
-                    case '\\': v += '\\'; break;
-                    case '/':  v += '/';  break;
-                    case 'b':  v += '\b'; break;
-                    case 'f':  v += '\f'; break;
-                    case 'n':  v += '\n'; break;
-                    case 'r':  v += '\r'; break;
-                    case 't':  v += '\t'; break;
-                    default:   v += j[e + 1]; break;
-                }
-                e += 2;
-                continue;
-            }
-            v += j[e++];
-        }
-        out = v;
-    } else {
-        size_t e = p;
-        while (e < j.size() && j[e] != ',' && j[e] != '}' && j[e] != '\n') e++;
-        out = j.substr(p, e - p);
-        while (!out.empty() && (out.back() == ' ' || out.back() == '\r' || out.back() == '\t')) out.pop_back();
-    }
-    return true;
-}
+static constexpr int kRequiredAudioSampleRate = 48000;
+static constexpr const char *kNormalizeOption = "--normalize";
+static constexpr const char *kSourceAudioOption = "--src-audio";
 
 static std::vector<float> wav_read(const char * path, int * frames, int * rate) {
     tts_cpp::acestep::WavReadResult result = tts_cpp::acestep::load_pcm16_wav(path);
@@ -101,10 +52,35 @@ static std::vector<float> wav_read(const char * path, int * frames, int * rate) 
     return std::move(result.pcm);
 }
 
-static void wav_write(const char * path, const std::vector<float> & pcm, int frames, int rate) {
+static bool load_source_audio(int argc, char ** argv,
+                              tts_cpp::acestep::GenerateParams & params) {
+    const char * source_path = arg_val(argc, argv, kSourceAudioOption);
+    if (!source_path) return true;
+    int source_frames = 0;
+    int source_rate = 0;
+    params.source_audio = wav_read(source_path, &source_frames, &source_rate);
+    if (params.source_audio.empty()) return false;
+    if (source_rate != kRequiredAudioSampleRate) {
+        fprintf(stderr, "[music-cli] source WAV is %d Hz; convert it to 48 kHz before generation\n",
+                source_rate);
+        return false;
+    }
+    fprintf(stderr, "[music-cli] source audio: %s (%.2fs, 48 kHz stereo)\n", source_path,
+            (float) source_frames / kRequiredAudioSampleRate);
+    return true;
+}
+
+static bool should_normalize_output(
+        int argc, char ** argv,
+        const tts_cpp::acestep::GenerateParams & params) {
+    return params.edit_plan.empty() || arg_flag(argc, argv, kNormalizeOption);
+}
+
+static void wav_write(const char * path, const std::vector<float> & pcm,
+                      int frames, int rate, bool normalize) {
     float peak = 1e-9f;
     for (int i = 0; i < frames * 2; i++) peak = std::fmax(peak, std::fabs(pcm[i]));
-    float  gain = 0.9f / peak;
+    float  gain = normalize ? 0.9f / peak : 1.0f;
     FILE * f    = fopen(path, "wb");
     if (!f) { fprintf(stderr, "cannot write %s\n", path); return; }
     const int ch = 2, bits = 16;
@@ -128,6 +104,8 @@ static void wav_write(const char * path, const std::vector<float> & pcm, int fra
 
 int main(int argc, char ** argv) {
     using namespace tts_cpp::acestep;
+    using music_cli::json_field;
+    using music_cli::read_text_file;
 
     EngineOptions o;
     o.verbose = true;
@@ -160,9 +138,19 @@ int main(int argc, char ** argv) {
                 "           [--src-audio <48-kHz PCM16 WAV>]  (cover source structure)\n"
                 "           [--task text2music|cover-nofsq]   (default text2music)\n"
                 "           [--cover-strength F] [--cover-noise F]  (cover defaults 1.0 / 0.0)\n"
+                "  editing: [--repaint-start SEC] [--repaint-end SEC|-1]\n"
+                "           [--repaint-mode conservative|balanced|aggressive]\n"
+                "           [--repaint-strength 0..1]\n"
+                "           [--flow-source-caption TEXT] [--flow-source-lyrics TEXT]\n"
+                "           [--flow-n-min F] [--flow-n-max F] [--flow-n-avg N]\n"
+                "           [--edit-plan plan.json]  (ordered/repeated operations)\n"
+                "           plan.json: {\"operations\":[{\"type\":\"repaint\",...},\n"
+                "             {\"type\":\"flow-edit\",\"source_caption\":\"...\",\n"
+                "              \"target_caption\":\"...\",\"n_min\":0,\"n_max\":1,\"n_avg\":1}]}\n"
                 "  sampler: [--steps N] [--shift F]  (default: auto from the DiT variant,\n"
                 "           turbo 8 / 3.0, base and sft 50 / 1.0)\n"
                 "           [--no-dcw]  (Haar DCW double mode is enabled by default)\n"
+                "  output:  [--normalize]  (peak-normalize edit output before PCM quantization)\n"
                 "           [--temp 0.85] [--cfg 2.0] [--topp 0.9] [--topk 0 (off)]\n"
                 "           [--no-phase1]  (values shown are the defaults)\n"
                 "  backend: [--gpu] [--threads N] [--backends-dir <dir>]\n"
@@ -192,8 +180,11 @@ int main(int argc, char ** argv) {
     // --req <json>: load caption/lyrics/metas and (if present) audio_codes to
     // bypass our LM — used for parity against acestep.cpp's ace-lm output.
     if (arg_val(argc, argv, "--req")) {
-        std::string j = read_file(arg_val(argc, argv, "--req"));
-        if (j.empty()) { fprintf(stderr, "[music-cli] cannot read --req json\n"); return 1; }
+      std::string j = read_text_file(arg_val(argc, argv, "--req"));
+      if (j.empty()) {
+        fprintf(stderr, "[music-cli] cannot read --req json\n");
+        return 1;
+      }
         std::string v;
         if (json_field(j, "caption", v)) p.caption = v;
         if (json_field(j, "lyrics", v)) p.lyrics = v;
@@ -238,25 +229,24 @@ int main(int argc, char ** argv) {
                 (float) reference_frames / 48000.0f);
     }
 
-    if (const char * source_path = arg_val(argc, argv, "--src-audio")) {
-        int source_frames = 0;
-        int source_rate   = 0;
-        p.source_audio = wav_read(source_path, &source_frames, &source_rate);
-        if (p.source_audio.empty()) return 1;
-        if (source_rate != 48000) {
-            fprintf(stderr, "[music-cli] source WAV is %d Hz; convert it to 48 kHz before generation\n",
-                    source_rate);
-            return 1;
-        }
-        fprintf(stderr, "[music-cli] source audio: %s (%.2fs, 48 kHz stereo)\n", source_path,
-                (float) source_frames / 48000.0f);
-    }
+    if (!load_source_audio(argc, argv, p)) return 1;
 
     if (const char * task = arg_val(argc, argv, "--task")) p.task_type = task;
     if (arg_val(argc, argv, "--cover-strength"))
         p.audio_cover_strength = (float) atof(arg_val(argc, argv, "--cover-strength"));
     if (arg_val(argc, argv, "--cover-noise"))
         p.cover_noise_strength = (float) atof(arg_val(argc, argv, "--cover-noise"));
+
+    std::string edit_error;
+    if (!music_cli::parse_edit_flags(argc, argv, p, edit_error) ||
+        !music_cli::validate_edit_configuration(p, edit_error)) {
+      fprintf(stderr, "[music-cli] %s\n", edit_error.c_str());
+      return 1;
+    }
+    if (!p.edit_plan.empty()) {
+      fprintf(stderr, "[music-cli] edit plan: %zu ordered operation(s)\n",
+              p.edit_plan.size());
+    }
 
     const char * out_path = arg_val(argc, argv, "--out") ? arg_val(argc, argv, "--out") : "music_out.wav";
 
@@ -297,6 +287,7 @@ int main(int argc, char ** argv) {
     int frames = (int) (r.pcm.size() / 2);
     fprintf(stderr, "[music-cli] generated %d codes, seed=%lld, %d frames (%.2fs)\n", r.metadata.n_codes,
             r.metadata.seed, frames, (float) frames / r.sample_rate);
-    wav_write(out_path, r.pcm, frames, r.sample_rate);
+    wav_write(out_path, r.pcm, frames, r.sample_rate,
+              should_normalize_output(argc, argv, p));
     return 0;
 }

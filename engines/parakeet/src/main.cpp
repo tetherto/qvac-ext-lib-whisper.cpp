@@ -49,7 +49,7 @@ void print_usage(const char * argv0) {
         "Combined ASR + diarization (\"who said what\") via --diarization-model.\n"
         "\n"
         "options:\n"
-        "  --model PATH         path to a CTC, TDT, EOU, or Sortformer GGUF (required)\n"
+        "  --model PATH         path to a CTC, RNN-T, TDT, EOU, or Sortformer GGUF (required)\n"
         "  --wav PATH           path to a 16 kHz mono wav file\n"
         "  --pcm-in PATH        path to a raw PCM file (mono, format selected by --pcm-format)\n"
         "  --pcm-format FMT     raw PCM sample format: s16le (default) or f32le\n"
@@ -134,7 +134,7 @@ void print_usage(const char * argv0) {
         "                       JSON Lines, one per segment. For Sortformer streaming, prints\n"
         "                       speaker segments instead of text.\n"
         "\n"
-        "  --diarization-model PATH         path to a Sortformer GGUF; combined with a CTC/TDT/EOU\n"
+        "  --diarization-model PATH         path to a Sortformer GGUF; combined with a CTC/RNN-T/TDT/EOU\n"
         "                                    --model, runs speaker-attributed transcription\n"
         "                                    (writes [start-end] speaker_N: text per segment).\n"
         "                                    Implies --emit text|jsonl per the same flag.\n"
@@ -158,7 +158,7 @@ void print_usage(const char * argv0) {
         "  --dump-mel PATH      write the C++ log-mel tensor as raw float32\n"
         "                       (n_mels, T_mel) to PATH; handy for offline diffing\n"
         "                       against mel.npy. n_mels is read from the loaded\n"
-        "                       GGUF (80 for CTC; 128 for TDT/EOU/Sortformer); the\n"
+        "                       GGUF (80 for CTC; 128 for RNN-T/TDT/EOU/Sortformer); the\n"
         "                       actual shape is logged at dump time.\n"
         "  --version            print version and exit\n"
         "  --help               this help text\n",
@@ -542,7 +542,7 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
     if (!extra.diarization_model_path.empty()) {
         if (model.model_type == ParakeetModelType::SORTFORMER) {
             PARAKEET_LOG_ERROR("error: --diarization-model expects --model to be a transcription\n"
-                                 "       (CTC/TDT/EOU) GGUF; got Sortformer at --model. Swap them.\n");
+                                 "       (CTC/RNN-T/TDT/EOU) GGUF; got Sortformer at --model. Swap them.\n");
             return 5;
         }
 
@@ -778,7 +778,8 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
         }
 
         const auto t3 = clock::now();
-        if (model.model_type == ParakeetModelType::TDT) {
+        if (model.model_type == ParakeetModelType::RNNT ||
+            model.model_type == ParakeetModelType::TDT) {
             static TdtRuntimeWeights rt;
             static bool rt_ready = false;
             if (!rt_ready) {
@@ -786,11 +787,19 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
                 rt_ready = true;
             }
             TdtDecodeOptions dopts;
+            if (model.model_type == ParakeetModelType::RNNT) {
+                dopts.max_symbols_per_step =
+                    model.encoder_cfg.rnnt_max_symbols_per_step;
+            }
             TdtDecodeResult  dres;
-            if (int rc = tdt_greedy_decode(model, rt,
-                                           enc_out.encoder_out.data(),
-                                           enc_out.n_enc_frames, enc_out.d_model,
-                                           dopts, dres); rc != 0) return rc;
+            const int rc = model.model_type == ParakeetModelType::RNNT
+                ? rnnt_greedy_decode(
+                    model, rt, enc_out.encoder_out.data(),
+                    enc_out.n_enc_frames, enc_out.d_model, dopts, dres)
+                : tdt_greedy_decode(
+                    model, rt, enc_out.encoder_out.data(),
+                    enc_out.n_enc_frames, enc_out.d_model, dopts, dres);
+            if (rc != 0) return rc;
             ids_out  = std::move(dres.token_ids);
             text_out = std::move(dres.text);
         } else if (model.model_type == ParakeetModelType::EOU) {

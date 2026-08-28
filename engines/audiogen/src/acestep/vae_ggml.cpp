@@ -556,7 +556,9 @@ int vae_model_decode(VaeModel * m, const float * latent, int T_latent, std::vect
     return T_latent * UPSAMPLE;
 }
 
-int vae_model_encode(VaeModel * m, const float * pcm, int frames, std::vector<float> & latent_out) {
+int vae_model_encode(VaeModel * m, const float * pcm, int frames,
+                     std::vector<float> & latent_out,
+                     const std::function<bool(int, int)> & on_node) {
     if (!m->has_enc) { fprintf(stderr, "[acestep-vae] encode called but encoder not loaded\n"); return -1; }
 
     ggml_init_params gp{ ggml_tensor_overhead() * 1024 + ggml_graph_overhead_custom(8192, false), nullptr, true };
@@ -570,10 +572,28 @@ int vae_model_encode(VaeModel * m, const float * pcm, int frames, std::vector<fl
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
     ggml_build_forward_expand(gf, z);
 
-    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
-    if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
+    const bool backend_is_cpu =
+        ggml_backend_dev_type(ggml_backend_get_device(m->backend)) ==
+        GGML_BACKEND_DEVICE_TYPE_CPU;
+    ggml_backend_t cpu_fallback = backend_is_cpu ? nullptr : backend_cpu_init();
+    ggml_backend_t backends[2] = { m->backend, cpu_fallback };
+    const int n_backends = backend_is_cpu ? 1 : 2;
+    ggml_backend_sched_t sched =
+        ggml_backend_sched_new(backends, nullptr, n_backends, 8192, false, false);
+    if (!sched) {
+        fprintf(stderr, "[acestep-vae] encode sched init failed (frames=%d)\n", frames);
+        if (cpu_fallback) ggml_backend_free(cpu_fallback);
+        ggml_free(ctx);
+        return -1;
+    }
+    VaeNodeProg prog{ ggml_graph_n_nodes(gf), 0, -1, &on_node, true, 0 };
+    if (on_node) {
+        ggml_backend_sched_set_eval_callback(sched, vae_eval_cb, &prog);
+    }
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
         fprintf(stderr, "[acestep-vae] encode alloc failed (frames=%d)\n", frames);
-        if (ga) ggml_gallocr_free(ga);
+        ggml_backend_sched_free(sched);
+        if (cpu_fallback) ggml_backend_free(cpu_fallback);
         ggml_free(ctx);
         return -1;
     }
@@ -584,8 +604,13 @@ int vae_model_encode(VaeModel * m, const float * pcm, int frames, std::vector<fl
         for (int t = 0; t < frames; ++t) ain[(size_t) c * frames + t] = pcm[(size_t) t * 2 + c];
     ggml_backend_tensor_set(a, ain.data(), 0, ain.size() * sizeof(float));
 
-    int rc = ggml_backend_graph_compute(m->backend, gf);
-    if (rc != GGML_STATUS_SUCCESS) { ggml_gallocr_free(ga); ggml_free(ctx); return -1; }
+    const ggml_status rc = ggml_backend_sched_graph_compute(sched, gf);
+    if (rc != GGML_STATUS_SUCCESS) {
+        ggml_backend_sched_free(sched);
+        if (cpu_fallback) ggml_backend_free(cpu_fallback);
+        ggml_free(ctx);
+        return -1;
+    }
 
     const int T_lat = (int) z->ne[0];
     const int ZC    = (int) z->ne[1];
@@ -597,7 +622,8 @@ int vae_model_encode(VaeModel * m, const float * pcm, int frames, std::vector<fl
     for (int t = 0; t < T_lat; ++t)
         for (int c = 0; c < 64; ++c) latent_out[(size_t) t * 64 + c] = raw[(size_t) c * T_lat + t];
 
-    ggml_gallocr_free(ga);
+    ggml_backend_sched_free(sched);
+    if (cpu_fallback) ggml_backend_free(cpu_fallback);
     ggml_free(ctx);
     return T_lat;
 }

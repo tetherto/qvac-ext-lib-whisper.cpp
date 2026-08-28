@@ -75,13 +75,22 @@ static inline float f32_to_bf16_to_f32(float x) {
     return y;
 }
 
+// Fill `out` from one advancing Philox stream. `start_subsequence` is the
+// number of samples already consumed from the generator.
+static inline void philox_randn_from(int64_t seed, int64_t start_subsequence,
+                                     float *out, int n,
+                                     bool bf16_round = true) {
+  for (int k = 0; k < n; k++) {
+    float vals[4];
+    philox_normal4(seed, start_subsequence + k, 0, vals);
+    out[k] = bf16_round ? f32_to_bf16_to_f32(vals[0]) : vals[0];
+  }
+}
+
 // Fill `out` with n N(0,1) samples matching torch.randn() on CUDA (bf16 dtype).
-static inline void philox_randn(int64_t seed, float * out, int n, bool bf16_round = true) {
-    for (int k = 0; k < n; k++) {
-        float vals[4];
-        philox_normal4(seed, k, 0, vals);
-        out[k] = bf16_round ? f32_to_bf16_to_f32(vals[0]) : vals[0];
-    }
+static inline void philox_randn(int64_t seed, float *out, int n,
+                                bool bf16_round = true) {
+  philox_randn_from(seed, 0, out, n, bf16_round);
 }
 
 } // namespace tts_cpp::acestep
