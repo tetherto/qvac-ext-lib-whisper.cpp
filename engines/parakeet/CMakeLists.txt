@@ -749,6 +749,15 @@ if (PARAKEET_BUILD_TESTS)
         set_property(TEST test-converter-rnnt PROPERTY LABELS unit)
     endif()
 
+    find_program(PARAKEET_BASH_EXECUTABLE bash)
+    if (PARAKEET_BASH_EXECUTABLE)
+        add_test(
+            NAME test-download-all-models
+            COMMAND ${PARAKEET_BASH_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/test/test_download_all_models.sh")
+        set_property(TEST test-download-all-models PROPERTY LABELS unit)
+    endif()
+
     # Regression gate for the round-1 capture_intermediates flag.
     # Asserts run_encoder(capture=true) and (capture=false) produce
     # bit-equal encoder_out + logits on a CTC GGUF.

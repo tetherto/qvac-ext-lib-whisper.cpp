@@ -224,7 +224,10 @@ The per-engine `whisper-cpp`, `parakeet-cpp`, `tts-cpp` and `audiogen-cpp` ports
 
 ### Parakeet
 
-Models are converted from NeMo checkpoints with `download-all-models.sh` and `convert-nemo-to-gguf.py`; see [engines/parakeet/README.md](engines/parakeet/README.md).
+Models are converted from NeMo checkpoints with `download-all-models.sh` and
+`convert-nemo-to-gguf.py`. The downloader covers every supported checkpoint,
+including the AI4Bharat IndicConformer hybrid; see
+[engines/parakeet/README.md](engines/parakeet/README.md).
 
 ```sh
 # transcribe (the GGUF metadata selects CTC / TDT / EOU)
