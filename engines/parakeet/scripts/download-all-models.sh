@@ -4,8 +4,8 @@
 # as `.nemo` archives, ready for `convert-nemo-to-gguf.py`.
 #
 # Idempotent: skips files that already exist on disk. Re-run any time to top up.
-# Total download budget on a clean machine: ~16.9 GiB at the time of writing
-# (TDT v3 + TDT 1.1b + Unified 0.6b + CTC 0.6b + CTC 1.1b +
+# Total download budget on a clean machine: ~19.3 GiB at the time of writing
+# (TDT v3 + TDT 1.1b + Unified 0.6b + CTC 0.6b + CTC 1.1b + IndicConformer +
 # TDT_CTC hybrid + EOU 120M + Sortformer v1 + streaming Sortformer v2 +
 # streaming Sortformer v2.1).
 # Already-cached checkpoints are untouched.
@@ -81,6 +81,15 @@ if [[ "${1:-all}" != "tdt" ]]; then
   echo "== nemo: parakeet-ctc-1.1b (English, ~4 GiB)"
   fetch "https://huggingface.co/nvidia/parakeet-ctc-1.1b/resolve/main/parakeet-ctc-1.1b.nemo" \
         "$NEMO_DIR/parakeet-ctc-1.1b.nemo"
+
+  hr
+  echo "== nemo: indicconformer_stt_multi_hybrid_rnnt_600m (AI4Bharat, 22 Indic langs, ~2.4 GiB)"
+  echo "         (hybrid RNNT+CTC checkpoint; converts CTC-only, --language"
+  echo "          selects the per-language token range at run time. The"
+  echo "          ai4bharat/indic-conformer-600m-multilingual HF repo ships"
+  echo "          only ONNX exports, so this fetches AI4Bharat's .nemo.)"
+  fetch "https://objectstore.e2enetworks.net/indicconformer/models/indicconformer_stt_multi_hybrid_rnnt_600m.nemo" \
+        "$NEMO_DIR/indicconformer_stt_multi_hybrid_rnnt_600m.nemo"
 
   hr
   echo "== nemo: parakeet-tdt_ctc-110m (small TDT+CTC hybrid, ~440 MiB)"

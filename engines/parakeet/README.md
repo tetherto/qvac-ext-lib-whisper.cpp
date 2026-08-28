@@ -282,8 +282,18 @@ Recorded CTC 0.6B quantization results on an M4 Air CPU:
 | q5_0 | 453 MiB | 1475 ms | ~650 ms | bit-equal |
 | q4_0 | 372 MiB | 1080 ms | 595 ms | bit-equal |
 
-The QVAC model registry provides runnable GGUFs for only a supported subset.
-Models outside that subset require local `.nemo` download and conversion.
+Every supported checkpoint is covered by this local pipeline:
+`scripts/download-all-models.sh` fetches the `.nemo` archive (including the
+AI4Bharat IndicConformer hybrid) and `scripts/convert-nemo-to-gguf.py` turns it
+into the runnable GGUF. The IndicConformer conversion emits the per-language
+token ranges the run-time `--language` selection needs:
+
+```bash
+python engines/parakeet/scripts/convert-nemo-to-gguf.py \
+  --ckpt engines/parakeet/models/indicconformer_stt_multi_hybrid_rnnt_600m.nemo \
+  --out engines/parakeet/models/indic-conformer-600m-multilingual.q8_0.gguf \
+  --quant q8_0
+```
 
 ## Public C++ API
 
@@ -391,6 +401,16 @@ build-parakeet/parakeet \
   --model engines/parakeet/models/parakeet-tdt-0.6b-v3.q8_0.gguf \
   --diarization-model engines/parakeet/models/diar_sortformer_4spk-v1.f16.gguf \
   --wav engines/parakeet/test/samples/diarization-sample-16k.wav
+
+# standalone Sortformer diarization: speaker segments only, no ASR model
+build-parakeet/parakeet \
+  --model engines/parakeet/models/diar_sortformer_4spk-v1.f16.gguf \
+  --wav engines/parakeet/test/samples/diarization-sample-16k.wav
+
+# IndicConformer: --language is required and selects the token range
+build-parakeet/parakeet \
+  --model engines/parakeet/models/indic-conformer-600m-multilingual.q8_0.gguf \
+  --wav engines/parakeet/test/samples/hi-16k.wav --language hi
 ```
 
 `live-mic` runs CTC/RNN-T/TDT/EOU transcription or Sortformer diarization.
