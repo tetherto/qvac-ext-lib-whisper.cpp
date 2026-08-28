@@ -73,12 +73,15 @@ download_checkpoint_files() {
 }
 
 download_campplus() {
-    if [ -f "$DIR/$CAMPPLUS_FILE" ]; then
+    local dest="$DIR/$CAMPPLUS_FILE"
+    local tmp="$dest.tmp"
+    if [ -f "$dest" ]; then
         echo "[ok] $CAMPPLUS_FILE"
         return
     fi
     echo "[download] $CAMPPLUS_FILE <- $CAMPPLUS_URL"
-    curl -fL --retry 3 -o "$DIR/$CAMPPLUS_FILE" "$CAMPPLUS_URL"
+    curl -fL --retry 3 -o "$tmp" "$CAMPPLUS_URL"
+    mv "$tmp" "$dest"
 }
 
 remove_hf_cache_dirs() {

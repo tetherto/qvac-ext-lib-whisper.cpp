@@ -40,12 +40,15 @@ parse_args() {
 
 download_asset() {
     local file="$1"
-    if [ -f "$DIR/$file" ]; then
+    local dest="$DIR/$file"
+    local tmp="$dest.tmp"
+    if [ -f "$dest" ]; then
         echo "[ok] $file"
         return
     fi
     echo "[download] $file <- $RELEASE_URL"
-    curl -fL --retry 3 -o "$DIR/$file" "$RELEASE_URL/$file"
+    curl -fL --retry 3 -o "$tmp" "$RELEASE_URL/$file"
+    mv "$tmp" "$dest"
 }
 
 download_assets() {
