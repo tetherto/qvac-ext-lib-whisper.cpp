@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       run_gpu:
-        description: 'Also run the GPU ctest lane (needs a [self-hosted, gpu] runner)'
+        description: 'Also run the GPU ctest lane (on the self-hosted NVIDIA Linux runner)'
         type: boolean
         default: false
 
@@ -158,22 +158,60 @@ jobs:
             exit 1
           fi
 
-  # Non-Metal GPU lane stays opt-in until self-hosted GPU runners exist.
+  # Non-Metal GPU lane, opt-in via run_gpu (Metal parity already runs in the
+  # build-test macOS lane's "Test (Metal)" step). Runner choice mirrors
+  # tts-ci.yml: the generic [self-hosted, gpu] label resolves to a mixed pool
+  # — an Apple Silicon host whose Vulkan loader is absent from the test
+  # rpath, and a Windows host whose default PowerShell breaks this bash run
+  # script — so pin the NVIDIA Linux runner the qvac monorepo's benchmark and
+  # e2e lanes use (it exposes nvidia-smi and a Vulkan ICD).
   gpu:
     if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
-    runs-on: [self-hosted, gpu]
+    runs-on: qvac-ubuntu2204-x64-gpu
     timeout-minutes: 90
     steps:
+      # This job is self-hosted-only, so no hosted-runner guard (see the
+      # build-test lane's cleanup step for the rationale).
+      - name: Manual Workspace Cleanup
+        run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
+        shell: bash
+        working-directory: .
       - uses: actions/checkout@v4
-      - name: Build ggml + engine (native backends) and run GPU suites
+      - name: Show what this runner has
+        run: |
+          uname -a
+          nvidia-smi || echo "no NVIDIA driver"
+          command -v nvcc && nvcc --version || echo "no CUDA toolkit on PATH"
+          ls /usr/local/cuda*/bin/nvcc 2>/dev/null || echo "no /usr/local/cuda*"
+          command -v vulkaninfo && vulkaninfo --summary 2>/dev/null | head -20 || echo "no vulkaninfo"
+      # GGML_VULKAN=ON is the backend the -L gpu suites target on this
+      # runner. CUDA is added only where a toolkit exists — requesting it
+      # without one fails the configure outright. A CPU-only ggml would skip
+      # or falsely pass the GPU suites.
+      - name: Build ggml + engine (native backends)
         run: |
           git clone --depth 1 --branch "$GGML_BRANCH" "$GGML_REPO" ggml-src
+          CUDA_OPTION=""
+          if command -v nvcc >/dev/null 2>&1 || [ -x /usr/local/cuda/bin/nvcc ]; then
+            NVCC_PATH=$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)
+            CUDA_OPTION="-DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=$NVCC_PATH"
+            echo "CUDA toolkit found at $NVCC_PATH; building the NVIDIA backend as well"
+          else
+            echo "::notice::no CUDA toolkit on this runner; the CUDA arms cannot run here"
+          fi
           cmake -S ggml-src -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
             -DGGML_VULKAN=ON \
+            $CUDA_OPTION \
             -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
           cmake --build ggml-src/build -j && cmake --install ggml-src/build
           cmake -S engines/audiogen -B build -DCMAKE_BUILD_TYPE=Release \
             -DAUDIOGEN_BUILD_TESTS=ON \
             -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
           cmake --build build -j
-          ctest --test-dir build -L gpu --output-on-failure --timeout 1200
+      # LD_LIBRARY_PATH: libqvac-speech-ggml.so resolves its ggml-cpu/base
+      # siblings transitively, and Linux RUNPATH doesn't apply to transitive
+      # loads, so the loader needs the directory explicitly.
+      - name: Run the GPU suites
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+        run: ctest --test-dir build -L gpu --output-on-failure --timeout 1200

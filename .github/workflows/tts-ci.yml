@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       run_gpu:
-        description: 'Also run the GPU ctest lane (needs a [self-hosted, gpu] runner)'
+        description: 'Also run the GPU ctest lane (on the self-hosted NVIDIA Linux runner)'
         type: boolean
         default: false
 
