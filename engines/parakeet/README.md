@@ -470,14 +470,20 @@ on an NVIDIA RTX 4000 SFF Ada:
 
 | Model | CPU RTF | CPU wall | Vulkan RTF | Vulkan wall |
 |---|---:|---:|---:|---:|
-| CTC | 0.078 | 1572 ms | 0.0023 | 47 ms |
-| TDT | 0.083 | 1670 ms | 0.0035 | 71 ms |
-| EOU | 0.030 | 607 ms | 0.0052 | 105 ms |
-| Sortformer | 0.025 | 508 ms | 0.0020 | 40 ms |
+| CTC | 0.112 | 2256 ms | 0.0022 | 43 ms |
+| TDT | 0.130 | 2607 ms | 0.0044 | 88 ms |
+| EOU | 0.051 | 1034 ms | 0.0034 | 68 ms |
+| Sortformer | 0.046 | 922 ms | 0.0019 | 38 ms |
+| Sortformer streaming | 0.032 | 646 ms | 0.0034 | 69 ms |
 
-Source: [workflow run 27415598451](https://github.com/tetherto/qvac/actions/runs/27415598451),
-12 June 2026, runner `qvac-ubuntu2204-x64-gpu`, with
-`parakeet-cpp` 2026-06-10 and `ggml-speech` revision `bec032cd`.
+The same run also covers the self-hosted Apple M4 Mac mini (Metal, q8_0):
+CTC 0.0113, TDT 0.0150, EOU 0.0097, Sortformer 0.0061, Sortformer
+streaming 0.0070.
+
+Source: [workflow run 31603189415](https://github.com/tetherto/qvac/actions/runs/31603189415),
+12 August 2026, runner `qvac-ubuntu2204-x64-gpu`, benchmarking the published
+`@qvac/asr-ggml@0.1.1` addon (released 2026-08-03, pinning `parakeet-cpp`
+2026-08-03).
 
 ## Repository layout
 

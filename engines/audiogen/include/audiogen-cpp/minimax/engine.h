@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audiogen-cpp/export.h"
+#include "audiogen-cpp/gpu_fallback.h"
 
 #include <cstdint>
 #include <functional>
@@ -60,6 +61,10 @@ public:
     void cancel() const;
     int sample_rate() const;
     std::string backend_name() const;
+
+    // Why a run asked for a GPU and got the CPU. `not_requested` when
+    // device=cpu, `none` when a GPU backend was acquired.
+    GpuFallbackReason gpu_fallback_reason() const;
 
 private:
     Engine();

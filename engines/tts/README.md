@@ -186,9 +186,9 @@ reference wav (T3 + S3Gen + HiFT, warm runs, excludes model load):
 
 | Backend                              | Wall      | `RTF`  | vs real-time |
 |--------------------------------------|----------:|-------:|-------------:|
-| Vulkan (CI · Linux x86-64, Q4_0)     |   419 ms  | 0.090  | **11.1×**    |
+| Vulkan (CI · Linux x86-64, Q4_0)     |   410 ms  | 0.099  | **10.1×**    |
 | Metal (Mac Studio M3 Ultra, Q4_0)    |   985 ms  | 0.16   | 6.4×         |
-| CPU (CI · Linux x86-64, Q4_0)        | 4 577 ms  | 1.25   | 0.80×        |
+| CPU (CI · Linux x86-64, Q4_0)        | 5 841 ms  | 1.54   | 0.65×        |
 | CPU (Mac Studio M3 Ultra, NEON)      | 7 568 ms  | 1.05   | 0.96×        |
 
 > Rows are independent warm runs on different machines/backends, so **`RTF`** —
@@ -663,6 +663,91 @@ the callback shape but does not reduce first-audio latency.
   --text "Hello from CosyVoice3." --out out.wav
 ```
 
+### Convert
+
+Everything the engine loads converts from the official
+[Fun-CosyVoice3-0.5B](https://huggingface.co/FunAudioLLM/Fun-CosyVoice3-0.5B-2512)
+checkpoint plus the 3D-Speaker CAM++ torch checkpoint;
+`scripts/download-cosyvoice3-checkpoint.sh` fetches both (Hugging Face CLI:
+`pip install -U huggingface_hub`). The LM/flow/HiFT converters need the
+[Conversion tooling](#conversion-tooling) environment with `torch`; the
+tokenizer converter additionally needs `pip install s3tokenizer` (or
+`--s3tokenizer-repo` at a checkout of it).
+
+```bash
+scripts/download-cosyvoice3-checkpoint.sh --dir checkpoints/cosyvoice3
+
+python3 scripts/convert-cosyvoice3-llm-to-gguf.py \
+    --llm checkpoints/cosyvoice3/llm.pt \
+    --outfile cosyvoice3-llm-f32.gguf --dtype f32
+python3 scripts/convert-cosyvoice3-flow-to-gguf.py \
+    --flow checkpoints/cosyvoice3/flow.pt \
+    --config checkpoints/cosyvoice3/cosyvoice3.yaml \
+    --outfile cosyvoice3-flow-f32.gguf --dtype f32
+python3 scripts/convert-cosyvoice3-hift-to-gguf.py \
+    --hift checkpoints/cosyvoice3/hift.pt \
+    --outfile cosyvoice3-hift-f32.gguf --dtype f32
+
+# voice-cloning add-on (required only when reference_audio is used)
+python3 scripts/convert-s3tokenizer-v3-to-gguf.py \
+    --onnx checkpoints/cosyvoice3/speech_tokenizer_v3.onnx \
+    --out cosyvoice3-s3tok-f16.gguf --outtype f16
+python3 scripts/convert-campplus-to-gguf.py \
+    --ckpt checkpoints/cosyvoice3/campplus_cn_common.bin \
+    --out cosyvoice3-campplus-f32.gguf
+```
+
+The LM converter also accepts `--dtype {f16,q8_0,q4_0}`; flow and HiFT accept
+`f32`/`f16`.
+
+The engine will not construct without a baked default voice (`voice.gguf`): it
+packs the four prompt tensors of one reference utterance, computed on the
+upstream PyTorch stack. The dump scripts load the upstream CosyVoice3 Python
+model, so they need a full Hugging Face snapshot (including `campplus.onnx`
+and the yaml/config set — the converter inputs fetched above are not enough)
+plus a [CosyVoice](https://github.com/FunAudioLLM/CosyVoice) checkout with its
+dependencies on `PYTHONPATH`:
+
+```bash
+hf download FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+    --local-dir checkpoints/Fun-CosyVoice3-0.5B
+
+PYTHONPATH=CosyVoice:CosyVoice/third_party/Matcha-TTS \
+python3 scripts/dump-cosyvoice3-reference.py \
+    --model-dir checkpoints/Fun-CosyVoice3-0.5B \
+    --prompt-audio CosyVoice/asset/zero_shot_prompt.wav \
+    --prompt-text "希望你以后能够做的比我还好呦。" \
+    --out-dir artifacts/cv3-ref
+PYTHONPATH=CosyVoice:CosyVoice/third_party/Matcha-TTS \
+python3 scripts/dump-cosyvoice3-llm-reference.py \
+    --model-dir checkpoints/Fun-CosyVoice3-0.5B \
+    --prompt-audio CosyVoice/asset/zero_shot_prompt.wav \
+    --prompt-text "希望你以后能够做的比我还好呦。" \
+    --out-dir artifacts/llm-ref
+
+python3 scripts/bake-cosyvoice3-voice.py \
+    --prompt-stok  artifacts/llm-ref/prompt_stok.npy \
+    --prompt-token artifacts/cv3-ref/prompt_token.npy \
+    --prompt-feat  artifacts/cv3-ref/prompt_feat.npy \
+    --embedding    artifacts/cv3-ref/embedding.npy \
+    --prompt-text "希望你以后能够做的比我还好呦。" \
+    --outfile voice.gguf
+```
+
+Any 5-15 s reference clip works in place of `zero_shot_prompt.wav`; pass its
+verbatim transcript as `--prompt-text`. Assemble the model directory the
+engine scans:
+
+```bash
+python3 scripts/assemble-cosyvoice3-model.py \
+    --llm cosyvoice3-llm-f32.gguf --flow cosyvoice3-flow-f32.gguf \
+    --hift cosyvoice3-hift-f32.gguf --voice voice.gguf \
+    --vocab checkpoints/cosyvoice3/CosyVoice-BlankEN/vocab.json \
+    --merges checkpoints/cosyvoice3/CosyVoice-BlankEN/merges.txt \
+    --s3tok cosyvoice3-s3tok-f16.gguf --campplus cosyvoice3-campplus-f32.gguf \
+    --out models/cosyvoice3-0.5b
+```
+
 ### Voice cloning
 
 With no reference audio the engine speaks with the baked default voice
@@ -751,8 +836,13 @@ faster** and a value above 1 means slower than real time.
 Three GGUFs, because the halves have different lifetimes: the LM and the codec
 decoder are needed for every synthesis, the codec encoder only to enrol a voice
 from a wav.  Both codec halves carry the codebooks, so each file stands alone.
+`scripts/download-audio8-checkpoint.sh` fetches the upstream checkpoint from
+[Audio8/Audio8-TTS-Preview-0.6b](https://huggingface.co/Audio8/Audio8-TTS-Preview-0.6b)
+(Hugging Face CLI: `pip install -U huggingface_hub`).
 
 ```bash
+scripts/download-audio8-checkpoint.sh --dir models/Audio8-TTS-Preview-0.6b
+
 python3 scripts/convert-audio8-lm-to-gguf.py \
     --model-dir models/Audio8-TTS-Preview-0.6b \
     --outfile models/audio8-lm-q8_0.gguf --dtype q8_0
@@ -1036,6 +1126,37 @@ Public APIs are installed under `<tts-cpp/lavasr/>`, and `lavasr-bench`
 exercises the denoiser, enhancer, or two-stage pipeline. Backend support differs
 between the two stages, so use the capability matrix rather than assuming every
 compiled ggml backend applies to both.
+
+### Convert
+
+`scripts/download-lavasr-onnx.sh` fetches the LavaSRcpp ONNX release assets
+the two converters read (the original torch weights live at
+[YatharthS/LavaSR](https://huggingface.co/YatharthS/LavaSR)); both converters
+accept `--ftype {f32,f16}`:
+
+```bash
+scripts/download-lavasr-onnx.sh --dir checkpoints/lavasr
+
+python3 scripts/convert-lavasr-denoiser-to-gguf.py \
+    --denoiser checkpoints/lavasr/denoiser_core_legacy_fixed63.onnx \
+    --out models/lavasr-denoiser-f32.gguf
+python3 scripts/convert-lavasr-enhancer-to-gguf.py \
+    --backbone checkpoints/lavasr/enhancer_backbone.onnx \
+    --spec-head checkpoints/lavasr/enhancer_spec_head.onnx \
+    --out models/lavasr-enhancer-f32.gguf
+```
+
+### Run
+
+`lavasr-bench` runs the two-stage pipeline over a wav and can write both
+stage outputs:
+
+```bash
+./build/lavasr-bench --denoiser models/lavasr-denoiser-f32.gguf \
+                     --enhancer models/lavasr-enhancer-f32.gguf \
+                     --in noisy.wav \
+                     --out-denoised denoised.wav --out-enhanced enhanced-48k.wav
+```
 
 ## Build paths
 
@@ -1682,18 +1803,18 @@ backend-comparable metric, wall time is workload-specific).
 
 | Engine                  | CPU RTF | Vulkan RTF | Vulkan wall | Vulkan tok/s |
 |-------------------------|--------:|-----------:|------------:|-------------:|
-| Chatterbox (Turbo)      |    1.34 |      0.090 |      368 ms |          186 |
-| Chatterbox Multilingual |    4.31 |      0.189 |     1097 ms |           73 |
-| Supertonic              |   0.079 |      n/a¹  |       n/a¹  |         n/a¹ |
+| Chatterbox (Turbo)      |    1.54 |      0.099 |      410 ms |          173 |
+| Chatterbox Multilingual |    5.81 |      0.182 |     1036 ms |           77 |
+| Supertonic              |   0.113 |      0.018 |       78 ms |          952 |
+| Supertonic Multilingual |   0.101 |      0.013 |       84 ms |         1087 |
+| Supertonic 3            |   0.225 |      0.029 |      118 ms |          631 |
 
-_Source: workflow run [#27415600049](https://github.com/tetherto/qvac/actions/runs/27415600049)
-(2026-06-12), runner `qvac-ubuntu2204-x64-gpu`, GPU **NVIDIA RTX 4000 SFF Ada
-Generation** (`backend=vulkan`). Chatterbox built against `tts-cpp` `1c75d6e9`
-on a benchmark branch; at the time of the run the shipped `tts-ggml` pin was the Android-safe
-`2026-06-03` revision. ¹ That run has no Supertonic Vulkan lane, so the Vulkan
-columns are unrecorded, not unsupported: Supertonic runs on Metal, Vulkan,
-OpenCL (Adreno), and CUDA, and the shipped `tts-ggml` addon has honoured
-`useGPU` / `nGpuLayers` for it since `0.3.0`._
+_Source: workflow run [#31603192731](https://github.com/tetherto/qvac/actions/runs/31603192731)
+(2026-08-12), runner `qvac-ubuntu2204-x64-gpu`, GPU **NVIDIA RTX 4000 SFF Ada
+Generation** (`backend=vulkan`), benchmarking the published
+`@qvac/tts-ggml@0.6.2` addon (released 2026-08-03, pinning `tts-cpp`
+2026-08-03#1). This run adds the previously missing Supertonic GPU lanes, so
+the Vulkan columns are now recorded for all engines._
 
 ### Mac Studio M3 Ultra (96 GB unified memory)
 

@@ -323,4 +323,8 @@ std::string Engine::backend_name() const {
     return name && *name ? name : "CPU";
 }
 
+GpuFallbackReason Engine::gpu_fallback_reason() const {
+    return g_backend_gpu_fallback_reason;
+}
+
 }

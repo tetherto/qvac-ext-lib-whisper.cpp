@@ -765,7 +765,7 @@ void test_model_pair_resolution() {
     namespace fs = std::filesystem;
     using tts_cpp::minimax::detail::ModelPair;
     using tts_cpp::minimax::detail::resolve_model_pair;
-    const fs::path root = fs::path("/tmp/tether") /
+    const fs::path root = fs::temp_directory_path() /
                           ("minimax-model-pair-" + std::to_string(std::random_device{}()));
     fs::create_directories(root / "mm3");
     touch(root / "mm3-lm-f16.gguf");
@@ -825,6 +825,7 @@ void test_device_backend_init() {
     CHECK(cpu_pair.cpu_backend != nullptr);
     CHECK(!cpu_pair.has_gpu);
     CHECK(cpu_pair.backend == cpu_pair.cpu_backend);
+    CHECK(g_backend_gpu_fallback_reason == tts_cpp::GpuFallbackReason::not_requested);
     CHECK(throws_runtime_error([] { backend_configure_device("auto"); }));
     backend_release(cpu_pair.backend, cpu_pair.cpu_backend);
 
@@ -832,6 +833,12 @@ void test_device_backend_init() {
     BackendPair auto_pair = backend_init("test");
     CHECK(auto_pair.cpu_backend != nullptr);
     CHECK(auto_pair.has_gpu == gpu_available);
+    if (gpu_available) {
+        CHECK(g_backend_gpu_fallback_reason == tts_cpp::GpuFallbackReason::none);
+    } else {
+        CHECK(g_backend_gpu_fallback_reason == tts_cpp::GpuFallbackReason::no_devices ||
+              g_backend_gpu_fallback_reason == tts_cpp::GpuFallbackReason::init_failed);
+    }
     backend_release(auto_pair.backend, auto_pair.cpu_backend);
 
     backend_configure_device("gpu");

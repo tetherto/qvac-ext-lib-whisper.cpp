@@ -99,6 +99,8 @@ namespace fs = std::filesystem;
 struct Engine::Impl {
     EngineOptions opts;
 
+    GpuFallbackReason gpu_fallback_reason = GpuFallbackReason::not_requested;
+
     ggml_backend_t backend       = nullptr;  // primary backend (GPU or CPU) for textenc/cond/DiT
     ggml_backend_t backend_cpu   = nullptr;  // CPU backend for the stages pinned off the GPU; == backend when primary is CPU
     ggml_backend_t backend_lm    = nullptr;  // backend the LM loads on (see create)
@@ -264,9 +266,12 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     // Falls back to CPU when no GPU backend is registered/available.
     bool on_gpu = false;
     if (opts.n_gpu_layers > 0) {
-        m->backend = backend_gpu_init();
+        m->backend = backend_gpu_init(&m->gpu_fallback_reason);
         on_gpu     = (m->backend != nullptr);
-        if (!on_gpu && v) fprintf(stderr, "[acestep-engine] GPU requested but no GPU backend available; using CPU\n");
+        if (!on_gpu && v) {
+            fprintf(stderr, "[acestep-engine] GPU requested but no GPU backend available (%s); using CPU\n",
+                    gpu_fallback_reason_name(m->gpu_fallback_reason));
+        }
     }
     if (!m->backend) m->backend = backend_cpu_init();
     if (!m->backend) throw std::runtime_error("acestep engine: backend init failed");
@@ -1838,5 +1843,7 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
 void        Engine::cancel() const { impl_->cancel_flag.store(true); }
 int         Engine::sample_rate() const { return impl_->sr; }  // cached; VAE loaded lazily
 std::string Engine::backend_name() const { return impl_->backend ? ggml_backend_name(impl_->backend) : "cpu"; }
+
+GpuFallbackReason Engine::gpu_fallback_reason() const { return impl_->gpu_fallback_reason; }
 
 } // namespace tts_cpp::acestep
