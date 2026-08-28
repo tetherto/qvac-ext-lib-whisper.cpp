@@ -49,8 +49,7 @@ class FakeBundle:
 
 class ConverterTests(unittest.TestCase):
     def setUp(self):
-        pathlib.Path("/tmp/tether").mkdir(parents=True, exist_ok=True)
-        self.temporary = tempfile.TemporaryDirectory(dir="/tmp/tether")
+        self.temporary = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temporary.name)
 
     def tearDown(self):
