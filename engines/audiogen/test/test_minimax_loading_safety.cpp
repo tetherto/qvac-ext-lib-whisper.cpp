@@ -89,7 +89,7 @@ void test_tensor_range_validation() {
 
 std::filesystem::path tiny_gguf_path() {
     const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
-    return std::filesystem::path("/tmp/tether") /
+    return std::filesystem::temp_directory_path() /
            ("minimax-loading-safety-" + std::to_string(unique) + ".gguf");
 }
 
@@ -228,7 +228,7 @@ void test_context_bucket_validation() {
 
 void test_backend_release_after_post_probe_failure() {
     const std::filesystem::path missing =
-        std::filesystem::path("/tmp/tether") / "minimax-loading-safety-missing.gguf";
+        std::filesystem::temp_directory_path() / "minimax-loading-safety-missing.gguf";
     std::filesystem::remove(missing);
 
     MM3Model model;

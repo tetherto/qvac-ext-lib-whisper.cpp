@@ -2622,7 +2622,7 @@ layout from the GGUF.
 ### Tier 2 closing the loop
 
 The Tier 2 PR (`feat/metal-optimization-supertonic` on
-tetherto/qvac-ext-lib-whisper.cpp) lands as:
+tetherto/qvac-fabric-speech.cpp) lands as:
 - 4 custom Metal kernels behind individual env-var gates
 - Load-time pretranspose mechanism + helper APIs
   (`try_pretransposed_weight`, `dense_matmul_time_pretransposed_ggml`)

@@ -12,7 +12,7 @@ installed public headers under `include/tts-cpp/`; the two Chatterbox families
 share one engine API, while the Supertonic generations share another.
 
 This directory is the in-tree `engines/tts` package in
-[`qvac-ext-lib-whisper.cpp`](../../README.md). It consumes the system
+[`qvac-fabric-speech.cpp`](../../README.md). It consumes the system
 `ggml-speech` package built from
 [`qvac-ext-ggml@speech`](https://github.com/tetherto/qvac-ext-ggml/tree/speech).
 The checkout intentionally starts without a local `ggml/`, `patches/`, or
@@ -186,9 +186,9 @@ reference wav (T3 + S3Gen + HiFT, warm runs, excludes model load):
 
 | Backend                              | Wall      | `RTF`  | vs real-time |
 |--------------------------------------|----------:|-------:|-------------:|
-| Vulkan (CI · Linux x86-64, Q4_0)     |   419 ms  | 0.090  | **11.1×**    |
+| Vulkan (CI · Linux x86-64, Q4_0)     |   410 ms  | 0.099  | **10.1×**    |
 | Metal (Mac Studio M3 Ultra, Q4_0)    |   985 ms  | 0.16   | 6.4×         |
-| CPU (CI · Linux x86-64, Q4_0)        | 4 577 ms  | 1.25   | 0.80×        |
+| CPU (CI · Linux x86-64, Q4_0)        | 5 841 ms  | 1.54   | 0.65×        |
 | CPU (Mac Studio M3 Ultra, NEON)      | 7 568 ms  | 1.05   | 0.96×        |
 
 > Rows are independent warm runs on different machines/backends, so **`RTF`** —
@@ -1682,18 +1682,18 @@ backend-comparable metric, wall time is workload-specific).
 
 | Engine                  | CPU RTF | Vulkan RTF | Vulkan wall | Vulkan tok/s |
 |-------------------------|--------:|-----------:|------------:|-------------:|
-| Chatterbox (Turbo)      |    1.34 |      0.090 |      368 ms |          186 |
-| Chatterbox Multilingual |    4.31 |      0.189 |     1097 ms |           73 |
-| Supertonic              |   0.079 |      n/a¹  |       n/a¹  |         n/a¹ |
+| Chatterbox (Turbo)      |    1.54 |      0.099 |      410 ms |          173 |
+| Chatterbox Multilingual |    5.81 |      0.182 |     1036 ms |           77 |
+| Supertonic              |   0.113 |      0.018 |       78 ms |          952 |
+| Supertonic Multilingual |   0.101 |      0.013 |       84 ms |         1087 |
+| Supertonic 3            |   0.225 |      0.029 |      118 ms |          631 |
 
-_Source: workflow run [#27415600049](https://github.com/tetherto/qvac/actions/runs/27415600049)
-(2026-06-12), runner `qvac-ubuntu2204-x64-gpu`, GPU **NVIDIA RTX 4000 SFF Ada
-Generation** (`backend=vulkan`). Chatterbox built against `tts-cpp` `1c75d6e9`
-on a benchmark branch; at the time of the run the shipped `tts-ggml` pin was the Android-safe
-`2026-06-03` revision. ¹ That run has no Supertonic Vulkan lane, so the Vulkan
-columns are unrecorded, not unsupported: Supertonic runs on Metal, Vulkan,
-OpenCL (Adreno), and CUDA, and the shipped `tts-ggml` addon has honoured
-`useGPU` / `nGpuLayers` for it since `0.3.0`._
+_Source: workflow run [#31603192731](https://github.com/tetherto/qvac/actions/runs/31603192731)
+(2026-08-12), runner `qvac-ubuntu2204-x64-gpu`, GPU **NVIDIA RTX 4000 SFF Ada
+Generation** (`backend=vulkan`), benchmarking the published
+`@qvac/tts-ggml@0.6.2` addon (released 2026-08-03, pinning `tts-cpp`
+2026-08-03#1). This run adds the previously missing Supertonic GPU lanes, so
+the Vulkan columns are now recorded for all engines._
 
 ### Mac Studio M3 Ultra (96 GB unified memory)
 

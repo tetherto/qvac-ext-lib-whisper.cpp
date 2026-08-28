@@ -49,7 +49,16 @@ struct LmSampleParams {
 
 // Temperature -> top_k -> top_p -> softmax -> multinomial. Mutates `logits`.
 // Ported verbatim from acestep.cpp/src/sampling.h.
-int sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng);
+// index_base: `logits` is the [index_base, V_full) suffix of a vector whose
+// dropped prefix is fully masked. Picks return slice_index + index_base; the
+// degenerate r==0 / all-masked edges return absolute 0, where the historical
+// full-vector walk lands.
+int sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng,
+                   int index_base = 0);
+
+// FSM forced-token fast path: equivalent to masking all but `token` to -1e9 and
+// running sample_top_k_p, including its RNG consumption and r==0 edge case.
+int lm_consume_forced(int token, float temperature, std::mt19937 & rng);
 
 // Build the Qwen3 chat prompt with an injected CoT metadata block (Phase 2).
 // The assistant turn stays open so the LM emits audio codes then <|im_end|>.

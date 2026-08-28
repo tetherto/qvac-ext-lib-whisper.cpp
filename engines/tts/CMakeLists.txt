@@ -18,7 +18,7 @@ option(TTS_CPP_BUILD_SHARED      "tts-cpp: build tts-cpp as a SHARED library (ot
 option(TTS_CPP_BUILD_EXECUTABLES "tts-cpp: build tts-cli, mel2wav, CosyVoice, Supertonic, Parler, LavaSR, and Audio8 command-line tools" ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_BUILD_TESTS       "tts-cpp: build per-stage numerical validation harnesses"   ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_INSTALL           "tts-cpp: generate install rules"                           ON)
-option(TTS_CPP_USE_SYSTEM_GGML   "tts-cpp: use find_package(ggml) instead of add_subdirectory(ggml). Defaults to ON for qvac-ext-lib-whisper.cpp and vcpkg builds. OFF requires a manually staged engines/tts/ggml checkout of qvac-ext-ggml@speech; this tree has no setup-ggml.sh or patches overlay." ON)
+option(TTS_CPP_USE_SYSTEM_GGML   "tts-cpp: use find_package(ggml) instead of add_subdirectory(ggml). Defaults to ON for qvac-fabric-speech.cpp and vcpkg builds. OFF requires a manually staged engines/tts/ggml checkout of qvac-ext-ggml@speech; this tree has no setup-ggml.sh or patches overlay." ON)
 # Note: the standalone chatterbox.cpp repo carries a TTS_CPP_GGML_LIB_PREFIX
 # option here that controls renaming of bundled libggml-*.so to
 # libspeech-ggml-*.so when add_subdirectory(ggml) builds it locally. This

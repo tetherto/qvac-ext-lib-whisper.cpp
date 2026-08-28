@@ -66,8 +66,10 @@ The 0.6B LM is used instead of the acestep.cpp README default 4B LM so both
 engines run the QVAC-validated combination. Put all four files in one
 directory and point both CLIs at it.
 
-Conversion from safetensors, if you must rebuild, uses `convert.py` from
-acestep.cpp. QVAC does not ship a converter; it loads that GGUF layout.
+Conversion from safetensors, if you must rebuild, uses
+`scripts/convert-acestep-to-gguf.py` plus the `acestep-quantize` binary (see
+the engine README's Model setup), which follow the acestep.cpp GGUF layout
+both engines load.
 
 ## Build QVAC music-cli
 

@@ -443,15 +443,17 @@ static ggml_tensor * build_cross_attn(ggml_context * ctx, DitModel * m, DitLayer
     ggml_tensor * k = linear(ctx, ly->ca_k_proj, enc);
     ggml_tensor * v = linear(ctx, ly->ca_v_proj, enc);
 
+    // QK norms run before the permute (self-attn's order): the norm reduces over
+    // D per head either way, but the pre-permute layout is contiguous - the
+    // strided form measured 3x slower on Vulkan at long sequence lengths.
     q = ggml_reshape_4d(ctx, q, D, Nh, S, N);
+    q = ggml_mul(ctx, ggml_rms_norm(ctx, q, c.rms_norm_eps), as_f32(ctx, ly->ca_q_norm));
     q = ggml_permute(ctx, q, 0, 2, 1, 3);
     k = ggml_reshape_4d(ctx, k, D, Nkv, enc_S, N);
+    k = ggml_mul(ctx, ggml_rms_norm(ctx, k, c.rms_norm_eps), as_f32(ctx, ly->ca_k_norm));
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
     v = ggml_reshape_4d(ctx, v, D, Nkv, enc_S, N);
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
-
-    q = ggml_mul(ctx, ggml_rms_norm(ctx, q, c.rms_norm_eps), as_f32(ctx, ly->ca_q_norm));
-    k = ggml_mul(ctx, ggml_rms_norm(ctx, k, c.rms_norm_eps), as_f32(ctx, ly->ca_k_norm));
 
     const float scale = 1.0f / sqrtf((float) D);
     ggml_tensor * attn = select_attention(ctx, q, k, v, mask, scale, m->use_flash_attn);
@@ -714,22 +716,29 @@ bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<fl
 
         input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.in_channels, T, N);
         ggml_set_input(input);
+        // Step-invariant inputs are also flagged as outputs: gallocr never hands
+        // an output's slot to the intermediate pool, so their bytes survive
+        // replays and are uploaded only when constants_dirty.
         enc_hidden = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, in.H_enc, enc_S, N);
         ggml_set_input(enc_hidden);
+        ggml_set_output(enc_hidden);
         t_val = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         ggml_set_input(t_val);
         tr_val = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         ggml_set_input(tr_val);
         positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) S * N);
         ggml_set_input(positions);
+        ggml_set_output(positions);
 
         if (has_sa) {
             sa_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, S, S, 1, N);
             ggml_set_input(sa_mask);
+            ggml_set_output(sa_mask);
         }
         if (has_ca) {
             ca_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, enc_S, S, 1, N);
             ggml_set_input(ca_mask);
+            ggml_set_output(ca_mask);
         }
 
         // timestep embeddings
@@ -784,15 +793,17 @@ bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<fl
     }
 
     ggml_backend_tensor_set(input, in.input_latents, 0, (size_t) c.in_channels * T * N * sizeof(float));
-    ggml_backend_tensor_set(enc_hidden, in.enc_hidden, 0, (size_t) in.H_enc * enc_S * N * sizeof(float));
     ggml_backend_tensor_set(t_val, &in.t, 0, sizeof(float));
     ggml_backend_tensor_set(tr_val, &in.t_r, 0, sizeof(float));
-    std::vector<int32_t> pos((size_t) S * N);
-    for (int n = 0; n < N; n++)
-        for (int s = 0; s < S; s++) pos[(size_t) n * S + s] = s;
-    ggml_backend_tensor_set(positions, pos.data(), 0, pos.size() * sizeof(int32_t));
-    if (sa_mask) ggml_backend_tensor_set(sa_mask, in.sa_mask_sw, 0, (size_t) S * S * N * sizeof(uint16_t));
-    if (ca_mask) ggml_backend_tensor_set(ca_mask, in.ca_mask, 0, (size_t) enc_S * S * N * sizeof(uint16_t));
+    if (!cache_hit || in.constants_dirty) {
+        ggml_backend_tensor_set(enc_hidden, in.enc_hidden, 0, (size_t) in.H_enc * enc_S * N * sizeof(float));
+        std::vector<int32_t> pos((size_t) S * N);
+        for (int n = 0; n < N; n++)
+            for (int s = 0; s < S; s++) pos[(size_t) n * S + s] = s;
+        ggml_backend_tensor_set(positions, pos.data(), 0, pos.size() * sizeof(int32_t));
+        if (sa_mask) ggml_backend_tensor_set(sa_mask, in.sa_mask_sw, 0, (size_t) S * S * N * sizeof(uint16_t));
+        if (ca_mask) ggml_backend_tensor_set(ca_mask, in.ca_mask, 0, (size_t) enc_S * S * N * sizeof(uint16_t));
+    }
 
     int rc = ggml_backend_graph_compute(m->backend, gf);
     if (rc != GGML_STATUS_SUCCESS) {
@@ -960,11 +971,13 @@ bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & la
     bool          cover_switched    = false;
     for (int step = 0; step < p.num_steps; step++) {
         if (p.on_step && !p.on_step(step, p.num_steps)) return false;
-        const float t_curr = p.schedule[step];
+        const float t_curr          = p.schedule[step];
+        bool        constants_dirty = (step == 0);
 
         if (p.cover_switch_step >= 0 && step >= p.cover_switch_step && !cover_switched &&
             p.context_switch != nullptr && p.enc_hidden_switch != nullptr) {
-            cover_switched = true;
+            cover_switched  = true;
+            constants_dirty = true;
             splice_context_channels(input_buf, p.context_switch, T, N, in_ch, ctx_ch);
             enc_hidden_active = p.enc_hidden_switch;
             fill_ca_mask_rows(ca_mask, p.real_enc_S_switch, enc_S, S, N);
@@ -991,9 +1004,10 @@ bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & la
         // text2music, which is also why the sampler runs a single conditional
         // pass (N == 1, no CFG). base/sft (50-step, CFG) parity is not yet
         // verified against the reference and would need t_r / uncond wiring.
-        fin.t_r           = t_curr;
-        fin.sa_mask_sw    = sa_mask.data();
-        fin.ca_mask       = ca_mask.data();
+        fin.t_r             = t_curr;
+        fin.sa_mask_sw      = sa_mask.data();
+        fin.ca_mask         = ca_mask.data();
+        fin.constants_dirty = constants_dirty;
 
         if (!dit_model_forward(m, fin, vt)) {
             fprintf(stderr, "[acestep-dit] sample: forward failed at step %d\n", step);

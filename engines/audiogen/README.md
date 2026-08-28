@@ -69,19 +69,31 @@ The frame rate, maximum frame count, flow defaults, and output sample rate come
 from GGUF metadata. Current converted files specify 25 frames per second, at
 most 9000 frames, 30 flow steps, CFG 1.7, and 44100 Hz output.
 
-Convert local upstream checkpoints without downloading weights:
+Download the Comfy-Org single-file safetensors checkpoint (the converter's
+preferred source; requires the Hugging Face CLI,
+`pip install -U huggingface_hub`) and convert it:
 
 ```sh
-python scripts/convert-minimax-music3-to-gguf.py \
-  --src /path/to/MiniMax-Music3 --out /path/to/output --quant f16
+scripts/download-minimax-music3.sh --dir checkpoints/MiniMax-Music3
+python3 scripts/convert-minimax-music3-to-gguf.py \
+  --src checkpoints/MiniMax-Music3 --out models/minimax --quant f16
 ```
 
-The converter emits the two-file contract and writes the
+An already-downloaded checkpoint converts the same way: point `--src` at the
+local directory. The converter emits the two-file contract and writes the
 MiniMax-Music3 Community License identifier into both files. Ship the upstream
 model license with converted weights.
 
-`mm3-replay` (built with `AUDIOGEN_BUILD_EXECUTABLES`) is the MiniMax parity
-harness: `--mode full` runs the pipeline from a caption/lyrics pair, `--mode
+`mm3-replay` (built with `AUDIOGEN_BUILD_EXECUTABLES`) is the MiniMax CLI and
+parity harness:
+
+```sh
+./build/engines/audiogen/mm3-replay --models models/minimax --out mm3-out --mode full \
+                                    --caption "warm lo-fi beat with vinyl crackle" \
+                                    --lyrics "[Instrumental]" --max-frames 300
+```
+
+`--mode full` runs the pipeline from a caption/lyrics pair, `--mode
 replay` forces recorded prompt tokens, semantic/acoustic codes, and per-window
 initial noise through the native pipeline and dumps the per-window latents,
 frame hiddens, and stitched audio for 1:1 comparison against the official
@@ -125,12 +137,12 @@ Detected from the `acestep.is_turbo` GGUF key; absent means base or sft.
 | turbo | 8 | 3.0 | fastest, no CFG on the DiT |
 | base / sft | 50 | 1.0 | DiT CFG and APG (`guidance > 1`) are deferred |
 
-Weights load quantized. `f32`, `f16`, and `bf16` are handled for norms and biases, and the detokenizer's `special_tokens` may be `q8_0`. This tree ships no converter: the stage GGUFs come from `convert.py` in [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp), the upstream C++/ggml implementation this port follows, which also publishes pre-quantized GGUFs at [Serveurperso/ACE-Step-1.5-GGUF](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF).
+Weights load quantized. `f32`, `f16`, and `bf16` are handled for norms and biases, and the detokenizer's `special_tokens` may be `q8_0`. The stage GGUFs are built in tree by `scripts/convert-acestep-to-gguf.py` and the `acestep-quantize` binary (see [Model setup](#model-setup)), both adapted from [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp), the upstream C++/ggml implementation this port follows, which also publishes pre-quantized GGUFs at [Serveurperso/ACE-Step-1.5-GGUF](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF).
 
 ### Model setup
 
-The QVAC registry publishes three validated four-file combinations. All use
-the same fixed text encoder, LM, and VAE; select one DiT:
+Three four-file combinations are validated. All use the same fixed text
+encoder, LM, and VAE; select one DiT:
 
 | Role | Filename | Quantization | Approximate size | Variants |
 |---|---|---|---:|---|
@@ -141,22 +153,36 @@ the same fixed text encoder, LM, and VAE; select one DiT:
 | DiT | `acestep-v15-turbo-Q8_0.gguf` | `q8_0` | 2.37 GB | `turbo-q8` |
 | DiT | `acestep-v15-sft-Q8_0.gguf` | `q8_0` | 2.37 GB | `sft` |
 
-From a [QVAC](https://github.com/tetherto/qvac) checkout with package
-dependencies installed, use its registry client rather than constructing
-storage URLs:
+Build these files locally in three steps: download the upstream safetensors
+checkpoints from Hugging Face, convert each stage to a self-contained BF16
+GGUF, and quantize the text encoder, LM, and DiT (the VAE always stays BF16).
+The download script needs the Hugging Face CLI
+(`pip install -U huggingface_hub`), the converter needs
+`pip install numpy gguf`, and `acestep-quantize` builds with
+`AUDIOGEN_BUILD_EXECUTABLES`. When built from the repository root, binaries
+live under `./build/engines/audiogen/`; a standalone `engines/audiogen` build
+places them under `./build/audiogen/` instead.
 
 ```sh
-npm --prefix packages/audiogen-ggml run download-models:registry -- \
-  --output models/acestep --variant turbo-q4
+scripts/download-acestep-checkpoints.sh --dir checkpoints
+python3 scripts/convert-acestep-to-gguf.py --checkpoints checkpoints --out models/bf16
+
+mkdir -p models/acestep
+./build/engines/audiogen/acestep-quantize models/bf16/Qwen3-Embedding-0.6B-BF16.gguf \
+                                        models/acestep/Qwen3-Embedding-0.6B-Q8_0.gguf Q8_0
+./build/engines/audiogen/acestep-quantize models/bf16/acestep-5Hz-lm-0.6B-BF16.gguf \
+                                        models/acestep/acestep-5Hz-lm-0.6B-Q8_0.gguf Q8_0
+./build/engines/audiogen/acestep-quantize models/bf16/acestep-v15-turbo-BF16.gguf \
+                                        models/acestep/acestep-v15-turbo-Q4_K_M.gguf Q4_K_M
+cp models/bf16/vae-BF16.gguf models/acestep/
 ```
 
-Replace `turbo-q4` with `turbo-q8` or `sft`. The `all` variant fetches all
-three DiTs, but do not then rely on `--models` alone: directory iteration does
-not define which matching DiT is selected. Store each variant in a separate
-directory, or pass the intended file explicitly with `--dit` /
-`EngineOptions::dit_model_path`. The registry entries record the upstream
-Hugging Face model-card links, but the registry GGUFs are QVAC-built artifacts.
-The external
+Quantize the turbo DiT to `Q8_0` instead for the `turbo-q8` combination; pass
+`--sft` to the download script and quantize `acestep-v15-sft-BF16.gguf` to
+`Q8_0` for the `sft` one. Keep one DiT per model directory rather than relying
+on `--models` alone: directory iteration does not define which matching DiT is
+selected, so with several present pass the intended file explicitly with
+`--dit` / `EngineOptions::dit_model_path`. The external
 `Serveurperso/ACE-Step-1.5-GGUF` files above have separate provenance and are
 not the combinations validated by QVAC.
 
@@ -527,8 +553,8 @@ cmake --build build/audiogen -j
 ctest --test-dir build/audiogen
 ```
 
-`test-acestep-units`, `test-minimax-units`, and `test-minimax-converter` cover
-weight-free CPU logic and need no GGUFs. MiniMax coverage includes metadata
+`test-acestep-units`, `test-acestep-converter`, `test-minimax-units`, and
+`test-minimax-converter` cover weight-free CPU logic and need no GGUFs. MiniMax coverage includes metadata
 compatibility, model-pair selection, Unicode token classes, frame validation,
 prompt assembly, unconditional masking, deterministic noise, flow scheduling,
 condition length, window stitching, sampler edge cases, and converter output

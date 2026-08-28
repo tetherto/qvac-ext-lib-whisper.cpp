@@ -765,7 +765,7 @@ void test_model_pair_resolution() {
     namespace fs = std::filesystem;
     using tts_cpp::minimax::detail::ModelPair;
     using tts_cpp::minimax::detail::resolve_model_pair;
-    const fs::path root = fs::path("/tmp/tether") /
+    const fs::path root = fs::temp_directory_path() /
                           ("minimax-model-pair-" + std::to_string(std::random_device{}()));
     fs::create_directories(root / "mm3");
     touch(root / "mm3-lm-f16.gguf");
