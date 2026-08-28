@@ -698,13 +698,45 @@ python3 scripts/convert-campplus-to-gguf.py \
 ```
 
 The LM converter also accepts `--dtype {f16,q8_0,q4_0}`; flow and HiFT accept
-`f32`/`f16`. The baked default voice (`voice.gguf`) packs four prompt tensors
-computed from one reference utterance on the upstream PyTorch stack: dump them
-with `scripts/dump-cosyvoice3-reference.py` and
-`scripts/dump-cosyvoice3-llm-reference.py` (run where torch and the CosyVoice
-repo are available, see the script headers), then write the GGUF with
-`scripts/bake-cosyvoice3-voice.py`. Assemble the model directory the engine
-scans:
+`f32`/`f16`.
+
+The engine will not construct without a baked default voice (`voice.gguf`): it
+packs the four prompt tensors of one reference utterance, computed on the
+upstream PyTorch stack. The dump scripts load the upstream CosyVoice3 Python
+model, so they need a full Hugging Face snapshot (including `campplus.onnx`
+and the yaml/config set — the converter inputs fetched above are not enough)
+plus a [CosyVoice](https://github.com/FunAudioLLM/CosyVoice) checkout with its
+dependencies on `PYTHONPATH`:
+
+```bash
+hf download FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+    --local-dir checkpoints/Fun-CosyVoice3-0.5B
+
+PYTHONPATH=CosyVoice:CosyVoice/third_party/Matcha-TTS \
+python3 scripts/dump-cosyvoice3-reference.py \
+    --model-dir checkpoints/Fun-CosyVoice3-0.5B \
+    --prompt-audio CosyVoice/asset/zero_shot_prompt.wav \
+    --prompt-text "希望你以后能够做的比我还好呦。" \
+    --out-dir artifacts/cv3-ref
+PYTHONPATH=CosyVoice:CosyVoice/third_party/Matcha-TTS \
+python3 scripts/dump-cosyvoice3-llm-reference.py \
+    --model-dir checkpoints/Fun-CosyVoice3-0.5B \
+    --prompt-audio CosyVoice/asset/zero_shot_prompt.wav \
+    --prompt-text "希望你以后能够做的比我还好呦。" \
+    --out-dir artifacts/llm-ref
+
+python3 scripts/bake-cosyvoice3-voice.py \
+    --prompt-stok  artifacts/llm-ref/prompt_stok.npy \
+    --prompt-token artifacts/cv3-ref/prompt_token.npy \
+    --prompt-feat  artifacts/cv3-ref/prompt_feat.npy \
+    --embedding    artifacts/cv3-ref/embedding.npy \
+    --prompt-text "希望你以后能够做的比我还好呦。" \
+    --outfile voice.gguf
+```
+
+Any 5-15 s reference clip works in place of `zero_shot_prompt.wav`; pass its
+verbatim transcript as `--prompt-text`. Assemble the model directory the
+engine scans:
 
 ```bash
 python3 scripts/assemble-cosyvoice3-model.py \

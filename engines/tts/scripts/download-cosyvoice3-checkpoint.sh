@@ -55,13 +55,12 @@ resolve_hf_cli() {
     fi
 }
 
+# No existence-based skip: hf download tracks completed files in $DIR/.cache
+# and re-fetches truncated or missing ones, which a plain -f test cannot tell
+# apart from complete downloads.
 download_checkpoint_file() {
     local file="$1"
-    if [ -f "$DIR/$file" ]; then
-        echo "[ok] $file"
-        return
-    fi
-    echo "[download] $file <- $REPO"
+    echo "[sync] $file <- $REPO"
     "$HF_CLI" download --quiet "$REPO" "$file" --local-dir "$DIR"
 }
 
@@ -84,10 +83,6 @@ download_campplus() {
     mv "$tmp" "$dest"
 }
 
-remove_hf_cache_dirs() {
-    find "$DIR" -name '.cache' -type d -exec rm -rf {} + 2> /dev/null || true
-}
-
 parse_args "$@"
 HF_CLI="$(resolve_hf_cli)"
 mkdir -p "$DIR"
@@ -95,6 +90,5 @@ mkdir -p "$DIR"
 download_checkpoint_files
 download_campplus
 
-remove_hf_cache_dirs
 echo "[done] checkpoint ready in $DIR"
 echo "[done] next: the CosyVoice3 conversion steps in README.md"
