@@ -343,6 +343,83 @@ int section_real_fft_parity(const parakeet::MelConfig & cfg,
 
 }
 
+int section_per_feature_cmvn(void) {
+    using namespace parakeet;
+
+    const int n_frames = 4;
+    const int n_mels   = 2;
+    const double eps   = 1e-5;
+
+    std::vector<float> mel = {
+        1.0f, 5.0f,
+        2.0f, 5.0f,
+        3.0f, 5.0f,
+        4.0f, 5.0f,
+    };
+    std::vector<float> expected(mel.size());
+    for (int idx = 0; idx < n_mels; ++idx) {
+        double sum = 0.0;
+        for (int t = 0; t < n_frames; ++t) sum += mel[t * n_mels + idx];
+        const double mean = sum / n_frames;
+        double ss = 0.0;
+        for (int t = 0; t < n_frames; ++t) {
+            const double d = mel[t * n_mels + idx] - mean;
+            ss += d * d;
+        }
+        const double std_ = std::sqrt(ss / (n_frames - 1)) + eps;
+        for (int t = 0; t < n_frames; ++t) {
+            expected[t * n_mels + idx] = (float)
+                ((mel[t * n_mels + idx] - (float) mean) *
+                 (1.0f / (float) std_));
+        }
+    }
+
+    apply_per_feature_cmvn(mel, n_frames, n_mels);
+    if (!bit_equal(mel, expected)) {
+        report_first_diff(expected, mel, "cmvn");
+        return 1;
+    }
+    for (int t = 0; t < n_frames; ++t) {
+        if (mel[t * n_mels + 1] != 0.0f) {
+            std::fprintf(stderr,
+                "[cmvn] FAIL: constant feature not zeroed at frame %d\n", t);
+            return 1;
+        }
+    }
+
+    std::vector<float> single = {3.0f, -2.0f};
+    apply_per_feature_cmvn(single, 1, 2);
+    if (single[0] != 0.0f || single[1] != 0.0f) {
+        std::fprintf(stderr, "[cmvn] FAIL: single frame must normalize to 0\n");
+        return 1;
+    }
+
+    std::vector<float> untouched = {1.0f, 2.0f};
+    std::vector<float> before = untouched;
+    apply_per_feature_cmvn(untouched, 0, 2);
+    apply_per_feature_cmvn(untouched, 1, 0);
+    if (!bit_equal(untouched, before)) {
+        std::fprintf(stderr, "[cmvn] FAIL: degenerate dims must be a no-op\n");
+        return 1;
+    }
+
+    std::vector<float> partial = {
+        10.0f, 10.0f,
+        20.0f, 20.0f,
+        777.0f, 888.0f,
+    };
+    apply_per_feature_cmvn(partial, 2, 2);
+    if (partial[4] != 777.0f || partial[5] != 888.0f) {
+        std::fprintf(stderr,
+            "[cmvn] FAIL: frames past n_valid_frames were modified\n");
+        return 1;
+    }
+
+    std::fprintf(stderr, "[cmvn] PASS  per-feature CMVN matches the NeMo "
+                         "two-pass f64 reference\n");
+    return 0;
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     using namespace parakeet;
 
@@ -353,6 +430,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     rc |= section_real_fft_parity(cfg, signal);
     rc |= section_stateful_vs_stateless_parity(cfg, signal);
     rc |= section_repeated_call_invariance(cfg, signal);
+    rc |= section_per_feature_cmvn();
 
     if (rc != 0) {
         std::fprintf(stderr, "[test-mel-fft-parity] FAIL\n");

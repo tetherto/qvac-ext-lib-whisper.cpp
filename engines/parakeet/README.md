@@ -448,12 +448,20 @@ ctest --test-dir build-parakeet --output-on-failure
 
 `download-all-models.sh` produces `.nemo` files, not runnable GGUFs. Missing
 model, audio, or reference fixtures cause individual tests to be registered as
-`DISABLED`, not failed. Configure again after adding a fixture. Test labels
-include `unit`, `fixture`, `cpu`, `gpu`, and `perf`; for example:
+`DISABLED`, not failed. Configure again after adding a fixture. Each test
+carries exactly one label out of `unit`, `fixture`, `cpu`, `gpu`, and `perf`.
+The fixture-free suite (the one CI runs) is selected by excluding the
+GPU-bound and timing-bound labels:
 
 ```bash
-ctest --test-dir build-parakeet -L cpu --output-on-failure
+ctest --test-dir build-parakeet -LE 'gpu|perf' --output-on-failure
 ```
+
+Model-free logic tests (`-L unit`) cover the CTC language mask, mel FFT
+parity and per-feature CMVN, RNN-T graph construction, long-form window
+planning, Sortformer finalization and probability thresholding, the
+streaming energy VAD, the SentencePiece detokenizer, and the NeMo
+converter (Python).
 
 Fixture roots are configurable with `PARAKEET_TEST_MODEL_DIR`,
 `PARAKEET_TEST_AUDIO_DIR`, and `PARAKEET_TEST_REF_DIR`. `test-gpu-vs-cpu`

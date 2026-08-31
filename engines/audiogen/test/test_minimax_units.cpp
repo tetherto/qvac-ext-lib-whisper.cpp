@@ -5,6 +5,7 @@
 #include "minimax/mm3-replay-io.h"
 #include "minimax/mm3-window-orchestrator.h"
 #include "minimax/progress.h"
+#include "minimax/request-utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -127,6 +128,175 @@ void test_prompt() {
           "<|im_start|><|caption_start|>Instrumental piano<|caption_end|><|lyrics_start|>"
           "[start]\n[instrumental]<|lyrics_end|><|im_end|><|audio_start|>");
     CHECK(throws_invalid_argument([] { build_prompt(" \n\t", "words"); }));
+}
+
+void test_request_text_primitives() {
+    CHECK(mm3_is_space(' '));
+    CHECK(mm3_is_space('\t'));
+    CHECK(mm3_is_space('\r'));
+    CHECK(mm3_is_space('\v'));
+    CHECK(mm3_is_space('\f'));
+    CHECK(!mm3_is_space('\n'));
+    CHECK(!mm3_is_space('a'));
+
+    CHECK(mm3_rstrip("a b \t\n") == "a b");
+    CHECK(mm3_rstrip("  x") == "  x");
+    CHECK(mm3_rstrip("").empty());
+
+    CHECK(mm3_strip("\n\t hi \n") == "hi");
+    CHECK(mm3_strip("hi") == "hi");
+    CHECK(mm3_strip(" \t ").empty());
+    CHECK(mm3_strip("").empty());
+
+    CHECK(mm3_str_blank(""));
+    CHECK(mm3_str_blank(" \t\n"));
+    CHECK(!mm3_str_blank(" a "));
+}
+
+void test_request_line_splitting() {
+    CHECK(mm3_split_lines("") == std::vector<std::string>({""}));
+    CHECK(mm3_split_lines("a\nb") == std::vector<std::string>({"a", "b"}));
+    CHECK(mm3_split_lines("a\n") == std::vector<std::string>({"a", ""}));
+    CHECK(mm3_split_lines("a\r\nb") == std::vector<std::string>({"a\r", "b"}));
+
+    CHECK(mm3_splitlines("").empty());
+    CHECK(mm3_splitlines("a\r\nb") == std::vector<std::string>({"a", "b"}));
+    CHECK(mm3_splitlines("a\rb") == std::vector<std::string>({"a", "b"}));
+    CHECK(mm3_splitlines("a\n") == std::vector<std::string>({"a"}));
+    CHECK(mm3_splitlines("\n\n") == std::vector<std::string>({"", ""}));
+
+    CHECK(mm3_join_lines({}).empty());
+    CHECK(mm3_join_lines({"a"}) == "a");
+    CHECK(mm3_join_lines({"a", "", "b"}) == "a\n\nb");
+    CHECK(mm3_join_lines(mm3_split_lines("a\nb\nc")) == "a\nb\nc");
+}
+
+void test_request_replace_and_tags() {
+    std::string text = "aaa";
+    mm3_replace_all(text, "aa", "b");
+    CHECK(text == "ba");
+    text = "ab";
+    mm3_replace_all(text, "a", "aa");
+    CHECK(text == "aab");
+    text = "x";
+    mm3_replace_all(text, "", "y");
+    CHECK(text == "x");
+
+    CHECK(mm3_rewrite_special_tags("tag: <|genre pop|> end") == "tag: genre is pop end");
+    CHECK(mm3_rewrite_special_tags("<|instrumental|>") == "instrumental");
+    CHECK(mm3_rewrite_special_tags("<|bpm  120|>") == "bpm is 120");
+    CHECK(mm3_rewrite_special_tags("<|a b c|>") == "a is b c");
+    CHECK(mm3_rewrite_special_tags("<||>").empty());
+    CHECK(mm3_rewrite_special_tags("<|unclosed") == "<|unclosed");
+    CHECK(mm3_rewrite_special_tags("plain") == "plain");
+    CHECK(mm3_rewrite_special_tags("").empty());
+
+    std::string tags;
+    CHECK(mm3_leading_tags("[Verse] hello", &tags));
+    CHECK(tags == "[Verse]");
+    CHECK(mm3_leading_tags("  [A] [B]x", &tags));
+    CHECK(tags == "[A] [B]");
+    CHECK(!mm3_leading_tags("no tags", &tags));
+    CHECK(!mm3_leading_tags("[]", &tags));
+    CHECK(!mm3_leading_tags("[unclosed", &tags));
+    CHECK(!mm3_leading_tags("", &tags));
+
+    CHECK(mm3_lower_tags("[VERSE 1] La [CHORUS]") == "[verse 1] La [chorus]");
+    CHECK(mm3_lower_tags("[]") == "[]");
+    CHECK(mm3_lower_tags("[open") == "[open");
+    CHECK(mm3_lower_tags("none") == "none");
+}
+
+void test_request_markdown_helpers() {
+    std::string line = "## Title";
+    mm3_strip_heading(line);
+    CHECK(line == "Title");
+    line = "  # T";
+    mm3_strip_heading(line);
+    CHECK(line == "T");
+    line = "####### x";  // 7 hashes: beyond the h1-h6 window, kept verbatim
+    mm3_strip_heading(line);
+    CHECK(line == "####### x");
+    line = "#Title";
+    mm3_strip_heading(line);
+    CHECK(line == "#Title");
+    line = "    # x";  // 4-space indent is a code block, not a heading
+    mm3_strip_heading(line);
+    CHECK(line == "    # x");
+
+    line = "- item";
+    mm3_strip_bullet(line, "*+-");
+    CHECK(line == "item");
+    line = "  + item";
+    mm3_strip_bullet(line, "*+-");
+    CHECK(line == "item");
+    line = "-item";
+    mm3_strip_bullet(line, "*+-");
+    CHECK(line == "-item");
+    line = "*";
+    mm3_strip_bullet(line, "*");
+    CHECK(line == "*");
+
+    CHECK(mm3_unwrap_bold_once("**bold**") == "bold");
+    CHECK(mm3_unwrap_bold_once("a **b** c **d**") == "a b c d");
+    CHECK(mm3_unwrap_bold_once("****") == "****");
+    CHECK(mm3_unwrap_bold_once("**open") == "**open");
+    CHECK(mm3_unwrap_bold_once("plain") == "plain");
+
+    CHECK(mm3_unwrap_italic("*it*") == "it");
+    CHECK(mm3_unwrap_italic("a*b*c") == "abc");
+    CHECK(mm3_unwrap_italic("**x**") == "**x**");
+    CHECK(mm3_unwrap_italic("*a\nb*") == "*a\nb*");
+    CHECK(mm3_unwrap_italic("*") == "*");
+
+    CHECK(mm3_is_hrule("---"));
+    CHECK(mm3_is_hrule(" *** "));
+    CHECK(mm3_is_hrule("___"));
+    CHECK(mm3_is_hrule("-*_"));  // mixed marks count as one run
+    CHECK(!mm3_is_hrule("--"));
+    CHECK(!mm3_is_hrule("- - -"));
+    CHECK(!mm3_is_hrule("--- x"));
+    CHECK(!mm3_is_hrule(""));
+}
+
+void test_request_clean_caption() {
+    CHECK(mm3_clean_caption("## **Bright** pop") == "Bright pop");
+    CHECK(mm3_clean_caption("# Title\n\n- **bold** item\n---\n*soft* line   \n\n\nnext") ==
+          "Title\nbold item\nsoft line\nnext");
+    CHECK(mm3_clean_caption("\xE2\x80\xA2 point") == "point");
+    CHECK(mm3_clean_caption("a    b") == "ab");
+    CHECK(mm3_clean_caption("<|genre rock|>") == "genre is rock");
+    CHECK(mm3_clean_caption("plain caption") == "plain caption");
+    CHECK(mm3_clean_caption("").empty());
+}
+
+void test_request_normalize_lyrics() {
+    CHECK(mm3_normalize_lyrics("[Verse] ignored\nHello ^ world") ==
+          "[start]\n[verse]\nHello\nworld");
+    CHECK(mm3_normalize_lyrics("[Intro]  \nLa la [Chorus] la\n\nend") ==
+          "[start]\n[intro]\nLa la\n[chorus]\nla\n\nend");
+    CHECK(mm3_normalize_lyrics("[instrumental]") == "[start]\n[instrumental]");
+    CHECK(mm3_normalize_lyrics("a ^ b") == "[start]\na\nb");
+    CHECK(mm3_normalize_lyrics("") == "[start]\n");
+}
+
+void test_request_assemble_prompt() {
+    using tts_cpp::minimax::detail::build_prompt;
+
+    bool instrumental = false;
+    CHECK(mm3_assemble_prompt("Piano", " \n\t", &instrumental) ==
+          "<|im_start|><|caption_start|>Piano<|caption_end|><|lyrics_start|>"
+          "[start]\n[instrumental]<|lyrics_end|><|im_end|><|audio_start|>");
+    CHECK(instrumental);
+
+    CHECK(mm3_assemble_prompt("- **Jazz** trio", "[INTRO] hum", &instrumental) ==
+          "<|im_start|><|caption_start|>Jazz trio<|caption_end|><|lyrics_start|>"
+          "[start]\n[intro]<|lyrics_end|><|im_end|><|audio_start|>");
+    CHECK(!instrumental);
+
+    CHECK(build_prompt("Calm <|genre ambient|> pad", "la la") ==
+          "<|im_start|><|caption_start|>Calm genre is ambient pad<|caption_end|><|lyrics_start|>"
+          "[start]\nla la<|lyrics_end|><|im_end|><|audio_start|>");
 }
 
 void test_unconditional_mask() {
@@ -932,6 +1102,13 @@ void test_progress_cancellation() {
 int main() {
     test_frame_validation();
     test_prompt();
+    test_request_text_primitives();
+    test_request_line_splitting();
+    test_request_replace_and_tags();
+    test_request_markdown_helpers();
+    test_request_clean_caption();
+    test_request_normalize_lyrics();
+    test_request_assemble_prompt();
     test_unconditional_mask();
     test_noise();
     test_flow_schedule();
