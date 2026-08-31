@@ -10,8 +10,8 @@
 // `--history-ms` and `--chunk-ms` override the default streaming knobs
 // (30000 / 2000); used to reproduce drift scenarios at different
 // rolling-window sizes. `--rttm-out` writes a NIST RTTM hypothesis
-// file of every emitted real streaming segment (terminators and
-// `is_final` synthetic markers excluded). The URI column is taken
+// file of every emitted real streaming segment (the `is_final`
+// synthetic terminator is excluded). The URI column is taken
 // from the WAV path's stem so the JS benchmark's DER evaluator can
 // ingest the file directly against the matching reference RTTM.
 
@@ -34,6 +34,80 @@ using parakeet_test::file_exists;
 using parakeet_test::load_wav_pcm16le_mono;
 
 using namespace parakeet;
+
+struct FinalizeStats {
+    int n_finals = 0;
+    int n_terminators = 0;
+};
+
+FinalizeStats collect_finalize_stats(
+    const std::vector<StreamingDiarizationSegment> & callbacks) {
+    FinalizeStats stats;
+    for (const auto & segment : callbacks) {
+        if (segment.is_final) ++stats.n_finals;
+        if (segment.speaker_id < 0) ++stats.n_terminators;
+    }
+    return stats;
+}
+
+bool check_finalize_path(Engine & engine,
+                         const SortformerStreamingOptions & base_opts,
+                         const std::vector<float> & samples,
+                         int sample_count,
+                         bool expect_real_tail,
+                         const char * name) {
+    std::vector<StreamingDiarizationSegment> callbacks;
+    SortformerStreamingOptions opts = base_opts;
+    opts.chunk_right_context_ms = 0;
+
+    auto session = engine.diarize_start(
+        opts,
+        [&](const StreamingDiarizationSegment & segment) {
+            callbacks.push_back(segment);
+        });
+    session->feed_pcm_f32(samples.data(), sample_count);
+    const size_t callbacks_before_finalize = callbacks.size();
+    session->finalize();
+    session->finalize(); // idempotent: must not emit a second terminator
+
+    int n_real_tail = 0;
+    bool real_tail_is_non_final = true;
+    for (size_t i = callbacks_before_finalize; i < callbacks.size(); ++i) {
+        if (callbacks[i].speaker_id >= 0) {
+            ++n_real_tail;
+            if (callbacks[i].is_final) real_tail_is_non_final = false;
+        }
+    }
+    const FinalizeStats stats = collect_finalize_stats(callbacks);
+    const bool last_is_terminator =
+        !callbacks.empty() &&
+        callbacks.back().is_final &&
+        callbacks.back().speaker_id == -1 &&
+        callbacks.back().start_s == callbacks.back().end_s;
+    const bool tail_count_ok =
+        expect_real_tail ? n_real_tail > 0 : n_real_tail == 0;
+    const bool tail_ok = real_tail_is_non_final && tail_count_ok;
+    if (stats.n_finals != 1 || stats.n_terminators != 1 ||
+        !last_is_terminator || !tail_ok) {
+        std::fprintf(
+            stderr,
+            "[sf-stream-test] FAIL finalize-%s: callbacks=%zu finals=%d "
+            "terminators=%d real_tail=%d last_is_terminator=%d "
+            "real_tail_is_non_final=%d\n",
+            name, callbacks.size(), stats.n_finals, stats.n_terminators,
+            n_real_tail, (int) last_is_terminator,
+            (int) real_tail_is_non_final);
+        return false;
+    }
+
+    std::fprintf(
+        stderr,
+        "[sf-stream-test] PASS finalize-%s: callbacks=%zu finals=%d "
+        "terminators=%d real_tail=%d\n",
+        name, callbacks.size(), stats.n_finals, stats.n_terminators,
+        n_real_tail);
+    return true;
+}
 
 int run_basic(const std::string & gguf_path,
               const std::string & wav_path,
@@ -156,10 +230,8 @@ int run_basic(const std::string & gguf_path,
 
         int dumped = 0;
         for (const auto & s : all) {
-            // Skip the synthetic terminator (speaker_id < 0) and zero-
-            // length is_final markers. Real trailing-chunk segments have
-            // is_final=true AND speaker_id>=0 AND positive duration --
-            // those we keep.
+            // Skip the synthetic terminator. Real trailing-chunk segments
+            // remain non-final and are retained when they have duration.
             if (s.speaker_id < 0) continue;
             const double dur = s.end_s - s.start_s;
             if (dur <= 0.0) continue;
@@ -185,6 +257,14 @@ int run_basic(const std::string & gguf_path,
             "[sf-stream-test] FAIL: expected exactly one is_final callback, got %d\n",
             n_finals);
         return 4;
+    }
+    if (n_terminators != 1 || all.empty() ||
+        all.back().speaker_id != -1 || !all.back().is_final) {
+        std::fprintf(stderr,
+            "[sf-stream-test] FAIL: final callback is not the single synthetic "
+            "terminator (terminators=%d callbacks=%zu)\n",
+            n_terminators, all.size());
+        return 16;
     }
     {
         int dup = 0;
@@ -234,11 +314,49 @@ int run_basic(const std::string & gguf_path,
         return 10;
     }
 
+    SortformerStreamingOptions finalize_opts = sopts;
+    finalize_opts.chunk_ms = 2000;
+    finalize_opts.history_ms = std::max(finalize_opts.history_ms,
+                                        finalize_opts.chunk_ms);
+    const int chunk_samples = sr * finalize_opts.chunk_ms / 1000;
+    if ((int) samples.size() < chunk_samples + chunk_samples / 2) {
+        std::fprintf(stderr,
+            "[sf-stream-test] FAIL: fixture too short for finalize path coverage "
+            "(samples=%zu need=%d)\n",
+            samples.size(), chunk_samples + chunk_samples / 2);
+        return 12;
+    }
+    if (!check_finalize_path(
+            engine, finalize_opts, samples, chunk_samples,
+            /*expect_real_tail=*/false, "no-tail")) {
+        return 13;
+    }
+    if (!check_finalize_path(
+            engine, finalize_opts, samples,
+            chunk_samples + chunk_samples / 2,
+            /*expect_real_tail=*/true, "tail-present")) {
+        return 14;
+    }
+
     {
-        auto session2 = engine.diarize_start(sopts, [](const StreamingDiarizationSegment &) {});
-        session2->feed_pcm_f32(samples.data(), (int) std::min<size_t>(samples.size(), 4 * sr));
+        int callbacks_after_cancel = 0;
+        SortformerStreamingOptions cancel_opts = sopts;
+        cancel_opts.chunk_right_context_ms = 0;
+        auto session2 = engine.diarize_start(
+            cancel_opts,
+            [&](const StreamingDiarizationSegment &) {
+                ++callbacks_after_cancel;
+            });
+        session2->feed_pcm_f32(samples.data(), chunk_samples / 2);
         session2->cancel();
         session2->cancel();
+        session2->finalize();
+        if (callbacks_after_cancel != 0) {
+            std::fprintf(stderr,
+                "[sf-stream-test] FAIL: cancelled finalize emitted %d callback(s)\n",
+                callbacks_after_cancel);
+            return 15;
+        }
     }
 
     std::fprintf(stderr, "[sf-stream-test] PASS\n");

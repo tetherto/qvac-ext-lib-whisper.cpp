@@ -112,6 +112,8 @@ namespace fs = std::filesystem;
 struct Engine::Impl {
     EngineOptions opts;
 
+    GpuFallbackReason gpu_fallback_reason = GpuFallbackReason::not_requested;
+
     ggml_backend_t backend       = nullptr;  // primary backend (GPU or CPU) for textenc/cond/DiT
     ggml_backend_t backend_cpu   = nullptr;  // CPU backend for the stages pinned off the GPU; == backend when primary is CPU
     ggml_backend_t backend_lm    = nullptr;  // backend the LM loads on (see create)
@@ -277,9 +279,12 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     // Falls back to CPU when no GPU backend is registered/available.
     bool on_gpu = false;
     if (opts.n_gpu_layers > 0) {
-        m->backend = backend_gpu_init();
+        m->backend = backend_gpu_init(&m->gpu_fallback_reason);
         on_gpu     = (m->backend != nullptr);
-        if (!on_gpu && v) fprintf(stderr, "[acestep-engine] GPU requested but no GPU backend available; using CPU\n");
+        if (!on_gpu && v) {
+            fprintf(stderr, "[acestep-engine] GPU requested but no GPU backend available (%s); using CPU\n",
+                    gpu_fallback_reason_name(m->gpu_fallback_reason));
+        }
     }
     if (!m->backend) m->backend = backend_cpu_init();
     if (!m->backend) throw std::runtime_error("acestep engine: backend init failed");
@@ -313,7 +318,8 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     ggml_backend_t detok_backend = m->backend;
     if (on_gpu) {
         const StagePlacement place =
-            resolve_stage_placement(backend_reg_name(m->backend), placement_overrides_from_env());
+            resolve_stage_placement(backend_reg_name(m->backend), backend_dev_description(m->backend),
+                                    placement_overrides_from_env());
         if (!place.enc_on_gpu)   enc_backend   = m->backend_cpu;
         if (!place.lm_on_gpu)    lm_backend    = m->backend_cpu;
         if (!place.detok_on_gpu) detok_backend = m->backend_cpu;
@@ -702,7 +708,21 @@ struct EncoderConditioning {
     int context_channels = 0;
     int sequence = 0;
     int hidden_size = 0;
+
+    // Post-switch conditioning (empty unless audio_cover_strength < 1); both
+    // hidden buffers share the padded row count, sequence_switch is the real one.
+    std::vector<float> context_switch;
+    std::vector<float> hidden_switch;
+    int sequence_switch = 0;
 };
+
+static int padded_conditioning_rows(const EncoderConditioning & conditioning) {
+    return std::max(conditioning.sequence, conditioning.sequence_switch);
+}
+
+static void pad_hidden_rows(std::vector<float> & hidden, int max_rows, int width) {
+    hidden.resize((size_t) max_rows * width, 0.0f);
+}
 
 struct NoiseSchedule {
     std::vector<float> noise;
@@ -902,7 +922,8 @@ static PromptTokens tokenize_prompt(const BpeTokenizer & tokenizer, const AcePro
 
 template <typename EngineImpl>
 static PromptEncoding encode_prompt(EngineImpl & engine, const PromptTokens & tokens,
-                                    GenerationState & state, StageDump & dump, StageTimes & timing) {
+                                    GenerationState & state, StageDump & dump, StageTimes & timing,
+                                    bool release_stage = true) {
     engine.ensure_textenc();
     PromptEncoding encoding;
     encoding.text_tokens = (int) tokens.text.size();
@@ -921,7 +942,7 @@ static PromptEncoding encode_prompt(EngineImpl & engine, const PromptTokens & to
     dump.write("05_lyric_embed", encoding.lyric_embedding, encoding.lyric_tokens,
                (int) (encoding.lyric_embedding.size() / (size_t) encoding.lyric_tokens));
 
-    if (state.low_memory) {
+    if (state.low_memory && release_stage) {
         if (engine.textenc && engine.opts.verbose) {
             fprintf(stderr, "[acestep-engine] freeing text-encoder (low-mem)\n");
         }
@@ -933,7 +954,8 @@ static PromptEncoding encode_prompt(EngineImpl & engine, const PromptTokens & to
 template <typename EngineImpl>
 static void encode_cross_attention(EngineImpl & engine, const PromptEncoding & prompt,
                                    const GenerationState & state, EncoderConditioning & output,
-                                   StageDump & dump, StageTimes & timing) {
+                                   StageDump & dump, StageTimes & timing,
+                                   bool release_stage = true) {
     const TimbreInput timbre = resolve_timbre_input(
         state.plan, state.conditioning.reference, state.context_latents,
         state.latent_frames, cond_model_silence_frame(engine.cond));
@@ -944,7 +966,7 @@ static void encode_cross_attention(EngineImpl & engine, const PromptEncoding & p
     }
     output.hidden_size = (int) (output.hidden.size() / (size_t) output.sequence);
 
-    if (state.low_memory) {
+    if (state.low_memory && release_stage) {
         if (engine.cond && engine.opts.verbose) {
             fprintf(stderr, "[acestep-engine] freeing cond-encoder (low-mem)\n");
         }
@@ -968,6 +990,26 @@ static std::string resolve_dit_instruction(const GenerateTask & task) {
 }
 
 template <typename EngineImpl>
+static void encode_switch_hidden(EngineImpl & engine, const PromptEncoding & prompt,
+                                 const GenerationState & state, EncoderConditioning & output) {
+    const TimbreInput timbre = resolve_timbre_input(
+        state.plan, state.conditioning.reference, state.context_latents,
+        state.latent_frames, cond_model_silence_frame(engine.cond));
+    if (!cond_model_forward(engine.cond, prompt.text_hidden.data(), prompt.text_tokens,
+                            prompt.lyric_embedding.data(), prompt.lyric_tokens,
+                            timbre.data, timbre.frames, output.hidden_switch,
+                            &output.sequence_switch)) {
+        throw std::runtime_error("acestep engine: cond-encoder switch forward failed");
+    }
+    if (state.low_memory) {
+        if (engine.cond && engine.opts.verbose) {
+            fprintf(stderr, "[acestep-engine] freeing cond-encoder (low-mem)\n");
+        }
+        engine.free_cond();
+    }
+}
+
+template <typename EngineImpl>
 static EncoderConditioning prepare_encoder_conditioning(EngineImpl & engine,
                                                          GenerationState & state,
                                                          StageDump & dump, StageTimes & timing) {
@@ -983,10 +1025,26 @@ static EncoderConditioning prepare_encoder_conditioning(EngineImpl & engine,
         state.context_latents, cond_model_silence_latent(engine.cond), output.frames,
         state.latent_frames, output.context_channels, config.out_channels);
     output.null_emb = cond_model_null_emb(engine.cond);
+    const bool needs_switch = needs_cover_conditioning_switch(state.task);
+    if (needs_switch) {
+        output.context_switch = make_dit_context(
+            state.context_latents, cond_model_silence_latent(engine.cond), output.frames,
+            0, output.context_channels, config.out_channels);
+    }
+    const std::string instruction = resolve_dit_instruction(state.task);
     const PromptTokens tokens = tokenize_prompt(
-        engine.bpe_text, state.prompt, state.language, resolve_dit_instruction(state.task).c_str());
-    const PromptEncoding prompt = encode_prompt(engine, tokens, state, dump, timing);
-    encode_cross_attention(engine, prompt, state, output, dump, timing);
+        engine.bpe_text, state.prompt, state.language, instruction.c_str());
+    const PromptEncoding prompt = encode_prompt(engine, tokens, state, dump, timing, !needs_switch);
+    encode_cross_attention(engine, prompt, state, output, dump, timing, !needs_switch);
+    if (needs_switch) {
+        const PromptTokens tokens_switch = tokenize_prompt(
+            engine.bpe_text, state.prompt, state.language, DIT_INSTR_TEXT2MUSIC);
+        const PromptEncoding prompt_switch = encode_prompt(engine, tokens_switch, state, dump, timing);
+        encode_switch_hidden(engine, prompt_switch, state, output);
+        const int rows = padded_conditioning_rows(output);
+        pad_hidden_rows(output.hidden, rows, output.hidden_size);
+        pad_hidden_rows(output.hidden_switch, rows, output.hidden_size);
+    }
     return output;
 }
 
@@ -1048,19 +1106,22 @@ static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params
                               StageDump & dump, StageTimes & timing, std::vector<float> & latent) {
     const DitConfig & config = engine.dit_cfg;
     const float guidance = resolve_guidance_scale(params.guidance_scale, config.is_turbo);
+    const int cover_switch_step = resolve_cover_switch_step(state.task, noise.steps);
     if (engine.opts.verbose) {
-        fprintf(stderr, "[acestep-engine] DiT: turbo=%d steps=%d shift=%.2f guidance=%.2f T=%d task=%s\n",
+        fprintf(stderr,
+                "[acestep-engine] DiT: turbo=%d steps=%d shift=%.2f guidance=%.2f T=%d task=%s cover_switch=%d\n",
                 (int) config.is_turbo, noise.steps, noise.shift, guidance,
-                conditioning.frames, state.task.type.c_str());
+                conditioning.frames, state.task.type.c_str(), cover_switch_step);
     }
     engine.ensure_dit();
     if (!report("dit", 0, noise.steps)) return false;
 
+    const bool has_switch = cover_switch_step >= 0 && !conditioning.context_switch.empty();
     DitSampleParams sample;
     sample.noise = noise.noise.data();
     sample.context_latents = conditioning.context.data();
     sample.enc_hidden = conditioning.hidden.data();
-    sample.enc_S = conditioning.sequence;
+    sample.enc_S = has_switch ? padded_conditioning_rows(conditioning) : conditioning.sequence;
     sample.H_enc = conditioning.hidden_size;
     sample.T = conditioning.frames;
     sample.N = 1;
@@ -1069,6 +1130,12 @@ static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params
     sample.real_enc_S = &conditioning.sequence;
     sample.guidance_scale = guidance;
     sample.null_cond_emb = conditioning.null_emb.empty() ? nullptr : conditioning.null_emb.data();
+    if (has_switch) {
+        sample.context_switch = conditioning.context_switch.data();
+        sample.enc_hidden_switch = conditioning.hidden_switch.data();
+        sample.real_enc_S_switch = &conditioning.sequence_switch;
+        sample.cover_switch_step = cover_switch_step;
+    }
     sample.dcw_enabled = resolve_dcw_enabled(params.dcw_enabled, config.is_turbo);
     sample.dcw_scaler = params.dcw_scaler;
     sample.dcw_high_scaler = params.dcw_high_scaler;
@@ -1105,7 +1172,10 @@ static bool decode_audio(EngineImpl & engine, const std::vector<float> & latent,
         completed = report("vae", done, total);
         return completed;
     });
-    if (!completed) return false;
+    if (!completed) {
+        result.pcm.clear();
+        return false;
+    }
     if (result.pcm.empty()) throw std::runtime_error("acestep engine: VAE decode failed");
     report("vae", 1, 1);
     timing.mark("vae");
@@ -1713,7 +1783,10 @@ static GenerateResult decode_edit_plan_result(
           completed = report(EDIT_STAGE_VAE, done, total);
           return completed;
         });
-    if (!completed) return result;
+    if (!completed) {
+        result.pcm.clear();
+        return result;
+    }
     if (result.pcm.empty()) {
         throw std::runtime_error(EDIT_ERROR_FINAL_DECODE);
     }
@@ -1814,5 +1887,7 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
 void        Engine::cancel() const { impl_->cancel_flag.store(true); }
 int         Engine::sample_rate() const { return impl_->sr; }  // cached; VAE loaded lazily
 std::string Engine::backend_name() const { return impl_->backend ? ggml_backend_name(impl_->backend) : "cpu"; }
+
+GpuFallbackReason Engine::gpu_fallback_reason() const { return impl_->gpu_fallback_reason; }
 
 } // namespace tts_cpp::acestep

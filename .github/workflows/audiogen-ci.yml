@@ -1,12 +1,12 @@
 # CI for the audiogen engine (engines/audiogen/ — ACE-Step music generation,
 # added alongside the repo reorg QIP that moved engines under engines/).
 #
-# Scope: build the audiogen-cpp library + its CPU-only unit tests against
+# Scope: build the audiogen-cpp library + its unit tests against
 # system ggml (qvac-ext-ggml @ speech — mandatory here: AUDIOGEN_USE_SYSTEM_GGML
 # defaults ON and the engine needs the custom snake / col2im_1d ops that live
-# on that branch), then run the non-GPU ctest suite (weight-free units;
-# model-dependent smoke harnesses stay downstream on-device). GPU suites need
-# real GPUs → self-hosted lane, mirrored from tts-ci.yml's gpu stub.
+# on that branch), then run the non-GPU ctest suite on both lanes and the
+# weight-free MiniMax Metal parity test on the self-hosted Apple-silicon
+# runner. Model-dependent smoke harnesses stay downstream on-device.
 name: audiogen CI
 
 on:
@@ -20,11 +20,6 @@ on:
       - 'engines/audiogen/**'
       - '.github/workflows/audiogen-ci.yml'
   workflow_dispatch:
-    inputs:
-      run_gpu:
-        description: 'Also run the GPU ctest lane (needs a [self-hosted, gpu] runner)'
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -42,15 +37,35 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-24.04
+          # Self-hosted Apple silicon, not hosted macOS. GitHub's hosted macOS
+          # runners expose an "Apple Paravirtual device" reporting only
+          # MTLGPUFamilyApple5, and ggml gates GGML_OP_MUL_MAT on simdgroup
+          # reduction (Apple7+), so no matmul can execute there and the parity
+          # test could only ever skip. Same conclusion tts-ci.yml reached in
+          # QVAC-22775. This is the runner the qvac monorepo uses for its
+          # Metal lanes (integration-test-asr-ggml.yml, cpp-tests-*.yml).
+          - os: macos-26
+            runner: qvac-macos26-arm64-gpu
+    runs-on: ${{ matrix.runner || matrix.os }}
     timeout-minutes: 60
     steps:
+      # Self-hosted runners are persistent, so a previous run's tree can survive
+      # into this one. See docs/ci/SELF-HOSTED-RUNNERS.md in the qvac monorepo.
+      - name: Manual Workspace Cleanup
+        run: rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
+        shell: bash
+        working-directory: .
+        if: runner.environment != 'github-hosted'
+
       - uses: actions/checkout@v4
 
       - name: Install ccache
         run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then brew install ccache; else sudo apt-get update -q && sudo apt-get install -y ccache; fi
+          if [ "$RUNNER_ENVIRONMENT" = "github-hosted" ]; then
+            if [ "$RUNNER_OS" = "macOS" ]; then brew install ccache; else sudo apt-get update -q && sudo apt-get install -y ccache; fi
+          fi
           echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
 
       - name: Resolve ggml pin (tip of ${{ env.GGML_BRANCH }})
@@ -62,9 +77,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ggml-install
-          # Shared portable (CPU-only) key with parakeet-ci.yml / tts-ci.yml:
-          # whichever engine lane builds ggml first serves the others.
-          key: ggml-install-portable-${{ matrix.os }}-${{ steps.ggml.outputs.sha }}
+          # Linux remains compatible with the shared portable cache. macOS
+          # carries the Metal backend needed by the MiniMax GPU parity test.
+          key: ggml-install-${{ runner.os == 'macOS' && 'metal' || 'portable' }}-${{ matrix.os }}-${{ steps.ggml.outputs.sha }}
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -73,8 +88,7 @@ jobs:
           key: ccache-audiogen-${{ matrix.os }}-${{ github.sha }}
           restore-keys: ccache-audiogen-${{ matrix.os }}-
 
-      # CPU-only ggml: this lane runs `-LE gpu` tests, and hosted runners
-      # have no Vulkan/OpenCL; Metal is exercised by the gpu lane instead.
+      # macOS builds with Metal for the parity test; Linux stays portable CPU-only.
       - name: Build ggml (system ggml, qvac-ext-ggml@${{ env.GGML_BRANCH }})
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         run: |
@@ -90,7 +104,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
-            -DGGML_METAL=OFF \
+            -DGGML_METAL=${{ runner.os == 'macOS' && 'ON' || 'OFF' }} \
             -DGGML_BUILD_TESTS=OFF \
             -DGGML_BUILD_EXAMPLES=OFF \
             -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
@@ -117,24 +131,32 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
         run: ctest --test-dir build -LE 'gpu|perf' --output-on-failure --timeout 600
 
-  # GPU lane stub: opt-in until self-hosted GPU runners exist (mirrors
-  # tts-ci.yml). hosted macos-14 exposes Metal, so folding `-L gpu` into the
-  # macOS build-test job is a cheap first experiment once GPU suites land.
-  gpu:
-    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
-    runs-on: [self-hosted, gpu]
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build ggml + engine (native backends) and run GPU suites
+      # ctest scores a SKIP (return code 77) as success, so a green tick here
+      # would not by itself mean the parity assertions ran. On this lane they
+      # must: the runner is real Apple silicon, so Metal is expected to be
+      # present AND to support MUL_MAT. Either skip marker means the job proved
+      # nothing, and is treated as a failure rather than a pass.
+      - name: Test (Metal)
+        if: runner.os == 'macOS'
         run: |
-          git clone --depth 1 --branch "$GGML_BRANCH" "$GGML_REPO" ggml-src
-          cmake -S ggml-src -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
-            -DGGML_VULKAN=ON \
-            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
-          cmake --build ggml-src/build -j && cmake --install ggml-src/build
-          cmake -S engines/audiogen -B build -DCMAKE_BUILD_TYPE=Release \
-            -DAUDIOGEN_BUILD_TESTS=ON \
-            -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
-          cmake --build build -j
-          ctest --test-dir build -L gpu --output-on-failure --timeout 1200
+          set -o pipefail
+          # -V, not --output-on-failure: the markers below are printed by a test
+          # that SKIPS, and --output-on-failure shows output only for failures,
+          # so the greps would silently never match.
+          ctest --test-dir build -R '^test-minimax-metal-ops$' -V --timeout 600 2>&1 | tee metal-test.log
+          if grep -q "SKIP Metal backend is unavailable" metal-test.log; then
+            echo "::error::Metal backend absent on the Apple-silicon runner — the parity test never ran"
+            exit 1
+          fi
+          if grep -q "SKIP Metal device cannot run MUL_MAT" metal-test.log; then
+            echo "::error::Metal device lacks simdgroup reduction, so MUL_MAT is unsupported — this runner was expected to expose an Apple7+ GPU"
+            exit 1
+          fi
+
+  # No opt-in GPU job here: audiogen's only gpu-labeled test is the Metal
+  # parity check (SKIP_RETURN_CODE 77 without Metal), which the build-test
+  # macOS lane already runs — and skip-guards — in its "Test (Metal)" step.
+  # On a non-Apple runner `ctest -L gpu` could only ever skip it and report a
+  # hollow pass. When audiogen grows a Vulkan/CUDA gpu-labeled test, add the
+  # lane back mirroring tts-ci.yml's gpu job (qvac-ubuntu2204-x64-gpu +
+  # runnable-arms reporter).

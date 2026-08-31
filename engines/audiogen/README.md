@@ -7,7 +7,7 @@ Native [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) and MiniMax-Musi
 | CMake project | `audiogen-cpp` v0.1.0 |
 | Public API | `tts_cpp::acestep::Engine`, `tts_cpp::minimax::Engine` |
 | Output | interleaved stereo PCM, model-defined sample rate, `pcm[t * 2 + ch]` |
-| Backends | CPU, Vulkan (including Android Mali iGPUs), Metal, OpenCL (validated on Adreno 700+) |
+| Backends | CPU, Vulkan (including Android Mali iGPUs), Metal, OpenCL (validated on Adreno 700+), CUDA |
 | ggml | requires the `ggml-speech` port for the custom `ggml_snake` and `ggml_col2im_1d` ops |
 | Consumed by | the `@qvac/audiogen-ggml` addon in [QVAC](https://github.com/tetherto/qvac) |
 
@@ -48,25 +48,52 @@ otherwise falls back to the CPU. On a GPU the weights and graphs live on the
 first usable backend the ggml registry offers (CUDA, Vulkan, Metal, ...) and a
 CPU backend backs any unsupported op; the full model pair must fit in device
 memory (~22 GB for the f16 pair). One MiniMax engine instance may be active at
-a time because its compute graphs are shared.
+a time because its compute graphs are shared. The weight-free
+`test-minimax-metal-ops` regression compares the 4096-channel condition
+projection and every DAC transposed-convolution stride against CPU on Metal.
+
+Vulkan and CUDA are the measured GPU backends, both on an RTX 5090. On each,
+`mm3-replay --mode replay` forcing the recorded official prompt tokens, codes,
+and noise reproduces the CPU rendering (time-domain audio correlation 0.9998
+on Vulkan, 0.9993 on CUDA), `--mode condcheck` confirms byte-identical DiT
+velocities across repeated computes, and `test-minimax-quality` lands the
+final flow latents on the learned manifold. Vulkan is measured with both the
+`q8_0` and the `f16` pair; the 22 GB `f16` pair far exceeds ggml's 1 GiB
+Vulkan suballocation block and loads through the chunked device buffers ggml
+creates automatically. The full `test-backend-ops` suite passes on the same
+device, including the `b_absmax=1e5` LM-shaped `mul_mat` stress cases.
+Metal and OpenCL remain unmeasured for MiniMax and take the same all-on-GPU
+placement, so measure them the same way before shipping them.
 
 The frame rate, maximum frame count, flow defaults, and output sample rate come
 from GGUF metadata. Current converted files specify 25 frames per second, at
 most 9000 frames, 30 flow steps, CFG 1.7, and 44100 Hz output.
 
-Convert local upstream checkpoints without downloading weights:
+Download the Comfy-Org single-file safetensors checkpoint (the converter's
+preferred source; requires the Hugging Face CLI,
+`pip install -U huggingface_hub`) and convert it:
 
 ```sh
-python scripts/convert-minimax-music3-to-gguf.py \
-  --src /path/to/MiniMax-Music3 --out /path/to/output --quant f16
+scripts/download-minimax-music3.sh --dir checkpoints/MiniMax-Music3
+python3 scripts/convert-minimax-music3-to-gguf.py \
+  --src checkpoints/MiniMax-Music3 --out models/minimax --quant f16
 ```
 
-The converter emits the two-file contract and writes the
+An already-downloaded checkpoint converts the same way: point `--src` at the
+local directory. The converter emits the two-file contract and writes the
 MiniMax-Music3 Community License identifier into both files. Ship the upstream
 model license with converted weights.
 
-`mm3-replay` (built with `AUDIOGEN_BUILD_EXECUTABLES`) is the MiniMax parity
-harness: `--mode full` runs the pipeline from a caption/lyrics pair, `--mode
+`mm3-replay` (built with `AUDIOGEN_BUILD_EXECUTABLES`) is the MiniMax CLI and
+parity harness:
+
+```sh
+./build/engines/audiogen/mm3-replay --models models/minimax --out mm3-out --mode full \
+                                    --caption "warm lo-fi beat with vinyl crackle" \
+                                    --lyrics "[Instrumental]" --max-frames 300
+```
+
+`--mode full` runs the pipeline from a caption/lyrics pair, `--mode
 replay` forces recorded prompt tokens, semantic/acoustic codes, and per-window
 initial noise through the native pipeline and dumps the per-window latents,
 frame hiddens, and stitched audio for 1:1 comparison against the official
@@ -128,12 +155,12 @@ music-cli --models <dir> --task lego --track guitar \
 
 `--guidance F` overrides the DiT guidance scale on base/sft (0 = auto).
 
-Weights load quantized. `f32`, `f16`, and `bf16` are handled for norms and biases, and the detokenizer's `special_tokens` may be `q8_0`. This tree ships no converter: the stage GGUFs come from `convert.py` in [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp), the upstream C++/ggml implementation this port follows, which also publishes pre-quantized GGUFs at [Serveurperso/ACE-Step-1.5-GGUF](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF).
+Weights load quantized. `f32`, `f16`, and `bf16` are handled for norms and biases, and the detokenizer's `special_tokens` may be `q8_0`. The stage GGUFs are built in tree by `scripts/convert-acestep-to-gguf.py` and the `acestep-quantize` binary (see [Model setup](#model-setup)), both adapted from [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp), the upstream C++/ggml implementation this port follows, which also publishes pre-quantized GGUFs at [Serveurperso/ACE-Step-1.5-GGUF](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF).
 
 ### Model setup
 
-The QVAC registry publishes three validated four-file combinations. All use
-the same fixed text encoder, LM, and VAE; select one DiT:
+Three four-file combinations are validated. All use the same fixed text
+encoder, LM, and VAE; select one DiT:
 
 | Role | Filename | Quantization | Approximate size | Variants |
 |---|---|---|---:|---|
@@ -144,44 +171,58 @@ the same fixed text encoder, LM, and VAE; select one DiT:
 | DiT | `acestep-v15-turbo-Q8_0.gguf` | `q8_0` | 2.37 GB | `turbo-q8` |
 | DiT | `acestep-v15-sft-Q8_0.gguf` | `q8_0` | 2.37 GB | `sft` |
 
-From a [QVAC](https://github.com/tetherto/qvac) checkout with package
-dependencies installed, use its registry client rather than constructing
-storage URLs:
+Build these files locally in three steps: download the upstream safetensors
+checkpoints from Hugging Face, convert each stage to a self-contained BF16
+GGUF, and quantize the text encoder, LM, and DiT (the VAE always stays BF16).
+The download script needs the Hugging Face CLI
+(`pip install -U huggingface_hub`), the converter needs
+`pip install numpy gguf`, and `acestep-quantize` builds with
+`AUDIOGEN_BUILD_EXECUTABLES`. When built from the repository root, binaries
+live under `./build/engines/audiogen/`; a standalone `engines/audiogen` build
+places them under `./build/audiogen/` instead.
 
 ```sh
-npm --prefix packages/audiogen-ggml run download-models:registry -- \
-  --output models/acestep --variant turbo-q4
+scripts/download-acestep-checkpoints.sh --dir checkpoints
+python3 scripts/convert-acestep-to-gguf.py --checkpoints checkpoints --out models/bf16
+
+mkdir -p models/acestep
+./build/engines/audiogen/acestep-quantize models/bf16/Qwen3-Embedding-0.6B-BF16.gguf \
+                                        models/acestep/Qwen3-Embedding-0.6B-Q8_0.gguf Q8_0
+./build/engines/audiogen/acestep-quantize models/bf16/acestep-5Hz-lm-0.6B-BF16.gguf \
+                                        models/acestep/acestep-5Hz-lm-0.6B-Q8_0.gguf Q8_0
+./build/engines/audiogen/acestep-quantize models/bf16/acestep-v15-turbo-BF16.gguf \
+                                        models/acestep/acestep-v15-turbo-Q4_K_M.gguf Q4_K_M
+cp models/bf16/vae-BF16.gguf models/acestep/
 ```
 
-Replace `turbo-q4` with `turbo-q8` or `sft`. The `all` variant fetches all
-three DiTs, but do not then rely on `--models` alone: directory iteration does
-not define which matching DiT is selected. Store each variant in a separate
-directory, or pass the intended file explicitly with `--dit` /
-`EngineOptions::dit_model_path`. The registry entries record the upstream
-Hugging Face model-card links, but the registry GGUFs are QVAC-built artifacts.
-The external
+Quantize the turbo DiT to `Q8_0` instead for the `turbo-q8` combination; pass
+`--sft` to the download script and quantize `acestep-v15-sft-BF16.gguf` to
+`Q8_0` for the `sft` one. Keep one DiT per model directory rather than relying
+on `--models` alone: directory iteration does not define which matching DiT is
+selected, so with several present pass the intended file explicitly with
+`--dit` / `EngineOptions::dit_model_path`. The external
 `Serveurperso/ACE-Step-1.5-GGUF` files above have separate provenance and are
 not the combinations validated by QVAC.
 
 ## Backends
 
 `n_gpu_layers > 0` (`--gpu` on the CLI) selects a GPU backend through the ggml
-registry. Selection tries Adreno 700+ OpenCL first; validated Vulkan/Metal
-discrete devices, then validated integrated devices; and finally other
-discrete, then integrated GPU backends. Integrated-device support is required
-because Vulkan reports Android UMA adapters such as Pixel's Mali-G715 as
-`IGPU`.
+registry. Selection tries Adreno 700+ OpenCL first; validated
+Vulkan/Metal/CUDA discrete devices, then validated integrated devices; and
+finally other discrete, then integrated GPU backends. Integrated-device
+support is required because Vulkan reports Android UMA adapters such as
+Pixel's Mali-G715 as `IGPU`.
 
 | Stage | Placement when a GPU is selected |
 |---|---|
 | DiT, VAE | GPU |
 | Text encoder, condition encoder | GPU, unless `ACESTEP_ENCODERS_CPU` is present |
-| LM | GPU on Metal and OpenCL; CPU on Vulkan and every unmeasured backend |
-| FSQ detokenizer | GPU on Vulkan, Metal, and OpenCL; CPU on every unmeasured backend |
+| LM | GPU on Metal, OpenCL, CUDA, and Vulkan Mesa RADV devices; CPU on other Vulkan devices and every unmeasured backend |
+| FSQ detokenizer | GPU on Vulkan, Metal, OpenCL, and CUDA; CPU on every unmeasured backend |
 
-The LM and detokenizer use an allowlist rather than a denylist: a backend keeps the CPU placement until the stage has been measured on it, so adding one cannot silently regress generated audio. Metal and OpenCL are validated for both stages; the recorded OpenCL validation used an Adreno 740. Vulkan is validated for the detokenizer, but the autoregressive LM remains on CPU because Mali-G715 testing showed code collapse and early termination on Vulkan.
+The LM and detokenizer use an allowlist rather than a denylist: a backend keeps the CPU placement until the stage has been measured on it, so adding one cannot silently regress generated audio. Metal and OpenCL are validated for both stages; the recorded OpenCL validation used an Adreno 740. Vulkan is validated for the detokenizer everywhere, and for the autoregressive LM per device (`vulkan_device_lm_validated`): Mesa RADV devices run the LM on the GPU, while every other Vulkan device keeps the CPU placement, because Mali-G715 testing showed code collapse and early termination on Vulkan. CUDA needs the `snake` / `col2im_1d` VAE kernels from the `ggml-speech` fork's CUDA backend and its `GGML_PREC_F32` MUL_MAT support (the LM-shaped q4_0/q4_K strided-B `b_absmax=1e5` stress cases produced NaN before the fork routed explicit-precision matmuls to the f32 cuBLAS path); with that ggml, `test-backend-ops` on an RTX 5090 passes the full suite, the Q8_0 LM matches the F32-dequantized reference at 0.9999 logit cosine with an identical greedy trajectory where the CPU Q8_0 path sits at 0.994, and `--quantized-batch-cfg-regression` passes, so the LM runs on the GPU. The HIP/MUSA builds of the same backend register as `ROCm`/`MUSA` and stay off the allowlist until measured.
 
-Measurement is against an F32-dequantized reference (`scripts/dequant_gguf.py`), not against CPU. CPU is not automatically ground truth for a quantized model — ggml's CPU matmul quantizes activations to Q8_1 internally. On Metal the LM reproduces the F32 argmax trajectory exactly where CPU Q8_0 diverges at the first token. On Mali Vulkan, however, the LM produces repeated semantic codes and can terminate at roughly half the requested duration, while the same device produces a diverse full-length sequence with the LM on CPU.
+Measurement is against an F32-dequantized reference (`scripts/dequant_gguf.py`), not against CPU. CPU is not automatically ground truth for a quantized model — ggml's CPU matmul quantizes activations to Q8_1 internally. On Metal the LM reproduces the F32 argmax trajectory exactly where CPU Q8_0 diverges at the first token. The RADV validation (AMD Strix Halo, Radeon 8060S) followed the same protocol: on 300-token prefills the Vulkan Q8_0 LM matches the F32 reference argmax on 3/3 probes with logit cosine >= 0.99999995, where CPU Q8_0 matches on 1/3 at cosine ~0.9998, and the GPU LM stage runs ~2x faster than the CPU path on that device. On Mali Vulkan, however, the LM produces repeated semantic codes and can terminate at roughly half the requested duration, while the same device produces a diverse full-length sequence with the LM on CPU.
 
 On a GPU that supports F32 flash attention, Phase 2 also decodes the conditional and unconditional CFG paths in one batched graph. This matches the reference `acestep.cpp` LM path: the same prompt, model, sampler settings, and seed produce the same semantic-code sequence. Unsupported backends keep the separate F32 manual-attention path.
 
@@ -224,7 +265,7 @@ Dumps use a flat `[ndim, d0, d1]` int32 header followed by the `f32` payload, th
 
 ### Memory
 
-By default no stage stays resident after `create()`: `generate()` loads each stage immediately before its step and frees it right after, so only one stage is resident for the LM, detokenizer, DiT, and VAE steps rather than all six at once, which is what keeps a non-entitled iOS app inside its memory budget. The one overlap is the condition encoder: it supplies the silence frame that pads the DiT context before the text encoder runs and its own forward comes after text encoding, so it is loaded first and the two encoders are co-resident until the text encoder is freed. That pair is the only two-stage overlap, not necessarily the largest memory footprint. A truthy `ACESTEP_KEEP_STAGES` opts out, eagerly loads every stage in `Engine::create()`, and keeps them resident.
+By default no stage stays resident after `create()`: `generate()` loads each stage immediately before its step and frees it right after, so only one stage is resident for the LM, detokenizer, DiT, and VAE steps rather than all six at once, which is what keeps a non-entitled iOS app inside its memory budget. The one overlap is the condition encoder: it supplies the silence frame that pads the DiT context before the text encoder runs and its own forward comes after text encoding, so it is loaded first and the two encoders are co-resident until the text encoder is freed. That pair is the only two-stage overlap, not necessarily the largest memory footprint. A truthy `ACESTEP_KEEP_STAGES` opts out, eagerly loads every stage in `Engine::create()`, and keeps them resident. With stages kept resident, the LM and DiT also retain their reusable forward graphs and activation pools between generations (they are freed with the model in the default per-stage mode), trading additional steady-state memory for repeat-generation speed.
 
 Long VAE decodes are split into overlapping windows. The engine probes the
 active backend's maximum allocation size against the real decode graph and
@@ -262,8 +303,8 @@ directory such as `Release/` beneath the executable directory. See the
 |---|---|---|
 | `AUDIOGEN_BUILD_LIBRARY` | `ON` | build the library; linkage follows `BUILD_SHARED_LIBS` |
 | `AUDIOGEN_BUILD_EXECUTABLES` | `ON` standalone, `OFF` as a subdirectory | CLIs and per-stage smoke harnesses |
-| `AUDIOGEN_BUILD_TESTS` | `ON` standalone, `OFF` as a subdirectory | CPU-only unit tests |
-| `AUDIOGEN_BUILD_MINIMAX` | `ON` on desktop, unavailable on Android and iOS | MiniMax-Music3 CPU engine |
+| `AUDIOGEN_BUILD_TESTS` | `ON` standalone, `OFF` as a subdirectory | unit, integration, and backend parity tests |
+| `AUDIOGEN_BUILD_MINIMAX` | `ON` on desktop, unavailable on Android and iOS | MiniMax-Music3 engine; CPU by default, GPU through `EngineOptions::device` |
 | `AUDIOGEN_INSTALL` | `ON` | generate install rules |
 | `AUDIOGEN_USE_SYSTEM_GGML` | `ON` | `find_package(ggml)`; required, there is no supported vendored ggml in this tree |
 | `AUDIOGEN_CCACHE` | `ON` | use ccache when available |
@@ -530,14 +571,24 @@ cmake --build build/audiogen -j
 ctest --test-dir build/audiogen
 ```
 
-`test-acestep-units`, `test-minimax-units`, and `test-minimax-converter` cover
-weight-free CPU logic and need no GGUFs. MiniMax coverage includes metadata
+`test-acestep-units`, `test-acestep-converter`, `test-minimax-units`, and
+`test-minimax-converter` cover weight-free CPU logic and need no GGUFs. MiniMax coverage includes metadata
 compatibility, model-pair selection, Unicode token classes, frame validation,
 prompt assembly, unconditional masking, deterministic noise, flow scheduling,
 condition length, window stitching, sampler edge cases, and converter output
 transactions. Set `AUDIOGEN_TEST_MINIMAX_MODELS_DIR` to a directory containing
 the MiniMax GGUF pair to run `test-minimax-integration`, which covers model
 loading, generation output, progress, and cancellation.
+On a Metal build, `ctest --test-dir build/audiogen -R
+test-minimax-metal-ops` runs the model-free CPU/Metal condition and vocoder
+parity regression. It skips with return code 77 either when Metal is
+unavailable or when the Metal device cannot run `MUL_MAT` — both parity graphs
+are matmul-based, and ggml gates `GGML_OP_MUL_MAT` on simdgroup reduction
+(`MTLGPUFamilyApple7`+), which virtualized GPUs such as the ones on hosted macOS
+CI runners do not report. Meaningful parity coverage therefore needs a
+non-virtualized Apple GPU, which is why the audiogen CI macOS lane runs on the
+self-hosted `qvac-macos26-arm64-gpu` runner and fails rather than passes if the
+test skips there.
 `test-acestep-integration` exercises the ACE-Step public API when model paths
 are supplied and otherwise reports a skipped test.
 
@@ -559,10 +610,14 @@ comparison.
 
 ## Performance
 
-There is no CI benchmark suite for this engine yet. `music-cli` always enables
+There is no CI benchmark lane for this engine yet. `music-cli` always enables
 verbose engine output and prints per-stage wall clock to stderr (`[music-cli]`,
 `[acestep-timing]`). Direct library use prints `[acestep-timing]` only when
 `EngineOptions::verbose` is enabled; it defaults to `false`.
+
+For a reproducible engine-to-engine measurement against upstream
+`acestep.cpp` (`ace-lm` + `ace-synth`, no addon), see
+[`benchmarks/comparison/README.md`](benchmarks/comparison/README.md).
 
 ## License
 

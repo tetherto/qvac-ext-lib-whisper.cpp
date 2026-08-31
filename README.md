@@ -1,4 +1,4 @@
-# qvac-ext-lib-whisper.cpp
+# qvac-fabric-speech.cpp
 
 On-device speech and audio AI in pure C++ on [ggml](https://github.com/tetherto/qvac-ext-ggml): speech-to-text, speaker diarization, end-of-utterance detection, text-to-speech, voice cloning, speech enhancement, and music generation.
 
@@ -116,11 +116,11 @@ Pair any CTC, TDT, or EOU GGUF with a Sortformer GGUF via `--diarization-model` 
 | Supertonic v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming |
 | Supertonic v2 | tts | 5 (`en`, `ko`, `es`, `pt`, `fr`) | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming |
 | Supertonic v3 | tts | 31 + `na` | 44.1 kHz | `f32`, `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | preset voices, streaming, `na` for unknown source language |
-| Parler-TTS mini-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | description-conditioned voice, no cloning |
-| Parler-TTS large-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | description-conditioned voice |
-| Indic Parler-TTS | tts | 21 Indic | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL | Indic prompt BPE tokenizer |
-| Fun-CosyVoice3-0.5B | tts | model-advertised multilingual text | 24 kHz | `f32` | CPU, Metal, Vulkan, OpenCL | Qwen2.5 LM + DiT flow + CausalHiFT; zero-shot/cross-lingual cloning from a reference WAV (native speech_tokenizer_v3 + CAM++); Metal, desktop Vulkan, and OpenCL are the validated GPU paths |
-| Audio8-TTS-Preview-0.6B | tts | multilingual | 44.1 kHz | `f32`, `f16`, `q8_0`; LM also `q4_0` | CPU, Metal, Vulkan, OpenCL | DualAR + DAC codec, zero-shot cloning from reference audio and transcript |
+| Parler-TTS mini-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL, CUDA | description-conditioned voice, no cloning |
+| Parler-TTS large-v1 | tts | English | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL, CUDA | description-conditioned voice |
+| Indic Parler-TTS | tts | 21 Indic | 44.1 kHz | `f32`, `f16`, `q8_0`, `q6_k` | CPU, Metal, Vulkan, OpenCL, CUDA | Indic prompt BPE tokenizer |
+| Fun-CosyVoice3-0.5B | tts | model-advertised multilingual text | 24 kHz | `f32` | CPU, Metal, Vulkan, OpenCL, CUDA | Qwen2.5 LM + DiT flow + CausalHiFT; zero-shot/cross-lingual cloning from a reference WAV (native speech_tokenizer_v3 + CAM++); Metal, desktop Vulkan, desktop CUDA, and OpenCL are the validated GPU paths |
+| Audio8-TTS-Preview-0.6B | tts | multilingual | 44.1 kHz | `f32`, `f16`, `q8_0`; LM also `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA | DualAR + DAC codec, zero-shot cloning from reference audio and transcript |
 
 When a TTS build carries both CUDA and Vulkan, backend selection prefers CUDA
 on NVIDIA hardware; `TTS_CPP_GPU_BACKEND=cuda|vulkan|metal|opencl` pins one
@@ -139,10 +139,10 @@ the [TTS capability table](engines/tts/README.md#capabilities).
 
 | Model | Engine | Task | Rate | Quantization | Backends | Notes |
 |---|---|---|---|---|---|---|
-| ACE-Step v15 turbo | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0`, `q4_k_m` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 8 diffusion steps by default |
-| ACE-Step v15 sft | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 50 diffusion steps by default, CFG via APG |
-| ACE-Step v15 base | audiogen | text-to-music, multi-track (lego) stems | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal, OpenCL (Adreno 700+) | 50 diffusion steps by default, CFG via APG, `--task lego --track <layer>` |
-| MiniMax-Music3 | audiogen | text-to-music | 44.1 kHz stereo | `f16`, `q8_0` | desktop CPU + GPU (CUDA, Vulkan, Metal via `EngineOptions::device`) | 25 fps, 30 flow steps, two GGUF files |
+| ACE-Step v15 turbo | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0`, `q4_k_m` | CPU, Vulkan, Metal, OpenCL (Adreno 700+), CUDA | 8 diffusion steps by default |
+| ACE-Step v15 sft | audiogen | text-to-music | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal, OpenCL (Adreno 700+), CUDA | 50 diffusion steps by default |
+| ACE-Step v15 base | audiogen | text-to-music, multi-track (lego) stems | 48 kHz stereo | `f32`, `f16`, `bf16`, `q8_0` | CPU, Vulkan, Metal, OpenCL (Adreno 700+), CUDA | 50 diffusion steps by default, `--task lego --track <layer>` |
+| MiniMax-Music3 | audiogen | text-to-music | 44.1 kHz stereo | `f16`, `q8_0` | desktop CPU + GPU (CUDA, Vulkan, Metal via `EngineOptions::device`) | 25 fps, 30 flow steps, two GGUF files; `test-minimax-metal-ops` checks Metal condition/vocoder parity on an Apple7+ GPU |
 
 ## Build
 
@@ -179,7 +179,7 @@ tests link an object library so they still see hidden internals. Consumers keep
 | `SPEECH_BUILD_TESTS` | `OFF` | build the engine test harnesses |
 | `SPEECH_BUILD_WHISPER_TESTS` | `OFF` | also build whisper's tests (transcription tests need downloaded models) |
 
-GPU backends come from the ggml build: `-DGGML_VULKAN=ON`, `-DGGML_OPENCL=ON`, `-DGGML_CUDA=ON`; Metal is on by default on Apple. Core ML is gated per engine and defaults to off on both, so add `-DWHISPER_COREML=ON -DPARAKEET_COREML=ON` on Apple for the Whisper encoder and Parakeet offline TDT encoder sidecars. For tests, configure with `-DSPEECH_BUILD_TESTS=ON`, then run the non-GPU suite with `ctest --test-dir build -LE 'gpu|perf'`.
+GPU backends come from the ggml build: `-DGGML_VULKAN=ON`, `-DGGML_OPENCL=ON`, `-DGGML_CUDA=ON`; Metal is on by default on Apple. Core ML is gated per engine and defaults to off on both, so add `-DWHISPER_COREML=ON -DPARAKEET_COREML=ON` on Apple for the Whisper encoder and Parakeet offline TDT encoder sidecars. For tests, configure with `-DSPEECH_BUILD_TESTS=ON`, then run the non-GPU suite with `ctest --test-dir build -LE 'gpu|perf'`. A Metal build also exposes `test-minimax-metal-ops`, the model-free AudioGen CPU/Metal parity regression; it skips unless the Metal device supports `MUL_MAT` (simdgroup reduction, `MTLGPUFamilyApple7`+), which rules out the virtualized GPUs on hosted macOS runners.
 
 Each engine also configures standalone (`cmake -S engines/parakeet`, and so on), which is what the CI lanes use.
 
@@ -210,6 +210,8 @@ The per-engine `whisper-cpp`, `parakeet-cpp`, `tts-cpp` and `audiogen-cpp` ports
 | `audio8-cli` | tts | Audio8 synthesis and zero-shot voice cloning |
 | `music-cli` | audiogen | end-to-end text-to-music |
 | `acestep-cli` | audiogen | Oobleck VAE decode and roundtrip harness |
+| `acestep-quantize` | audiogen | requantize converted ACE-Step stage GGUFs |
+| `mm3-replay` | audiogen | MiniMax-Music3 generation and parity harness |
 | `lavasr-bench` | tts | denoiser and enhancer benchmark |
 | `mel2wav` | tts | HiFT mel to wav |
 
@@ -223,7 +225,10 @@ The per-engine `whisper-cpp`, `parakeet-cpp`, `tts-cpp` and `audiogen-cpp` ports
 
 ### Parakeet
 
-Models are converted from NeMo checkpoints with `download-all-models.sh` and `convert-nemo-to-gguf.py`; see [engines/parakeet/README.md](engines/parakeet/README.md).
+Models are converted from NeMo checkpoints with `download-all-models.sh` and
+`convert-nemo-to-gguf.py`. The downloader covers every supported checkpoint,
+including the AI4Bharat IndicConformer hybrid; see
+[engines/parakeet/README.md](engines/parakeet/README.md).
 
 ```sh
 # transcribe (the GGUF metadata selects CTC / TDT / EOU)
@@ -298,8 +303,9 @@ See [Voice conditioning](engines/tts/README.md#voice-conditioning-cross-engine).
 
 AudioGen uses four GGUF files for six runtime weight sets. The DiT file also
 contains the FSQ detokenizer and condition encoder; see the
-[AudioGen model setup](engines/audiogen/README.md#model-setup) for validated
-file combinations and registry download instructions.
+[AudioGen model setup](engines/audiogen/README.md#model-setup) for the
+validated file combinations and the download, conversion, and quantization
+steps that produce them.
 
 ```sh
 ./build/engines/audiogen/music-cli --models models/acestep \
@@ -309,36 +315,58 @@ file combinations and registry download instructions.
 
 ## Performance
 
-`RTF = inference_time / audio_duration`, lower is better. The parakeet and tts READMEs carry the full tables, methodology, and reproduction steps; audiogen has no benchmark suite yet and reports per-stage wall clock on stderr.
+`RTF = inference_time / audio_duration`, lower is better. The parakeet and tts
+READMEs carry their full tables, methodology, and reproduction steps. AudioGen
+has a reproducible
+[engine comparison harness](engines/audiogen/benchmarks/comparison/README.md)
+for CPU, Metal, Vulkan, and CUDA; `music-cli` also reports per-stage wall clock
+on stderr.
 
 ### ASR, end-of-utterance, diarization
 
-CI numbers, `q8_0` GGUFs, 1 warmup plus 5 timed runs, host `qvac-ubuntu2204-x64-gpu` (CPU: Intel Core i5-13500, GPU: NVIDIA RTX 4000 SFF Ada, Vulkan). Full table: [engines/parakeet/README.md](engines/parakeet/README.md#ci-benchmarks-latest-ggml-speech-linux-x86-64).
+CI numbers from the published `@qvac/asr-ggml@0.1.1` addon ([run 31603189415](https://github.com/tetherto/qvac/actions/runs/31603189415), 2026-08-12), `q8_0` GGUFs, 1 warmup plus 5 timed runs, host `qvac-ubuntu2204-x64-gpu` (CPU: Intel Core i5-13500, GPU: NVIDIA RTX 4000 SFF Ada, Vulkan). Full table: [engines/parakeet/README.md](engines/parakeet/README.md#performance).
 
 | Model | CPU RTF | CPU wall | Vulkan RTF | Vulkan wall |
 |---|--:|--:|--:|--:|
-| Parakeet CTC | 0.078 | 1572 ms | 0.0023 | 47 ms |
-| Parakeet TDT | 0.083 | 1670 ms | 0.0035 | 71 ms |
-| Parakeet EOU | 0.030 | 607 ms | 0.0052 | 105 ms |
-| Sortformer | 0.025 | 508 ms | 0.0020 | 40 ms |
+| Parakeet CTC | 0.112 | 2256 ms | 0.0022 | 43 ms |
+| Parakeet TDT | 0.130 | 2607 ms | 0.0044 | 88 ms |
+| Parakeet EOU | 0.051 | 1034 ms | 0.0034 | 68 ms |
+| Sortformer | 0.046 | 922 ms | 0.0019 | 38 ms |
+| Sortformer streaming | 0.032 | 646 ms | 0.0034 | 69 ms |
+| Whisper base | 0.035 | 699 ms | 0.0057 | 117 ms |
+| Whisper small | 0.122 | 2453 ms | 0.0098 | 200 ms |
 
 ### Text-to-speech
 
-CI numbers, `q4_0` GGUFs, same host. Full table: [engines/tts/README.md](engines/tts/README.md#performance).
+CI numbers from the published `@qvac/tts-ggml@0.6.2` addon ([run 31603192731](https://github.com/tetherto/qvac/actions/runs/31603192731), 2026-08-12), `q4_0` GGUFs, same host. Full table: [engines/tts/README.md](engines/tts/README.md#performance).
 
 | Model | CPU RTF | Vulkan RTF | Vulkan wall | Vulkan tok/s |
 |---|--:|--:|--:|--:|
-| Chatterbox Turbo | 1.34 | 0.090 | 368 ms | 186 |
-| Chatterbox Multilingual | 4.31 | 0.189 | 1097 ms | 73 |
-| Supertonic | 0.079 | n/a | n/a | n/a |
+| Chatterbox Turbo | 1.54 | 0.099 | 410 ms | 173 |
+| Chatterbox Multilingual | 5.81 | 0.182 | 1036 ms | 77 |
+| Supertonic | 0.113 | 0.018 | 78 ms | 952 |
+| Supertonic Multilingual | 0.101 | 0.013 | 84 ms | 1087 |
+| Supertonic 3 | 0.225 | 0.029 | 118 ms | 631 |
 
-That CI run has no Supertonic GPU lane, so its Vulkan columns are unrecorded rather than unsupported.
+### Brain-computer interface
+
+CI numbers from the published `@qvac/bci-whispercpp@0.6.0` addon ([run 31602627344](https://github.com/tetherto/qvac/actions/runs/31602627344), 2026-08-12), `ggml-bci-windowed` model. Throughput in tokens/s, higher is better.
+
+| Host | CPU tok/s | Vulkan tok/s | Vulkan wall |
+|---|--:|--:|--:|
+| Linux x86-64 (i5-13500 / RTX 4000 SFF Ada) | 27.0 | 355.6 | 42 ms |
+| Windows x64 (`qvac-win25-x64-gpu`) | 20.1 | 36.0 | 349 ms |
+| Linux arm64 (`ubuntu-24.04-arm`, CPU-only lane) | 16.8 | n/a | n/a |
+
+The macOS arm64 lane runs on the GitHub-hosted `macos-26` runner, whose virtualised Metal device is not representative (6.6 tok/s vs 398 tok/s on the previously used self-hosted M-series box), so it is omitted here.
 
 ### Apple silicon
 
 | Model | Host | Backend | Quantization | RTF | vs real-time |
 |---|---|---|---|--:|--:|
-| Parakeet TDT 0.6b v3 | Apple silicon, host not recorded | Metal | `q8_0` | 0.006 | 160x |
+| Parakeet TDT 0.6b v3 | Mac mini M4 (CI, `mac-mini-m4-gpu`) | Metal | `q8_0` | 0.015 | 67x |
+| Parakeet CTC | Mac mini M4 (CI, `mac-mini-m4-gpu`) | Metal | `q8_0` | 0.011 | 88x |
+| Whisper small | Mac mini M4 (CI, `mac-mini-m4-gpu`) | Metal | `q8_0` | 0.027 | 37x |
 | Chatterbox Turbo | Mac Studio M3 Ultra | Metal | `q4_0` | 0.16 | 6.4x |
 | Chatterbox Turbo | Mac Studio M3 Ultra | CPU (NEON) | `q4_0` | 1.05 | 0.96x |
 | Chatterbox Multilingual (`--cfm-steps 7`) | Mac Studio M3 Ultra | Metal | `q4_0` | 0.30 | 3.3x |
@@ -358,7 +386,7 @@ On-device Android and iOS performance is tracked by the benchmark lanes in [QVAC
 
 ## Use in QVAC
 
-These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons, which consume the `speech-cpp` vcpkg port built from this repo. The CLIs here are development and validation entry points: for anything beyond them, such as the JavaScript and TypeScript APIs on the Bare runtime, model download and registry, and desktop plus mobile app integration, see QVAC.
+These engines ship inside [QVAC](https://github.com/tetherto/qvac) as SDK addons, which consume the `speech-cpp` vcpkg port built from this repo. The CLIs here are development and validation entry points: for anything beyond them, such as the JavaScript and TypeScript APIs on the Bare runtime and desktop plus mobile app integration, see QVAC.
 
 | QVAC addon | Wraps | `speech-cpp` features consumed |
 |---|---|---|

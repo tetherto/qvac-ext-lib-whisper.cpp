@@ -650,6 +650,13 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "--model" "${_qvp_eou_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_eou_q8_gguf}" "${_qvp_jfk_wav}")
 
+    # Model-independent finalization state regression. This runs on every
+    # checkout even when the streaming Sortformer v2.1 fixture is not staged.
+    add_executable(test-sortformer-finalize test/test_sortformer_finalize.cpp)
+    target_include_directories(test-sortformer-finalize PRIVATE src)
+    parakeet_apply_ccache(test-sortformer-finalize)
+    parakeet_register_test(test-sortformer-finalize LABEL "unit")
+
     add_executable(test-sortformer-streaming test/test_sortformer_streaming.cpp)
     target_link_libraries(test-sortformer-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-sortformer-streaming PRIVATE include src ggml/include)
@@ -740,6 +747,15 @@ if (PARAKEET_BUILD_TESTS)
             COMMAND ${Python3_EXECUTABLE}
                     "${CMAKE_CURRENT_SOURCE_DIR}/test/test_convert_nemo_to_gguf.py")
         set_property(TEST test-converter-rnnt PROPERTY LABELS unit)
+    endif()
+
+    find_program(PARAKEET_BASH_EXECUTABLE bash)
+    if (PARAKEET_BASH_EXECUTABLE)
+        add_test(
+            NAME test-download-all-models
+            COMMAND ${PARAKEET_BASH_EXECUTABLE}
+                    "${CMAKE_CURRENT_SOURCE_DIR}/test/test_download_all_models.sh")
+        set_property(TEST test-download-all-models PROPERTY LABELS unit)
     endif()
 
     # Regression gate for the round-1 capture_intermediates flag.

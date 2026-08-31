@@ -487,6 +487,48 @@ void run_lego_base_lane() {
     fs::remove_all(dump_dir);
 }
 
+// Runs the autoregressive LM for real (phase-2 code generation) twice with one
+// seed: covers the LM decode graph reuse paths and pins cross-run determinism.
+void run_lm_generation_scenario(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir) {
+    using namespace tts_cpp::acestep;
+
+    GenerateParams params;
+    params.caption         = "integration lm scenario";
+    params.lyrics          = "[Instrumental]";
+    params.duration        = 1.0f;
+    params.inference_steps = TEST_STEPS;
+    params.shift           = TEST_SHIFT;
+    params.seed            = TEST_SEED;
+    params.lm_phase1       = false;
+
+    StageLog first_stages;
+    const GenerateResult first = generate_with_stage_log(engine, params, first_stages);
+    CHECK(!first.pcm.empty());
+    CHECK(first.metadata.n_codes > 0);
+    CHECK(first_stages.contains(TEST_LM_STAGE));
+    const TensorDump first_codes = read_tensor_dump(dump_dir / "01_lm_codes.bin");
+    CHECK(!first_codes.values.empty());
+
+    StageLog second_stages;
+    const GenerateResult second = generate_with_stage_log(engine, params, second_stages);
+    const TensorDump second_codes = read_tensor_dump(dump_dir / "01_lm_codes.bin");
+    CHECK(vectors_match(first_codes.values, second_codes.values));
+    CHECK(second.pcm == first.pcm);
+}
+
+void run_cover_strength_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+    GenerateParams params = make_generate_params();
+    params.audio_cover_strength = 0.5f;
+    params.cover_noise_strength = 0.0f;
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(result.sample_rate == TEST_SAMPLE_RATE);
+    CHECK(stages.contains("source"));
+    CHECK(!stages.contains(TEST_LM_STAGE));
+}
+
 int run_integration(const char * models_dir) {
     using namespace tts_cpp::acestep;
 
@@ -508,9 +550,11 @@ int run_integration(const char * models_dir) {
         CHECK(stages.contains("reference"));
         CHECK(!stages.contains("lm"));
         verify_stage_dumps(dump_dir);
+        run_cover_strength_scenario(*engine);
         run_edit_scenarios(*engine, dump_dir);
         run_lego_scenario(*engine, dump_dir);
         run_lego_base_lane();
+        run_lm_generation_scenario(*engine, dump_dir);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "FAIL integration exception: %s\n", error.what());
         ++failures;

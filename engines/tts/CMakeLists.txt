@@ -18,7 +18,7 @@ option(TTS_CPP_BUILD_SHARED      "tts-cpp: build tts-cpp as a SHARED library (ot
 option(TTS_CPP_BUILD_EXECUTABLES "tts-cpp: build tts-cli, mel2wav, CosyVoice, Supertonic, Parler, LavaSR, and Audio8 command-line tools" ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_BUILD_TESTS       "tts-cpp: build per-stage numerical validation harnesses"   ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_INSTALL           "tts-cpp: generate install rules"                           ON)
-option(TTS_CPP_USE_SYSTEM_GGML   "tts-cpp: use find_package(ggml) instead of add_subdirectory(ggml). Defaults to ON for qvac-ext-lib-whisper.cpp and vcpkg builds. OFF requires a manually staged engines/tts/ggml checkout of qvac-ext-ggml@speech; this tree has no setup-ggml.sh or patches overlay." ON)
+option(TTS_CPP_USE_SYSTEM_GGML   "tts-cpp: use find_package(ggml) instead of add_subdirectory(ggml). Defaults to ON for qvac-fabric-speech.cpp and vcpkg builds. OFF requires a manually staged engines/tts/ggml checkout of qvac-ext-ggml@speech; this tree has no setup-ggml.sh or patches overlay." ON)
 # Note: the standalone chatterbox.cpp repo carries a TTS_CPP_GGML_LIB_PREFIX
 # option here that controls renaming of bundled libggml-*.so to
 # libspeech-ggml-*.so when add_subdirectory(ggml) builds it locally. This
@@ -197,26 +197,34 @@ foreach(_tts_ggml_backend metal vulkan cuda opencl)
         set(TTS_CPP_GGML_${_tts_ggml_backend_uc} TRUE)
     endif()
 endforeach()
-# Parler allowlist: Metal / Vulkan / OpenCL (parler/gguf.cpp).
+# Parler allowlist: Metal / Vulkan / OpenCL / CUDA (parler/gguf.cpp).
 set(TTS_CPP_PARLER_GPU FALSE)
-if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_VULKAN OR TTS_CPP_GGML_OPENCL)
+if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_VULKAN OR TTS_CPP_GGML_OPENCL OR
+    TTS_CPP_GGML_CUDA)
     set(TTS_CPP_PARLER_GPU TRUE)
 endif()
-# CosyVoice3 allowlist: Metal / OpenCL everywhere, Vulkan on Windows and
-# non-Android Linux only (cosyvoice_gpu_requirement() in
+# CosyVoice3 allowlist: Metal / OpenCL everywhere, Vulkan and CUDA on
+# Windows and non-Android Linux only (cosyvoice_gpu_requirement() in
 # cosyvoice_pipeline.h -- keep the two conditions in lockstep). The
 # platform guard mirrors the runtime split: a build whose only GPU
 # backend the runtime requirement would refuse (Android or Apple
 # Vulkan-only) must not register gpu test variants that would hard-fail
 # instead of skipping.
 set(TTS_CPP_COSYVOICE_GPU FALSE)
-set(_tts_cosy_vulkan_platform FALSE)
+set(_tts_cosy_desktop_platform FALSE)
 if (WIN32 OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
-    set(_tts_cosy_vulkan_platform TRUE)
+    set(_tts_cosy_desktop_platform TRUE)
 endif()
 if (TTS_CPP_GGML_METAL OR TTS_CPP_GGML_OPENCL OR
-    (TTS_CPP_GGML_VULKAN AND _tts_cosy_vulkan_platform))
+    ((TTS_CPP_GGML_VULKAN OR TTS_CPP_GGML_CUDA) AND _tts_cosy_desktop_platform))
     set(TTS_CPP_COSYVOICE_GPU TRUE)
+endif()
+set(_tcb_cosy_arms "")
+if (TTS_CPP_GGML_CUDA AND _tts_cosy_desktop_platform)
+    list(APPEND _tcb_cosy_arms cuda)
+endif()
+if (TTS_CPP_GGML_VULKAN AND _tts_cosy_desktop_platform)
+    list(APPEND _tcb_cosy_arms vulkan)
 endif()
 
 # The standalone chatterbox.cpp source carries a bundled-ggml filename-prefix
@@ -718,6 +726,18 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "--flow-gguf" "${_tcb_cosy_flow_gguf}" "--in-dir" "${_tcb_cosy_ref}"
             REQUIRES "${_tcb_cosy_flow_gguf}" "${_tcb_cosy_ref}/flow_mel.npy")
         set_property(TEST test-cosyvoice-flow-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        # Per-backend pins of the same harness, so a host carrying several GPU
+        # backends covers each by name; TTS_CPP_GPU_BACKEND fails loud when the
+        # named backend is absent, so an arm cannot pass on the CPU.
+        foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+            tts_cpp_register_test(test-cosyvoice-flow-${_tcb_cosy_arm}
+                EXE      test-cosyvoice-flow
+                LABEL    "gpu"
+                ARGS     "--flow-gguf" "${_tcb_cosy_flow_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+                REQUIRES "${_tcb_cosy_flow_gguf}" "${_tcb_cosy_ref}/flow_mel.npy")
+            set_property(TEST test-cosyvoice-flow-${_tcb_cosy_arm} APPEND PROPERTY ENVIRONMENT
+                         "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+        endforeach()
     endif()
 
     add_executable(test-cosyvoice-llm test/test_cosyvoice_llm.cpp ${_tcb_cosy_core_srcs})
@@ -736,6 +756,18 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "--llm-gguf" "${_tcb_cosy_llm_gguf}" "--in-dir" "${_tcb_cosy_ref}"
             REQUIRES "${_tcb_cosy_llm_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
         set_property(TEST test-cosyvoice-llm-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        # Per-backend pins of the same harness, so a host carrying several GPU
+        # backends covers each by name; TTS_CPP_GPU_BACKEND fails loud when the
+        # named backend is absent, so an arm cannot pass on the CPU.
+        foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+            tts_cpp_register_test(test-cosyvoice-llm-${_tcb_cosy_arm}
+                EXE      test-cosyvoice-llm
+                LABEL    "gpu"
+                ARGS     "--llm-gguf" "${_tcb_cosy_llm_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+                REQUIRES "${_tcb_cosy_llm_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
+            set_property(TEST test-cosyvoice-llm-${_tcb_cosy_arm} APPEND PROPERTY ENVIRONMENT
+                         "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+        endforeach()
         # Quantized-weight variants: mul_mat_f32acc specifically changes the
         # f16/quantized accumulation paths (ggml-vulkan reduces those in f16
         # under PREC_DEFAULT), which the f32 fixture cannot exercise. Same
@@ -750,6 +782,15 @@ if (TTS_CPP_BUILD_TESTS)
                 ARGS     "--llm-gguf" "${_tcb_cosy_llm_quant_gguf}" "--in-dir" "${_tcb_cosy_ref}"
                 REQUIRES "${_tcb_cosy_llm_quant_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
             set_property(TEST test-cosyvoice-llm-gpu-${_tcb_cosy_quant} APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+            foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+                tts_cpp_register_test(test-cosyvoice-llm-${_tcb_cosy_arm}-${_tcb_cosy_quant}
+                    EXE      test-cosyvoice-llm
+                    LABEL    "gpu"
+                    ARGS     "--llm-gguf" "${_tcb_cosy_llm_quant_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+                    REQUIRES "${_tcb_cosy_llm_quant_gguf}" "${_tcb_cosy_ref}/gen_tokens.npy")
+                set_property(TEST test-cosyvoice-llm-${_tcb_cosy_arm}-${_tcb_cosy_quant} APPEND PROPERTY ENVIRONMENT
+                             "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+            endforeach()
         endforeach()
     endif()
 
@@ -769,6 +810,18 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "--hift-gguf" "${_tcb_cosy_hift_gguf}" "--in-dir" "${_tcb_cosy_ref}"
             REQUIRES "${_tcb_cosy_hift_gguf}" "${_tcb_cosy_ref}/hift_wav.npy")
         set_property(TEST test-cosyvoice-hift-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        # Per-backend pins of the same harness, so a host carrying several GPU
+        # backends covers each by name; TTS_CPP_GPU_BACKEND fails loud when the
+        # named backend is absent, so an arm cannot pass on the CPU.
+        foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+            tts_cpp_register_test(test-cosyvoice-hift-${_tcb_cosy_arm}
+                EXE      test-cosyvoice-hift
+                LABEL    "gpu"
+                ARGS     "--hift-gguf" "${_tcb_cosy_hift_gguf}" "--in-dir" "${_tcb_cosy_ref}"
+                REQUIRES "${_tcb_cosy_hift_gguf}" "${_tcb_cosy_ref}/hift_wav.npy")
+            set_property(TEST test-cosyvoice-hift-${_tcb_cosy_arm} APPEND PROPERTY ENVIRONMENT
+                         "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+        endforeach()
     endif()
 
     # ---- speech_tokenizer_v3 (CosyVoice3 zero-shot cloning front-end) -----
@@ -812,6 +865,15 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--in-dir" "${_tcb_cosy_s3tok_ref}"
             REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
         set_property(TEST test-s3tokenizer-v3-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+            tts_cpp_register_test(test-s3tokenizer-v3-${_tcb_cosy_arm}
+                EXE      test-s3tokenizer-v3
+                LABEL    "gpu"
+                ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--in-dir" "${_tcb_cosy_s3tok_ref}"
+                REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
+            set_property(TEST test-s3tokenizer-v3-${_tcb_cosy_arm} APPEND PROPERTY ENVIRONMENT
+                         "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+        endforeach()
         set(_tcb_cosy_s3tok_q8_gguf "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-s3tok-q8_0.gguf")
         tts_cpp_register_test(test-s3tokenizer-v3-gpu-q8_0
             EXE      test-s3tokenizer-v3
@@ -819,6 +881,15 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_q8_gguf}" "--in-dir" "${_tcb_cosy_s3tok_ref}" "--min-token-match" "0.93"
             REQUIRES "${_tcb_cosy_s3tok_q8_gguf}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
         set_property(TEST test-s3tokenizer-v3-gpu-q8_0 APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+            tts_cpp_register_test(test-s3tokenizer-v3-${_tcb_cosy_arm}-q8_0
+                EXE      test-s3tokenizer-v3
+                LABEL    "gpu"
+                ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_q8_gguf}" "--in-dir" "${_tcb_cosy_s3tok_ref}" "--min-token-match" "0.93"
+                REQUIRES "${_tcb_cosy_s3tok_q8_gguf}" "${_tcb_cosy_s3tok_ref}/tokens.npy")
+            set_property(TEST test-s3tokenizer-v3-${_tcb_cosy_arm}-q8_0 APPEND PROPERTY ENVIRONMENT
+                         "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+        endforeach()
     endif()
 
     # ---- CosyVoice3 cloning front-end round-trip -------------------------
@@ -864,6 +935,17 @@ if (TTS_CPP_BUILD_TESTS)
             REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
                      "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/prompt_stok.npy")
         set_property(TEST test-cosyvoice-frontend-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+            tts_cpp_register_test(test-cosyvoice-frontend-${_tcb_cosy_arm}
+                EXE      test-cosyvoice-frontend
+                LABEL    "gpu"
+                ARGS     "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--campplus-gguf" "${_tcb_cosy_campplus_gguf}"
+                         "--wav" "${_tcb_cosy_prompt_wav}" "--in-dir" "${_tcb_cosy_ref}"
+                REQUIRES "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                         "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/prompt_stok.npy")
+            set_property(TEST test-cosyvoice-frontend-${_tcb_cosy_arm} APPEND PROPERTY ENVIRONMENT
+                         "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+        endforeach()
     endif()
 
     # Thread-safety guard for the shared mel/fbank extraction (concurrent
@@ -962,6 +1044,19 @@ if (TTS_CPP_BUILD_TESTS)
                      "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
                      "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/gen_tokens.npy")
         set_property(TEST test-cosyvoice-clone-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+            tts_cpp_register_test(test-cosyvoice-clone-${_tcb_cosy_arm}
+                EXE      test-cosyvoice-clone
+                LABEL    "gpu"
+                ARGS     "--model-dir" "${TTS_CPP_TEST_MODEL_DIR}" "--wav" "${_tcb_cosy_prompt_wav}"
+                         "--tokens-npy" "${_tcb_cosy_ref}/gen_tokens.npy" "--s3tok-gguf" "${_tcb_cosy_s3tok_f32}" "--campplus-gguf" "${_tcb_cosy_campplus_gguf}"
+                REQUIRES "${TTS_CPP_TEST_MODEL_DIR}/cosyvoice3-llm-f32.gguf"
+                         "${TTS_CPP_TEST_MODEL_DIR}/voice.gguf"
+                         "${_tcb_cosy_s3tok_f32}" "${_tcb_cosy_campplus_gguf}"
+                         "${_tcb_cosy_prompt_wav}" "${_tcb_cosy_ref}/gen_tokens.npy")
+            set_property(TEST test-cosyvoice-clone-${_tcb_cosy_arm} APPEND PROPERTY ENVIRONMENT
+                         "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+        endforeach()
     endif()
 
     # Deviceless policy test for GpuBackendRequirement filtering (the per-device
@@ -988,6 +1083,16 @@ if (TTS_CPP_BUILD_TESTS)
             EXE   test-cosyvoice-conv1d
             LABEL "gpu")
         set_property(TEST test-cosyvoice-conv1d-gpu APPEND PROPERTY ENVIRONMENT "COSYVOICE_TEST_GPU=1")
+        # Per-backend pins of the same harness, so a host carrying several GPU
+        # backends covers each by name; TTS_CPP_GPU_BACKEND fails loud when the
+        # named backend is absent, so an arm cannot pass on the CPU.
+        foreach(_tcb_cosy_arm IN LISTS _tcb_cosy_arms)
+            tts_cpp_register_test(test-cosyvoice-conv1d-${_tcb_cosy_arm}
+                EXE   test-cosyvoice-conv1d
+                LABEL "gpu")
+            set_property(TEST test-cosyvoice-conv1d-${_tcb_cosy_arm} APPEND PROPERTY ENVIRONMENT
+                         "COSYVOICE_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${_tcb_cosy_arm}")
+        endforeach()
     endif()
 
     # Map-in-place loader: byte-exact round-trip + clean failure on a truncated
@@ -1126,11 +1231,15 @@ if (TTS_CPP_BUILD_TESTS)
                      "${_tcb_audio8_ref_wav}")
         set_property(TEST test-audio8-lm-${suffix} test-audio8-codec-${suffix}
                           test-audio8-engine-${suffix} APPEND
-                     PROPERTY ENVIRONMENT "AUDIO8_TEST_GPU=${suffix}")
+                     PROPERTY ENVIRONMENT "AUDIO8_TEST_GPU=${suffix}"
+                                          "TTS_CPP_GPU_BACKEND=${suffix}")
     endfunction()
 
-    # Audio8 allowlist: Vulkan / Metal / OpenCL (audio8/gguf.cpp
-    # GpuBackendRequirement::Vulkan | Metal | OpenCL).
+    # Audio8 allowlist: Vulkan / Metal / OpenCL / CUDA (audio8/gguf.cpp
+    # GpuBackendRequirement::Vulkan | Metal | OpenCL | CUDA).
+    if (TTS_CPP_GGML_CUDA)
+        tts_cpp_register_audio8_gpu_tests(cuda)
+    endif()
     if (TTS_CPP_GGML_VULKAN)
         tts_cpp_register_audio8_gpu_tests(vulkan)
         if (TARGET audio8-cli)
@@ -1145,6 +1254,8 @@ if (TTS_CPP_BUILD_TESTS)
                            "--out" "${CMAKE_CURRENT_BINARY_DIR}/audio8-vulkan-q8_0.wav"
                 PASS_REGEX "on Vulkan"
                 REQUIRES   "${_tcb_audio8_lm_q8}" "${_tcb_audio8_decoder_q8}")
+            set_property(TEST test-audio8-cli-vulkan-q8_0 APPEND PROPERTY ENVIRONMENT
+                         "TTS_CPP_GPU_BACKEND=vulkan")
         endif()
     endif()
     if (TTS_CPP_GGML_METAL)
@@ -1322,6 +1433,24 @@ if (TTS_CPP_BUILD_TESTS)
             ARGS     "${_tcb_parler_gguf}" "${_tcb_parler_ref}"
             REQUIRES "${_tcb_parler_gguf}" "${_tcb_parler_ref}/dacrand_wav.npy")
         set_property(TEST test-parler-dac-gpu APPEND PROPERTY ENVIRONMENT "PARLER_TEST_GPU=1")
+        # Per-backend pins of the same harness, so a host carrying several GPU
+        # backends covers each by name; TTS_CPP_GPU_BACKEND fails loud when
+        # the named backend is absent, so an arm cannot pass on the CPU.
+        function(tts_cpp_register_parler_dac_arm suffix)
+            tts_cpp_register_test(test-parler-dac-${suffix}
+                EXE      test-parler-dac
+                LABEL    "gpu"
+                ARGS     "${_tcb_parler_gguf}" "${_tcb_parler_ref}"
+                REQUIRES "${_tcb_parler_gguf}" "${_tcb_parler_ref}/dacrand_wav.npy")
+            set_property(TEST test-parler-dac-${suffix} APPEND PROPERTY ENVIRONMENT
+                         "PARLER_TEST_GPU=1" "TTS_CPP_GPU_BACKEND=${suffix}")
+        endfunction()
+        if (TTS_CPP_GGML_CUDA)
+            tts_cpp_register_parler_dac_arm(cuda)
+        endif()
+        if (TTS_CPP_GGML_VULKAN)
+            tts_cpp_register_parler_dac_arm(vulkan)
+        endif()
     endif()
 
     add_executable(test-parler-e2e test/parler/test_e2e.cpp

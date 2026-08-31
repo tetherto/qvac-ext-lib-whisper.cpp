@@ -21,6 +21,10 @@ inline int g_backend_threads = 1;
 inline std::string g_backend_modules_dir;
 inline std::string g_backend_device = "cpu";
 
+// Set by backend_init on the one shared acquisition; read back through
+// Engine::gpu_fallback_reason().
+inline tts_cpp::GpuFallbackReason g_backend_gpu_fallback_reason = tts_cpp::GpuFallbackReason::not_requested;
+
 static void backend_configure_cpu(int n_threads, const std::string & modules_dir) {
     const int requested_threads = n_threads > 0 ? n_threads : 1;
     if (!tts_cpp::minimax::detail::backend_configuration_matches(
@@ -105,7 +109,7 @@ static BackendPair backend_init(const char * tag) {
         throw std::runtime_error("minimax engine: CPU backend initialization failed");
     }
     if (g_backend_device == "gpu" || g_backend_device == "auto") {
-        if (ggml_backend_t gpu = tts_cpp::acestep::backend_gpu_init()) {
+        if (ggml_backend_t gpu = tts_cpp::acestep::backend_gpu_init(&g_backend_gpu_fallback_reason)) {
             pair.backend = gpu;
             pair.has_gpu = true;
             fprintf(stderr, "[%s] Using GPU backend %s (%s); CPU handles unsupported ops\n", tag,
@@ -113,13 +117,17 @@ static BackendPair backend_init(const char * tag) {
         } else if (g_backend_device == "gpu") {
             // An explicit GPU request must not silently degrade into a run that
             // is orders of magnitude slower; only device=auto may fall back.
+            const char * reason = tts_cpp::gpu_fallback_reason_name(g_backend_gpu_fallback_reason);
             ggml_backend_free(pair.cpu_backend);
             throw std::runtime_error(
-                "minimax engine: device=gpu but no usable GPU backend was found; "
-                "use device=auto for CPU fallback");
+                std::string("minimax engine: device=gpu but no usable GPU backend was found (") + reason +
+                "); use device=auto for CPU fallback");
         } else {
-            fprintf(stderr, "[%s] device=auto found no usable GPU backend; using CPU\n", tag);
+            fprintf(stderr, "[%s] device=auto found no usable GPU backend (%s); using CPU\n", tag,
+                    tts_cpp::gpu_fallback_reason_name(g_backend_gpu_fallback_reason));
         }
+    } else {
+        g_backend_gpu_fallback_reason = tts_cpp::GpuFallbackReason::not_requested;
     }
     g_backend_cache = pair;
     g_backend_refs = 1;

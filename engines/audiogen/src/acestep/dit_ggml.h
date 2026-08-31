@@ -81,6 +81,10 @@ struct DitForwardInputs {
     // Attention masks (F16), row-major [KV, Q, 1, N]; null = unmasked.
     const void * sa_mask_sw = nullptr;  // [S, S, 1, N] self-attn sliding window
     const void * ca_mask    = nullptr;  // [enc_S, S, 1, N] cross-attn encoder padding
+
+    // false = enc_hidden/positions/masks are unchanged since the previous call
+    // on this model, so their uploads are skipped (their graph slots persist).
+    bool constants_dirty = true;
 };
 
 // Run one forward pass. Writes velocity [out_channels, T, N] (channel-major per
@@ -129,6 +133,17 @@ struct DitSampleParams {
     float         repaint_injection_ratio = DIT_REPAINT_DISABLED_RATIO;
     int           repaint_crossfade_frames = DIT_REPAINT_DISABLED_CROSSFADE;
     bool          repaint_preserve_latent = false;
+
+    // Cover conditioning switch (audio_cover_strength < 1): from step
+    // `cover_switch_step` on, the context channels swap to `context_switch`
+    // (silence) and the encoder states swap to `enc_hidden_switch` (the
+    // text2music-instruction encoding, zero-padded to enc_S rows;
+    // `real_enc_S_switch` carries its true per-batch lengths for the
+    // cross-attention mask). -1 disables the switch.
+    const float * context_switch    = nullptr;  // [in_channels-out_channels, T, N]
+    const float * enc_hidden_switch = nullptr;  // [H_enc, enc_S, N]
+    const int *   real_enc_S_switch = nullptr;  // [N]
+    int           cover_switch_step = -1;
 
     // Optional per-step progress hook, fired at the start of each Euler step
     // with (step, num_steps). Return false to request cancellation (the sampler

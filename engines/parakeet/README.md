@@ -282,8 +282,18 @@ Recorded CTC 0.6B quantization results on an M4 Air CPU:
 | q5_0 | 453 MiB | 1475 ms | ~650 ms | bit-equal |
 | q4_0 | 372 MiB | 1080 ms | 595 ms | bit-equal |
 
-The QVAC model registry provides runnable GGUFs for only a supported subset.
-Models outside that subset require local `.nemo` download and conversion.
+Every supported checkpoint is covered by this local pipeline:
+`scripts/download-all-models.sh` fetches the `.nemo` archive (including the
+AI4Bharat IndicConformer hybrid) and `scripts/convert-nemo-to-gguf.py` turns it
+into the runnable GGUF. The IndicConformer conversion emits the per-language
+token ranges the run-time `--language` selection needs:
+
+```bash
+python engines/parakeet/scripts/convert-nemo-to-gguf.py \
+  --ckpt engines/parakeet/models/indicconformer_stt_multi_hybrid_rnnt_600m.nemo \
+  --out engines/parakeet/models/indic-conformer-600m-multilingual.q8_0.gguf \
+  --quant q8_0
+```
 
 ## Public C++ API
 
@@ -357,11 +367,11 @@ avoid relying on the heuristic.
 `SortformerStreamSession::aosc_active()` reports whether the session actually
 took the AOSC path.
 
-Known limitation: on long AOSC inputs, final-event signaling is currently
-nondeterministic and the session can emit no `is_final` marker instead of
-exactly one. The diarization output remains valid. Consumers must call
-`finalize()`, but should not yet rely exclusively on the final marker for AOSC
-session completion.
+Every non-cancelled `finalize()` drains any trailing partial chunk and then
+emits exactly one final synthetic terminator (`speaker_id=-1`,
+`is_final=true`, and `start_s == end_s`). Real speaker segments always remain
+non-final. Repeated `finalize()` calls are idempotent, while cancellation
+suppresses the terminator.
 
 ## CLI and microphone examples
 
@@ -391,6 +401,16 @@ build-parakeet/parakeet \
   --model engines/parakeet/models/parakeet-tdt-0.6b-v3.q8_0.gguf \
   --diarization-model engines/parakeet/models/diar_sortformer_4spk-v1.f16.gguf \
   --wav engines/parakeet/test/samples/diarization-sample-16k.wav
+
+# standalone Sortformer diarization: speaker segments only, no ASR model
+build-parakeet/parakeet \
+  --model engines/parakeet/models/diar_sortformer_4spk-v1.f16.gguf \
+  --wav engines/parakeet/test/samples/diarization-sample-16k.wav
+
+# IndicConformer: --language is required and selects the token range
+build-parakeet/parakeet \
+  --model engines/parakeet/models/indic-conformer-600m-multilingual.q8_0.gguf \
+  --wav engines/parakeet/test/samples/hi-16k.wav --language hi
 ```
 
 `live-mic` runs CTC/RNN-T/TDT/EOU transcription or Sortformer diarization.
@@ -450,14 +470,20 @@ on an NVIDIA RTX 4000 SFF Ada:
 
 | Model | CPU RTF | CPU wall | Vulkan RTF | Vulkan wall |
 |---|---:|---:|---:|---:|
-| CTC | 0.078 | 1572 ms | 0.0023 | 47 ms |
-| TDT | 0.083 | 1670 ms | 0.0035 | 71 ms |
-| EOU | 0.030 | 607 ms | 0.0052 | 105 ms |
-| Sortformer | 0.025 | 508 ms | 0.0020 | 40 ms |
+| CTC | 0.112 | 2256 ms | 0.0022 | 43 ms |
+| TDT | 0.130 | 2607 ms | 0.0044 | 88 ms |
+| EOU | 0.051 | 1034 ms | 0.0034 | 68 ms |
+| Sortformer | 0.046 | 922 ms | 0.0019 | 38 ms |
+| Sortformer streaming | 0.032 | 646 ms | 0.0034 | 69 ms |
 
-Source: [workflow run 27415598451](https://github.com/tetherto/qvac/actions/runs/27415598451),
-12 June 2026, runner `qvac-ubuntu2204-x64-gpu`, with
-`parakeet-cpp` 2026-06-10 and `ggml-speech` revision `bec032cd`.
+The same run also covers the self-hosted Apple M4 Mac mini (Metal, q8_0):
+CTC 0.0113, TDT 0.0150, EOU 0.0097, Sortformer 0.0061, Sortformer
+streaming 0.0070.
+
+Source: [workflow run 31603189415](https://github.com/tetherto/qvac/actions/runs/31603189415),
+12 August 2026, runner `qvac-ubuntu2204-x64-gpu`, benchmarking the published
+`@qvac/asr-ggml@0.1.1` addon (released 2026-08-03, pinning `parakeet-cpp`
+2026-08-03).
 
 ## Repository layout
 

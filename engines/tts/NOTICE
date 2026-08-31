@@ -2,7 +2,7 @@ tts-cpp
 Copyright 2026 QVAC contributors
 
 The tts-cpp package code is licensed under MIT. It is the multi-engine
-engines/tts component of qvac-ext-lib-whisper.cpp, not a bundled copy of one
+engines/tts component of qvac-fabric-speech.cpp, not a bundled copy of one
 model project. Model checkpoints, upstream reference implementations, and
 optional conversion-time Python packages remain under their own licenses.
 No model weights are distributed in this source directory.

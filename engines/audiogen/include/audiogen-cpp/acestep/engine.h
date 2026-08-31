@@ -38,6 +38,7 @@
 // Deferred: DiT CFG/APG (guidance>1, base/sft only).
 
 #include "audiogen-cpp/export.h"
+#include "audiogen-cpp/gpu_fallback.h"
 
 #include <functional>
 #include <memory>
@@ -173,8 +174,9 @@ struct GenerateParams {
     std::string track;
 
     // Fraction of DiT steps that keep the source context (0..1). Default 1.0
-    // keeps source context for every step. Values < 1.0 need DiT context
-    // switching and are rejected until that path is ported.
+    // keeps source context for every step. Values < 1.0 switch the DiT to a
+    // silence context and the text2music instruction at step
+    // floor(steps * strength), so the tail of the run generates freely.
     float audio_cover_strength = 1.0f;
 
     // Blend initial DiT noise toward clean source latents (0..1). 0 = pure
@@ -235,6 +237,10 @@ public:
 
     int         sample_rate() const;  // 48000
     std::string backend_name() const;
+
+    // Why a run asked for a GPU and got the CPU. `not_requested` when
+    // n_gpu_layers <= 0, `none` when a GPU backend was acquired.
+    GpuFallbackReason gpu_fallback_reason() const;
 
 private:
     Engine();

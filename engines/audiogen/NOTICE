@@ -31,11 +31,14 @@ Upstream model code
       src/acestep/cond_ggml.{h,cpp}     from src/cond-enc.h
       src/acestep/detok_ggml.{h,cpp}    from src/fsq-detok.h
       src/acestep/dit_ggml.{h,cpp}      from src/dit-graph.h and src/dit*.h
+      scripts/convert-acestep-to-gguf.py         from convert.py
+      scripts/download-acestep-checkpoints.sh    from checkpoints.sh
+      src/acestep/quantize_policy.h and
+      src/acestep/quantize_cli.cpp               from tools/quantize.cpp
 
-    The stage GGUFs this engine loads are produced by that project's
-    convert.py, and src/acestep/engine.cpp follows its pipeline wiring and
-    LM sampling defaults so the two implementations can be compared tensor
-    by tensor.
+    The stage GGUFs this engine loads follow that project's layout, and
+    src/acestep/engine.cpp follows its pipeline wiring and LM sampling
+    defaults so the two implementations can be compared tensor by tensor.
 
 --- mit (MIT License) ---
 

@@ -3,7 +3,9 @@
 #include "metadata_fsm.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,16 +26,45 @@ struct TokenProb {
     float prob;
 };
 
-int sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng) {
+static double lm_ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// Phase timing prints: on with verbose or ACESTEP_LM_TIMING=1.
+static bool lm_timing_enabled(bool verbose) {
+    return verbose || std::getenv("ACESTEP_LM_TIMING") != nullptr;
+}
+
+// Forced-token fast path: with a single live logit the masked sampler's softmax
+// sum is exactly 1.0 (exp(0)=1, exp(-inf/-1e9)=0), so it draws from dist(0,1)
+// and returns the live token - except the r==0 edge, where its acc-walk stops
+// at index 0. Consume one draw to keep the RNG stream identical.
+int lm_consume_forced(int token, float temperature, std::mt19937 & rng) {
+    if (temperature <= 0.0f) return token;  // argmax path draws nothing
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    const float r = dist(rng);
+    if (r == 0.0f && token != 0) return 0;
+    return token;
+}
+
+int sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng,
+                   int index_base) {
     if (temperature <= 0.0f) {
-        return (int) (std::max_element(logits, logits + V) - logits);
+        return (int) (std::max_element(logits, logits + V) - logits) + index_base;
     }
 
     static thread_local std::vector<float>     tmp_buf;
     static thread_local std::vector<TokenProb> sorted_buf;
+    static thread_local std::vector<int>       cand_id;
+    static thread_local std::vector<float>     cand_e;
+    static thread_local std::vector<uint8_t>   cand_dead;
 
-    float inv_temp = 1.0f / temperature;
-    for (int i = 0; i < V; i++) logits[i] *= inv_temp;
+    float inv_temp  = 1.0f / temperature;
+    float max_logit = -INFINITY;
+    for (int i = 0; i < V; i++) {
+        logits[i] *= inv_temp;
+        if (logits[i] > max_logit) max_logit = logits[i];
+    }
 
     if (top_k > 0 && top_k < V) {
         tmp_buf.resize(V);
@@ -46,35 +77,55 @@ int sample_top_k_p(float * logits, int V, float temperature, float top_p, int to
     }
 
     if (top_p > 0.0f && top_p < 1.0f) {
-        float max_logit = -INFINITY;
-        for (int i = 0; i < V; i++) {
-            if (logits[i] > max_logit) max_logit = logits[i];
-        }
+        // One ascending sweep: exp + sum + candidate collect. Bit-identical to
+        // the historical multi-pass form: expf(-inf) == 0.0f exactly, adding
+        // 0.0f preserves the accumulator, and top_k masking never drops the max.
+        float cutoff  = max_logit - 16.0f;
         float sum_exp = 0.0f;
-        for (int i = 0; i < V; i++) sum_exp += expf(logits[i] - max_logit);
-        float inv_sum = 1.0f / sum_exp;
-
-        float cutoff = max_logit - 16.0f;
-        sorted_buf.clear();
+        cand_id.clear();
+        cand_e.clear();
         for (int i = 0; i < V; i++) {
-            if (logits[i] >= cutoff) {
-                float prob = expf(logits[i] - max_logit) * inv_sum;
-                sorted_buf.push_back({ i, prob });
-            } else {
-                logits[i] = -INFINITY;
+            float x = logits[i];
+            float e = (x == -INFINITY) ? 0.0f : expf(x - max_logit);
+            sum_exp += e;
+            if (x >= cutoff) {
+                cand_id.push_back(i);
+                cand_e.push_back(e);
             }
         }
 
-        int K = (int) sorted_buf.size();
-        if (K > 0) {
-            std::sort(sorted_buf.begin(), sorted_buf.end(),
-                      [](const TokenProb & a, const TokenProb & b) { return a.prob > b.prob; });
-            float cum = 0.0f;
-            for (int i = 0; i < K; i++) {
-                if (i > 0 && cum >= top_p) logits[sorted_buf[i].id] = -INFINITY;
-                cum += sorted_buf[i].prob;
-            }
+        int K = (int) cand_id.size();
+        if (K == 0) return 0;  // all -inf: historical acc-walk lands on index 0
+
+        float inv_sum = 1.0f / sum_exp;
+        sorted_buf.clear();
+        for (int j = 0; j < K; j++) sorted_buf.push_back({ j, cand_e[j] * inv_sum });
+        std::sort(sorted_buf.begin(), sorted_buf.end(),
+                  [](const TokenProb & a, const TokenProb & b) { return a.prob > b.prob; });
+
+        cand_dead.assign((size_t) K, 0);
+        float cum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            if (k > 0 && cum >= top_p) cand_dead[sorted_buf[k].id] = 1;
+            cum += sorted_buf[k].prob;
         }
+
+        // The top-prob candidate survives and carries max_logit, so the
+        // historical re-softmax reduces to the surviving e values in id order.
+        float sum = 0.0f;
+        for (int j = 0; j < K; j++)
+            if (!cand_dead[j]) sum += cand_e[j];
+
+        std::uniform_real_distribution<float> dist(0.0f, sum);
+        float r = dist(rng);
+        if (r == 0.0f) return 0;  // historical acc-walk edge: absolute index 0 wins at acc 0
+        float acc = 0.0f;
+        for (int j = 0; j < K; j++) {
+            if (cand_dead[j]) continue;
+            acc += cand_e[j];
+            if (acc >= r) return cand_id[j] + index_base;
+        }
+        return 0;
     }
 
     float max_val = -INFINITY;
@@ -88,11 +139,12 @@ int sample_top_k_p(float * logits, int V, float temperature, float top_p, int to
     }
 
     std::uniform_real_distribution<float> dist(0.0f, sum);
-    float                                 r   = dist(rng);
-    float                                 acc = 0.0f;
+    float                                 r = dist(rng);
+    if (r == 0.0f) return 0;  // same acc-walk edge: absolute index 0 wins at acc 0
+    float acc = 0.0f;
     for (int i = 0; i < V; i++) {
         acc += logits[i];
-        if (acc >= r) return i;
+        if (acc >= r) return i + index_base;
     }
     return 0;
 }
@@ -324,6 +376,11 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     const bool      stop_at_reasoning = !gen_lyrics;
     const bool      inspire     = need_lyrics;  // bare caption -> INSPIRE expansion
 
+    // With the FSM active and the reasoning stop set, no sampled token can ever
+    // reach the audio-code band, so the forward projects only the prefix head.
+    const int V_lim = (use_fsm && stop_at_reasoning) ? AUDIO_CODE_BASE : 0;
+    const int V_eff = V_lim > 0 ? V_lim : V;
+
     std::vector<int> prompt_tokens;
     if (inspire) {
         std::string user_msg = base.caption;
@@ -336,7 +393,7 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     // FSM setup: constrain the CoT YAML. Force any user-provided metadata.
     MetadataFSM fsm;
     if (use_fsm) {
-        fsm.init(bpe, V, params.verbose);
+        fsm.init(bpe, V_eff, params.verbose);
         fsm.skip_caption = !use_cot_caption && !inspire;
         if (base.bpm > 0)               fsm.force_field(bpe, MetadataFSM::BPM_VALUE, std::to_string(base.bpm));
         if (base.duration > 0)          fsm.force_field(bpe, MetadataFSM::DURATION_VALUE,
@@ -350,11 +407,19 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     std::vector<int>   gen_tokens;
     std::vector<float> lg;
 
+    const bool timing       = lm_timing_enabled(params.verbose);
+    double     prefill_ms   = 0.0;
+    double     decode_ms    = 0.0;
+    double     sampler_ms   = 0.0;
+    int        decode_steps = 0;
+
+    auto t_prefill = std::chrono::steady_clock::now();
     lm_reset(m, 0);
-    if (!lm_model_forward(m, prompt_tokens.data(), (int) prompt_tokens.size(), lg, 0)) {
+    if (!lm_model_forward(m, prompt_tokens.data(), (int) prompt_tokens.size(), lg, 0, nullptr, V_lim)) {
         fprintf(stderr, "[lm-phase1] prefill failed\n");
         return false;
     }
+    prefill_ms = lm_ms_since(t_prefill);
     if (params.verbose)
         fprintf(stderr, "[lm-phase1] prefill %zu tokens, fsm=%d inspire=%d gen_lyrics=%d\n", prompt_tokens.size(),
                 (int) use_fsm, (int) inspire, (int) gen_lyrics);
@@ -362,8 +427,15 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     bool codes_phase = false;
     int  tok;
     {
-        if (use_fsm && fsm.enabled) fsm.apply_mask(lg.data());
-        tok = sample_top_k_p(lg.data(), V, params.temperature, params.top_p, params.top_k, rng);
+        auto      t_sample = std::chrono::steady_clock::now();
+        const int forced   = (use_fsm && fsm.enabled) ? fsm.forced_token() : -1;
+        if (forced >= 0) {
+            tok = lm_consume_forced(forced, params.temperature, rng);
+        } else {
+            if (use_fsm && fsm.enabled) fsm.apply_mask(lg.data());
+            tok = sample_top_k_p(lg.data(), V_eff, params.temperature, params.top_p, params.top_k, rng);
+        }
+        sampler_ms += lm_ms_since(t_sample);
         if (tok != TOKEN_IM_END) {
             if (use_fsm && fsm.enabled) fsm.update(tok);
             if (tok == TOKEN_THINK_END) codes_phase = true;
@@ -374,24 +446,29 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     const int max_new = params.max_new_tokens > 0 ? params.max_new_tokens : 2048;
     for (int step = 0; step < max_new && tok != TOKEN_IM_END; step++) {
         if (codes_phase && stop_at_reasoning) break;
-        int32_t t = (int32_t) tok;
-        if (!lm_model_forward(m, &t, 1, lg, 0)) {
+        int32_t t        = (int32_t) tok;
+        auto    t_decode = std::chrono::steady_clock::now();
+        if (!lm_model_forward(m, &t, 1, lg, 0, nullptr, V_lim)) {
             fprintf(stderr, "[lm-phase1] decode step %d failed\n", step);
             return false;
         }
-        float * lc = lg.data();
-        if (use_fsm && fsm.enabled && !codes_phase) fsm.apply_mask(lc);
-        if (codes_phase && !lyrics_mode) {
+        decode_ms += lm_ms_since(t_decode);
+        decode_steps++;
+        auto      t_sample = std::chrono::steady_clock::now();
+        float *   lc       = lg.data();
+        const int forced   = (use_fsm && fsm.enabled && !codes_phase) ? fsm.forced_token() : -1;
+        if (forced >= 0) {
+            tok = lm_consume_forced(forced, params.temperature, rng);
+        } else if (codes_phase && !lyrics_mode) {
             for (int v = TOKEN_IM_END + 1; v < AUDIO_CODE_BASE; v++) lc[v] = -1e9f;
-        }
-
-        if (codes_phase && !lyrics_mode) {
             int V_eff = V - TOKEN_IM_END;
             tok       = sample_top_k_p(lc + TOKEN_IM_END, V_eff, params.temperature, params.top_p, params.top_k, rng) +
                   TOKEN_IM_END;
         } else {
-            tok = sample_top_k_p(lc, V, params.temperature, params.top_p, params.top_k, rng);
+            if (use_fsm && fsm.enabled && !codes_phase) fsm.apply_mask(lc);
+            tok = sample_top_k_p(lc, V_eff, params.temperature, params.top_p, params.top_k, rng);
         }
+        sampler_ms += lm_ms_since(t_sample);
 
         if (tok == TOKEN_IM_END) break;
         if (use_fsm && fsm.enabled && !codes_phase) fsm.update(tok);
@@ -403,6 +480,10 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
         }
         gen_tokens.push_back(tok);
     }
+
+    if (timing)
+        fprintf(stderr, "[lm-timing] phase1 prefill=%.1f decode=%.1f sampler=%.1f steps=%d\n", prefill_ms, decode_ms,
+                sampler_ms, decode_steps);
 
     std::string text = bpe_decode(bpe, gen_tokens);
     if (params.verbose)
@@ -460,29 +541,41 @@ bool lm_generate_codes(LMModel *              m,
 
     std::vector<float> lc, lu;  // cond / uncond logits
 
+    const bool timing          = lm_timing_enabled(params.verbose);
+    double     prefill_cond_ms   = 0.0;
+    double     prefill_uncond_ms = 0.0;
+    double     decode_ms         = 0.0;
+    double     sampler_ms        = 0.0;
+    int        decode_steps      = 0;
+
+    const int out_v = V - TOKEN_IM_END;                // compact logit space: EOS at index 0
+    const int code0 = AUDIO_CODE_BASE - TOKEN_IM_END;  // first audio code, compact index
+
     // CFG combine (cond + w*(cond-uncond)) then restrict to EOS + audio codes,
-    // then sample. When CFG is off, `lu` is unused.
-    auto combine_mask_sample = [&]() -> int {
-        if (use_cfg) {
+    // then sample - all in the compact [TOKEN_IM_END, V) logit space. Entries
+    // below TOKEN_IM_END were only ever masked to -1e9, so index_base sampling
+    // is exact - including the r==0 draw, which lands on absolute token 0.
+    auto combine_mask_sample = [&](float * c, const float * u) -> int {
+        if (use_cfg && u) {
             const float w = params.cfg_scale;
-            for (int v = AUDIO_CODE_BASE; v < V; v++) lc[v] = lu[v] + w * (lc[v] - lu[v]);
-            lc[TOKEN_IM_END] = lu[TOKEN_IM_END] + w * (lc[TOKEN_IM_END] - lu[TOKEN_IM_END]);
+            c[0] = u[0] + w * (c[0] - u[0]);
+            for (int v = code0; v < out_v; v++) c[v] = u[v] + w * (c[v] - u[v]);
         }
-        for (int v = 0; v < AUDIO_CODE_BASE; v++) {
-            if (v != TOKEN_IM_END) lc[v] = -1e9f;
-        }
-        return sample_top_k_p(lc.data(), V, params.temperature, params.top_p, params.top_k, rng);
+        for (int v = 1; v < code0; v++) c[v] = -1e9f;
+        return sample_top_k_p(c, out_v, params.temperature, params.top_p, params.top_k, rng, TOKEN_IM_END);
     };
 
     const char *       dump_layers_path = std::getenv("ACESTEP_LM_DUMP_LAYERS");
     std::vector<float> layer_states;
 
+    auto t_prefill = std::chrono::steady_clock::now();
     lm_reset(m, 0);
     if (!lm_model_forward(m, tokens.data(), (int) tokens.size(), lc, 0,
                           dump_layers_path ? &layer_states : nullptr)) {
         fprintf(stderr, "[lm-pipeline] cond prefill failed\n");
         return false;
     }
+    prefill_cond_ms = lm_ms_since(t_prefill);
     if (const char * path = std::getenv("ACESTEP_LM_DUMP_LOGITS")) {
         if (FILE * f = fopen(path, "wb")) {
             fwrite(lc.data(), sizeof(float), lc.size(), f);
@@ -503,11 +596,13 @@ bool lm_generate_codes(LMModel *              m,
         }
     }
     if (use_cfg) {
+        t_prefill = std::chrono::steady_clock::now();
         lm_reset(m, 1);
         if (!lm_model_forward(m, uncond.data(), (int) uncond.size(), lu, 1)) {
             fprintf(stderr, "[lm-pipeline] uncond prefill failed\n");
             return false;
         }
+        prefill_uncond_ms = lm_ms_since(t_prefill);
     }
     const bool batch_cfg = use_cfg && lm_model_supports_batched_decode(m);
     if (params.verbose)
@@ -517,26 +612,28 @@ bool lm_generate_codes(LMModel *              m,
                 use_cfg ? params.cfg_scale : 1.0f, use_cfg ? "" : " (CFG off)",
                 batch_cfg ? " (batched decode)" : "");
 
-    int tok = combine_mask_sample();
+    auto t_sample = std::chrono::steady_clock::now();
+    int  tok = combine_mask_sample(lc.data() + TOKEN_IM_END, use_cfg ? lu.data() + TOKEN_IM_END : nullptr);
+    sampler_ms += lm_ms_since(t_sample);
     if (tok != TOKEN_IM_END && tok >= AUDIO_CODE_BASE && tok < AUDIO_CODE_BASE + AUDIO_CODE_COUNT) {
         codes_out.push_back(tok - AUDIO_CODE_BASE);
     }
 
+    std::vector<float> batched;  // compact [TOKEN_IM_END, V) logits x {cond, uncond}
     for (int step = 0; step < max_tokens && tok != TOKEN_IM_END; step++) {
-        int32_t t = (int32_t) tok;
+        int32_t       t        = (int32_t) tok;
+        auto          t_decode = std::chrono::steady_clock::now();
+        float *       samp_c   = nullptr;
+        const float * samp_u   = nullptr;
         if (batch_cfg) {
             const int32_t ids[2] = { t, t };
             const int     sets[2] = { 0, 1 };
-            std::vector<float> batched;
             if (!lm_model_forward_batch(m, ids, sets, 2, batched, TOKEN_IM_END)) {
                 fprintf(stderr, "[lm-pipeline] batched CFG decode step %d failed\n", step);
                 return false;
             }
-            const int out_v = V - TOKEN_IM_END;
-            lc.assign((size_t) V, -1e9f);
-            lu.assign((size_t) V, -1e9f);
-            std::copy_n(batched.data(), out_v, lc.data() + TOKEN_IM_END);
-            std::copy_n(batched.data() + out_v, out_v, lu.data() + TOKEN_IM_END);
+            samp_c = batched.data();
+            samp_u = batched.data() + out_v;
         } else {
             if (!lm_model_forward(m, &t, 1, lc, 0)) {
                 fprintf(stderr, "[lm-pipeline] cond decode step %d failed\n", step);
@@ -546,8 +643,14 @@ bool lm_generate_codes(LMModel *              m,
                 fprintf(stderr, "[lm-pipeline] uncond decode step %d failed\n", step);
                 return false;
             }
+            samp_c = lc.data() + TOKEN_IM_END;
+            samp_u = use_cfg ? lu.data() + TOKEN_IM_END : nullptr;
         }
-        tok = combine_mask_sample();
+        decode_ms += lm_ms_since(t_decode);
+        decode_steps++;
+        t_sample = std::chrono::steady_clock::now();
+        tok      = combine_mask_sample(samp_c, samp_u);
+        sampler_ms += lm_ms_since(t_sample);
         if (tok == TOKEN_IM_END) break;
         if (tok >= AUDIO_CODE_BASE && tok < AUDIO_CODE_BASE + AUDIO_CODE_COUNT) {
             codes_out.push_back(tok - AUDIO_CODE_BASE);
@@ -561,6 +664,10 @@ bool lm_generate_codes(LMModel *              m,
             params.on_step(step + 1, max_tokens);
         }
     }
+
+    if (timing)
+        fprintf(stderr, "[lm-timing] phase2 prefill-cond=%.1f prefill-uncond=%.1f decode=%.1f sampler=%.1f steps=%d\n",
+                prefill_cond_ms, prefill_uncond_ms, decode_ms, sampler_ms, decode_steps);
 
     if (params.verbose) {
         fprintf(stderr, "[lm-pipeline] generated %zu audio codes\n", codes_out.size());

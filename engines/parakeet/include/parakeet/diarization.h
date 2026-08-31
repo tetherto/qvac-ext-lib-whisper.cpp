@@ -42,15 +42,12 @@ struct DiarizationResult {
     double total_ms        = 0.0;
 };
 
-// One speaker span emitted by SortformerStreamSession. `is_final=true`
-// flags the LAST callback the session will fire; it is either:
-//   - a real segment from the trailing partial chunk (when audio ends
-//     mid-chunk), or
-//   - a synthetic terminator with `speaker_id = -1` and `start_s ==
-//     end_s` (when audio ended exactly on a chunk boundary, so all
-//     real segments were already delivered as `is_final=false`).
-// Consumers should treat `speaker_id < 0` as "session done, no new
-// segment" and skip any text/append logic for it.
+// One speaker span emitted by SortformerStreamSession. Every non-cancelled
+// finalize() emits exactly one LAST callback with `is_final=true`: a synthetic
+// terminator whose `speaker_id = -1` and `start_s == end_s`. Real speaker
+// segments, including segments drained from a trailing partial chunk, always
+// have `is_final=false`. Consumers should treat `speaker_id < 0` as "session
+// done, no new segment" and skip any text/append logic for it.
 struct StreamingDiarizationSegment {
     int    speaker_id  = 0;
     double start_s     = 0.0;
