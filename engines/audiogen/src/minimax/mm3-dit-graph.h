@@ -4,14 +4,13 @@
 
 #include "backend.h"
 #include "ggml.h"
-#include "build-flags.h"
 #include "logic.h"
+#include "mm3-flash-attn.h"
 #include "mm3-flow-runtime.h"
 
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -150,8 +149,7 @@ static bool mm3_dit_prepare(const MM3Model & m, MM3DitGraph * g, std::string * e
     g->cpu_backend = bp.cpu_backend;
     g->backend_ref = true;
 
-    const char * no_fa = std::getenv("MM3_DIT_NO_FLASH");
-    g->use_flash_attn  = bp.has_gpu && !HOT_STEP_FA_DISABLED && !(no_fa && no_fa[0] && no_fa[0] != '0');
+    g->use_flash_attn = mm3_use_flash_attn(bp.has_gpu, /*default_on=*/true, "MM3_DIT_NO_FLASH", nullptr);
 
     std::string e;
     if (!mm3_dit_readback_f32(m.synth.dit.time_fourier, &g->fourier_w, &e, "dit.time_fourier.weight")) {

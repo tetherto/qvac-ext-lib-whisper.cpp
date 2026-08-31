@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -41,6 +42,15 @@ struct ArCandidates {
     std::vector<float> conditional;
     std::vector<float> unconditional;
     std::vector<float> guided;
+};
+
+// The compact LM head packs the semantic block at row-offset 0, EOS as the last row.
+constexpr int64_t kCompactHeadSemanticOffset = 0;
+
+struct CompactHeadCopy {
+    size_t src_offset = 0;
+    size_t dst_offset = 0;
+    size_t nbytes = 0;
 };
 
 struct SynthesisContract {
@@ -132,6 +142,9 @@ int64_t sample_top_k(const float * logits, int64_t count, int top_k, std::mt1993
 bool collect_ar_candidates(const float * logits, int64_t row_stride, int64_t eos,
                            int64_t semantic_offset, int64_t semantic_vocab,
                            ArCandidates & candidates, int64_t & nonfinite_count);
+int64_t compact_head_row_count(int64_t semantic_vocab);
+bool compact_head_copy_plan(int64_t vocab, int64_t semantic_offset, int64_t semantic_vocab, int64_t eos,
+                            size_t row_size, std::array<CompactHeadCopy, 2> & plan);
 void guide_ar_candidates(ArCandidates & candidates, float cfg_scale);
 void apply_conditional_top_k(ArCandidates & candidates, int top_k);
 void build_acoustic_rows(const int32_t * codes, int64_t codebooks, int64_t acoustic_vocab,

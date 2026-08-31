@@ -14,6 +14,9 @@
 // DiT deterministic across repeated computes with interleaved CFG branches.
 //
 // Requires AUDIOGEN_TEST_MINIMAX_MODELS_DIR; exits 77 (ctest skip) otherwise.
+// With --q4 the model directory comes from AUDIOGEN_TEST_MINIMAX_Q4_MODELS_DIR
+// instead, so the same checks gate a quantized pair in a separate process
+// (the static LM/DiT graph caches are not rebuilt for a second in-process load).
 
 #include "minimax/backend.h"
 #include "minimax/logic.h"
@@ -22,6 +25,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -46,6 +50,35 @@ double latent_std(const std::vector<float> & latents) {
     }
     const double mean = sum / (double) latents.size();
     return std::sqrt(sum_sq / (double) latents.size() - mean * mean);
+}
+
+// The tiled vocoder decode must be bit-identical to a single-shot decode:
+// MM3_VOC_OVERLAP frames of context exceed the conv stack's receptive field,
+// so every tile interior reproduces the full-length computation exactly.
+bool vocoder_tiling_is_bit_exact(const MM3Model & model, std::string * error) {
+    const int64_t L  = (int64_t) model.synth_cfg.dit.window_latents;
+    const int64_t FC = (int64_t) model.synth_cfg.voc.fold_channels;
+    if (L <= MM3_VOC_CHUNK) {
+        *error = "window_latents does not exercise the tiled path";
+        return false;
+    }
+    std::vector<float> latents;
+    tts_cpp::minimax::detail::fill_noise(11, 0, latents, L * 2 * FC);
+
+    std::vector<float> single, tiled;
+    const int64_t T = L * (int64_t) model.synth_cfg.voc.total_upsample;
+    single.assign((size_t) (2 * T), 0.0f);
+    tiled.assign((size_t) (2 * T), 0.0f);
+    if (!mm3_vocoder_prepare(model, &g_mm3_voc, error) ||
+        !mm3_vocoder_decode_tiled(model, latents, L, single, L, MM3_VOC_OVERLAP, error) ||
+        !mm3_vocoder_decode_tiled(model, latents, L, tiled, MM3_VOC_CHUNK, MM3_VOC_OVERLAP, error)) {
+        return false;
+    }
+    if (std::memcmp(single.data(), tiled.data(), single.size() * sizeof(float)) != 0) {
+        *error = "tiled vocoder output differs from single-shot output";
+        return false;
+    }
+    return true;
 }
 
 bool dit_is_deterministic_across_computes(const MM3Model & model, std::string * error) {
@@ -75,10 +108,12 @@ bool dit_is_deterministic_across_computes(const MM3Model & model, std::string * 
 
 }  // namespace
 
-int main() {
-    const char * models_dir = std::getenv("AUDIOGEN_TEST_MINIMAX_MODELS_DIR");
+int main(int argc, char ** argv) {
+    const bool   q4_run  = argc > 1 && std::strcmp(argv[1], "--q4") == 0;
+    const char * env_var = q4_run ? "AUDIOGEN_TEST_MINIMAX_Q4_MODELS_DIR" : "AUDIOGEN_TEST_MINIMAX_MODELS_DIR";
+    const char * models_dir = std::getenv(env_var);
     if (!models_dir || !*models_dir) {
-        std::fprintf(stderr, "SKIP set AUDIOGEN_TEST_MINIMAX_MODELS_DIR to run\n");
+        std::fprintf(stderr, "SKIP set %s to run\n", env_var);
         return 77;
     }
 
@@ -103,6 +138,11 @@ int main() {
         ++failures;
     }
 
+    if (!vocoder_tiling_is_bit_exact(model, &error)) {
+        std::fprintf(stderr, "FAIL vocoder tiling: %s\n", error.c_str());
+        ++failures;
+    }
+
     MM3GenRequest request;
     request.prompt = tts_cpp::minimax::detail::build_prompt("A short warm piano note.", "");
     request.max_frames = 48;
@@ -122,6 +162,7 @@ int main() {
     CHECK(result.frames > 0);
     CHECK(result.n_windows == 1);
     CHECK(result.n_samples > 0);
+    CHECK(!result.ids_cond_used.empty());
     CHECK(!result.has_nan);
     CHECK(result.peak > 0.005f);
     CHECK(result.rms > 0.001);

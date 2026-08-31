@@ -201,7 +201,14 @@ std::string candidate_for_quant(const CandidateMap & candidates, const std::stri
 }
 
 ModelPair select_prioritized_pair(const CandidateMap & lm, const CandidateMap & synth) {
-    static const std::vector<std::string> priorities = {"q8_0", "f16", "bf16"};
+    // Every variant acestep-quantize can emit, best fidelity first after the
+    // established q8_0 > f16 > bf16 head. f32 sits last: a dequantized-to-F32
+    // pair (scripts/dequant_gguf.py) is a diagnostic reference, only picked
+    // when nothing production-shaped exists.
+    static const std::vector<std::string> priorities = {"q8_0",   "f16",    "bf16",   "q6_k",
+                                                        "q5_k_m", "q5_k_s", "q4_k_m", "q4_k_s",
+                                                        "q3_k_l", "q3_k_m", "q3_k_s", "q2_k",
+                                                        "f32"};
     for (const std::string & quant : priorities) {
         const std::string lm_path = candidate_for_quant(lm, quant);
         const std::string synth_path = candidate_for_quant(synth, quant);
@@ -560,6 +567,21 @@ bool collect_ar_candidates(const float * logits, int64_t row_stride, int64_t eos
         candidates.unconditional[static_cast<size_t>(index + 1)] =
             normalize(unconditional[semantic_offset + index]);
     }
+    return true;
+}
+
+int64_t compact_head_row_count(int64_t semantic_vocab) {
+    return semantic_vocab + 1;
+}
+
+bool compact_head_copy_plan(int64_t vocab, int64_t semantic_offset, int64_t semantic_vocab, int64_t eos,
+                            size_t row_size, std::array<CompactHeadCopy, 2> & plan) {
+    if (row_size == 0 || vocab <= 0 || semantic_offset < 0 || semantic_vocab <= 0 ||
+        semantic_offset > vocab - semantic_vocab || eos < 0 || eos >= vocab) {
+        return false;
+    }
+    plan[0] = { static_cast<size_t>(semantic_offset) * row_size, 0, static_cast<size_t>(semantic_vocab) * row_size };
+    plan[1] = { static_cast<size_t>(eos) * row_size, static_cast<size_t>(semantic_vocab) * row_size, row_size };
     return true;
 }
 

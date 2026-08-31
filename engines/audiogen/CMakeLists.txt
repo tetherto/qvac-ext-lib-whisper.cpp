@@ -293,6 +293,9 @@ if (AUDIOGEN_BUILD_TESTS)
         audiogen_link_in_tree_binary(test-minimax-quality)
         audiogen_register_test(test-minimax-quality LABEL "integration")
         set_property(TEST test-minimax-quality PROPERTY SKIP_RETURN_CODE 77)
+        add_test(NAME test-minimax-quality-q4 COMMAND $<TARGET_FILE:test-minimax-quality> --q4)
+        set_property(TEST test-minimax-quality-q4 PROPERTY LABELS "integration")
+        set_property(TEST test-minimax-quality-q4 PROPERTY SKIP_RETURN_CODE 77)
 
         add_executable(test-minimax-metal-ops test/test_minimax_metal_ops.cpp)
         audiogen_link_in_tree_binary(test-minimax-metal-ops)
@@ -306,6 +309,18 @@ if (AUDIOGEN_BUILD_TESTS)
             )
             set_property(TEST test-minimax-converter PROPERTY LABELS "unit")
             set_property(TEST test-minimax-converter PROPERTY ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+            add_test(NAME test-minimax-quant-audit
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_audit_quant_types.py
+            )
+            set_property(TEST test-minimax-quant-audit PROPERTY LABELS "unit")
+            set_property(TEST test-minimax-quant-audit PROPERTY ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+            add_test(NAME test-minimax-dump-compare
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_compare_ar_dumps.py
+            )
+            set_property(TEST test-minimax-dump-compare PROPERTY LABELS "unit")
+            set_property(TEST test-minimax-dump-compare PROPERTY ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
         endif()
     endif()
 

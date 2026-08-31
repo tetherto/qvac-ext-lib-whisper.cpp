@@ -29,8 +29,7 @@ struct MM3DepthStep {
     ggml_tensor * in_hidden = nullptr;
     ggml_tensor * in_sem    = nullptr;
     ggml_tensor * in_ac     = nullptr;
-    ggml_tensor * out_logit = nullptr;
-    ggml_tensor * out_hid   = nullptr;
+    ggml_tensor * out_fused = nullptr;
 
     ggml_tensor * mask = nullptr;
     int64_t       S    = 0;
@@ -194,17 +193,19 @@ static bool mm3_depth_build_step(const MM3Model & m, MM3DepthGraph * g, int cb, 
         ctx, ggml_view_3d(ctx, h, H, 1, 2, h->nb[1], h->nb[2], (size_t) (S - 1) * h->nb[1]));
 
     ggml_tensor * logits = ggml_mul_mat(ctx, w.head[(size_t) (cb - 1)], last);
+    ggml_set_name(last, "mm3_depth_hidden");
+    ggml_set_name(logits, "mm3_depth_logits");
 
-    s->out_hid   = last;
-    s->out_logit = logits;
-    ggml_set_name(s->out_hid, "mm3_depth_hidden");
-    ggml_set_name(s->out_logit, "mm3_depth_logits");
-    ggml_set_output(s->out_hid);
-    ggml_set_output(s->out_logit);
+    // One fused output per step: [hidden row0, hidden row1, logits row0,
+    // logits row1], so the host needs a single readback instead of two.
+    ggml_tensor * hid_flat   = ggml_reshape_1d(ctx, last, ggml_nelements(last));
+    ggml_tensor * logit_flat = ggml_reshape_1d(ctx, logits, ggml_nelements(logits));
+    s->out_fused             = ggml_concat(ctx, hid_flat, logit_flat, 0);
+    ggml_set_name(s->out_fused, "mm3_depth_fused");
+    ggml_set_output(s->out_fused);
 
     s->graph = ggml_new_graph_custom(ctx, MM3_DEPTH_MAX_NODES, false);
-    ggml_build_forward_expand(s->graph, s->out_hid);
-    ggml_build_forward_expand(s->graph, s->out_logit);
+    ggml_build_forward_expand(s->graph, s->out_fused);
 
     ggml_backend_sched_reset(s->sched);
     if (!ggml_backend_sched_alloc_graph(s->sched, s->graph)) {
@@ -380,8 +381,7 @@ static bool mm3_depth_decode_frame(const MM3Model & m, const float * lm_hidden_c
     const int32_t      sem_id  = semantic_code + (int32_t) lc.semantic_vocab_offset;
     const float        cfg     = lc.ar_cfg_scale > 0.0f ? lc.ar_cfg_scale : 1.5f;
     std::vector<int32_t> ac_rows((size_t) NC, 0);
-    std::vector<float>   logit_buf((size_t) (V * 2));
-    std::vector<float>   hid_buf((size_t) (H * 2));
+    std::vector<float>   fused_buf((size_t) (H * 2 + V * 2));
     std::vector<float>   samp_scratch;
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -403,22 +403,25 @@ static bool mm3_depth_decode_frame(const MM3Model & m, const float * lm_hidden_c
             return false;
         }
 
-        ggml_backend_tensor_get(s->out_logit, logit_buf.data(), 0, (size_t) (V * 2) * sizeof(float));
-        ggml_backend_tensor_get(s->out_hid, hid_buf.data(), 0, (size_t) (H * 2) * sizeof(float));
+        ggml_backend_tensor_get(s->out_fused, fused_buf.data(), 0, fused_buf.size() * sizeof(float));
+
+        // Offsets follow the fused layout built in mm3_depth_build_step.
+        float * hid_buf   = fused_buf.data();
+        float * logit_buf = fused_buf.data() + (size_t) (H * 2);
 
         float * lc_row = out->logits_cond.data() + (size_t) ((cb - 1) * V);
         float * lu_row = out->logits_uncond.data() + (size_t) ((cb - 1) * V);
-        memcpy(lc_row, logit_buf.data(), (size_t) V * sizeof(float));
-        memcpy(lu_row, logit_buf.data() + V, (size_t) V * sizeof(float));
+        memcpy(lc_row, logit_buf, (size_t) V * sizeof(float));
+        memcpy(lu_row, logit_buf + V, (size_t) V * sizeof(float));
 
-        memcpy(out->hiddens.data() + (size_t) ((cb - 1) * H), hid_buf.data(), (size_t) H * sizeof(float));
+        memcpy(out->hiddens.data() + (size_t) ((cb - 1) * H), hid_buf, (size_t) H * sizeof(float));
 
         int32_t code;
         if (forced_codes) {
             code = forced_codes[cb - 1];
         } else {
 
-            float * guided = logit_buf.data() + V;
+            float * guided = logit_buf + V;
             for (int64_t i = 0; i < V; i++) {
                 const float u = lu_row[i];
                 guided[i]     = u + cfg * (lc_row[i] - u);
