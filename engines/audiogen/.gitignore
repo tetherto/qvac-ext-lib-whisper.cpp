@@ -13,3 +13,4 @@ src/acestep/vae_decode_bin.cpp
 
 # macOS
 .DS_Store
+output/

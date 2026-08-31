@@ -101,6 +101,12 @@ bool dit_gguf_bool(const DitGGUF & g, const std::string & key, bool def) {
     return gguf_get_val_bool(g.ctx, id);
 }
 
+std::string dit_gguf_str(const DitGGUF & g, const std::string & key, const std::string & def) {
+    int64_t id = gguf_find_key(g.ctx, key.c_str());
+    if (id < 0) return def;
+    return gguf_get_val_str(g.ctx, id);
+}
+
 bool dit_gguf_read_config(const DitGGUF & g, DitConfig & cfg) {
     try {
         cfg.n_layers          = (int) dit_gguf_u32(g, "acestep-dit.block_count");
@@ -117,6 +123,8 @@ bool dit_gguf_read_config(const DitGGUF & g, DitConfig & cfg) {
         cfg.rms_norm_eps      = dit_gguf_f32(g, "acestep-dit.attention.layer_norm_rms_epsilon");
         // convert.py only writes acestep.is_turbo when true; absent => base/sft.
         cfg.is_turbo          = dit_gguf_bool(g, "acestep.is_turbo", false);
+        cfg.model_name        = dit_gguf_str(g, "general.name", "");
+        cfg.is_sft            = is_sft_model_name(cfg.model_name);
     } catch (const std::exception & e) {
         fprintf(stderr, "[acestep-dit] %s\n", e.what());
         return false;
