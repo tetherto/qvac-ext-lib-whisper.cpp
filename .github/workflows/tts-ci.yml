@@ -170,9 +170,15 @@ jobs:
           else
             echo "::notice::no CUDA toolkit on this runner; the CUDA arms cannot run here"
           fi
+          # GGML_BUILD_TESTS=OFF as every other ggml build in this repo does:
+          # this lane runs the *engine's* ctest suite, never ggml's, so
+          # compiling ggml's tests only spends runner time and couples the
+          # lane to breakage in code it does not exercise.
           cmake -S ggml-src -B ggml-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
             -DGGML_VULKAN=ON \
             $CUDA_OPTION \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
             -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
           cmake --build ggml-src/build -j && cmake --install ggml-src/build
           cmake -S engines/tts -B build -DCMAKE_BUILD_TYPE=Release \
