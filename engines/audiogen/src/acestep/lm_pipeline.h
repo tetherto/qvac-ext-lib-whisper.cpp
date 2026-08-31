@@ -65,6 +65,10 @@ int lm_consume_forced(int token, float temperature, std::mt19937 & rng);
 // The assistant turn stays open so the LM emits audio codes then <|im_end|>.
 std::vector<int> build_lm_prompt_with_cot(const BpeTokenizer & bpe, const AcePrompt & prompt);
 
+// User message for the INSPIRE prompt: the caption, plus the instrumental hint
+// when the caller explicitly requested "[Instrumental]" lyrics.
+std::string lm_inspire_user_message(const std::string & caption, const std::string & lyrics);
+
 // Phase 1: auto-generate missing metadata (bpm/keyscale/duration/timesignature/
 // language) — and lyrics for a bare caption — via FSM-constrained decoding.
 // Mutates `prompt` in place (gap-fill: only empty fields are overwritten).

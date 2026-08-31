@@ -504,9 +504,6 @@ static constexpr int TEMPO_SLOW_BPM_MAX     = 80;
 static constexpr int TEMPO_MODERATE_BPM_MAX = 120;
 static constexpr int TEMPO_FAST_BPM_MAX     = 160;
 
-static constexpr const char * DEFAULT_VOCAL_LANGUAGE = "en";
-static constexpr const char * EDIT_VOCAL_LANGUAGE    = "unknown";
-static constexpr const char * INSTRUMENTAL_LYRICS    = "[Instrumental]";
 static constexpr const char * EDIT_STAGE_SOURCE    = "source";
 static constexpr const char * EDIT_STAGE_REFERENCE = "reference";
 static constexpr const char * EDIT_STAGE_REPAINT   = "repaint";
@@ -599,7 +596,7 @@ static AcePrompt make_prompt(const GenerateParams & params, const std::string & 
                                 ? build_conditioning_caption(
                                       params.caption, params.bpm, params.timesignature, params.keyscale)
                                 : params.caption;
-    prompt.lyrics         = params.lyrics.empty() ? INSTRUMENTAL_LYRICS : params.lyrics;
+    prompt.lyrics         = resolve_prompt_lyrics(params);
     prompt.duration       = params.duration;
     prompt.bpm            = params.bpm;
     prompt.keyscale       = params.keyscale;
@@ -724,10 +721,7 @@ static GenerationState make_generation_state(const GenerateParams & params, bool
     }
     state.plan = make_generation_plan(params, state.task);
     state.seed = resolve_seed(params.seed);
-    state.language = params.vocal_language.empty()
-                         ? (params.edit_plan.empty() ? DEFAULT_VOCAL_LANGUAGE
-                                                     : EDIT_VOCAL_LANGUAGE)
-                         : params.vocal_language;
+    state.language = resolve_prompt_language(params);
     if (params.augment_caption_with_metadata) {
         state.original_caption = params.caption;
     }
@@ -782,6 +776,14 @@ static bool needs_lm_phase_one(const GenerateParams & params, const AcePrompt & 
     return params.lm_phase1 && !has_complete_metadata(prompt);
 }
 
+// Fields simple mode left empty for the LM must never stay empty past Phase 1:
+// downstream prompt building and metadata reporting rely on them.
+static void finalize_simple_mode_prompt(GenerationState & state) {
+    if (state.prompt.lyrics.empty()) state.prompt.lyrics = INSTRUMENTAL_LYRICS;
+    if (state.prompt.vocal_language.empty()) state.prompt.vocal_language = DEFAULT_VOCAL_LANGUAGE;
+    state.language = state.prompt.vocal_language;
+}
+
 // Returns false only on cancellation. A plain Phase-1 failure falls back to the
 // provided/default metadata, except in simple mode, where the LM expansion is
 // the whole point of the request.
@@ -792,6 +794,7 @@ static bool run_lm_phase_one(EngineImpl & engine, const GenerateParams & params,
     phase_one.max_new_tokens = 0;
     if (lm_generate_phase1(engine.lm, engine.bpe_lm, state.prompt, phase_one,
                            true, true, params.simple_mode)) {
+        if (params.simple_mode) finalize_simple_mode_prompt(state);
         return true;
     }
     if (engine.cancel_flag.load()) return false;
