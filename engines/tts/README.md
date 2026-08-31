@@ -289,7 +289,10 @@ and use detail-namespaced symbols outside the `TTS_CPP_API` public
 surface, so the integrated port keeps the default
 `TTS_CPP_BUILD_SHARED=OFF` and `TTS_CPP_BUILD_TESTS=OFF`.  See
 [**Useful CMake options**](#useful-cmake-options) below for the full
-flag table.
+flag table. The streaming text chunker (`split_for_streaming`:
+sentence/clause/whitespace boundary priority, first-chunk latency knob,
+tiny-tail merge, CJK sentence ends) is pinned model-free by
+`test-supertonic-chunker`.
 
 ## Pipelines
 
@@ -499,7 +502,10 @@ the prompt language is known.
 
 Verification: `ctest -R test-parler` runs tokenizer/T5/decoder/delay/DAC/
 e2e parity against `.npy` fixtures produced by
-`scripts/parler/dump-reference.py` (HF PyTorch reference, greedy).  The
+`scripts/parler/dump-reference.py` (HF PyTorch reference, greedy).
+`test-parler-gguf-load` needs no fixtures: it synthesizes tiny GGUFs and
+asserts the loader fails closed on truncated files, missing metadata, and
+wrong-typed metadata.  The
 greedy token trace matches HF exactly; the DAC waveform matches at
 >120 dB SNR. Default decoding is sampled (temperature 1.0, top-k 50, from
 `generation_config.json`). End-user `--greedy` and `top_k=1` requests are
@@ -1104,9 +1110,11 @@ ctest -R audio8 --output-on-failure
 | `test-audio8-timing` | that the per-stage times are disjoint and bounded by the total they are reported against |
 | `test-audio8-cli` | the CLI's flags, `-ngl` and `--n-gpu-layers` among them, and the `--dump-codes` file format |
 | `test-audio8-cli-verbose` | the same flags through the binary: `--verbose` reaching stderr and codes surviving a synthesis |
+| `test-audio8-sampling-filter` | the top-k / top-p / temperature candidate filter on synthetic score vectors: k and p cutoffs, temperature ordering, degenerate cases |
 
-`test-audio8-ras` and `test-audio8-cli` are the two that run on a checkout with
-no models; every other target needs the dumps.
+`test-audio8-ras`, `test-audio8-cli`, and `test-audio8-sampling-filter` are the
+three that run on a checkout with no models; every other target needs the
+dumps.
 
 On a build with a GPU backend compiled in, the `lm`, `codec` and `engine`
 suites are registered a second time per backend as `test-audio8-<suite>-metal`,
@@ -1597,7 +1605,9 @@ Everything is self-contained in the two `.gguf` files:
 
 - `chatterbox-t3-turbo.gguf` embeds the BPE tokenizer (vocab + merges +
   added tokens) as standard `tokenizer.ggml.*` metadata, which the C++
-  binary loads out of GGUF at startup.
+  binary loads out of GGUF at startup. The tokenizer itself (merge chains,
+  byte-level encoding, added-token spans, `punc_norm`) is pinned model-free
+  by `test-gpt2-bpe` on a hand-built vocabulary.
 - `chatterbox-s3gen.gguf` embeds the built-in reference voice (embedding,
   prompt token, prompt mel) under `s3gen/builtin/*`.
 

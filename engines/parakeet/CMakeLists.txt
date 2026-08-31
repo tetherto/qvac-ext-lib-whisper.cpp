@@ -672,6 +672,29 @@ if (PARAKEET_BUILD_TESTS)
     parakeet_apply_ccache(test-sortformer-finalize)
     parakeet_register_test(test-sortformer-finalize LABEL "unit")
 
+    # Probability-thresholding logic shared by the offline and AOSC
+    # diarization paths (header-only, no GGUF).
+    add_executable(test-sortformer-segments test/test_sortformer_segments.cpp)
+    target_include_directories(test-sortformer-segments PRIVATE src)
+    parakeet_apply_ccache(test-sortformer-segments)
+    parakeet_register_test(test-sortformer-segments LABEL "unit")
+
+    # RMS energy VAD state machine used by the CTC/TDT streaming sessions.
+    add_executable(test-energy-vad
+        test/test_energy_vad.cpp
+        src/energy_vad.cpp)
+    target_include_directories(test-energy-vad PRIVATE src)
+    parakeet_apply_ccache(test-energy-vad)
+    parakeet_register_test(test-energy-vad LABEL "unit")
+
+    # SentencePiece detokenizer + starts_word stamping (synthetic vocab).
+    add_executable(test-sentencepiece-bpe
+        test/test_sentencepiece_bpe.cpp
+        src/sentencepiece_bpe.cpp)
+    target_include_directories(test-sentencepiece-bpe PRIVATE src)
+    parakeet_apply_ccache(test-sentencepiece-bpe)
+    parakeet_register_test(test-sentencepiece-bpe LABEL "unit")
+
     add_executable(test-sortformer-streaming test/test_sortformer_streaming.cpp)
     target_link_libraries(test-sortformer-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-sortformer-streaming PRIVATE include src ggml/include)

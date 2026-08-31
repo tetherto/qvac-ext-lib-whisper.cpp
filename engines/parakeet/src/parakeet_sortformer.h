@@ -29,6 +29,7 @@
 // pre-conformer-layers* embedding space (`fc_d_model`, 512 in v2.1).
 
 #include "parakeet_ctc.h"
+#include "sortformer_segments.h"
 
 #include <cstdint>
 #include <string>
@@ -38,12 +39,6 @@ namespace parakeet {
 
 struct SortformerDiarizationOptions {
     float threshold = 0.5f;
-};
-
-struct SortformerSegment {
-    int    speaker_id = 0;
-    double start_s    = 0.0;
-    double end_s      = 0.0;
 };
 
 struct SortformerDiarizationResult {

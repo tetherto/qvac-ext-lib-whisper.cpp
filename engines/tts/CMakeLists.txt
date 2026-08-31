@@ -1186,6 +1186,16 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-audio8-ras)
     tts_cpp_register_test(test-audio8-ras)
 
+    # The top-k / top-p / temperature candidate filter on synthetic score
+    # vectors, which the fixture sampler test only reaches through reference
+    # dumps.  No fixtures, so it runs on a bare checkout.
+    add_executable(test-audio8-sampling-filter test/audio8/test_sampling_filter.cpp
+        src/audio8/sampling.cpp)
+    target_include_directories(test-audio8-sampling-filter PRIVATE src)
+    target_compile_definitions(test-audio8-sampling-filter PRIVATE _GLIBCXX_ASSERTIONS)
+    tts_cpp_apply_ccache(test-audio8-sampling-filter)
+    tts_cpp_register_test(test-audio8-sampling-filter)
+
     # End-to-end through the public engine, both the text path and the cloning
     # path, so it links the whole library rather than the stage sources.
     add_executable(test-audio8-engine test/audio8/test_engine.cpp)
@@ -1309,6 +1319,16 @@ if (TTS_CPP_BUILD_TESTS)
         src/backend_selection.cpp
         src/sched_dispatch.cpp
         src/log.cpp)
+
+    # Fail-closed GGUF loading: synthesizes tiny metadata-only GGUFs (truncated
+    # file, missing keys, missing tensors, wrong-typed key) and asserts the
+    # loader rejects each one.  No fixtures, so it runs on a bare checkout.
+    add_executable(test-parler-gguf-load test/parler/test_gguf_load.cpp
+        ${_tcb_parler_core_srcs})
+    target_link_libraries(test-parler-gguf-load PRIVATE ggml)
+    target_include_directories(test-parler-gguf-load PRIVATE ggml/include include src)
+    tts_cpp_apply_ccache(test-parler-gguf-load)
+    tts_cpp_register_test(test-parler-gguf-load)
 
     add_executable(test-parler-delay test/parler/test_delay.cpp src/parler/delay.cpp)
     target_include_directories(test-parler-delay PRIVATE src)
@@ -1817,9 +1837,11 @@ if (TTS_CPP_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "${_tcb_super2_gguf}"
         REQUIRES "${_tcb_super2_gguf}")
+    # gpu, not fixture: argv[2]=99 moves the graph onto the GPU, so this arm
+    # must stay out of the CPU-only lane even once the fixture is staged.
     tts_cpp_register_test(test-supertonic-sched-equivalence-gpu
         EXE      test-supertonic-sched-equivalence
-        LABEL    "fixture"
+        LABEL    "gpu"
         ARGS     "${_tcb_super2_gguf}" "99"
         REQUIRES "${_tcb_super2_gguf}")
     # Per-backend pins of the same bit-exactness check, so a host carrying
@@ -2080,6 +2102,22 @@ if (TTS_CPP_BUILD_TESTS)
     target_include_directories(test-text-split PRIVATE src)
     tts_cpp_apply_ccache(test-text-split)
     tts_cpp_register_test(test-text-split LABEL "cpu")
+
+    # Chatterbox Turbo prompt tokenizer on a hand-built vocab: merge chains,
+    # byte-level encoding, paralinguistic added-token spans, punc_norm.
+    add_executable(test-gpt2-bpe test/test_gpt2_bpe.cpp src/gpt2_bpe.cpp)
+    target_include_directories(test-gpt2-bpe PRIVATE src)
+    tts_cpp_apply_ccache(test-gpt2-bpe)
+    tts_cpp_register_test(test-gpt2-bpe LABEL "cpu")
+
+    # Supertonic streaming chunker: pure text -> chunks policy (boundary
+    # priority, tolerance windows, min-chunk floor, tail merge).  No model,
+    # no ggml.
+    add_executable(test-supertonic-chunker test/test_supertonic_chunker.cpp
+        src/supertonic_chunker.cpp)
+    target_include_directories(test-supertonic-chunker PRIVATE src)
+    tts_cpp_apply_ccache(test-supertonic-chunker)
+    tts_cpp_register_test(test-supertonic-chunker LABEL "unit")
 
     # LavaSR DSP primitives: resampler, STFT/ISTFT, Slaney mel,
     # FastLR crossover merge.  Pure host math (no model / no ggml), compiled

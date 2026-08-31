@@ -176,7 +176,7 @@ tests link an object library so they still see hidden internals. Consumers keep
 | `AUDIOGEN_BUILD_MINIMAX` | desktop `ON`, mobile `OFF` | build the desktop MiniMax-Music3 engine (CPU by default, GPU via `EngineOptions::device`) |
 | `SPEECH_BUILD_EXECUTABLES` | `ON` | build the CLIs; set `OFF` for library-only builds |
 | `SPEECH_BUILD_TESTS` | `OFF` | build the engine test harnesses |
-| `SPEECH_BUILD_WHISPER_TESTS` | `OFF` | also build whisper's tests (transcription tests need downloaded models) |
+| `SPEECH_BUILD_WHISPER_TESTS` | `OFF` | also build whisper's tests (committed weightless stubs cover tiny..large pipeline smokes; only `test-vad-full` needs a downloaded model) |
 
 GPU backends come from the ggml build: `-DGGML_VULKAN=ON`, `-DGGML_OPENCL=ON`, `-DGGML_CUDA=ON`; Metal is on by default on Apple. Core ML is gated per engine and defaults to off on both, so add `-DWHISPER_COREML=ON -DPARAKEET_COREML=ON` on Apple for the Whisper encoder and Parakeet offline TDT encoder sidecars. For tests, configure with `-DSPEECH_BUILD_TESTS=ON`, then run the non-GPU suite with `ctest --test-dir build -LE 'gpu|perf'`. A Metal build also exposes `test-minimax-metal-ops`, the model-free AudioGen CPU/Metal parity regression; it skips unless the Metal device supports `MUL_MAT` (simdgroup reduction, `MTLGPUFamilyApple7`+), which rules out the virtualized GPUs on hosted macOS runners.
 

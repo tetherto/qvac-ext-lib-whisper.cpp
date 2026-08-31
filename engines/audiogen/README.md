@@ -554,9 +554,12 @@ ctest --test-dir build/audiogen
 ```
 
 `test-acestep-units`, `test-acestep-converter`, `test-minimax-units`, and
-`test-minimax-converter` cover weight-free CPU logic and need no GGUFs. MiniMax coverage includes metadata
-compatibility, model-pair selection, Unicode token classes, frame validation,
-prompt assembly, unconditional masking, deterministic noise, flow scheduling,
+`test-minimax-converter` cover weight-free CPU logic and need no GGUFs.
+ACE-Step coverage includes the BPE tokenizer (UTF-8 decode, merges, byte
+fallback, decode round-trip) on a hand-built vocabulary. MiniMax coverage
+includes metadata compatibility, model-pair selection, Unicode token classes,
+frame validation, prompt assembly and the request-utils caption/lyrics
+cleanup helpers, unconditional masking, deterministic noise, flow scheduling,
 condition length, window stitching, sampler edge cases, and converter output
 transactions. Set `AUDIOGEN_TEST_MINIMAX_MODELS_DIR` to a directory containing
 the MiniMax GGUF pair to run `test-minimax-integration`, which covers model
@@ -573,6 +576,9 @@ self-hosted `qvac-macos26-arm64-gpu` runner and fails rather than passes if the
 test skips there.
 `test-acestep-integration` exercises the ACE-Step public API when model paths
 are supplied and otherwise reports a skipped test.
+`test-audiogen-comparison-lib` runs the engine-comparison harness's own
+`node:test` suites (`benchmarks/comparison/tests/`) on hosts with node,
+so the harness's adapters, aggregation, and report logic stay verified.
 
 Stage dumps are the tool for localising a backend divergence. Run the same prompt twice with `--dump-stages`, then compare:
 

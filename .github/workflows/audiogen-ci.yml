@@ -68,6 +68,14 @@ jobs:
           fi
           echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
 
+      # Without numpy + gguf the converter test silently drops its real
+      # safetensors -> GGUF round-trip cases (@skipUnless) and only the
+      # dependency-free classes assert anything. Hosted-only: the persistent
+      # self-hosted runner's Python environment is not ours to mutate.
+      - name: Install converter-test Python deps (numpy, gguf)
+        if: runner.environment == 'github-hosted' && runner.os == 'Linux'
+        run: python3 -m pip install --user numpy gguf
+
       - name: Resolve ggml pin (tip of ${{ env.GGML_BRANCH }})
         id: ggml
         run: echo "sha=$(git ls-remote "$GGML_REPO" "refs/heads/$GGML_BRANCH" | cut -f1)" >> "$GITHUB_OUTPUT"

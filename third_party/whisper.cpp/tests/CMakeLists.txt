@@ -103,6 +103,22 @@ target_include_directories(${LOGITS_SLICE_TEST} PRIVATE ../src)
 add_test(NAME ${LOGITS_SLICE_TEST} COMMAND ${LOGITS_SLICE_TEST})
 set_tests_properties(${LOGITS_SLICE_TEST} PROPERTIES LABELS "unit;gh")
 
+# language lookup-table unit test (QVAC patch, see PATCHES.md; no model needed)
+set(LANG_TEST test-whisper-lang)
+add_executable(${LANG_TEST} ${LANG_TEST}.cpp)
+target_include_directories(${LANG_TEST} PRIVATE ../include ../ggml/include)
+target_link_libraries(${LANG_TEST} PRIVATE whisper)
+add_test(NAME ${LANG_TEST} COMMAND ${LANG_TEST})
+set_tests_properties(${LANG_TEST} PROPERTIES LABELS "unit;gh")
+
+# default-parameter contract test (QVAC patch, see PATCHES.md; no model needed)
+set(PARAMS_TEST test-whisper-params)
+add_executable(${PARAMS_TEST} ${PARAMS_TEST}.cpp)
+target_include_directories(${PARAMS_TEST} PRIVATE ../include ../ggml/include)
+target_link_libraries(${PARAMS_TEST} PRIVATE whisper)
+add_test(NAME ${PARAMS_TEST} COMMAND ${PARAMS_TEST})
+set_tests_properties(${PARAMS_TEST} PROPERTIES LABELS "unit;gh")
+
 # VAD test tests VAD in isolation
 set(VAD_TEST test-vad)
 add_executable(${VAD_TEST} ${VAD_TEST}.cpp)
