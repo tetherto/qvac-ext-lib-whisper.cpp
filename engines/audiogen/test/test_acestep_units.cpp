@@ -648,6 +648,59 @@ void test_gpu_fallback_reason() {
     }
 }
 
+// 6c. GPU tier policy --------------------------------------------------------
+// Speech-engine GPU selection prefers CUDA over Vulkan on the same NVIDIA
+// card, and prefers discrete over integrated adapters. gpu_tier_for is the
+// pure ranking that drives that; the picks-first-of-tier walk lives in
+// backend_gpu_init and is exercised indirectly by the audiogen integration
+// lane, so the ranking itself needs the direct unit test.
+void test_gpu_tier_policy() {
+    using tts_cpp::acestep::GpuTier;
+    using tts_cpp::acestep::gpu_tier_for;
+
+    // Adreno 700+ OpenCL wins outright — the OpenCL kernels are the validated
+    // path on Snapdragon 8 Gen 2+.
+    CHECK(gpu_tier_for("OpenCL", GGML_BACKEND_DEVICE_TYPE_GPU,  740) == GpuTier::AdrenoOpenCL700Plus);
+    CHECK(gpu_tier_for("OpenCL", GGML_BACKEND_DEVICE_TYPE_IGPU, 740) == GpuTier::AdrenoOpenCL700Plus);
+    // Adreno 6xx OpenCL is not routed to the OpenCL tier here (broken kernels)
+    // — the calling code separately skips it; the ranking treats it as generic OpenCL.
+    CHECK(gpu_tier_for("OpenCL", GGML_BACKEND_DEVICE_TYPE_GPU,  640) != GpuTier::AdrenoOpenCL700Plus);
+
+    // CUDA outranks Vulkan on the same NVIDIA card.
+    CHECK(gpu_tier_for("CUDA",   GGML_BACKEND_DEVICE_TYPE_GPU,  -1)  == GpuTier::CudaDiscrete);
+    CHECK(gpu_tier_for("Vulkan", GGML_BACKEND_DEVICE_TYPE_GPU,  -1)  == GpuTier::ValidatedDiscrete);
+    CHECK(static_cast<int>(GpuTier::CudaDiscrete) <
+          static_cast<int>(GpuTier::ValidatedDiscrete));
+
+    // Tegra / Jetson CUDA reports IGPU on some drivers — still preferred over
+    // a validated Vulkan discrete via the CUDA-first rule.
+    CHECK(gpu_tier_for("CUDA", GGML_BACKEND_DEVICE_TYPE_IGPU, -1) == GpuTier::CudaIntegrated);
+    CHECK(static_cast<int>(GpuTier::CudaIntegrated) <
+          static_cast<int>(GpuTier::ValidatedDiscrete));
+
+    // Discrete outranks integrated at every tier that has both — the
+    // other-addons behavior we are matching (llm/diffusion prefer dGPU).
+    CHECK(static_cast<int>(GpuTier::CudaDiscrete)      < static_cast<int>(GpuTier::CudaIntegrated));
+    CHECK(static_cast<int>(GpuTier::ValidatedDiscrete) < static_cast<int>(GpuTier::ValidatedIntegrated));
+    CHECK(static_cast<int>(GpuTier::OtherDiscrete)     < static_cast<int>(GpuTier::OtherIntegrated));
+
+    // Metal is validated; MTL is the new registry name for the same backend.
+    CHECK(gpu_tier_for("Metal", GGML_BACKEND_DEVICE_TYPE_GPU,  -1) == GpuTier::ValidatedDiscrete);
+    CHECK(gpu_tier_for("MTL",   GGML_BACKEND_DEVICE_TYPE_IGPU, -1) == GpuTier::ValidatedIntegrated);
+
+    // Non-GPU device types are not selectable — the ranking rejects them so
+    // the CPU/Accel devices never leak into the GPU pass.
+    CHECK(gpu_tier_for("Vulkan", GGML_BACKEND_DEVICE_TYPE_CPU,   -1) == GpuTier::NotSelectable);
+    CHECK(gpu_tier_for("BLAS",   GGML_BACKEND_DEVICE_TYPE_ACCEL, -1) == GpuTier::NotSelectable);
+    CHECK(gpu_tier_for(nullptr,  GGML_BACKEND_DEVICE_TYPE_CPU,   -1) == GpuTier::NotSelectable);
+
+    // A fake "ROCm" / "MUSA" registry lands in the Other tier — unvalidated
+    // but still a candidate below every validated GPU, matching the current
+    // {require_validated, ...} nest in backend_gpu_init.
+    CHECK(gpu_tier_for("ROCm", GGML_BACKEND_DEVICE_TYPE_GPU,  -1) == GpuTier::OtherDiscrete);
+    CHECK(gpu_tier_for("MUSA", GGML_BACKEND_DEVICE_TYPE_IGPU, -1) == GpuTier::OtherIntegrated);
+}
+
 // 7. stage placement ---------------------------------------------------------
 // Which backend each stage runs on decides which numerical path the generated
 // audio takes, so the policy is locked here rather than only observed on a
@@ -1838,6 +1891,7 @@ int main() {
     test_vae_window_core();
     test_backend_device_types();
     test_gpu_fallback_reason();
+    test_gpu_tier_policy();
     test_stage_placement();
     test_placement_env();
     test_parallel_rows();

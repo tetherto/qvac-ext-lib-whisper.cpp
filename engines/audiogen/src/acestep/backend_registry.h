@@ -111,13 +111,59 @@ inline bool backend_dev_prefers_opencl(ggml_backend_dev_t dev) {
                     parse_adreno_version(ggml_backend_dev_description(dev))) >= 700;
 }
 
-// GPU backend from the registry. Prefer Adreno 700+ OpenCL, then a measured
-// Vulkan/Metal device, then a discrete adapter, while still preserving the
-// historical fallback to another GPU backend when none of those exist. Off
-// Adreno nothing changes: Vulkan stays preferred over OpenCL because the
-// complete ACE-Step pipeline, including the VAE custom ops, is validated there.
-// Accepting IGPU is required for UMA adapters such as Pixel's Mali GPU, Apple
-// integrated GPUs and Adreno itself.
+// Tier ranking for GPU selection (lower = preferred). Kept as a pure function
+// on (registry name, ggml device type, parsed Adreno version) so unit tests
+// can exercise the policy against a synthesised device topology without a
+// live ggml registry.
+//
+// Ordering mirrors backend_gpu_init below:
+//   0. Adreno 700+ OpenCL — validated + faster than Vulkan on Snapdragon.
+//   1. CUDA on a discrete GPU — vendor-native, preferred over Vulkan on NVIDIA.
+//   2. CUDA on an integrated GPU (Tegra) — same rationale, discrete-first tie-break.
+//   3. Validated (Vulkan/Metal/CUDA-shaped) GPU on a discrete adapter.
+//   4. Validated GPU on an integrated adapter (UMA Vulkan, Apple iGPU, ...).
+//   5. Any other GPU on a discrete adapter (unvalidated backends).
+//   6. Any other GPU on an integrated adapter.
+//   7. Not a GPU / non-selectable — never picked.
+enum class GpuTier {
+    AdrenoOpenCL700Plus     = 0,
+    CudaDiscrete            = 1,
+    CudaIntegrated          = 2,
+    ValidatedDiscrete       = 3,
+    ValidatedIntegrated     = 4,
+    OtherDiscrete           = 5,
+    OtherIntegrated         = 6,
+    NotSelectable           = 7,
+};
+
+inline GpuTier gpu_tier_for(const char *                     reg_name,
+                            enum ggml_backend_dev_type       dev_type,
+                            int                              adreno_version) {
+    if (!backend_device_type_is_gpu(dev_type)) return GpuTier::NotSelectable;
+    const bool integrated = (dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU);
+    if (reg_name && std::strcmp(reg_name, "OpenCL") == 0 && adreno_version >= 700) {
+        return GpuTier::AdrenoOpenCL700Plus;
+    }
+    if (reg_name && std::strcmp(reg_name, "CUDA") == 0) {
+        return integrated ? GpuTier::CudaIntegrated : GpuTier::CudaDiscrete;
+    }
+    if (backend_reg_name_is_validated_gpu(reg_name)) {
+        return integrated ? GpuTier::ValidatedIntegrated : GpuTier::ValidatedDiscrete;
+    }
+    return integrated ? GpuTier::OtherIntegrated : GpuTier::OtherDiscrete;
+}
+
+// GPU backend from the registry. Prefer Adreno 700+ OpenCL, then CUDA on
+// NVIDIA (vendor-native, measurably faster than the same card's Vulkan
+// adapter), then a validated Vulkan/Metal device, then a discrete adapter,
+// while still preserving the historical fallback to another GPU backend
+// when none of those exist. Off Adreno / non-NVIDIA nothing changes: Vulkan
+// stays preferred over OpenCL because the complete ACE-Step pipeline,
+// including the VAE custom ops, is validated there. Accepting IGPU is
+// required for UMA adapters such as Pixel's Mali GPU, Apple integrated GPUs
+// and Adreno itself. The {require_validated, {GPU, IGPU}} nest below already
+// prefers discrete over integrated (dGPU tier tried before iGPU tier at the
+// same validated level).
 //
 // Try every matching device so one adapter failing to initialise does not hide
 // another usable one.
@@ -136,6 +182,32 @@ inline ggml_backend_t backend_gpu_init(GpuFallbackReason * reason = nullptr) {
         if (ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr)) {
             if (reason) *reason = GpuFallbackReason::none;
             return backend;
+        }
+    }
+
+    // CUDA-first pass on NVIDIA. When a build carries both CUDA and Vulkan
+    // and the same NVIDIA card is exposed through both, the generic
+    // validated-GPU loop below would race to whichever ggml enumerates first
+    // (typically Vulkan). CUDA is vendor-native and measurably faster on
+    // that card, so try every visible CUDA device first — GPU tier before
+    // IGPU tier (CUDA on tegra-class hardware surfaces as IGPU) to keep the
+    // discrete-first preference.
+    for (enum ggml_backend_dev_type wanted :
+         {GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU}) {
+        const size_t n_dev = ggml_backend_dev_count();
+        for (size_t i = 0; i < n_dev; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev) continue;
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            if (!backend_device_type_is_gpu(type) || type != wanted) continue;
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+            if (!reg_name || std::strcmp(reg_name, "CUDA") != 0) continue;
+            saw_device = true;
+            if (ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr)) {
+                if (reason) *reason = GpuFallbackReason::none;
+                return backend;
+            }
         }
     }
 
