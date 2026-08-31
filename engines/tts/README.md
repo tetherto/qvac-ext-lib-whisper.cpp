@@ -1166,6 +1166,12 @@ stage outputs:
                      --out-denoised denoised.wav --out-enhanced enhanced-48k.wav
 ```
 
+`test-lavasr-gguf-load` needs no fixtures: it synthesizes tiny metadata-only
+GGUFs and asserts both stage loaders fail closed on a missing, empty,
+truncated, unmarked, cross-architecture, or tensorless file. The denoiser and
+enhancer GGUFs differ only by `general.architecture`, so each loader has to
+refuse the other's file.
+
 ## Build paths
 
 Prerequisites are CMake 3.20 or newer, a C++17 compiler, and either an installed
@@ -1376,6 +1382,8 @@ validation harnesses:
 | `build/test-t3-caches`        | T3 step-graph cache validation (no-arg = initial-state, GGUF arg = warm-cache + bit-exact end-to-end check) |
 | `build/test-supertonic-*`     | Per-stage Supertonic parity harnesses (`preprocess`, `vocoder` ± `trace` / `pointwise`, `duration` ± `trace`, `text-encoder` ± `trace`, `vector` ± `trace`, `pipeline`); each takes `MODEL.gguf REF_DIR` |
 | `build/test-metal-ops`        | Metal-only: parity check for `diag_mask_inf`, `pad_ext`, and fast `conv_transpose_1d` (only useful when built with `-DGGML_METAL=ON`) |
+| `build/test-cosyvoice-time-emb` | Sinusoidal timestep embedding for the CosyVoice3 flow DiT: sin/cos layout, the 1000x scale, the four-decade frequency schedule, batch-row independence (no GGUF) |
+| `build/test-lavasr-gguf-load`   | Fail-closed GGUF loading for both LavaSR stages: missing, empty, truncated, unmarked, cross-architecture, and tensorless files (no GGUF) |
 
 The test targets register with CTest. From a single-config build directory use
 `ctest -L unit` or `ctest -L fixture`; with Visual Studio or another
