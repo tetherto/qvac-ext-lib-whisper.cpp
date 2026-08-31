@@ -653,9 +653,17 @@ void test_gpu_fallback_reason() {
 // 6c. GPU tier policy --------------------------------------------------------
 // Speech-engine GPU selection prefers CUDA over Vulkan on the same NVIDIA
 // card, and prefers discrete over integrated adapters. gpu_tier_for is the
-// pure ranking that drives that; the picks-first-of-tier walk lives in
-// backend_gpu_init and is exercised indirectly by the audiogen integration
-// lane, so the ranking itself needs the direct unit test.
+// pure ranking that captures that policy so a synthesised device topology can
+// be scored without a live ggml-backend registry.
+//
+// SCOPE: this test covers the classifier (what tier a device lands in) and
+// the enum-constant ordering (which tier outranks which). It does NOT
+// exercise backend_gpu_init's actual walk in backend_registry.h: that
+// function has its own parallel Adreno-OpenCL / CUDA-first / {require_validated,
+// {GPU, IGPU}} sequence and does not call gpu_tier_for today, so a reordering
+// of that walk would silently pass this test. Keeping the two in sync is a
+// code-review contract; the deeper fix (drive backend_gpu_init off
+// gpu_tier_for as the single source of truth) is tracked separately.
 void test_gpu_tier_policy() {
     using tts_cpp::acestep::GpuTier;
     using tts_cpp::acestep::gpu_tier_for;
