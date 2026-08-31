@@ -22,6 +22,7 @@ namespace fs = std::filesystem;
 constexpr int TEST_SAMPLE_RATE = 48000;
 constexpr int TEST_CHANNELS = 2;
 constexpr int TEST_SECONDS = 2;
+constexpr int TEST_LEGO_PARTIAL_HOP_FRAMES = 480;
 constexpr int TEST_STEPS = 2;
 constexpr float TEST_SHIFT = 3.0f;
 constexpr float TEST_NOISE_STRENGTH = 0.5f;
@@ -45,6 +46,9 @@ constexpr char TEST_FLOW_TARGET_CAPTION[] = "A warm evolving synth pad";
 constexpr char TEST_UNKNOWN_LANGUAGE[] = "unknown";
 constexpr char TEST_LM_STAGE[] = "lm";
 constexpr char TEST_TURBO_ERROR[] = "turbo DiT only";
+constexpr char TEST_LEGO_BASE_ERROR[] = "requires a base DiT";
+constexpr char TEST_LEGO_SKIP_FORMAT[] =
+    "[test-acestep-integration] lego skipped: fixture is not a base DiT\n";
 constexpr char TEST_FLOW_SKIP_FORMAT[] =
     "[test-acestep-integration] flow-edit skipped: supplied model is not turbo\n";
 
@@ -414,6 +418,84 @@ void run_edit_scenarios(tts_cpp::acestep::Engine & engine, const fs::path & dump
     run_edit_vae_cancel_scenario(engine, fixture);
 }
 
+tts_cpp::acestep::GenerateParams make_lego_params() {
+    tts_cpp::acestep::GenerateParams params = make_generate_params();
+    params.task_type = tts_cpp::acestep::TASK_LEGO;
+    params.track = "guitar";
+    params.caption = "Clean electric guitar layer integration test";
+    params.reference_audio.clear();
+    params.cover_noise_strength = 0.0f;
+    params.source_audio.resize(
+        params.source_audio.size() + (size_t) TEST_LEGO_PARTIAL_HOP_FRAMES * TEST_CHANNELS, 0.0f);
+    return params;
+}
+
+void inspect_lego_context_frame(const TensorDump & context, const TensorDump & source, int frame,
+                                bool & matches_source, bool & mask_always_active) {
+    const float * row = context.values.data() + (size_t) frame * context.columns;
+    for (int channel = 0; channel < TEST_LATENT_CHANNELS; ++channel) {
+        if (row[TEST_LATENT_CHANNELS + channel] != TEST_CONTEXT_ACTIVE_VALUE) mask_always_active = false;
+        if (frame < source.rows &&
+            row[channel] != source.values[(size_t) frame * source.columns + channel]) {
+            matches_source = false;
+        }
+    }
+}
+
+void verify_lego_source_context(const fs::path & dump_dir) {
+    const TensorDump context = read_tensor_dump(dump_dir / TEST_CONTEXT_DUMP);
+    const TensorDump source = read_tensor_dump(dump_dir / TEST_SOURCE_DUMP);
+    CHECK(!context.values.empty());
+    CHECK(context.columns == TEST_CONTEXT_CHANNELS);
+    CHECK(!source.values.empty());
+    CHECK(source.columns == TEST_LATENT_CHANNELS);
+    if (context.values.empty() || context.columns != TEST_CONTEXT_CHANNELS ||
+        source.values.empty() || source.columns != TEST_LATENT_CHANNELS) {
+        return;
+    }
+    bool matches_source = true;
+    bool mask_always_active = true;
+    for (int frame = 0; frame < context.rows; ++frame) {
+        inspect_lego_context_frame(context, source, frame, matches_source, mask_always_active);
+    }
+    CHECK(matches_source);
+    CHECK(mask_always_active);
+}
+
+void run_lego_checks(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir) {
+    using namespace tts_cpp::acestep;
+    GenerateParams params = make_lego_params();
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(stages.contains("source"));
+    CHECK(!stages.contains(TEST_LM_STAGE));
+    CHECK(!fs::exists(dump_dir / "01_lm_codes.bin"));
+    CHECK(result.pcm.size() == params.source_audio.size());
+    verify_lego_source_context(dump_dir);
+}
+
+void run_lego_scenario(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir) {
+    try {
+        run_lego_checks(engine, dump_dir);
+    } catch (const std::invalid_argument & error) {
+        if (std::string(error.what()).find(TEST_LEGO_BASE_ERROR) == std::string::npos) throw;
+        std::fprintf(stderr, TEST_LEGO_SKIP_FORMAT);
+    }
+}
+
+// Optional base-model lane: when AUDIOGEN_TEST_BASE_MODELS_DIR is set, lego
+// must execute for real — a rejection there is a failure, not a skip.
+void run_lego_base_lane() {
+    const char * base_models_dir = std::getenv("AUDIOGEN_TEST_BASE_MODELS_DIR");
+    if (!base_models_dir || !*base_models_dir) return;
+    const fs::path dump_dir = make_dump_directory();
+    std::unique_ptr<tts_cpp::acestep::Engine> engine =
+        tts_cpp::acestep::Engine::create(make_engine_options(base_models_dir, dump_dir));
+    run_lego_checks(*engine, dump_dir);
+    fs::remove_all(dump_dir);
+}
+
 // Runs the autoregressive LM for real (phase-2 code generation) twice with one
 // seed: covers the LM decode graph reuse paths and pins cross-run determinism.
 void run_lm_generation_scenario(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir) {
@@ -557,6 +639,8 @@ int run_integration(const char * models_dir) {
         verify_stage_dumps(dump_dir);
         run_cover_strength_scenario(*engine);
         run_edit_scenarios(*engine, dump_dir);
+        run_lego_scenario(*engine, dump_dir);
+        run_lego_base_lane();
         run_lm_generation_scenario(*engine, dump_dir);
         run_simple_mode_scenario(*engine);
         run_lm_phase1_cancel_scenario(*engine);

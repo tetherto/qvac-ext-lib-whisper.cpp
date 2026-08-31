@@ -95,6 +95,19 @@ static const char * DIT_INSTR_TEXT2MUSIC = "Fill the audio semantic mask based o
 static const char * DIT_INSTR_COVER      = "Generate audio semantic tokens based on the given conditions:";
 static const char * DIT_INSTR_REPAINT    = "Repaint the mask area based on the given conditions:";
 
+static std::string uppercase_track_name(const std::string & track) {
+    std::string upper = track;
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+                   [](unsigned char ch) { return (char) std::toupper(ch); });
+    return upper;
+}
+
+// Lego instruction, uppercase track per the reference implementation
+// (task_utils.py formats TASK_INSTRUCTIONS["lego"] with track_name.upper()).
+static std::string make_lego_instruction(const std::string & track) {
+    return "Generate the " + uppercase_track_name(track) + " track based on the audio context:";
+}
+
 namespace fs = std::filesystem;
 
 struct Engine::Impl {
@@ -688,6 +701,7 @@ struct PromptEncoding {
 struct EncoderConditioning {
     std::vector<float> context;
     std::vector<float> hidden;
+    std::vector<float> null_emb;
     int frames = 0;
     int context_channels = 0;
     int sequence = 0;
@@ -990,6 +1004,18 @@ static void encode_cross_attention(EngineImpl & engine, const PromptEncoding & p
     dump.write("06_enc_hidden", output.hidden, output.sequence, output.hidden_size);
 }
 
+static void validate_lego_model(const DitConfig & config, const GenerateTask & task) {
+    if (!is_lego_task(task.type)) return;
+    if (const std::string error = lego_model_error(config.is_turbo, config.is_sft); !error.empty()) {
+        throw std::invalid_argument(error);
+    }
+}
+
+static std::string resolve_dit_instruction(const GenerateTask & task) {
+    if (is_lego_task(task.type)) return make_lego_instruction(task.track);
+    return DIT_INSTR_COVER;
+}
+
 template <typename EngineImpl>
 static void encode_switch_hidden(EngineImpl & engine, const PromptEncoding & prompt,
                                  const GenerationState & state, EncoderConditioning & output) {
@@ -1015,6 +1041,7 @@ static EncoderConditioning prepare_encoder_conditioning(EngineImpl & engine,
                                                          GenerationState & state,
                                                          StageDump & dump, StageTimes & timing) {
     const DitConfig & config = engine.dit_cfg;
+    validate_lego_model(config, state.task);
     const int patch = config.patch_size;
     EncoderConditioning output;
     output.frames = ((state.latent_frames + patch - 1) / patch) * patch;
@@ -1024,14 +1051,16 @@ static EncoderConditioning prepare_encoder_conditioning(EngineImpl & engine,
     output.context = make_dit_context(
         state.context_latents, cond_model_silence_latent(engine.cond), output.frames,
         state.latent_frames, output.context_channels, config.out_channels);
+    output.null_emb = cond_model_null_emb(engine.cond);
     const bool needs_switch = needs_cover_conditioning_switch(state.task);
     if (needs_switch) {
         output.context_switch = make_dit_context(
             state.context_latents, cond_model_silence_latent(engine.cond), output.frames,
             0, output.context_channels, config.out_channels);
     }
+    const std::string instruction = resolve_dit_instruction(state.task);
     const PromptTokens tokens = tokenize_prompt(
-        engine.bpe_text, state.prompt, state.language, DIT_INSTR_COVER);
+        engine.bpe_text, state.prompt, state.language, instruction.c_str());
     const PromptEncoding prompt = encode_prompt(engine, tokens, state, dump, timing, !needs_switch);
     encode_cross_attention(engine, prompt, state, output, dump, timing, !needs_switch);
     if (needs_switch) {
@@ -1103,10 +1132,12 @@ static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params
                               NoiseSchedule & noise, const StageReporter & report,
                               StageDump & dump, StageTimes & timing, std::vector<float> & latent) {
     const DitConfig & config = engine.dit_cfg;
+    const float guidance = resolve_guidance_scale(params.guidance_scale, config.is_turbo);
     const int cover_switch_step = resolve_cover_switch_step(state.task, noise.steps);
     if (engine.opts.verbose) {
-        fprintf(stderr, "[acestep-engine] DiT: turbo=%d steps=%d shift=%.2f T=%d task=%s cover_switch=%d\n",
-                (int) config.is_turbo, noise.steps, noise.shift,
+        fprintf(stderr,
+                "[acestep-engine] DiT: turbo=%d steps=%d shift=%.2f guidance=%.2f T=%d task=%s cover_switch=%d\n",
+                (int) config.is_turbo, noise.steps, noise.shift, guidance,
                 conditioning.frames, state.task.type.c_str(), cover_switch_step);
     }
     engine.ensure_dit();
@@ -1124,13 +1155,17 @@ static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params
     sample.schedule = noise.schedule.data();
     sample.num_steps = noise.steps;
     sample.real_enc_S = &conditioning.sequence;
+    sample.guidance_scale = guidance;
+    sample.null_cond_emb = conditioning.null_emb.size() >= (size_t) conditioning.hidden_size
+                               ? conditioning.null_emb.data()
+                               : nullptr;
     if (has_switch) {
         sample.context_switch = conditioning.context_switch.data();
         sample.enc_hidden_switch = conditioning.hidden_switch.data();
         sample.real_enc_S_switch = &conditioning.sequence_switch;
         sample.cover_switch_step = cover_switch_step;
     }
-    sample.dcw_enabled = params.dcw_enabled;
+    sample.dcw_enabled = resolve_dcw_enabled(params.dcw_enabled, config.is_turbo);
     sample.dcw_scaler = params.dcw_scaler;
     sample.dcw_high_scaler = params.dcw_high_scaler;
     sample.on_step = [&](int step, int total) { return report("dit", step, total); };
@@ -1181,6 +1216,15 @@ static bool decode_audio(EngineImpl & engine, const std::vector<float> & latent,
         engine.free_vae();
     }
     return true;
+}
+
+// A lego stem must mix sample-for-sample over its source. The decode length is
+// a whole multiple of the VAE hop rounded up to the DiT patch size, so it can
+// overshoot the source (trim) or undershoot it by up to one hop (pad silence).
+static void match_stem_to_source_length(const GenerateParams & params, const GenerationState & state,
+                                        GenerateResult & result) {
+    if (!is_lego_task(state.task.type)) return;
+    result.pcm.resize(params.source_audio.size(), 0.0f);
 }
 
 static AcePrompt make_edit_prompt(const GenerateParams & params, const std::string & caption,
@@ -1839,9 +1883,7 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
     StageTimes timing;
     StageDump dump(engine.opts.dump_stages_dir, engine.opts.verbose);
     if (!params.edit_plan.empty()) {
-        GenerateResult edited = run_audio_edit_plan(engine, params, report, dump, timing);
-        if (params.normalize_loudness) normalize_loudness(edited.pcm);
-        return edited;
+        return run_audio_edit_plan(engine, params, report, dump, timing);
     }
 
     GenerationState state = make_generation_state(params, engine.keep_stages);
@@ -1865,6 +1907,7 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
                       report, dump, timing, result)) {
         return result;
     }
+    match_stem_to_source_length(params, state, result);
     if (params.normalize_loudness) normalize_loudness(result.pcm);
     populate_metadata(state, result);
     return result;

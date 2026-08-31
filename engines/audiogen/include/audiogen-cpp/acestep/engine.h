@@ -132,6 +132,7 @@ struct GenerateParams {
     float       duration = 20.0f;        // target seconds (drives LM code count)
     int         inference_steps = 0;     // 0 = auto (turbo: 8, base/sft: 50)
     float       shift = 0.0f;            // 0 = auto (turbo: 3.0, base/sft: 1.0)
+    float       guidance_scale = 0.0f;   // 0 = auto (turbo: 1.0, base/sft: 7.0); >1 runs CFG via APG
     std::string vocal_language;          // optional hint, e.g. "en"
     int         bpm = 0;                 // optional; 0 => N/A (LM/DiT infer)
     std::string keyscale;                // optional, e.g. "C major"
@@ -144,10 +145,11 @@ struct GenerateParams {
     int         lm_top_k       = 0;      // 0 = disabled (top_p only)
     float       lm_cfg_scale   = 2.0f;   // classifier-free guidance for codes
     bool        lm_phase1      = true;   // auto-fill missing metadata (FSM CoT)
-    // Percentile loudness normalization on the output PCM (the acestep.cpp
-    // export behavior): the 99.999th-percentile sample scales to 1.0 and the
-    // tail above it hard-clips, maximizing perceived loudness. Disable to get
-    // the raw VAE output.
+    // Percentile loudness normalization on the generation output PCM (the
+    // acestep.cpp export behavior): the 99.999th-percentile sample scales to
+    // 1.0 and the tail above it hard-clips, maximizing perceived loudness.
+    // Disable to get the raw VAE output. Audio-edit outputs are never
+    // normalized: repaint preserves untouched source regions bit-for-bit.
     bool        normalize_loudness = true;
     // Simple Mode: treat `caption` as a short natural-language query and let
     // the LM inspire pass compose the full request before synthesis — detailed
@@ -156,7 +158,8 @@ struct GenerateParams {
     // text2music with no pre-supplied audio_codes; `lyrics` must be empty (the
     // LM writes them) or "[Instrumental]" (forwarded as the instrumental hint).
     bool        simple_mode    = false;
-    // Official sampler-side Haar DCW "double" correction.
+    // Official sampler-side Haar DCW "double" correction. Applied on turbo
+    // DiTs only: the official preset disables DCW for base/sft models.
     bool        dcw_enabled     = true;
     float       dcw_scaler      = 0.05f;  // low band coefficient: t * scaler
     float       dcw_high_scaler = 0.02f;  // high band coefficient: (1-t) * scaler
@@ -174,9 +177,17 @@ struct GenerateParams {
     std::vector<float> source_audio;
 
     // Task discriminator (mirrors acestep.cpp AceRequest::task_type).
-    // Supported today: "text2music" | "cover-nofsq".
+    // Supported today: "text2music" | "cover-nofsq" | "lego".
     // "cover" (FSQ roundtrip) is accepted at the API but not implemented yet.
+    // "lego" generates a new instrument layer that follows source_audio and
+    // returns only that layer; it requires a base DiT (turbo and sft are
+    // rejected).
     std::string task_type = "text2music";
+
+    // Lego target layer. Required when task_type is "lego"; one of:
+    // vocals|backing_vocals|drums|bass|guitar|keyboard|percussion|strings|
+    // synth|fx|brass|woodwinds.
+    std::string track;
 
     // Fraction of DiT steps that keep the source context (0..1). Default 1.0
     // keeps source context for every step. Values < 1.0 switch the DiT to a

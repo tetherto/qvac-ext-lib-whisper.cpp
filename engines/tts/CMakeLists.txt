@@ -1103,6 +1103,15 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-cosyvoice-load)
     tts_cpp_register_test(test-cosyvoice-load LABEL "unit")
 
+    # Sinusoidal timestep embedding for the flow DiT. Pure function on the CFM
+    # step path, so it needs no GGUF.
+    add_executable(test-cosyvoice-time-emb
+        test/test_cosyvoice_time_emb.cpp ${_tcb_cosy_core_srcs})
+    target_link_libraries(test-cosyvoice-time-emb PRIVATE ggml)
+    target_include_directories(test-cosyvoice-time-emb PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-cosyvoice-time-emb)
+    tts_cpp_register_test(test-cosyvoice-time-emb LABEL "unit")
+
     # Qwen2 BPE tokenizer parity (header-only; no GGUF weights, just the Qwen2
     # vocab.json/merges.txt bundled with the model + HF-reference ids from
     # scripts/dump-cosyvoice3-tokenizer-reference.py).
@@ -2122,6 +2131,20 @@ if (TTS_CPP_BUILD_TESTS)
     # LavaSR DSP primitives: resampler, STFT/ISTFT, Slaney mel,
     # FastLR crossover merge.  Pure host math (no model / no ggml), compiled
     # straight from the lavasr/dsp sources so it always runs in CI.
+    # Fail-closed GGUF loading for both LavaSR stages: synthesizes tiny
+    # metadata-only GGUFs and asserts each loader rejects a missing, empty,
+    # truncated, unmarked, cross-architecture, or tensorless file.
+    add_executable(test-lavasr-gguf-load
+        test/test_lavasr_gguf_load.cpp
+        src/lavasr/denoiser_gguf.cpp
+        src/lavasr/enhancer_gguf.cpp
+        src/lavasr/denoiser_core.cpp
+        src/lavasr/enhancer_core.cpp)
+    target_link_libraries(test-lavasr-gguf-load PRIVATE ggml)
+    target_include_directories(test-lavasr-gguf-load PRIVATE ggml/include src test)
+    tts_cpp_apply_ccache(test-lavasr-gguf-load)
+    tts_cpp_register_test(test-lavasr-gguf-load LABEL "unit")
+
     add_executable(test-lavasr-dsp
         test/test_lavasr_dsp.cpp
         src/lavasr/dsp/resampler.cpp

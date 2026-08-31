@@ -170,6 +170,8 @@ struct MM3GenRequest {
 
     std::vector<std::vector<float>> forced_noise;
 
+    int64_t dump_iters = 0;
+
     bool keep_window_latents = false;
 
     std::function<bool()> should_cancel;
@@ -187,6 +189,10 @@ struct MM3GenResult {
     std::vector<int64_t> window_L;
     std::vector<int64_t> window_overlap;
     std::vector<int64_t> forced_noise_used;
+
+    // The conditional prompt ids the run actually used (tokenized from the
+    // prompt when ids_cond was empty), so a full run records the replay input.
+    std::vector<int32_t> ids_cond_used;
 
     std::vector<std::vector<float>> window_latents;
 
@@ -270,6 +276,7 @@ static bool mm3_prepare_ar_options(const MM3GenRequest & request, int64_t acoust
     options.max_frames = request.max_frames;
     options.seed = request.seed;
     options.collect_hiddens = true;
+    options.dump_iters = request.dump_iters;
     options.should_cancel = request.should_cancel;
     if (!request.forced_semantic.empty()) {
         const int64_t expected =
@@ -316,6 +323,11 @@ static bool mm3_run_ar_stage(const MM3Model & model, const MM3GenRequest & reque
     if (static_cast<int64_t>(result->ar.frame_hiddens.size()) != expected) {
         return mm3_fail(error, "the AR stage returned a frame-hidden block of the wrong size");
     }
+    // The synth stages never touch the LM again; releasing its KV cache and
+    // sched compute buffers here frees a few hundred MiB before the DiT and
+    // vocoder allocate, which is what lets the whole pipeline fit a 10 GiB
+    // GPU. mm3_lm_prepare rebuilds everything on the next generation.
+    mm3_lm_free(&g_mm3_lm);
     return true;
 }
 
@@ -475,6 +487,7 @@ static bool mm3_generate(const MM3Model & model, const MM3GenRequest & request,
     if (!mm3_prepare_token_ids(model, request, tokenizer, conditional, unconditional, error)) {
         return false;
     }
+    result->ids_cond_used = conditional;
     if (!mm3_run_ar_stage(model, request, dimensions, conditional, unconditional,
                           progress, result, error)) {
         return false;

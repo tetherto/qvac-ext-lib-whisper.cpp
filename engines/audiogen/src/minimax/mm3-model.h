@@ -5,6 +5,7 @@
 #include "logic.h"
 #include "weight-ctx.h"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -161,9 +162,9 @@ struct MM3LmLayer {
 };
 
 struct MM3LmWeights {
-    ggml_tensor *           token_embd  = nullptr;
-    ggml_tensor *           output_norm = nullptr;
-    ggml_tensor *           output      = nullptr;
+    ggml_tensor *           token_embd     = nullptr;
+    ggml_tensor *           output_norm    = nullptr;
+    ggml_tensor *           output_compact = nullptr;
     std::vector<MM3LmLayer> blk;
 };
 
@@ -390,6 +391,50 @@ struct MM3Loader {
             (*tmap)[name] = t;
         }
         return t;
+    }
+
+    // Loads only the semantic-block + EOS rows of an output-head tensor, skipping the
+    // rest of the vocabulary (decode only ever samples those rows; see collect_ar_candidates).
+    ggml_tensor * req_compact_head(const std::string & name, int64_t h, int64_t vocab, int64_t semantic_offset,
+                                   int64_t semantic_vocab, int64_t eos) {
+        if (gguf_find_tensor(gf->gguf, name.c_str()) < 0) {
+            fail("missing tensor '" + name + "'");
+            return nullptr;
+        }
+        ggml_tensor * src = ggml_get_tensor(gf->meta, name.c_str());
+        if (!src) {
+            fail("tensor '" + name + "' not in meta context");
+            return nullptr;
+        }
+        if (src->ne[0] != h || src->ne[1] != vocab || src->ne[2] != 1 || src->ne[3] != 1) {
+            char buf[320];
+            snprintf(buf, sizeof(buf),
+                     "tensor '%s' shape mismatch: file [%lld,%lld,%lld,%lld] expected [%lld,%lld,1,1]", name.c_str(),
+                     (long long) src->ne[0], (long long) src->ne[1], (long long) src->ne[2], (long long) src->ne[3],
+                     (long long) h, (long long) vocab);
+            fail(buf);
+            return nullptr;
+        }
+
+        const size_t                                             row_size = ggml_row_size(src->type, h);
+        std::array<tts_cpp::minimax::detail::CompactHeadCopy, 2> plan{};
+        if (!tts_cpp::minimax::detail::compact_head_copy_plan(vocab, semantic_offset, semantic_vocab, eos, row_size,
+                                                              plan)) {
+            fail("compact head bounds for '" + name + "' do not fit the vocabulary");
+            return nullptr;
+        }
+
+        const int64_t compact_rows = tts_cpp::minimax::detail::compact_head_row_count(semantic_vocab);
+        ggml_tensor * dst          = ggml_new_tensor_2d(wctx->ctx, src->type, h, compact_rows);
+        ggml_set_name(dst, "output_compact.weight");
+
+        const uint8_t * base = (const uint8_t *) gf_get_data(*gf, name.c_str());
+        wctx->pending.push_back({ dst, base + plan[0].src_offset, plan[0].nbytes, plan[0].dst_offset });
+        wctx->pending.push_back({ dst, base + plan[1].src_offset, plan[1].nbytes, plan[1].dst_offset });
+        if (tmap) {
+            (*tmap)["output_compact.weight"] = dst;
+        }
+        return dst;
     }
 };
 
@@ -752,9 +797,10 @@ static bool mm3_load_lm_tensors(MM3Model * m, const GGUFModel & gf, std::vector<
     wctx_init(&m->wctx_lm, 3 + L * 11);
     MM3Loader ld{ &m->wctx_lm, &gf, &m->tmap_lm, errs };
 
-    m->lm.token_embd  = ld.req("token_embd.weight", H, V);
-    m->lm.output_norm = ld.req("output_norm.weight", H);
-    m->lm.output      = ld.req("output.weight", H, V);
+    m->lm.token_embd     = ld.req("token_embd.weight", H, V);
+    m->lm.output_norm    = ld.req("output_norm.weight", H);
+    m->lm.output_compact = ld.req_compact_head("output.weight", H, V, (int64_t) c.semantic_vocab_offset,
+                                               (int64_t) c.semantic_vocab_size, (int64_t) c.eos_audio);
 
     m->lm.blk.assign((size_t) L, MM3LmLayer{});
     for (int i = 0; i < L; i++) {

@@ -955,8 +955,11 @@ quantisation:
                 DiT timestep Fourier basis is always F32.
 
   You do not have to quantise here. Emitting f16 and running the existing
-  `quantize` tool over mm3-lm-f16.gguf is the better-trodden path for the LM,
-  and it gives access to the k-quants this script does not implement.
+  `acestep-quantize` tool over mm3-lm-f16.gguf and mm3-synth-f16.gguf is the
+  better-trodden path (it gives access to the k-quants this script does not
+  implement); acestep-quantize quantizes the synth file's DiT, holds the RVQ
+  depth decoder at q8_0, and keeps the condition encoder and vocoder at their
+  converted precision.
 
 sources (--src may be repeated; directories are scanned recursively):
   preferred  Comfy-Org/MiniMax-Music-3     (single-file safetensors)

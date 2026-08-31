@@ -89,7 +89,22 @@ inline bool quant_important_l(const char * name) {
 }
 
 inline bool quant_is_embed(const char * name) {
-    return std::strstr(name, "embed_tokens.weight") != nullptr;
+    return std::strstr(name, "embed_tokens.weight") != nullptr ||
+           std::strstr(name, "token_embd.weight") != nullptr;
+}
+
+inline bool quant_is_untied_output(const char * name, const char * arch) {
+    return std::strcmp(arch, "qwen3") == 0 && std::strcmp(name, "output.weight") == 0;
+}
+
+inline bool quant_is_mm3_protected_component(const char * name) {
+    return std::strncmp(name, "cond.", 5) == 0 || std::strncmp(name, "voc.", 4) == 0 ||
+           std::strcmp(name, "dit.time_fourier.weight") == 0 ||
+           std::strcmp(name, "depth.pos_embd.weight") == 0;
+}
+
+inline bool quant_is_mm3_depth(const char * name, const char * arch) {
+    return std::strcmp(arch, "mm3") == 0 && std::strncmp(name, "depth.", 6) == 0;
 }
 
 inline bool quant_should_quantize(const char * name, int n_dims, const char * arch) {
@@ -109,6 +124,9 @@ inline bool quant_should_quantize(const char * name, int n_dims, const char * ar
         return false;
     }
     if (std::strstr(name, "null_condition_emb")) {
+        return false;
+    }
+    if (std::strcmp(arch, "mm3") == 0 && quant_is_mm3_protected_component(name)) {
         return false;
     }
     return true;
@@ -137,7 +155,11 @@ inline enum ggml_type quant_pick_type(const char *         name,
         return GGML_TYPE_COUNT;
     }
 
-    if (quant_is_embed(name) && !std::strstr(arch, "text-enc")) {
+    if (quant_is_mm3_depth(name, arch)) {
+        return GGML_TYPE_Q8_0;
+    }
+
+    if ((quant_is_embed(name) || quant_is_untied_output(name, arch)) && !std::strstr(arch, "text-enc")) {
         return v.embed != GGML_TYPE_COUNT ? v.embed : v.base;
     }
 

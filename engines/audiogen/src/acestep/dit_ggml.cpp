@@ -795,14 +795,16 @@ bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<fl
     ggml_backend_tensor_set(input, in.input_latents, 0, (size_t) c.in_channels * T * N * sizeof(float));
     ggml_backend_tensor_set(t_val, &in.t, 0, sizeof(float));
     ggml_backend_tensor_set(tr_val, &in.t_r, 0, sizeof(float));
-    if (!cache_hit || in.constants_dirty) {
+    if (!cache_hit || in.cond_dirty) {
         ggml_backend_tensor_set(enc_hidden, in.enc_hidden, 0, (size_t) in.H_enc * enc_S * N * sizeof(float));
+        if (ca_mask) ggml_backend_tensor_set(ca_mask, in.ca_mask, 0, (size_t) enc_S * S * N * sizeof(uint16_t));
+    }
+    if (!cache_hit || in.constants_dirty) {
         std::vector<int32_t> pos((size_t) S * N);
         for (int n = 0; n < N; n++)
             for (int s = 0; s < S; s++) pos[(size_t) n * S + s] = s;
         ggml_backend_tensor_set(positions, pos.data(), 0, pos.size() * sizeof(int32_t));
         if (sa_mask) ggml_backend_tensor_set(sa_mask, in.sa_mask_sw, 0, (size_t) S * S * N * sizeof(uint16_t));
-        if (ca_mask) ggml_backend_tensor_set(ca_mask, in.ca_mask, 0, (size_t) enc_S * S * N * sizeof(uint16_t));
     }
 
     int rc = ggml_backend_graph_compute(m->backend, gf);
@@ -891,6 +893,40 @@ static void preserve_repaint_latent(const DitSampleParams & params, size_t laten
         (size_t) params.T, params.repaint_crossfade_frames, channels);
 }
 
+static constexpr double DIT_APG_MOMENTUM       = -0.75;
+static constexpr double DIT_APG_NORM_THRESHOLD = 2.5;
+
+static void apg_accumulate_momentum(std::vector<double> & running, std::vector<double> & diff) {
+    for (size_t i = 0; i < diff.size(); i++) {
+        running[i] = diff[i] + DIT_APG_MOMENTUM * running[i];
+        diff[i]    = running[i];
+    }
+}
+
+static double apg_channel_norm(const double * values, int T, int Oc, int channel) {
+    double sum = 0.0;
+    for (int t = 0; t < T; t++) {
+        const double v = values[(size_t) t * Oc + channel];
+        sum += v * v;
+    }
+    return std::sqrt(sum);
+}
+
+static void apg_scale_channel(double * values, int T, int Oc, int channel, double scale) {
+    for (int t = 0; t < T; t++) {
+        values[(size_t) t * Oc + channel] *= scale;
+    }
+}
+
+static void apg_clip_channel_norms(double * diff, int T, int Oc) {
+    for (int c = 0; c < Oc; c++) {
+        const double norm = apg_channel_norm(diff, T, Oc, c);
+        if (norm > DIT_APG_NORM_THRESHOLD) {
+            apg_scale_channel(diff, T, Oc, c, DIT_APG_NORM_THRESHOLD / norm);
+        }
+    }
+}
+
 static void fill_ca_mask_rows(std::vector<uint16_t> & ca_mask, const int * real_enc_S,
                               int enc_S, int S, int N) {
     for (int b = 0; b < N; b++) {
@@ -902,6 +938,89 @@ static void fill_ca_mask_rows(std::vector<uint16_t> & ca_mask, const int * real_
             }
         }
     }
+}
+
+static double apg_channel_norm_f32(const float * values, int T, int Oc, int channel) {
+    double sum = 0.0;
+    for (int t = 0; t < T; t++) {
+        const double v = values[(size_t) t * Oc + channel];
+        sum += v * v;
+    }
+    return std::sqrt(sum);
+}
+
+static void apg_remove_parallel_component(double * diff, const float * cond, int T, int Oc, int channel) {
+    const double norm = apg_channel_norm_f32(cond, T, Oc, channel);
+    if (norm <= 0.0) return;
+    const double inv_norm = 1.0 / norm;
+    double dot = 0.0;
+    for (int t = 0; t < T; t++) {
+        const size_t idx = (size_t) t * Oc + channel;
+        dot += diff[idx] * (double) cond[idx] * inv_norm;
+    }
+    for (int t = 0; t < T; t++) {
+        const size_t idx = (size_t) t * Oc + channel;
+        diff[idx] -= dot * (double) cond[idx] * inv_norm;
+    }
+}
+
+static void apg_project_orthogonal(double * diff, const float * cond, int T, int Oc) {
+    for (int c = 0; c < Oc; c++) {
+        apg_remove_parallel_component(diff, cond, T, Oc, c);
+    }
+}
+
+static std::vector<double> apg_velocity_difference(const std::vector<float> & velocity,
+                                                   const std::vector<float> & velocity_uncond) {
+    std::vector<double> diff(velocity.size());
+    for (size_t i = 0; i < diff.size(); i++) {
+        diff[i] = (double) velocity[i] - (double) velocity_uncond[i];
+    }
+    return diff;
+}
+
+static void apg_shape_batch_updates(std::vector<double> & diff, const std::vector<float> & velocity,
+                                    int T, int Oc, int N) {
+    const size_t n_per = (size_t) T * Oc;
+    for (int b = 0; b < N; b++) {
+        apg_clip_channel_norms(diff.data() + (size_t) b * n_per, T, Oc);
+        apg_project_orthogonal(diff.data() + (size_t) b * n_per, velocity.data() + (size_t) b * n_per, T, Oc);
+    }
+}
+
+static void apg_apply_guided_update(std::vector<float> & velocity, const std::vector<double> & diff,
+                                    float guidance_scale) {
+    const double weight = (double) guidance_scale - 1.0;
+    for (size_t i = 0; i < diff.size(); i++) {
+        velocity[i] = (float) ((double) velocity[i] + weight * diff[i]);
+    }
+}
+
+void dit_apg_guide(std::vector<float> &       velocity,
+                   const std::vector<float> & velocity_uncond,
+                   std::vector<double> &      momentum,
+                   float                      guidance_scale,
+                   int                        T,
+                   int                        Oc,
+                   int                        N) {
+    std::vector<double> diff = apg_velocity_difference(velocity, velocity_uncond);
+    apg_accumulate_momentum(momentum, diff);
+    apg_shape_batch_updates(diff, velocity, T, Oc, N);
+    apg_apply_guided_update(velocity, diff, guidance_scale);
+}
+
+static std::vector<float> make_null_enc_hidden(const float * null_emb, int H_enc, int enc_S, int N) {
+    std::vector<float> hidden((size_t) H_enc * enc_S * N);
+    for (int b = 0; b < N; b++) {
+        for (int s = 0; s < enc_S; s++) {
+            memcpy(&hidden[((size_t) b * enc_S + s) * H_enc], null_emb, (size_t) H_enc * sizeof(float));
+        }
+    }
+    return hidden;
+}
+
+static std::vector<uint16_t> make_visible_ca_mask(int enc_S, int S, int N) {
+    return std::vector<uint16_t>((size_t) enc_S * S * N, ggml_fp32_to_fp16(0.0f));
 }
 
 static void splice_context_channels(std::vector<float> & input_buf, const float * context,
@@ -967,6 +1086,18 @@ bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & la
         xt_before.resize(n_per * N);
         denoised.resize(n_per * N);
     }
+
+    const bool use_cfg = p.guidance_scale > 1.0f && p.null_cond_emb != nullptr && p.H_enc > 0;
+    std::vector<float>    vt_uncond;
+    std::vector<float>    null_enc_hidden;
+    std::vector<uint16_t> null_ca_mask;
+    std::vector<double>   apg_momentum;
+    if (use_cfg) {
+        null_enc_hidden = make_null_enc_hidden(p.null_cond_emb, p.H_enc, enc_S, N);
+        null_ca_mask    = make_visible_ca_mask(enc_S, S, N);
+        apg_momentum.assign(n_per * N, 0.0);
+    }
+
     const float * enc_hidden_active = p.enc_hidden;
     bool          cover_switched    = false;
     for (int step = 0; step < p.num_steps; step++) {
@@ -1000,18 +1131,32 @@ bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & la
         fin.enc_S         = enc_S;
         fin.H_enc         = p.H_enc;
         fin.t             = t_curr;
-        // t_r == t (t_diff == 0, so time_embed_r sees 0). Holds for turbo
-        // text2music, which is also why the sampler runs a single conditional
-        // pass (N == 1, no CFG). base/sft (50-step, CFG) parity is not yet
-        // verified against the reference and would need t_r / uncond wiring.
+        // t_r == t (t_diff == 0, so time_embed_r sees 0) for both turbo and
+        // base/sft: the reference passes timestep_r = timestep unconditionally.
         fin.t_r             = t_curr;
         fin.sa_mask_sw      = sa_mask.data();
         fin.ca_mask         = ca_mask.data();
+        // CFG alternates cond/uncond enc_hidden and ca_mask on the shared graph
+        // cache, so their uploads can never be skipped; positions and sa_mask
+        // stay valid between steps and across the cond/uncond pair.
+        fin.cond_dirty      = constants_dirty || use_cfg;
         fin.constants_dirty = constants_dirty;
 
         if (!dit_model_forward(m, fin, vt)) {
             fprintf(stderr, "[acestep-dit] sample: forward failed at step %d\n", step);
             return false;
+        }
+
+        if (use_cfg) {
+            DitForwardInputs fin_uncond = fin;
+            fin_uncond.enc_hidden       = null_enc_hidden.data();
+            fin_uncond.ca_mask          = null_ca_mask.data();
+            fin_uncond.constants_dirty  = false;
+            if (!dit_model_forward(m, fin_uncond, vt_uncond)) {
+                fprintf(stderr, "[acestep-dit] sample: uncond forward failed at step %d\n", step);
+                return false;
+            }
+            dit_apg_guide(vt, vt_uncond, apg_momentum, p.guidance_scale, T, Oc, N);
         }
 
         // Euler ODE step. Final step integrates all the way to x0 (t_next = 0).

@@ -4,13 +4,12 @@
 
 #include "backend.h"
 #include "ggml.h"
-#include "build-flags.h"
+#include "mm3-flash-attn.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -277,7 +276,7 @@ static bool mm3_lm_build_slot(const MM3Model & m, MM3LmGraph * g, MM3LmSlot * s,
     ggml_set_name(s->out_hidden, "mm3_lm_last_hidden");
     ggml_set_output(s->out_hidden);
 
-    s->out_logits = ggml_mul_mat(ctx, m.lm.output, last);
+    s->out_logits = ggml_mul_mat(ctx, m.lm.output_compact, last);
     ggml_set_name(s->out_logits, "mm3_lm_logits");
     ggml_set_output(s->out_logits);
 
@@ -334,7 +333,7 @@ static bool mm3_lm_prepare(const MM3Model & m, MM3LmGraph * g, int64_t n_ctx_nee
         }
         return false;
     }
-    if (!m.lm.token_embd || !m.lm.output || !m.lm.output_norm) {
+    if (!m.lm.token_embd || !m.lm.output_compact || !m.lm.output_norm) {
         if (err) {
             *err = "the LM weights are not resident";
         }
@@ -367,10 +366,10 @@ static bool mm3_lm_prepare(const MM3Model & m, MM3LmGraph * g, int64_t n_ctx_nee
         g->cpu_backend = bp.cpu_backend;
         g->backend_ref = true;
 
-        const char * no_fa = std::getenv("MM3_LM_NO_FLASH");
-        g->use_flash_attn  = bp.has_gpu && !HOT_STEP_FA_DISABLED && !(no_fa && no_fa[0] && no_fa[0] != '0');
-        g->lm_token        = lt;
-        g->synth_token     = st;
+        g->use_flash_attn =
+            mm3_use_flash_attn(bp.has_gpu, /*default_on=*/false, "MM3_LM_NO_FLASH", "MM3_LM_FLASH");
+        g->lm_token    = lt;
+        g->synth_token = st;
     }
 
     if (g->n_ctx >= want) {
@@ -452,13 +451,13 @@ static void mm3_lm_upload_step(MM3LmGraph * g, MM3LmSlot * s, int64_t T, int64_t
 
 static void mm3_lm_read_outputs(const MM3LmConfig & c, const MM3LmSlot & s, float * out_hidden, float * out_logits,
                                 float * out_feedback) {
-    const size_t H = (size_t) c.embedding_length;
-    const size_t V = (size_t) c.vocab_size;
+    const size_t H  = (size_t) c.embedding_length;
+    const size_t CV = (size_t) tts_cpp::minimax::detail::compact_head_row_count((int64_t) c.semantic_vocab_size);
     if (out_hidden) {
         ggml_backend_tensor_get(s.out_hidden, out_hidden, 0, H * MM3_LM_CFG_ROWS * sizeof(float));
     }
     if (out_logits) {
-        ggml_backend_tensor_get(s.out_logits, out_logits, 0, V * MM3_LM_CFG_ROWS * sizeof(float));
+        ggml_backend_tensor_get(s.out_logits, out_logits, 0, CV * MM3_LM_CFG_ROWS * sizeof(float));
     }
     if (out_feedback && s.out_feedback) {
         ggml_backend_tensor_get(s.out_feedback, out_feedback, 0, H * sizeof(float));
