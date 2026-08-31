@@ -118,15 +118,39 @@ void test_adreno_700plus_opencl_wins_top_tier() {
 
 void test_adreno_6xx_opencl_not_promoted() {
     // Older Adreno 6xx OpenCL is known-broken (miscomputes on some kernels),
-    // so it does NOT get the top-tier bump. Whisper isn't the layer that
-    // filters broken drivers — that's the addon's job before it calls the
-    // picker — but the picker must not accidentally promote 6xx to the top.
-    // With only an Adreno 6xx OpenCL + a Vulkan iGPU visible, both fall
-    // into the integrated tier and Vulkan (enum 0) wins by enumeration
-    // order — the picker never claims OpenCL was preferable.
+    // so it does NOT get the top-tier bump and is routed to the last-resort
+    // OpenCL bucket. A Vulkan sibling on the same host must win regardless of
+    // enumeration order — before the last-resort bucket existed, 6xx OpenCL
+    // enumerated first grabbed the integrated tier and beat Vulkan.
     CHECK(pick({
         {"Vulkan", true, -1},    // index 0 — Adreno 660 Vulkan
-        {"OpenCL", true, 660},   // index 1 — Adreno 660 OpenCL (NOT top tier)
+        {"OpenCL", true, 660},   // index 1 — Adreno 660 OpenCL (last resort)
+    }) == 0);
+    CHECK(pick({
+        {"OpenCL", true, 660},   // index 0 — Adreno 660 OpenCL first
+        {"Vulkan", true, -1},    // index 1 — Vulkan still wins
+    }) == 1);
+    CHECK(pick({
+        {"OpenCL", true, 660},   // OpenCL-only — the last-resort bucket is
+    }) == 0);                    // still selectable, just deprioritised.
+}
+
+void test_desktop_opencl_deprioritized_below_vulkan() {
+    // Non-Adreno desktop OpenCL (adreno_version == -1) is treated like
+    // 6xx: routed to the last-resort tier, so a Vulkan/Metal dGPU on the same
+    // host wins. Matches the `opencl_other` bucket in parakeet / audiogen /
+    // tts so the four speech engines reach the same verdict on the same host.
+    CHECK(pick({
+        {"OpenCL", false, -1},   // index 0 — desktop OpenCL first
+        {"Vulkan", false, -1},   // index 1 — Vulkan wins
+    }) == 1);
+    CHECK(pick({
+        {"Vulkan", false, -1},
+        {"OpenCL", false, -1},
+    }) == 0);
+    // Desktop OpenCL is still selectable when it is the only GPU present.
+    CHECK(pick({
+        {"OpenCL", false, -1},
     }) == 0);
 }
 
@@ -178,6 +202,7 @@ int main() {
     test_cuda_integrated_still_over_other_discrete();
     test_adreno_700plus_opencl_wins_top_tier();
     test_adreno_6xx_opencl_not_promoted();
+    test_desktop_opencl_deprioritized_below_vulkan();
     test_only_integrated_available();
     test_only_discrete_available();
     test_empty_device_list();

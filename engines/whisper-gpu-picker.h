@@ -92,11 +92,16 @@ inline int parse_adreno_version_whisper_picker(const char * s) {
 //      CUDA is safe.)
 //   2. First CUDA device on a discrete GPU (typical NVIDIA).
 //   3. First CUDA device on an integrated GPU (Tegra/Jetson).
-//   4. Otherwise, first discrete (GPU) non-CUDA device — Vulkan/Metal on a
-//      dGPU, etc.
-//   5. Otherwise, first integrated (IGPU) device — UMA Vulkan, Mali iGPU,
-//      Intel iGPU, Apple integrated, etc.
-//   6. Otherwise 0 (whisper's own default; whisper_backend_init_gpu will
+//   4. Otherwise, first discrete (GPU) non-CUDA, non-OpenCL device —
+//      Vulkan/Metal on a dGPU, etc.
+//   5. Otherwise, first integrated (IGPU) non-OpenCL device — UMA Vulkan,
+//      Mali iGPU, Intel iGPU, Apple integrated, etc.
+//   6. Otherwise, first OpenCL device that did not qualify for the Adreno
+//      700+ tier — Adreno 6xx (known-broken kernels), desktop OpenCL, or any
+//      other unrecognised OpenCL adapter. Ranked last so a Vulkan/Metal
+//      sibling on the same host is preferred; matches the `opencl_other`
+//      last-resort tier in parakeet / audiogen / tts.
+//   7. Otherwise 0 (whisper's own default; whisper_backend_init_gpu will
 //      report "no GPU found" and return nullptr, and the caller falls back
 //      to CPU as before).
 //
@@ -115,6 +120,7 @@ inline int pick_whisper_gpu_device() {
     int idx_cuda_integrated = -1;
     int idx_discrete        = -1;
     int idx_integrated      = -1;
+    int idx_opencl_other    = -1;
 
     int cnt = 0;
     for (size_t i = 0; i < n_dev; ++i) {
@@ -136,7 +142,14 @@ inline int pick_whisper_gpu_device() {
                                  parse_adreno_version_whisper_picker(ggml_backend_dev_description(dev)))
                       : -1;
 
+        // OpenCL that did not qualify for Adreno-700+ (Adreno 6xx broken,
+        // desktop OpenCL, or unrecognised) is routed to the last-resort tier
+        // rather than the generic discrete/integrated buckets. This matches
+        // parakeet's `opencl_other` bucket (parakeet_ctc.cpp) and keeps a
+        // Vulkan/Metal sibling on the same host preferred over a driver we
+        // don't want to pick by default.
         if      (is_opencl && adreno_v >= 700 && idx_adreno_opencl   < 0) idx_adreno_opencl   = cnt;
+        else if (is_opencl                    && idx_opencl_other    < 0) idx_opencl_other    = cnt;
         else if (is_cuda   && !is_integrated  && idx_cuda_discrete   < 0) idx_cuda_discrete   = cnt;
         else if (is_cuda   &&  is_integrated  && idx_cuda_integrated < 0) idx_cuda_integrated = cnt;
         else if (!is_cuda  && !is_integrated  && idx_discrete        < 0) idx_discrete        = cnt;
@@ -150,6 +163,7 @@ inline int pick_whisper_gpu_device() {
     if (idx_cuda_integrated >= 0) return idx_cuda_integrated;
     if (idx_discrete        >= 0) return idx_discrete;
     if (idx_integrated      >= 0) return idx_integrated;
+    if (idx_opencl_other    >= 0) return idx_opencl_other;
     return 0;
 }
 
@@ -171,17 +185,21 @@ inline int pick_whisper_gpu_device_from(const PickerDevice * devs, size_t n) {
     int idx_cuda_integrated = -1;
     int idx_discrete        = -1;
     int idx_integrated      = -1;
+    int idx_opencl_other    = -1;
 
     for (size_t i = 0; i < n; ++i) {
         const PickerDevice & d = devs[i];
         const bool is_cuda   = d.reg_name && std::strcmp(d.reg_name, "CUDA")   == 0;
         const bool is_opencl = d.reg_name && std::strcmp(d.reg_name, "OpenCL") == 0;
         const int  idx       = static_cast<int>(i);
+        // See pick_whisper_gpu_device above: OpenCL that misses the Adreno-700+
+        // gate goes to the last-resort tier so a Vulkan/Metal sibling wins.
         if      (is_opencl && d.adreno_version >= 700 && idx_adreno_opencl   < 0) idx_adreno_opencl   = idx;
-        else if (is_cuda   && !d.is_integrated        && idx_cuda_discrete   < 0) idx_cuda_discrete   = idx;
-        else if (is_cuda   &&  d.is_integrated        && idx_cuda_integrated < 0) idx_cuda_integrated = idx;
-        else if (!is_cuda  && !d.is_integrated        && idx_discrete        < 0) idx_discrete        = idx;
-        else if (!is_cuda  &&  d.is_integrated        && idx_integrated      < 0) idx_integrated      = idx;
+        else if (is_opencl                             && idx_opencl_other   < 0) idx_opencl_other    = idx;
+        else if (is_cuda   && !d.is_integrated         && idx_cuda_discrete   < 0) idx_cuda_discrete   = idx;
+        else if (is_cuda   &&  d.is_integrated         && idx_cuda_integrated < 0) idx_cuda_integrated = idx;
+        else if (!is_cuda  && !d.is_integrated         && idx_discrete        < 0) idx_discrete        = idx;
+        else if (!is_cuda  &&  d.is_integrated         && idx_integrated      < 0) idx_integrated      = idx;
     }
 
     if (idx_adreno_opencl   >= 0) return idx_adreno_opencl;
@@ -189,6 +207,7 @@ inline int pick_whisper_gpu_device_from(const PickerDevice * devs, size_t n) {
     if (idx_cuda_integrated >= 0) return idx_cuda_integrated;
     if (idx_discrete        >= 0) return idx_discrete;
     if (idx_integrated      >= 0) return idx_integrated;
+    if (idx_opencl_other    >= 0) return idx_opencl_other;
     return 0;
 }
 

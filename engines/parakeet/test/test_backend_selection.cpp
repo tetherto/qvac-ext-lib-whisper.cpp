@@ -1,14 +1,20 @@
-// Model-free unit tests for parakeet's GPU-tier selection policy
-// (parakeet::gpu_tier_for).
+// Model-free unit tests for parakeet's GPU-tier classification
+// (parakeet::gpu_tier_for + the GpuTier enum ordering).
 //
 // parakeet's init_gpu_backend must prefer CUDA over Vulkan on NVIDIA, and
 // prefer discrete GPUs over integrated ones, matching the existing
 // llm-llamacpp / diffusion behavior. The tier ranking is a pure function so
 // a synthesised device topology can be scored without touching the live
-// ggml-backend registry (which needs real drivers to populate). If someone
-// edits init_gpu_backend's bucket order without touching the ranking here,
-// the test still fails because the ordering constants encode the same
-// policy.
+// ggml-backend registry (which needs real drivers to populate).
+//
+// SCOPE: these tests cover the classifier (what tier a device lands in) and
+// the enum-constant ordering (which tier outranks which). They do NOT
+// exercise init_gpu_backend's actual bucket walk in parakeet_ctc.cpp: that
+// function has its own parallel `try_init(...)` sequence and does not call
+// gpu_tier_for today, so a reordering of its try_init calls would silently
+// pass these tests. Keeping the two in sync is a code-review contract; the
+// deeper fix (drive init_gpu_backend off gpu_tier_for as the single source
+// of truth) is tracked separately.
 //
 // Exit 0 on success; non-zero with FAIL lines otherwise.
 
