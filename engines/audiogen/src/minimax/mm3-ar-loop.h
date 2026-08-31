@@ -66,6 +66,7 @@ struct MM3ArConfig {
     int64_t hidden = 0;
     int64_t vocab = 0;
     int64_t semantic_vocab = 0;
+    int64_t compact_vocab = 0;
     int64_t acoustic_codebooks = 0;
     int64_t acoustic_vocab = 0;
     int64_t semantic_offset = 0;
@@ -170,6 +171,8 @@ static bool mm3_ar_resolve_config(const MM3Model & model,
     resolved.vocab = static_cast<int64_t>(config.vocab_size);
     resolved.semantic_vocab =
         static_cast<int64_t>(config.semantic_vocab_size);
+    resolved.compact_vocab =
+        tts_cpp::minimax::detail::compact_head_row_count(resolved.semantic_vocab);
     resolved.acoustic_codebooks =
         static_cast<int64_t>(config.num_codebooks) - 1;
     resolved.acoustic_vocab =
@@ -217,7 +220,7 @@ static void mm3_ar_initialize_workspace(const MM3ArConfig & config,
     workspace.hidden.resize(
         static_cast<size_t>(config.hidden * MM3_LM_CFG_ROWS));
     workspace.logits.resize(
-        static_cast<size_t>(config.vocab * MM3_LM_CFG_ROWS));
+        static_cast<size_t>(config.compact_vocab * MM3_LM_CFG_ROWS));
     workspace.feedback.resize(static_cast<size_t>(config.hidden));
     workspace.acoustic_rows.resize(
         static_cast<size_t>(config.acoustic_codebooks));
@@ -247,10 +250,11 @@ static bool mm3_ar_collect_candidates(const MM3ArConfig & config,
                                       MM3ArWorkspace & workspace,
                                       MM3ArResult * result,
                                       std::string * error) {
+    // Compact head layout: semantic block at row-offset 0, EOS is the last row.
     if (!tts_cpp::minimax::detail::collect_ar_candidates(
-            workspace.logits.data(), config.vocab, config.eos,
-            config.semantic_offset, config.semantic_vocab, workspace.candidates,
-            result->nonfinite_logits)) {
+            workspace.logits.data(), config.compact_vocab, config.semantic_vocab,
+            tts_cpp::minimax::detail::kCompactHeadSemanticOffset, config.semantic_vocab,
+            workspace.candidates, result->nonfinite_logits)) {
         return mm3_ar_fail(error, "the LM candidate layout is invalid");
     }
     return true;
@@ -354,10 +358,10 @@ static void mm3_ar_create_dump(const MM3ArConfig & config,
     dump.last_hidden = workspace.hidden;
     dump.sem_logits.resize(static_cast<size_t>(2 * config.semantic_vocab));
     memcpy(dump.sem_logits.data(),
-           workspace.logits.data() + config.semantic_offset,
+           workspace.logits.data() + tts_cpp::minimax::detail::kCompactHeadSemanticOffset,
            static_cast<size_t>(config.semantic_vocab) * sizeof(float));
     memcpy(dump.sem_logits.data() + config.semantic_vocab,
-           workspace.logits.data() + config.vocab + config.semantic_offset,
+           workspace.logits.data() + config.compact_vocab + tts_cpp::minimax::detail::kCompactHeadSemanticOffset,
            static_cast<size_t>(config.semantic_vocab) * sizeof(float));
     dump.guided.assign(workspace.candidates.guided.begin() + 1,
                        workspace.candidates.guided.end());

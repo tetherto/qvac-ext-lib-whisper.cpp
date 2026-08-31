@@ -13,7 +13,13 @@
 #include <string>
 #include <vector>
 
-#define MM3_VOC_CHUNK   1024
+// Max latent frames per vocoder graph. The im2col columns of the full-rate
+// convolutions scale with decoded length (a 689-frame window needs a 1.29 GiB
+// compute buffer, which does not fit next to the weights on a 10 GiB GPU), so
+// longer windows decode as overlapped tiles; the interior of each tile is
+// bit-identical to a single-shot decode because MM3_VOC_OVERLAP exceeds the
+// conv stack's receptive field.
+#define MM3_VOC_CHUNK   256
 
 #define MM3_VOC_OVERLAP 32
 
@@ -460,6 +466,10 @@ static bool mm3_voc_run(const MM3Model & m, MM3VocGraph * g, const float * src, 
 
 static MM3VocGraph g_mm3_voc;
 
+static bool mm3_vocoder_decode_tiled(const MM3Model & m, const std::vector<float> & latents, int64_t L,
+                                     std::vector<float> & out_stereo, int64_t chunk, int64_t overlap,
+                                     std::string * err);
+
 static bool mm3_vocoder_decode(const MM3Model & m, const std::vector<float> & latents, int64_t L,
                                std::vector<float> & out_stereo, std::string * err = nullptr) {
     if (L <= 0) {
@@ -493,10 +503,25 @@ static bool mm3_vocoder_decode(const MM3Model & m, const std::vector<float> & la
         return false;
     }
     out_stereo.assign((size_t) (2 * T), 0.0f);
+    return mm3_vocoder_decode_tiled(m, latents, L, out_stereo, MM3_VOC_CHUNK, MM3_VOC_OVERLAP, err);
+}
+
+// Tiled decode with explicit chunk/overlap so the tile-vs-single-shot
+// bit-equality is testable; production callers use the MM3_VOC_* constants.
+static bool mm3_vocoder_decode_tiled(const MM3Model & m, const std::vector<float> & latents, int64_t L,
+                                     std::vector<float> & out_stereo, int64_t chunk, int64_t overlap,
+                                     std::string * err) {
+    const MM3VocConfig & vc = m.synth_cfg.voc;
+    const int64_t        up = (int64_t) vc.total_upsample;
+    const int64_t        FC = (int64_t) vc.fold_channels;
+    int64_t T = 0;
+    if (!mm3_voc_expected_length(L, up, &T, err)) {
+        return false;
+    }
 
     MM3VocGraph * g = &g_mm3_voc;
 
-    if (L <= MM3_VOC_CHUNK) {
+    if (L <= chunk) {
         for (int ch = 0; ch < 2; ch++) {
             if (!mm3_voc_run(m, g, latents.data() + (size_t) (ch * FC * L), L,
                              out_stereo.data() + (size_t) (ch * T),
@@ -507,8 +532,8 @@ static bool mm3_vocoder_decode(const MM3Model & m, const std::vector<float> & la
         return true;
     }
 
-    const int64_t      ov   = MM3_VOC_OVERLAP;
-    const int64_t      core = MM3_VOC_CHUNK - 2 * ov;
+    const int64_t      ov   = overlap;
+    const int64_t      core = chunk - 2 * ov;
     std::vector<float> win;
     std::vector<float> tile;
     for (int64_t cs = 0; cs < L; cs += core) {
