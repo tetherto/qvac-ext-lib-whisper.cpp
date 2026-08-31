@@ -1908,7 +1908,9 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
         return result;
     }
     match_stem_to_source_length(params, state, result);
-    if (params.normalize_loudness) normalize_loudness(result.pcm);
+    if (params.normalize_loudness && !is_lego_task(state.task.type)) {
+        normalize_loudness(result.pcm);
+    }
     populate_metadata(state, result);
     return result;
 }

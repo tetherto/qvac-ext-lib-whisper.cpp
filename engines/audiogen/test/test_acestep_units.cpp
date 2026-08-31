@@ -1200,6 +1200,10 @@ void test_simple_mode_prompt_resolvers() {
     params.vocal_language.clear();
     params.edit_plan.push_back(RepaintParams{});
     CHECK(resolve_prompt_language(params) == "unknown");
+
+    params.edit_plan.clear();
+    params.task_type = tts_cpp::acestep::TASK_LEGO;
+    CHECK(resolve_prompt_language(params) == "unknown");
 }
 
 void test_normalize_loudness() {
