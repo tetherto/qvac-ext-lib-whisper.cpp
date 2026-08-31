@@ -82,8 +82,11 @@ struct DitForwardInputs {
     const void * sa_mask_sw = nullptr;  // [S, S, 1, N] self-attn sliding window
     const void * ca_mask    = nullptr;  // [enc_S, S, 1, N] cross-attn encoder padding
 
-    // false = enc_hidden/positions/masks are unchanged since the previous call
-    // on this model, so their uploads are skipped (their graph slots persist).
+    // false = the inputs are unchanged since the previous call on this model,
+    // so their uploads are skipped (their graph slots persist). cond_dirty
+    // covers enc_hidden and ca_mask (they alternate between the cond and
+    // uncond pass under CFG); constants_dirty covers positions and sa_mask.
+    bool cond_dirty      = true;
     bool constants_dirty = true;
 };
 

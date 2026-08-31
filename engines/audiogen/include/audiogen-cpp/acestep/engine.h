@@ -165,7 +165,8 @@ struct GenerateParams {
     // Supported today: "text2music" | "cover-nofsq" | "lego".
     // "cover" (FSQ roundtrip) is accepted at the API but not implemented yet.
     // "lego" generates a new instrument layer that follows source_audio and
-    // returns only that layer; it requires a base/sft DiT (turbo is rejected).
+    // returns only that layer; it requires a base DiT (turbo and sft are
+    // rejected).
     std::string task_type = "text2music";
 
     // Lego target layer. Required when task_type is "lego"; one of:

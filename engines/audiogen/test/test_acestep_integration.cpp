@@ -22,6 +22,7 @@ namespace fs = std::filesystem;
 constexpr int TEST_SAMPLE_RATE = 48000;
 constexpr int TEST_CHANNELS = 2;
 constexpr int TEST_SECONDS = 2;
+constexpr int TEST_LEGO_PARTIAL_HOP_FRAMES = 480;
 constexpr int TEST_STEPS = 2;
 constexpr float TEST_SHIFT = 3.0f;
 constexpr float TEST_NOISE_STRENGTH = 0.5f;
@@ -418,6 +419,8 @@ tts_cpp::acestep::GenerateParams make_lego_params() {
     params.caption = "Clean electric guitar layer integration test";
     params.reference_audio.clear();
     params.cover_noise_strength = 0.0f;
+    params.source_audio.resize(
+        params.source_audio.size() + (size_t) TEST_LEGO_PARTIAL_HOP_FRAMES * TEST_CHANNELS, 0.0f);
     return params;
 }
 

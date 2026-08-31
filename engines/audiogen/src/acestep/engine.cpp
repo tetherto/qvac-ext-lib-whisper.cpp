@@ -1129,7 +1129,9 @@ static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params
     sample.num_steps = noise.steps;
     sample.real_enc_S = &conditioning.sequence;
     sample.guidance_scale = guidance;
-    sample.null_cond_emb = conditioning.null_emb.empty() ? nullptr : conditioning.null_emb.data();
+    sample.null_cond_emb = conditioning.null_emb.size() >= (size_t) conditioning.hidden_size
+                               ? conditioning.null_emb.data()
+                               : nullptr;
     if (has_switch) {
         sample.context_switch = conditioning.context_switch.data();
         sample.enc_hidden_switch = conditioning.hidden_switch.data();
@@ -1189,14 +1191,13 @@ static bool decode_audio(EngineImpl & engine, const std::vector<float> & latent,
     return true;
 }
 
-// A lego stem must mix sample-for-sample over its source: latent frames are
-// patch-aligned upward, so the decode can overshoot the source length.
-static void trim_stem_to_source(const GenerateParams & params, const GenerationState & state,
-                                GenerateResult & result) {
+// A lego stem must mix sample-for-sample over its source. The decode length is
+// a whole multiple of the VAE hop rounded up to the DiT patch size, so it can
+// overshoot the source (trim) or undershoot it by up to one hop (pad silence).
+static void match_stem_to_source_length(const GenerateParams & params, const GenerationState & state,
+                                        GenerateResult & result) {
     if (!is_lego_task(state.task.type)) return;
-    if (result.pcm.size() > params.source_audio.size()) {
-        result.pcm.resize(params.source_audio.size());
-    }
+    result.pcm.resize(params.source_audio.size(), 0.0f);
 }
 
 static AcePrompt make_edit_prompt(const GenerateParams & params, const std::string & caption,
@@ -1879,7 +1880,7 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
                       report, dump, timing, result)) {
         return result;
     }
-    trim_stem_to_source(params, state, result);
+    match_stem_to_source_length(params, state, result);
     populate_metadata(state, result);
     return result;
 }

@@ -795,14 +795,16 @@ bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<fl
     ggml_backend_tensor_set(input, in.input_latents, 0, (size_t) c.in_channels * T * N * sizeof(float));
     ggml_backend_tensor_set(t_val, &in.t, 0, sizeof(float));
     ggml_backend_tensor_set(tr_val, &in.t_r, 0, sizeof(float));
-    if (!cache_hit || in.constants_dirty) {
+    if (!cache_hit || in.cond_dirty) {
         ggml_backend_tensor_set(enc_hidden, in.enc_hidden, 0, (size_t) in.H_enc * enc_S * N * sizeof(float));
+        if (ca_mask) ggml_backend_tensor_set(ca_mask, in.ca_mask, 0, (size_t) enc_S * S * N * sizeof(uint16_t));
+    }
+    if (!cache_hit || in.constants_dirty) {
         std::vector<int32_t> pos((size_t) S * N);
         for (int n = 0; n < N; n++)
             for (int s = 0; s < S; s++) pos[(size_t) n * S + s] = s;
         ggml_backend_tensor_set(positions, pos.data(), 0, pos.size() * sizeof(int32_t));
         if (sa_mask) ggml_backend_tensor_set(sa_mask, in.sa_mask_sw, 0, (size_t) S * S * N * sizeof(uint16_t));
-        if (ca_mask) ggml_backend_tensor_set(ca_mask, in.ca_mask, 0, (size_t) enc_S * S * N * sizeof(uint16_t));
     }
 
     int rc = ggml_backend_graph_compute(m->backend, gf);
@@ -1135,8 +1137,10 @@ bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & la
         fin.sa_mask_sw      = sa_mask.data();
         fin.ca_mask         = ca_mask.data();
         // CFG alternates cond/uncond enc_hidden and ca_mask on the shared graph
-        // cache, so its uploads can never be skipped.
-        fin.constants_dirty = constants_dirty || use_cfg;
+        // cache, so their uploads can never be skipped; positions and sa_mask
+        // stay valid between steps and across the cond/uncond pair.
+        fin.cond_dirty      = constants_dirty || use_cfg;
+        fin.constants_dirty = constants_dirty;
 
         if (!dit_model_forward(m, fin, vt)) {
             fprintf(stderr, "[acestep-dit] sample: forward failed at step %d\n", step);
@@ -1147,6 +1151,7 @@ bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & la
             DitForwardInputs fin_uncond = fin;
             fin_uncond.enc_hidden       = null_enc_hidden.data();
             fin_uncond.ca_mask          = null_ca_mask.data();
+            fin_uncond.constants_dirty  = false;
             if (!dit_model_forward(m, fin_uncond, vt_uncond)) {
                 fprintf(stderr, "[acestep-dit] sample: uncond forward failed at step %d\n", step);
                 return false;
