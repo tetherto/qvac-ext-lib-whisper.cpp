@@ -3,7 +3,11 @@
 // Umbrella include for libqvac-parakeet (each header below can also be included alone).
 //
 //   <parakeet/export.h>      - PARAKEET_API visibility macro
-//   <parakeet/cli.h>         - parakeet_cli_main C entry point
+//   <parakeet/cli.h>         - parakeet_cli_main / parakeet_fit_cli_main C
+//                                   entry points
+//   <parakeet/fit.h>         - fit_params memory-fit preflight (project
+//                                   whether a GGUF fits the device without
+//                                   loading weights)
 //   <parakeet/log.h>         - parakeet_log_set host log sink
 //   <parakeet/engine.h>      - Engine + EngineOptions / EngineResult
 //                                   (CTC, RNN-T, TDT, EOU, Sortformer behind one
@@ -33,6 +37,7 @@
 
 #include "export.h"
 #include "cli.h"
+#include "fit.h"
 #include "log.h"
 #include "engine.h"
 #include "streaming.h"

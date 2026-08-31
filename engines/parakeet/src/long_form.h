@@ -113,6 +113,87 @@ inline int resolve_long_form_window_frames(int requested, int pos_emb_max_len,
     return window_frames;
 }
 
+// ── Long-form window policy (shared by the engine and the fit projector) ──
+
+// Auto per-window encoder-frame ceiling (~300 s at 80 ms/frame). Caps the
+// O(T_enc^2) attention score tensor at a few hundred MB per window while still
+// giving the decoder long committed spans, so a multi-hour input needs only a
+// handful of windows. Overridden downward by the model's pos_emb_max_len.
+constexpr int kLongFormAutoWindowFrames  = 3750;
+// Shared context each side (~20 s at 80 ms/frame). Comfortably exceeds the
+// deepest shipped encoder's convolutional receptive field (24 conformer layers
+// x depthwise kernel 9 ~= 100 frames each side) plus the subsampling stack, so
+// committed centre frames closely match the single-pass encoder.
+constexpr int kLongFormAutoContextFrames = 256;
+// Floor so a pathologically small pos_emb_max_len can't collapse the centre.
+constexpr int kLongFormMinWindowFrames   = 256;
+
+struct LongFormPlan {
+    bool enabled        = false;
+    int  window_frames  = 0;  // encoder frames per window (center + 2 * context)
+    int  context_frames = 0;  // encoder frames of shared context each side
+    int  center_frames  = 0;  // committed encoder frames per window
+    int  sub            = 0;  // subsampling factor (mel frames per encoder frame)
+};
+
+// Pure core of the engine's long-form resolution: decide the effective window
+// from the requested EngineOptions values (`requested_window_frames` /
+// `requested_context_frames`, EngineOptions::long_form_* semantics), the
+// model's trained positional range and subsampling factor, and whether
+// `n_mel_frames` is long enough to need windowing at all. Inputs that fit
+// within a single window keep the bit-identical single-pass path.
+// The fit projector (parakeet_fit.cpp) shares this so its projected window
+// matches what a real Engine run would use.
+inline LongFormPlan resolve_long_form_plan_frames(int requested_window_frames,
+                                                  int requested_context_frames,
+                                                  int pos_emb_max_len,
+                                                  int subsampling_factor,
+                                                  long long n_mel_frames) {
+    LongFormPlan plan;
+
+    if (requested_window_frames < 0) {
+        return plan;
+    }
+
+    const int sub = subsampling_factor > 0 ? subsampling_factor : 8;
+    plan.sub = sub;
+
+    const int window_frames = resolve_long_form_window_frames(
+        requested_window_frames, pos_emb_max_len,
+        kLongFormAutoWindowFrames, kLongFormMinWindowFrames);
+
+    int context_frames = requested_context_frames;
+    if (context_frames == 0) {
+        context_frames = kLongFormAutoContextFrames;
+    }
+    if (context_frames < 0) {
+        context_frames = 0;
+    }
+    if (context_frames > window_frames / 4) {
+        context_frames = window_frames / 4;
+    }
+
+    // Defense-in-depth: the window/4 context clamp above keeps
+    // center = window - 2*context >= window/2 > 0, so this cannot trigger under
+    // the current policy; it guards a future window/context tuning that could.
+    const int center_frames = window_frames - 2 * context_frames;
+    if (center_frames <= 0) {
+        return plan;
+    }
+
+    // Only window when a single-pass encoder run would exceed the ceiling; the
+    // encoder emits roughly n_mel_frames / sub frames.
+    if (n_mel_frames <= (long long) window_frames * sub) {
+        return plan;
+    }
+
+    plan.enabled        = true;
+    plan.window_frames  = window_frames;
+    plan.context_frames = context_frames;
+    plan.center_frames  = center_frames;
+    return plan;
+}
+
 struct WindowTrim {
     int left_drop;   // leading encoder frames (left context) to discard
     int center_cnt;  // committed encoder frames to keep

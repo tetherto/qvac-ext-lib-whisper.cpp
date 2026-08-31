@@ -478,7 +478,11 @@ void build_lstm_joint_graph(TdtRuntimeWeights & rt) {
 // the metadata locally and freeing it at eviction keeps streaming
 // callers (Mode 3 with varying right-lookahead-ms → many distinct
 // T_enc) bounded by the LRU cap regardless of distinct-T churn.
-TdtRuntimeWeights::EncProjGraph build_enc_proj_graph(TdtRuntimeWeights & rt, int T) {
+// `measure_bytes` (fit projection): when non-null the graph is built and its
+// compute buffer *sized* into `*measure_bytes` instead of allocated; an empty
+// EncProjGraph is returned.
+TdtRuntimeWeights::EncProjGraph build_enc_proj_graph(TdtRuntimeWeights & rt, int T,
+                                                     size_t * measure_bytes = nullptr) {
     TdtRuntimeWeights::EncProjGraph g{};
     g.T = T;
 
@@ -517,6 +521,17 @@ TdtRuntimeWeights::EncProjGraph build_enc_proj_graph(TdtRuntimeWeights & rt, int
 
     g.cg = ggml_new_graph_custom(g.ctx, /*size*/ 32, /*grads*/ false);
     ggml_build_forward_expand(g.cg, g.out);
+
+    if (measure_bytes) {
+        *measure_bytes = 0;
+        ggml_gallocr_t pricer = ggml_gallocr_new(ggml_backend_get_default_buffer_type(rt.backend));
+        if (pricer) {
+            ggml_gallocr_reserve_n_size(pricer, g.cg, nullptr, nullptr, measure_bytes);
+            ggml_gallocr_free(pricer);
+        }
+        ggml_free(g.ctx);
+        return TdtRuntimeWeights::EncProjGraph{};
+    }
 
     g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(rt.backend));
     if (!g.alloc || !ggml_gallocr_alloc_graph(g.alloc, g.cg)) {
@@ -630,7 +645,13 @@ TdtRuntimeWeights::~TdtRuntimeWeights() {
     // backend is owned by ParakeetCtcModel::Impl; don't free here.
 }
 
-int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
+// Shared body of tdt_prepare_runtime and tdt_measure_runtime. When `measure`
+// is non-null every allocation the real path makes is sized into `measure`
+// instead of performed (fit projection; requires a metadata-only model whose
+// weight tensors are marked externally-allocated), and W is left non-ready.
+// `measure_enc_frames` sizes the worst-case per-window enc-projection graph.
+static int tdt_prepare_runtime_impl(const ParakeetCtcModel & model, TdtRuntimeWeights & W,
+                                    DecoderFitMeasure * measure, int measure_enc_frames) {
     W = TdtRuntimeWeights{};
 
     const bool is_rnnt = model.model_type == ParakeetModelType::RNNT;
@@ -689,6 +710,24 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
     }
 
     if (!W.use_graphs) {
+        if (measure) {
+            // ---- CPU fallback, sized: the dequantised host f32 copies ----
+            auto f32_bytes = [](const ggml_tensor * t) {
+                return t ? (size_t) ggml_nelements(t) * sizeof(float) : (size_t) 0;
+            };
+            measure->host_bytes += f32_bytes(W.weights->predict_embed);
+            for (const TdtLstmLayer & lyr : W.weights->lstm) {
+                measure->host_bytes += f32_bytes(lyr.w_ih) + f32_bytes(lyr.w_hh)
+                                     + f32_bytes(lyr.b_ih) + f32_bytes(lyr.b_hh);
+            }
+            measure->host_bytes += f32_bytes(W.weights->joint_enc_w)
+                                 + f32_bytes(W.weights->joint_enc_b)
+                                 + f32_bytes(W.weights->joint_pred_w)
+                                 + f32_bytes(W.weights->joint_pred_b)
+                                 + f32_bytes(W.weights->joint_out_w)
+                                 + f32_bytes(W.weights->joint_out_b);
+            return 0;
+        }
         // ---- CPU fallback: dequantise weights to host f32 ----
         dequantize_to_f32(W.weights->predict_embed, W.embed);
         W.host_lstm.clear();
@@ -743,10 +782,23 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
         ggml_set_name(W.pred_persist,     "tdt.pred_persist");
         ggml_set_name(W.enc_proj_persist, "tdt.enc_proj_persist");
 
-        W.persist_buffer = ggml_backend_alloc_ctx_tensors(W.persist_ctx, W.backend);
-        if (!W.persist_buffer) {
-            std::fprintf(stderr, "tdt_prepare_runtime: failed to allocate persistent state buffer\n");
-            return 4;
+        if (measure) {
+            // Size the persistent state, then mark it externally-allocated so
+            // the graph measurements below don't count it a second time.
+            measure->device_state_bytes += ggml_backend_alloc_ctx_tensors_from_buft_size(
+                W.persist_ctx, ggml_backend_get_default_buffer_type(W.backend));
+            for (ggml_tensor * t = ggml_get_first_tensor(W.persist_ctx); t;
+                 t = ggml_get_next_tensor(W.persist_ctx, t)) {
+                if (!t->data && !t->view_src) {
+                    t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+                }
+            }
+        } else {
+            W.persist_buffer = ggml_backend_alloc_ctx_tensors(W.persist_ctx, W.backend);
+            if (!W.persist_buffer) {
+                std::fprintf(stderr, "tdt_prepare_runtime: failed to allocate persistent state buffer\n");
+                return 4;
+            }
         }
         W.enc_proj_T_max = T_max;
     }
@@ -769,6 +821,34 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
     build_joint_graph(W);
     build_lstm_joint_graph(W);
 
+    if (measure) {
+        // The three fixed-shape gallocrs coexist for the runtime's lifetime,
+        // so their buffers sum (they are not shared or maxed).
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(W.backend);
+        for (ggml_cgraph * cg : { W.g_lstm, W.g_joint, W.g_lstm_joint }) {
+            ggml_gallocr_t pricer = ggml_gallocr_new(buft);
+            if (!pricer) {
+                std::fprintf(stderr, "tdt_measure_runtime: failed to create pricing gallocr\n");
+                return 6;
+            }
+            size_t sz = 0;
+            ggml_gallocr_reserve_n_size(pricer, cg, nullptr, nullptr, &sz);
+            ggml_gallocr_free(pricer);
+            measure->device_compute_bytes += sz;
+        }
+        // Worst-case per-window enc-projection graph (built lazily at decode
+        // time). Larger windows are projected in <= k_enc_proj_T_max chunks,
+        // matching enc_proj_persist's capacity.
+        int T = measure_enc_frames;
+        if (T > TdtRuntimeWeights::k_enc_proj_T_max) T = TdtRuntimeWeights::k_enc_proj_T_max;
+        if (T > 0) {
+            size_t sz = 0;
+            build_enc_proj_graph(W, T, &sz);
+            measure->device_compute_bytes += sz;
+        }
+        return 0;
+    }
+
     W.alloc_lstm       = ggml_gallocr_new(ggml_backend_get_default_buffer_type(W.backend));
     W.alloc_joint      = ggml_gallocr_new(ggml_backend_get_default_buffer_type(W.backend));
     W.alloc_lstm_joint = ggml_gallocr_new(ggml_backend_get_default_buffer_type(W.backend));
@@ -784,6 +864,17 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
     }
 
     return 0;
+}
+
+int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
+    return tdt_prepare_runtime_impl(model, W, /*measure=*/nullptr, /*measure_enc_frames=*/0);
+}
+
+int tdt_measure_runtime(const ParakeetCtcModel & model, int worst_enc_frames,
+                        DecoderFitMeasure & out) {
+    out = DecoderFitMeasure{};
+    TdtRuntimeWeights W;  // scaffolding only; destructor frees the metadata ctxs
+    return tdt_prepare_runtime_impl(model, W, &out, worst_enc_frames);
 }
 
 namespace {
