@@ -483,6 +483,7 @@ combinations are rejected rather than silently ignored.
 | `--bpm N`, `--key STR`, `--tsig STR`, `--lang CODE` | inferred | optional metadata hints |
 | `--steps N`, `--shift F` | per variant | sampler overrides |
 | `--no-dcw` | DCW enabled | disable the official Haar low/high correction applied after each DiT step |
+| `--no-loudness` | normalization on | skip the percentile loudness normalization (99.999th percentile to 1.0, tail hard-clipped) applied to the output PCM |
 | `--temp F`, `--topp F`, `--topk N`, `--cfg F` | `0.85`, `0.9`, off, `2.0` | LM sampling for the audio codes |
 | `--no-phase1` | off | skip the LM metadata auto-fill pass |
 | `--simple` | off | Simple Mode: expand `--caption` into a full request (lyrics regenerate unless `--lyrics "[Instrumental]"` is passed) |

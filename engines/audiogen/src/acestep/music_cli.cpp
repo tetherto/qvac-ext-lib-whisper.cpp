@@ -153,6 +153,7 @@ int main(int argc, char ** argv) {
                 "  sampler: [--steps N] [--shift F]  (default: auto from the DiT variant,\n"
                 "           turbo 8 / 3.0, base and sft 50 / 1.0)\n"
                 "           [--no-dcw]  (Haar DCW double mode is enabled by default)\n"
+                "           [--no-loudness]  (skip the percentile loudness normalization)\n"
                 "  output:  [--normalize]  (peak-normalize edit output before PCM quantization)\n"
                 "           [--temp 0.85] [--cfg 2.0] [--topp 0.9] [--topk 0 (off)]\n"
                 "           [--no-phase1]  (values shown are the defaults)\n"
@@ -179,6 +180,7 @@ int main(int argc, char ** argv) {
     if (arg_val(argc, argv, "--topp")) p.lm_top_p = (float) atof(arg_val(argc, argv, "--topp"));
     if (arg_flag(argc, argv, "--no-phase1")) p.lm_phase1 = false;
     if (arg_flag(argc, argv, "--no-dcw")) p.dcw_enabled = false;
+    if (arg_flag(argc, argv, "--no-loudness")) p.normalize_loudness = false;
     if (arg_flag(argc, argv, "--simple")) {
         p.simple_mode = true;
         if (!arg_val(argc, argv, "--lyrics")) p.lyrics.clear();

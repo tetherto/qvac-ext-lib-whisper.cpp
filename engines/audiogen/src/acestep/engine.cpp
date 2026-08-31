@@ -9,6 +9,7 @@
 #include "acestep/dit_gguf.h"  // DitGGUF: read DiT config + validate GGUF headers at create()
 #include "acestep/lm_ggml.h"
 #include "acestep/lm_pipeline.h"
+#include "acestep/loudness.h"
 #include "acestep/philox.h"
 #include "acestep/textenc_ggml.h"
 
@@ -1838,7 +1839,9 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
     StageTimes timing;
     StageDump dump(engine.opts.dump_stages_dir, engine.opts.verbose);
     if (!params.edit_plan.empty()) {
-        return run_audio_edit_plan(engine, params, report, dump, timing);
+        GenerateResult edited = run_audio_edit_plan(engine, params, report, dump, timing);
+        if (params.normalize_loudness) normalize_loudness(edited.pcm);
+        return edited;
     }
 
     GenerationState state = make_generation_state(params, engine.keep_stages);
@@ -1862,6 +1865,7 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
                       report, dump, timing, result)) {
         return result;
     }
+    if (params.normalize_loudness) normalize_loudness(result.pcm);
     populate_metadata(state, result);
     return result;
 }
