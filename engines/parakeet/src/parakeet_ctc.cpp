@@ -394,7 +394,8 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
         const char *       reg_name;
     };
     std::vector<Cand> opencl_adreno_700plus;
-    std::vector<Cand> cuda_gpu;               // CUDA, preferred over Vulkan on the same NVIDIA card
+    std::vector<Cand> cuda_gpu_discrete;      // CUDA on a dGPU (typical NVIDIA), preferred over Vulkan on the same card
+    std::vector<Cand> cuda_gpu_integrated;    // CUDA on an iGPU (Tegra/Jetson) — still CUDA-first, but ranks below cuda_gpu_discrete
     std::vector<Cand> other_gpu_discrete;     // Discrete non-OpenCL GPUs (Vulkan/Metal on dGPU, ...)
     std::vector<Cand> other_gpu_integrated;   // Integrated non-OpenCL GPUs (iGPU / UMA)
     std::vector<Cand> opencl_other;           // Non-Adreno OpenCL (e.g. desktop)
@@ -444,8 +445,14 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
                 opencl_other.push_back({dev, name, desc, reg_name});
             }
         } else if (is_cuda) {
-            // CUDA (dGPU) — preferred over Vulkan on NVIDIA.
-            cuda_gpu.push_back({dev, name, desc, reg_name});
+            // CUDA — preferred over Vulkan on NVIDIA. Split by device type so
+            // a discrete NVIDIA CUDA adapter is tried before a Tegra/Jetson
+            // integrated one, matching the GpuTier ranking in backend_util.h
+            // (CudaDiscrete < CudaIntegrated). In practice a single host has
+            // only one CUDA device, but keeping the split honest lets the
+            // pure gpu_tier_for unit test guard the ordering.
+            if (is_integrated) cuda_gpu_integrated.push_back({dev, name, desc, reg_name});
+            else               cuda_gpu_discrete.push_back({dev, name, desc, reg_name});
         } else {
             // Non-OpenCL GPUs (Vulkan, Metal, Mali iGPU, Intel, ...). Mali
             // (Valhall) Vulkan runs the encoder + CTC/TDT/EOU heads correctly;
@@ -463,15 +470,17 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
     // Tier policy:
     //   1. Adreno 700+: prefer OpenCL (validated, faster than Vulkan
     //      on Snapdragon 8 Gen 2/3/4 etc.).
-    //   2. CUDA: vendor-native on NVIDIA, and measurably faster than the
-    //      same card's Vulkan adapter, so it outranks Vulkan when a build
-    //      carries both.
-    //   3. Discrete non-OpenCL GPU: Vulkan on a dGPU, Metal on Apple,
+    //   2. CUDA on a discrete GPU: vendor-native on NVIDIA, and measurably
+    //      faster than the same card's Vulkan adapter, so it outranks
+    //      Vulkan when a build carries both.
+    //   3. CUDA on an integrated GPU: Tegra/Jetson (CUDA reported as IGPU).
+    //      Still CUDA-first over Vulkan, but ranked below discrete CUDA.
+    //   4. Discrete non-OpenCL GPU: Vulkan on a dGPU, Metal on Apple,
     //      Vulkan on Adreno (Android), etc. Preferred over iGPUs to
     //      match the discrete-first behavior of llm/diffusion.
-    //   4. Integrated non-OpenCL GPU: iGPU / UMA Vulkan as the fallback
+    //   5. Integrated non-OpenCL GPU: iGPU / UMA Vulkan as the fallback
     //      (Mali iGPU, Intel iGPU, ...).
-    //   5. Last resort: any other OpenCL device (e.g. desktop OpenCL
+    //   6. Last resort: any other OpenCL device (e.g. desktop OpenCL
     //      or non-Adreno mobile when no Vulkan is registered).
     auto try_init = [&](const std::vector<Cand> & bucket) -> ggml_backend_t {
         for (const Cand & c : bucket) {
@@ -491,7 +500,8 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
     if (!opencl_adreno_700plus.empty()) {
         if (ggml_backend_t b = try_init(opencl_adreno_700plus)) return b;
     }
-    if (ggml_backend_t b = try_init(cuda_gpu)) return b;
+    if (ggml_backend_t b = try_init(cuda_gpu_discrete)) return b;
+    if (ggml_backend_t b = try_init(cuda_gpu_integrated)) return b;
     if (ggml_backend_t b = try_init(other_gpu_discrete)) return b;
     if (ggml_backend_t b = try_init(other_gpu_integrated)) return b;
     if (ggml_backend_t b = try_init(opencl_other)) return b;

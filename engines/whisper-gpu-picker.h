@@ -40,22 +40,63 @@
 
 #include "ggml-backend.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
+#include <string>
 
 namespace qvac::speech {
 
+// Adreno generation from a device name/description: "Adreno (TM) 740" -> 740,
+// the Snapdragon-X "Adreno X1-85" naming -> 800 (7xx/8xx-tier silicon), else
+// -1. Mirrors parse_adreno_version in engines/tts/src/backend_selection.cpp
+// and engines/audiogen/src/acestep/backend_registry.h so the four speech
+// stacks (tts / audiogen / parakeet / whisper-caller) reach the same verdict
+// on the same hardware. Hand-rolled rather than <regex> to keep this header
+// cheap to include.
+inline int parse_adreno_version_whisper_picker(const char * s) {
+    if (!s) return -1;
+    std::string t(s);
+    for (char & c : t) c = (char) std::tolower((unsigned char) c);
+    int best = -1;
+    for (size_t p = t.find("dreno"); p != std::string::npos; p = t.find("dreno", p + 1)) {
+        for (size_t i = p + 5; i < t.size(); ++i) {
+            if (t[i] == 'x' && i + 1 < t.size() && std::isdigit((unsigned char) t[i + 1])) {
+                if (best < 800) best = 800;
+                break;
+            }
+            if (!std::isdigit((unsigned char) t[i])) continue;
+            size_t j = i;
+            while (j < t.size() && std::isdigit((unsigned char) t[j])) ++j;
+            const size_t len = j - i;
+            if (len >= 3 && len <= 4) {
+                const int v = std::stoi(t.substr(i, len));
+                if (v > best) best = v;
+            }
+            break;
+        }
+    }
+    return best;
+}
+
 // Return the index-among-GPU-devices — using whisper.cpp's exact enumeration
 // order (GPU + IGPU, in ggml registry order) — that the QVAC speech tier
-// policy prefers (CUDA-first on NVIDIA, discrete-first over integrated).
+// policy prefers.
 //
-//   1. First CUDA device (dGPU tier before iGPU tier — CUDA-on-tegra shows up
-//      as IGPU on some drivers, so we still fall through the iGPU tier if
-//      no discrete CUDA card is visible).
-//   2. Otherwise, first discrete (GPU) non-CUDA device — Vulkan/Metal on a
+//   1. Adreno 700+ OpenCL — Snapdragon 8 Gen 2/3/4 ship validated ggml-opencl
+//      kernels that outperform the same card's Vulkan adapter. Matches the
+//      top tier used by parakeet / audiogen / tts on the same hardware; the
+//      packages/asr-ggml addon that consumes this helper runs on Android, so
+//      the tier is load-bearing there. (Adreno and NVIDIA CUDA never coexist
+//      on the same host — Adreno is Snapdragon-only — so putting Adreno above
+//      CUDA is safe.)
+//   2. First CUDA device on a discrete GPU (typical NVIDIA).
+//   3. First CUDA device on an integrated GPU (Tegra/Jetson).
+//   4. Otherwise, first discrete (GPU) non-CUDA device — Vulkan/Metal on a
 //      dGPU, etc.
-//   3. Otherwise, first integrated (IGPU) device — UMA Vulkan, Mali iGPU,
+//   5. Otherwise, first integrated (IGPU) device — UMA Vulkan, Mali iGPU,
 //      Intel iGPU, Apple integrated, etc.
-//   4. Otherwise 0 (whisper's own default; whisper_backend_init_gpu will
+//   6. Otherwise 0 (whisper's own default; whisper_backend_init_gpu will
 //      report "no GPU found" and return nullptr, and the caller falls back
 //      to CPU as before).
 //
@@ -69,6 +110,7 @@ inline int pick_whisper_gpu_device() {
     // Whisper counts GPU-or-IGPU devices linearly; we mirror that counting
     // so the index we return means the same thing on the whisper side.
     // Track the first hit in each tier as we walk.
+    int idx_adreno_opencl   = -1;
     int idx_cuda_discrete   = -1;
     int idx_cuda_integrated = -1;
     int idx_discrete        = -1;
@@ -86,17 +128,24 @@ inline int pick_whisper_gpu_device() {
 
         ggml_backend_reg_t reg      = ggml_backend_dev_backend_reg(dev);
         const char *       reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
-        const bool         is_cuda  = reg_name && std::strcmp(reg_name, "CUDA") == 0;
+        const bool         is_cuda   = reg_name && std::strcmp(reg_name, "CUDA")   == 0;
+        const bool         is_opencl = reg_name && std::strcmp(reg_name, "OpenCL") == 0;
         const bool         is_integrated = (type == GGML_BACKEND_DEVICE_TYPE_IGPU);
+        const int          adreno_v =
+            is_opencl ? std::max(parse_adreno_version_whisper_picker(ggml_backend_dev_name(dev)),
+                                 parse_adreno_version_whisper_picker(ggml_backend_dev_description(dev)))
+                      : -1;
 
-        if (is_cuda && !is_integrated && idx_cuda_discrete   < 0) idx_cuda_discrete   = cnt;
-        if (is_cuda &&  is_integrated && idx_cuda_integrated < 0) idx_cuda_integrated = cnt;
-        if (!is_cuda && !is_integrated && idx_discrete       < 0) idx_discrete        = cnt;
-        if (!is_cuda &&  is_integrated && idx_integrated     < 0) idx_integrated      = cnt;
+        if      (is_opencl && adreno_v >= 700 && idx_adreno_opencl   < 0) idx_adreno_opencl   = cnt;
+        else if (is_cuda   && !is_integrated  && idx_cuda_discrete   < 0) idx_cuda_discrete   = cnt;
+        else if (is_cuda   &&  is_integrated  && idx_cuda_integrated < 0) idx_cuda_integrated = cnt;
+        else if (!is_cuda  && !is_integrated  && idx_discrete        < 0) idx_discrete        = cnt;
+        else if (!is_cuda  &&  is_integrated  && idx_integrated      < 0) idx_integrated      = cnt;
 
         ++cnt;
     }
 
+    if (idx_adreno_opencl   >= 0) return idx_adreno_opencl;
     if (idx_cuda_discrete   >= 0) return idx_cuda_discrete;
     if (idx_cuda_integrated >= 0) return idx_cuda_integrated;
     if (idx_discrete        >= 0) return idx_discrete;
@@ -105,17 +154,19 @@ inline int pick_whisper_gpu_device() {
 }
 
 // Testable form of the tier policy: takes an explicit device list (registry
-// name, is-integrated) and returns the index the policy prefers. Kept
-// alongside `pick_whisper_gpu_device` so both call the same logic; the
-// process-scoped version above is a thin wrapper that reads the ggml
-// registry and delegates here. Exposed for unit tests that simulate a
+// name, is-integrated, adreno_version) and returns the index the policy
+// prefers. Kept alongside `pick_whisper_gpu_device` so both call the same
+// logic; the process-scoped version above is a thin wrapper that reads the
+// ggml registry and delegates here. Exposed for unit tests that simulate a
 // fake device topology without depending on the host's real GPU set.
 struct PickerDevice {
-    const char * reg_name;      // registry name, e.g. "CUDA" / "Vulkan" / "Metal" / "OpenCL"
-    bool         is_integrated; // true for GGML_BACKEND_DEVICE_TYPE_IGPU
+    const char * reg_name;       // registry name, e.g. "CUDA" / "Vulkan" / "Metal" / "OpenCL"
+    bool         is_integrated;  // true for GGML_BACKEND_DEVICE_TYPE_IGPU
+    int          adreno_version; // parsed Adreno generation (700, 740, 800, ...); -1 for non-Adreno
 };
 
 inline int pick_whisper_gpu_device_from(const PickerDevice * devs, size_t n) {
+    int idx_adreno_opencl   = -1;
     int idx_cuda_discrete   = -1;
     int idx_cuda_integrated = -1;
     int idx_discrete        = -1;
@@ -123,14 +174,17 @@ inline int pick_whisper_gpu_device_from(const PickerDevice * devs, size_t n) {
 
     for (size_t i = 0; i < n; ++i) {
         const PickerDevice & d = devs[i];
-        const bool is_cuda = d.reg_name && std::strcmp(d.reg_name, "CUDA") == 0;
-        const int  idx     = static_cast<int>(i);
-        if (is_cuda && !d.is_integrated && idx_cuda_discrete   < 0) idx_cuda_discrete   = idx;
-        if (is_cuda &&  d.is_integrated && idx_cuda_integrated < 0) idx_cuda_integrated = idx;
-        if (!is_cuda && !d.is_integrated && idx_discrete       < 0) idx_discrete        = idx;
-        if (!is_cuda &&  d.is_integrated && idx_integrated     < 0) idx_integrated      = idx;
+        const bool is_cuda   = d.reg_name && std::strcmp(d.reg_name, "CUDA")   == 0;
+        const bool is_opencl = d.reg_name && std::strcmp(d.reg_name, "OpenCL") == 0;
+        const int  idx       = static_cast<int>(i);
+        if      (is_opencl && d.adreno_version >= 700 && idx_adreno_opencl   < 0) idx_adreno_opencl   = idx;
+        else if (is_cuda   && !d.is_integrated        && idx_cuda_discrete   < 0) idx_cuda_discrete   = idx;
+        else if (is_cuda   &&  d.is_integrated        && idx_cuda_integrated < 0) idx_cuda_integrated = idx;
+        else if (!is_cuda  && !d.is_integrated        && idx_discrete        < 0) idx_discrete        = idx;
+        else if (!is_cuda  &&  d.is_integrated        && idx_integrated      < 0) idx_integrated      = idx;
     }
 
+    if (idx_adreno_opencl   >= 0) return idx_adreno_opencl;
     if (idx_cuda_discrete   >= 0) return idx_cuda_discrete;
     if (idx_cuda_integrated >= 0) return idx_cuda_integrated;
     if (idx_discrete        >= 0) return idx_discrete;
