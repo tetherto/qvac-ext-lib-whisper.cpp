@@ -1127,6 +1127,45 @@ void test_generate_task_errors() {
     CHECK(approx(task.audio_cover_strength, 0.5f));
 }
 
+void test_simple_mode_policy() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::TASK_COVER_NOFSQ;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+    params.simple_mode = true;
+    params.caption = "a romantic modern salsa with male lead vocals for a wedding";
+    params.lyrics.clear();
+    CHECK(resolve_generate_task(params, task).empty());
+
+    params.lyrics = "[Instrumental]";
+    CHECK(resolve_generate_task(params, task).empty());
+
+    params.lyrics = "[verse]\nuser lyrics";
+    CHECK(resolve_generate_task(params, task).find("lyrics must be empty") != std::string::npos);
+
+    params.lyrics.clear();
+    params.caption.clear();
+    CHECK(resolve_generate_task(params, task).find("requires a caption") != std::string::npos);
+
+    params.caption = "a short query";
+    params.task_type = TASK_COVER_NOFSQ;
+    params.source_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("only task 'text2music'") != std::string::npos);
+
+    params.task_type.clear();
+    params.source_audio.clear();
+    params.audio_codes.assign(4, 1);
+    CHECK(resolve_generate_task(params, task).find("pre-supplied audio_codes") != std::string::npos);
+
+    params.audio_codes.clear();
+    params.simple_mode = false;
+    params.lyrics = "[verse]\nuser lyrics";
+    CHECK(resolve_generate_task(params, task).empty());
+}
+
 void test_cover_conditioning_switch() {
     using tts_cpp::acestep::GenerateTask;
     using tts_cpp::acestep::TASK_COVER_NOFSQ;
@@ -1997,6 +2036,7 @@ int main() {
     test_generate_task_audio_layout();
     test_generate_task_errors();
     test_generate_task_strengths();
+    test_simple_mode_policy();
     test_cover_conditioning_switch();
     test_generation_plans();
     test_generation_conditioning();

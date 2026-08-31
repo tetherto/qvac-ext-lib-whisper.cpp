@@ -437,6 +437,60 @@ void run_lm_generation_scenario(tts_cpp::acestep::Engine & engine, const fs::pat
     CHECK(second.pcm == first.pcm);
 }
 
+// Simple Mode end to end: a short query expands into a complete request (the
+// LM inspire pass writes lyrics and fills unset metadata) before synthesis.
+void run_simple_mode_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    GenerateParams params;
+    params.caption         = "a short upbeat electronic jingle with female vocals";
+    params.lyrics.clear();
+    params.simple_mode     = true;
+    params.duration        = 2.0f;
+    params.inference_steps = TEST_STEPS;
+    params.shift           = TEST_SHIFT;
+    params.seed            = TEST_SEED;
+
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(result.metadata.n_codes > 0);
+    CHECK(stages.contains(TEST_LM_STAGE));
+    CHECK(stages.contains_detailed_progress(TEST_LM_STAGE));
+    CHECK(!result.metadata.caption.empty());
+    CHECK(!result.metadata.lyrics.empty());
+    CHECK(result.metadata.bpm > 0);
+    CHECK(!result.metadata.keyscale.empty());
+    CHECK(result.metadata.timesignature > 0);
+    CHECK(!result.metadata.vocal_language.empty());
+}
+
+// Cancelling from the first LM progress tick must abort generation cleanly.
+void run_lm_cancel_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    GenerateParams params;
+    params.caption         = "a cancelled simple mode request";
+    params.lyrics.clear();
+    params.simple_mode     = true;
+    params.duration        = 2.0f;
+    params.inference_steps = TEST_STEPS;
+    params.shift           = TEST_SHIFT;
+    params.seed            = TEST_SEED;
+
+    bool cancelled_mid_decode = false;
+    const GenerateResult result =
+        engine.generate(params, [&](const std::string & stage, int step, int total) {
+            if (stage == TEST_LM_STAGE && total > 1 && step > 0) {
+                cancelled_mid_decode = true;
+                return false;
+            }
+            return true;
+        });
+    CHECK(cancelled_mid_decode);
+    CHECK(result.pcm.empty());
+}
+
 void run_cover_strength_scenario(tts_cpp::acestep::Engine & engine) {
     using namespace tts_cpp::acestep;
     GenerateParams params = make_generate_params();
@@ -474,6 +528,8 @@ int run_integration(const char * models_dir) {
         run_cover_strength_scenario(*engine);
         run_edit_scenarios(*engine, dump_dir);
         run_lm_generation_scenario(*engine, dump_dir);
+        run_simple_mode_scenario(*engine);
+        run_lm_cancel_scenario(*engine);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "FAIL integration exception: %s\n", error.what());
         ++failures;

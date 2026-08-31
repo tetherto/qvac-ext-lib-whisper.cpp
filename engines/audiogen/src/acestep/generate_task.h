@@ -26,6 +26,23 @@ inline float clamp_strength(float value) {
     return std::clamp(value, 0.0f, 1.0f);
 }
 
+inline std::string validate_simple_mode(const GenerateParams & params, const std::string & task_type) {
+    if (!params.simple_mode) return {};
+    if (params.caption.empty()) {
+        return "acestep engine: simple_mode requires a caption query";
+    }
+    if (task_type != TASK_TEXT2MUSIC) {
+        return "acestep engine: simple_mode supports only task 'text2music', got '" + task_type + "'";
+    }
+    if (!params.audio_codes.empty()) {
+        return "acestep engine: simple_mode cannot take pre-supplied audio_codes";
+    }
+    if (!params.lyrics.empty() && params.lyrics != AUDIO_EDIT_DEFAULT_LYRICS) {
+        return "acestep engine: simple_mode lyrics must be empty (LM writes them) or \"[Instrumental]\"";
+    }
+    return {};
+}
+
 inline std::string resolve_generate_task(const GenerateParams & params, GenerateTask & task) {
     task.type = params.task_type.empty() ? TASK_TEXT2MUSIC : params.task_type;
 
@@ -34,6 +51,9 @@ inline std::string resolve_generate_task(const GenerateParams & params, Generate
         return "acestep engine: unsupported task_type '" + task.type +
                "' (expected text2music|cover|cover-nofsq)";
     }
+
+    const std::string simple_mode_error = validate_simple_mode(params, task.type);
+    if (!simple_mode_error.empty()) return simple_mode_error;
 
     if (!std::isfinite(params.audio_cover_strength)) {
         return "acestep engine: audio_cover_strength must be finite";

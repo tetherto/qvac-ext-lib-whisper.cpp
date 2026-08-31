@@ -773,12 +773,37 @@ static LmSampleParams make_lm_sample_params(const GenerateParams & params, long 
     sample.cfg_scale = params.lm_cfg_scale;
     sample.seed = (uint32_t) seed;
     sample.verbose = verbose;
-    sample.on_step = [&](int current, int total) { report("lm", current, total); };
+    sample.on_step = [&](int current, int total) { return report("lm", current, total); };
     return sample;
 }
 
+static bool needs_lm_phase_one(const GenerateParams & params, const AcePrompt & prompt) {
+    if (params.simple_mode) return true;
+    return params.lm_phase1 && !has_complete_metadata(prompt);
+}
+
+// Returns false only on cancellation. A plain Phase-1 failure falls back to the
+// provided/default metadata, except in simple mode, where the LM expansion is
+// the whole point of the request.
 template <typename EngineImpl>
-static void generate_audio_codes(EngineImpl & engine, const GenerateParams & params,
+static bool run_lm_phase_one(EngineImpl & engine, const GenerateParams & params,
+                             GenerationState & state, const LmSampleParams & sample) {
+    LmSampleParams phase_one = sample;
+    phase_one.max_new_tokens = 0;
+    if (lm_generate_phase1(engine.lm, engine.bpe_lm, state.prompt, phase_one,
+                           true, true, params.simple_mode)) {
+        return true;
+    }
+    if (engine.cancel_flag.load()) return false;
+    if (params.simple_mode) {
+        throw std::runtime_error("acestep engine: simple_mode LM expansion failed");
+    }
+    fprintf(stderr, "[acestep-engine] Phase 1 failed; falling back to provided/default metas\n");
+    return true;
+}
+
+template <typename EngineImpl>
+static bool generate_audio_codes(EngineImpl & engine, const GenerateParams & params,
                                  GenerationState & state, const StageReporter & report,
                                  std::vector<int> & codes) {
     if (!params.audio_codes.empty()) {
@@ -786,22 +811,20 @@ static void generate_audio_codes(EngineImpl & engine, const GenerateParams & par
         if (engine.opts.verbose) {
             fprintf(stderr, "[acestep-engine] using %zu pre-supplied codes (LM skipped)\n", codes.size());
         }
-        return;
+        return true;
     }
 
     engine.ensure_lm();
     const LmSampleParams sample =
         make_lm_sample_params(params, state.seed, engine.opts.verbose, report);
-    if (params.lm_phase1 && !has_complete_metadata(state.prompt)) {
-        LmSampleParams phase_one = sample;
-        phase_one.max_new_tokens = 0;
-        if (!lm_generate_phase1(engine.lm, engine.bpe_lm, state.prompt, phase_one)) {
-            fprintf(stderr, "[acestep-engine] Phase 1 failed; falling back to provided/default metas\n");
-        }
+    if (needs_lm_phase_one(params, state.prompt)) {
+        if (!run_lm_phase_one(engine, params, state, sample)) return false;
     }
     if (!lm_generate_codes(engine.lm, engine.bpe_lm, state.prompt, sample, codes) || codes.empty()) {
+        if (engine.cancel_flag.load()) return false;
         throw std::runtime_error("acestep engine: LM produced no audio codes");
     }
+    return true;
 }
 
 template <typename EngineImpl>
@@ -809,7 +832,7 @@ static bool run_lm_stage(EngineImpl & engine, const GenerateParams & params,
                          GenerationState & state, const StageReporter & report,
                          StageDump & dump, StageTimes & timing, std::vector<int> & codes) {
     if (!report("lm", 0, 1)) return false;
-    generate_audio_codes(engine, params, state, report, codes);
+    if (!generate_audio_codes(engine, params, state, report, codes)) return false;
     if (!report("lm", 1, 1)) return false;
 
     if (state.low_memory) {
