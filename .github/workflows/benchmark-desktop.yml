@@ -1,0 +1,290 @@
+# Desktop-only speech benchmark workflow.
+#
+# WHY THIS EXISTS
+# Gustavo asked for a single workflow (QVAC-24274) that runs benchmarks across
+# every speech engine's model families on desktop runners, with a comma-list
+# selector at dispatch time and a summary table at the end. Mobile lanes are
+# out of scope; those live in the qvac monorepo's per-addon benchmarks.
+#
+# TRIGGER
+# workflow_dispatch only — never on push/PR. The full matrix downloads several
+# GB of GGUFs and pulls a self-hosted macOS runner, so it must be human-driven.
+#
+# STRUCTURE
+#   plan       — expand `model_families` (comma list or "all") into a matrix
+#                over (family, runner). Emits JSON consumed by `bench`.
+#   bench      — one job per matrix cell. Builds the engine, fetches models
+#                from s3://$MODEL_S3_BUCKET/qvac_models_compiled/ggml/, runs
+#                scripts/benchmarks/run-family.sh, uploads result.json.
+#   summarize  — always-run tail job. Downloads every result.json artifact
+#                and renders one markdown table via scripts/benchmarks/summarize.py.
+#
+# The per-family bench spec (S3 paths, build target, CLI args) lives in
+# scripts/benchmarks/families.json so editing a family doesn't touch this YAML.
+
+name: speech-benchmark-desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_families:
+        description: >-
+          Comma-separated family names, or "all". Families:
+          whisper, parakeet, sortformer, chatterbox, supertonic, parler,
+          cosyvoice, audio8, lavasr, acestep, minimax.
+        required: false
+        default: "all"
+        type: string
+      runners:
+        description: >-
+          Comma-separated runner labels. Supported: linux, macos.
+          (Linux = ubuntu-24.04 hosted; macos = qvac-macos26-arm64-gpu self-hosted.)
+        required: false
+        default: "linux,macos"
+        type: string
+      whisper_sizes:
+        description: >-
+          Comma-separated whisper model sizes to benchmark (tiny, base, small).
+          Larger sizes are excluded per the task to preserve runner minutes.
+        required: false
+        default: "tiny,base,small"
+        type: string
+      runs_per_bench:
+        description: "Timed iterations per bench (median reported)."
+        required: false
+        default: "3"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write   # required for aws-actions/configure-aws-credentials OIDC.
+
+env:
+  GGML_REPO: https://github.com/tetherto/qvac-ext-ggml.git
+  GGML_BRANCH: speech
+  AWS_REGION: eu-central-1
+  ALL_FAMILIES: "whisper,parakeet,sortformer,chatterbox,supertonic,parler,cosyvoice,audio8,lavasr,acestep,minimax"
+
+jobs:
+  # ---------- 1. Expand inputs into a matrix ------------------------------
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.expand.outputs.matrix }}
+    steps:
+      - id: expand
+        env:
+          IN_FAMILIES: ${{ inputs.model_families }}
+          IN_RUNNERS:  ${{ inputs.runners }}
+          IN_WHISPER:  ${{ inputs.whisper_sizes }}
+        run: |
+          set -euo pipefail
+
+          # "all" -> full family list; otherwise split the comma list and trim.
+          if [[ "$IN_FAMILIES" == "all" || -z "$IN_FAMILIES" ]]; then
+            families="$ALL_FAMILIES"
+          else
+            families="$IN_FAMILIES"
+          fi
+
+          # Map runner labels -> matrix entries. `os` is the GHA `runs-on`
+          # value; `label` is the friendly name we surface in the summary table.
+          runners_json="[]"
+          IFS=',' read -ra rlabels <<< "$IN_RUNNERS"
+          for r in "${rlabels[@]}"; do
+            r_trim="$(echo "$r" | xargs)"
+            case "$r_trim" in
+              linux) runners_json="$(echo "$runners_json" | jq -c '. + [{"label":"linux","os":"ubuntu-24.04"}]')" ;;
+              macos) runners_json="$(echo "$runners_json" | jq -c '. + [{"label":"macos","os":"qvac-macos26-arm64-gpu"}]')" ;;
+              *) echo "unknown runner label: $r_trim" >&2; exit 1 ;;
+            esac
+          done
+
+          # Whisper is fan-out on size; every other family collapses to one row.
+          IFS=',' read -ra sizes <<< "$IN_WHISPER"
+          whisper_sizes_json="$(printf '%s\n' "${sizes[@]}" | jq -R 'select(length>0) | . | ltrimstr(" ") | rtrimstr(" ")' | jq -s -c .)"
+
+          cells="[]"
+          IFS=',' read -ra flist <<< "$families"
+          for f in "${flist[@]}"; do
+            f_trim="$(echo "$f" | xargs)"
+            [[ -z "$f_trim" ]] && continue
+            for r in $(echo "$runners_json" | jq -c '.[]'); do
+              if [[ "$f_trim" == "whisper" ]]; then
+                for s in $(echo "$whisper_sizes_json" | jq -r '.[]'); do
+                  cells="$(echo "$cells" | jq -c --arg fam "$f_trim" --arg size "$s" --argjson r "$r" \
+                    '. + [{"family":$fam,"whisper_size":$size,"runner_label":$r.label,"runner_os":$r.os}]')"
+                done
+              else
+                cells="$(echo "$cells" | jq -c --arg fam "$f_trim" --argjson r "$r" \
+                  '. + [{"family":$fam,"whisper_size":"","runner_label":$r.label,"runner_os":$r.os}]')"
+              fi
+            done
+          done
+
+          matrix="$(jq -c -n --argjson include "$cells" '{include: $include}')"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "planned matrix:"
+          echo "$matrix" | jq .
+
+  # ---------- 2. Bench a single (family, runner) cell ---------------------
+  bench:
+    needs: plan
+    if: ${{ needs.plan.outputs.matrix != '' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner_os }}
+    # continue-on-error so a single family failure doesn't skip the summary.
+    continue-on-error: true
+    timeout-minutes: 120
+    steps:
+      - name: Clean self-hosted workspace
+        if: runner.name != 'GitHub Actions'
+        run: |
+          # Self-hosted runners aren't wiped between jobs — remove any stale
+          # build/ and bench-models/ from a prior dispatch to keep timings
+          # honest and disk usage bounded.
+          rm -rf build ggml-src ggml-install bench-models artifacts
+          mkdir -p artifacts
+
+      - uses: actions/checkout@v4
+
+      - name: Install jq (Linux — macOS ships it)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y jq
+
+      - name: Install ccache
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            command -v ccache >/dev/null || brew install ccache
+          else
+            sudo apt-get install -y ccache
+          fi
+          echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve ggml pin (tip of ${{ env.GGML_BRANCH }})
+        id: ggml
+        run: echo "sha=$(git ls-remote "$GGML_REPO" "refs/heads/$GGML_BRANCH" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ggml install
+        id: ggml-cache
+        uses: actions/cache@v4
+        with:
+          path: ggml-install
+          key: ggml-install-portable-${{ matrix.runner_os }}-${{ steps.ggml.outputs.sha }}
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-benchmark-${{ matrix.runner_os }}-${{ matrix.family }}-${{ github.sha }}
+          restore-keys: |
+            ccache-benchmark-${{ matrix.runner_os }}-${{ matrix.family }}-
+            ccache-benchmark-${{ matrix.runner_os }}-
+
+      - name: Build ggml (system ggml, qvac-ext-ggml@${{ env.GGML_BRANCH }})
+        if: steps.ggml-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git init -q ggml-src
+          git -C ggml-src remote add origin "$GGML_REPO"
+          git -C ggml-src fetch --depth 1 origin "${{ steps.ggml.outputs.sha }}"
+          git -C ggml-src checkout -q FETCH_HEAD
+          cmake -S ggml-src -B ggml-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
+          cmake --build ggml-src/build -j4
+          cmake --install ggml-src/build
+
+      - name: Configure umbrella build
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSPEECH_BUILD_TESTS=OFF \
+            -DSPEECH_BUILD_EXECUTABLES=ON \
+            -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
+
+      - name: Build bench target for family=${{ matrix.family }}
+        id: build
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          target="$(jq -r --arg f "${{ matrix.family }}" '.[$f].cmake_target' scripts/benchmarks/families.json)"
+          echo "building target: $target"
+          # shellcheck disable=SC2086
+          cmake --build build --target $target -j4
+
+      - name: Run bench
+        env:
+          MODEL_S3_BUCKET: ${{ secrets.MODEL_S3_BUCKET }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          extra_args=()
+          if [[ -n "${{ matrix.whisper_size }}" ]]; then
+            extra_args+=(--whisper-size "${{ matrix.whisper_size }}")
+          fi
+          scripts/benchmarks/run-family.sh \
+            --family "${{ matrix.family }}" \
+            --runs "${{ inputs.runs_per_bench }}" \
+            --build-dir build \
+            --models-root "$PWD/bench-models" \
+            --audio-dir engines/parakeet/test/samples \
+            --runner "${{ matrix.runner_label }}" \
+            "${extra_args[@]}" \
+            --out "artifacts/result.json"
+
+          # If the build step above failed, run-family.sh will have written
+          # a `build-failed` row via its own error path.
+          if [[ "${{ steps.build.outcome }}" == "failure" ]]; then
+            jq '.status = "build-failed" | .notes = (.notes + " (cmake build failed)")' \
+              artifacts/result.json > artifacts/result.json.tmp
+            mv artifacts/result.json.tmp artifacts/result.json
+          fi
+
+      # Include the whisper size in the artifact name so the fan-out cells
+      # don't clobber each other's uploads.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ matrix.family }}${{ matrix.whisper_size && format('-{0}', matrix.whisper_size) || '' }}-${{ matrix.runner_label }}
+          path: artifacts/result.json
+          retention-days: 14
+
+  # ---------- 3. Aggregate + render summary table -------------------------
+  summarize:
+    needs: bench
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all bench artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          path: all-results
+
+      - name: Render summary table
+        run: |
+          set -euo pipefail
+          python3 scripts/benchmarks/summarize.py \
+            --results-dir all-results \
+            --out speech-benchmark-findings.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speech-benchmark-findings
+          path: speech-benchmark-findings.md
+          retention-days: 90

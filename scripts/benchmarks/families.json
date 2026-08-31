@@ -1,0 +1,156 @@
+{
+  "_schema": {
+    "description": "Per-family benchmark spec for .github/workflows/benchmark-desktop.yml. Kept out of YAML so it can be edited without touching the workflow, actionlint-diffed independently, and shared with local runs of scripts/benchmarks/run-family.sh.",
+    "fields": {
+      "cmake_target": "Ninja/CMake target(s) to build. Multiple targets space-separated.",
+      "bench_kind":   "'native' when the engine ships a *-bench binary that accepts --runs and --json-out; 'time-wrapped' when we time N invocations of a CLI and take the median wall-clock ourselves.",
+      "binary":       "Path (relative to build/) of the executable to invoke.",
+      "s3_prefix":    "Prefix under s3://$MODEL_S3_BUCKET/qvac_models_compiled/ggml/. All entries in `models` are downloaded to models/<family>/ from this prefix.",
+      "models":       "List of files to fetch. Directory structure is preserved (path segments before the filename become the local subdir).",
+      "args":         "Command-line arguments as a single string. Use ${MODEL_DIR} / ${MODELS_ROOT} placeholders that run-family.sh expands.",
+      "notes":        "Free text; surfaced in the summary table's 'notes' column."
+    }
+  },
+
+  "whisper": {
+    "cmake_target": "whisper-bench",
+    "bench_kind":   "native",
+    "binary":       "third_party/whisper.cpp/bin/whisper-bench",
+    "s3_prefix":    "whisper",
+    "models_by_size": {
+      "tiny":  ["2026-01-01/tiny-ggml-model.bin"],
+      "base":  ["2026-03-05/en-base-ggml-model-q8_0.bin"],
+      "small": []
+    },
+    "args": "-m ${MODEL_PATH} -t 4",
+    "notes": "Whisper's own bench prints per-op timings; the median wall-clock is captured by run-family.sh with time. 'small' has no registry path yet — surfaced as 'not-in-registry'."
+  },
+
+  "parakeet": {
+    "cmake_target": "parakeet-cli",
+    "bench_kind":   "time-wrapped",
+    "binary":       "engines/parakeet/parakeet-cli",
+    "s3_prefix":    "parakeet",
+    "models": [
+      "2026-08-13/parakeet-unified-en-0.6b.q8_0.gguf",
+      "2026-05-11/parakeet-tdt-0.6b-v3.q8_0.gguf"
+    ],
+    "args": "--model ${MODEL_DIR}/parakeet-unified-en-0.6b.q8_0.gguf --wav ${AUDIO_DIR}/jfk.wav",
+    "notes": "Uses the shared jfk.wav fixture (10 s clip) to keep runs deterministic."
+  },
+
+  "sortformer": {
+    "cmake_target": "parakeet-cli",
+    "bench_kind":   "time-wrapped",
+    "binary":       "engines/parakeet/parakeet-cli",
+    "s3_prefix":    "parakeet",
+    "models": [
+      "2026-05-20/diar_streaming_sortformer_4spk-v2.1.q8_0.gguf",
+      "2026-08-13/parakeet-unified-en-0.6b.q8_0.gguf"
+    ],
+    "args": "--model ${MODEL_DIR}/parakeet-unified-en-0.6b.q8_0.gguf --diarization-model ${MODEL_DIR}/diar_streaming_sortformer_4spk-v2.1.q8_0.gguf --wav ${AUDIO_DIR}/jfk.wav",
+    "notes": "Diarization mode; uses the streaming Sortformer alongside the ASR CTC."
+  },
+
+  "chatterbox": {
+    "cmake_target": "tts-cli",
+    "bench_kind":   "time-wrapped",
+    "binary":       "engines/tts/tts-cli",
+    "s3_prefix":    "chatterbox",
+    "models": [
+      "2026-05-18/chatterbox-t3-turbo-q8_0.gguf",
+      "2026-06-01/chatterbox-s3gen-q8_0.gguf"
+    ],
+    "args": "--engine chatterbox --t3-model ${MODEL_DIR}/chatterbox-t3-turbo-q8_0.gguf --s3gen-model ${MODEL_DIR}/chatterbox-s3gen-q8_0.gguf --text 'benchmark run' --out /dev/null",
+    "notes": "Chatterbox has no dedicated -bench; wall-clock via tts-cli for a fixed 'benchmark run' prompt."
+  },
+
+  "supertonic": {
+    "cmake_target": "supertonic-bench",
+    "bench_kind":   "native",
+    "binary":       "engines/tts/supertonic-bench",
+    "s3_prefix":    "supertonic",
+    "models": ["2026-06-15/supertonic3-q8_0.gguf"],
+    "args": "--model ${MODEL_DIR}/supertonic3-q8_0.gguf --text 'benchmark run'",
+    "notes": "Emits JSON via --json-out; median_ms field is authoritative."
+  },
+
+  "parler": {
+    "cmake_target": "parler-bench",
+    "bench_kind":   "native",
+    "binary":       "engines/tts/parler-bench",
+    "s3_prefix":    "parler-tts",
+    "models": ["2026-07-20/parler-mini-v1-q8_0.gguf"],
+    "args": "--model ${MODEL_DIR}/parler-mini-v1-q8_0.gguf --text 'benchmark run'",
+    "notes": "Native bench; JSON schema matches supertonic-bench."
+  },
+
+  "cosyvoice": {
+    "cmake_target": "cosyvoice-bench",
+    "bench_kind":   "native",
+    "binary":       "engines/tts/cosyvoice-bench",
+    "s3_prefix":    "cosy_voice",
+    "models": [
+      "2026-07-23/cosyvoice3-llm-q8_0.gguf",
+      "2026-07-23/cosyvoice3-flow-f32.gguf",
+      "2026-07-23/cosyvoice3-hift-f32.gguf",
+      "2026-07-23/cosyvoice3-voice-en.gguf",
+      "2026-08-14/cosyvoice3-s3tok-q8_0.gguf",
+      "2026-08-14/campplus-f32.gguf"
+    ],
+    "args": "--model-dir ${MODEL_DIR}",
+    "notes": "Model-dir mode: bench discovers the six shards under one directory."
+  },
+
+  "audio8": {
+    "cmake_target": "audio8-cli",
+    "bench_kind":   "time-wrapped",
+    "binary":       "engines/tts/audio8-cli",
+    "s3_prefix":    "audio-8",
+    "models": [
+      "2026-08-12/audio8-lm-q8_0.gguf",
+      "2026-08-12/audio8-codec-encoder-q8_0.gguf",
+      "2026-08-12/audio8-codec-decoder-q8_0.gguf"
+    ],
+    "args": "--lm ${MODEL_DIR}/audio8-lm-q8_0.gguf --codec-decoder ${MODEL_DIR}/audio8-codec-decoder-q8_0.gguf --text 'benchmark run' --out /dev/null",
+    "notes": "audio8-cli has no --bench flag; wall-clock via time."
+  },
+
+  "lavasr": {
+    "cmake_target": "lavasr-bench",
+    "bench_kind":   "native",
+    "binary":       "engines/tts/lavasr-bench",
+    "s3_prefix":    "lavasr",
+    "models": [
+      "2026-07-03/lavasr-denoiser-f16.gguf",
+      "2026-06-26/lavasr-enhancer-f16.gguf"
+    ],
+    "args": "--denoiser ${MODEL_DIR}/lavasr-denoiser-f16.gguf --enhancer ${MODEL_DIR}/lavasr-enhancer-f16.gguf --seconds 6",
+    "notes": "No q8_0 available in the registry; f16 weights only."
+  },
+
+  "acestep": {
+    "cmake_target": "music-cli",
+    "bench_kind":   "time-wrapped",
+    "binary":       "engines/audiogen/music-cli",
+    "s3_prefix":    "acestep",
+    "models": [
+      "2026-07-22/Qwen3-Embedding-0.6B-Q8_0.gguf",
+      "2026-07-22/acestep-5Hz-lm-0.6B-Q8_0.gguf",
+      "2026-07-22/acestep-v15-turbo-Q8_0.gguf",
+      "2026-07-22/vae-BF16.gguf"
+    ],
+    "args": "--model-dir ${MODEL_DIR} --prompt 'benchmark run' --duration 4",
+    "notes": "~5 GB combined; hosted-linux runners may skip if the per-runner disk budget is exceeded."
+  },
+
+  "minimax": {
+    "cmake_target": "mm3-replay",
+    "bench_kind":   "time-wrapped",
+    "binary":       "engines/audiogen/mm3-replay",
+    "s3_prefix":    "",
+    "models": [],
+    "args": "",
+    "notes": "MODEL_MISSING: no S3 registry path yet. Row emitted, execution skipped. Follow-up: upload MiniMax-Music3 GGUFs."
+  }
+}
