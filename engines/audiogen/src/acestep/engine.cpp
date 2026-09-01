@@ -2043,6 +2043,10 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
     result.sample_rate = engine.sr;
     result.channels = AUDIO_CHANNELS;
 
+    if (engine.cancel_flag.load()) {
+        return result;
+    }
+
     const StageReporter report = [&](const char * stage, int step, int total) {
         if (progress && !progress(stage, step, total)) {
             engine.cancel_flag.store(true);
