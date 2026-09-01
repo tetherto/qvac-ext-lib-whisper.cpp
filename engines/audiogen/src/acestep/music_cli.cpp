@@ -312,8 +312,12 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "[music-cli] cannot write %s\n", lrc_path);
             return 1;
         }
-        fwrite(r.metadata.lrc.data(), 1, r.metadata.lrc.size(), lrc_file);
+        const size_t written = fwrite(r.metadata.lrc.data(), 1, r.metadata.lrc.size(), lrc_file);
         fclose(lrc_file);
+        if (written != r.metadata.lrc.size()) {
+            fprintf(stderr, "[music-cli] short write on %s\n", lrc_path);
+            return 1;
+        }
         fprintf(stderr, "[music-cli] wrote %s (lyrics score %.4f)\n", lrc_path, r.metadata.lyrics_score);
     }
     return 0;

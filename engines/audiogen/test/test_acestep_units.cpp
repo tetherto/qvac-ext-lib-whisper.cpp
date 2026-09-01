@@ -1423,7 +1423,7 @@ void test_lrc_request_policy() {
     GenerateParams params;
     GenerateTask task;
     params.generate_lrc = true;
-    params.lyrics = "[verse]\nuna linea para alinear";
+    params.lyrics = "[verse]\na line to align";
     CHECK(resolve_generate_task(params, task).empty());
 
     params.lyrics = "[Instrumental]";
@@ -1437,7 +1437,7 @@ void test_lrc_request_policy() {
     CHECK(resolve_generate_task(params, task).empty());
 
     params.simple_mode = false;
-    params.lyrics = "[verse]\nuna linea";
+    params.lyrics = "[verse]\na line to align";
     params.edit_plan.push_back(RepaintParams{});
     CHECK(resolve_generate_task(params, task).find("audio edit path") != std::string::npos);
 }
