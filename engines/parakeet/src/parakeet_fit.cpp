@@ -10,6 +10,7 @@
 #include "parakeet/fit.h"
 
 #include "backend_util.h"
+#include "fit_util.h"
 #include "long_form.h"
 #include "parakeet_ctc.h"
 #include "parakeet_eou.h"
@@ -59,10 +60,9 @@ int encoder_out_frames(const EncoderConfig & enc, long long n_mel_frames) {
     return (int) t;
 }
 
-uint64_t sat_add(uint64_t a, uint64_t b) {
-    const uint64_t s = a + b;
-    return s < a ? std::numeric_limits<uint64_t>::max() : s;
-}
+using fitutil::sat_add;
+using fitutil::sat_mul;
+using fitutil::sat_u64_from_double;
 
 }  // namespace
 
@@ -123,9 +123,14 @@ FitResult fit_params(const FitOptions & opts) {
 
     // ── Workload → worst-case single-encode window ─────────────────────────
     const MelConfig & mel = model.mel_cfg;
-    const long long total_mel = std::max<long long>(
-        1, (long long) std::ceil((double) opts.audio_seconds *
-                                 (double) mel.sample_rate / (double) mel.hop_length));
+    // Clamp through double before the integer conversion: a float
+    // audio_seconds large enough to overflow long long must saturate (and
+    // then surface as workload-too-large / DOES-NOT-FIT), not hit UB.
+    const long long total_mel = (long long) std::min<uint64_t>(
+        std::max<uint64_t>(1, sat_u64_from_double(
+            std::ceil((double) opts.audio_seconds *
+                      (double) mel.sample_rate / (double) mel.hop_length))),
+        (uint64_t) std::numeric_limits<long long>::max());
 
     // The transcribe paths bound device memory by sliding the encoder over
     // long inputs (resolve_long_form_plan + run_encoder_windowed). Offline
@@ -243,28 +248,40 @@ FitResult fit_params(const FitOptions & opts) {
     //    device buffers): input samples, mel slab, stitched encoder output,
     //    CTC logits, encoder-graph host mirrors, CPU-path decoder weights. ──
     {
+        // Saturating throughout: host_bytes feeds the verdict on
+        // unified-memory devices, so a wrap here could flip a real
+        // DOES-NOT-FIT into FITS.
         uint64_t host = 0;
-        host += (uint64_t) std::llround((double) opts.audio_seconds * mel.sample_rate)
-              * sizeof(float);                                        // input samples
-        host += (uint64_t) total_mel * mel.n_mels * sizeof(float);    // mel spectrogram
-        host += (uint64_t) total_enc * model.encoder_cfg.d_model * sizeof(float);  // encoder_out
+        host = sat_add(host, sat_mul(sat_u64_from_double(std::ceil(
+                   (double) opts.audio_seconds * mel.sample_rate)),
+                   sizeof(float)));                                   // input samples
+        host = sat_add(host, sat_mul(sat_mul((uint64_t) total_mel, (uint64_t) mel.n_mels),
+                                     sizeof(float)));                 // mel spectrogram
+        host = sat_add(host, sat_mul(sat_mul((uint64_t) total_enc,
+                                             (uint64_t) model.encoder_cfg.d_model),
+                                     sizeof(float)));                 // encoder_out
         if (model.model_type == ParakeetModelType::CTC) {
-            host += (uint64_t) total_enc * model.vocab_size * sizeof(float);       // logits
+            host = sat_add(host, sat_mul(sat_mul((uint64_t) total_enc,
+                                                 (uint64_t) model.vocab_size),
+                                         sizeof(float)));             // logits
         }
         // EncoderGraph host mirrors -- relative positional encoding and
         // (chunked-attention models) the T x T attention mask -- are owned per
         // cached graph, so one worst-window mirror per resident graph.
-        uint64_t mirrors = (uint64_t) (2 * (long long) window_enc - 1) *
-                           model.encoder_cfg.d_model * sizeof(float);
+        uint64_t mirrors = sat_mul((uint64_t) (2 * (long long) window_enc - 1),
+                                   sat_mul((uint64_t) model.encoder_cfg.d_model,
+                                           sizeof(float)));
         if (model.encoder_cfg.att_chunked_limited &&
             model.encoder_cfg.att_context_left  >= 0 &&
             model.encoder_cfg.att_context_right >= 0) {
-            mirrors += (uint64_t) window_enc * window_enc * sizeof(float);
+            mirrors = sat_add(mirrors,
+                              sat_mul(sat_mul((uint64_t) window_enc, (uint64_t) window_enc),
+                                      sizeof(float)));
         }
-        host += mirrors * resident_mel.size();
-        host += dm.host_bytes;           // CPU decode path: dequantised f32 weights
-        host += lm.sortformer_cpu_bytes; // Mali-Vulkan CPU head copy (host RAM)
-        host  = sat_add(host, extra_host);
+        host = sat_add(host, sat_mul(mirrors, resident_mel.size()));
+        host = sat_add(host, dm.host_bytes);           // CPU decode path: dequantised f32 weights
+        host = sat_add(host, lm.sortformer_cpu_bytes); // Mali-Vulkan CPU head copy (host RAM)
+        host = sat_add(host, extra_host);
         r.host_bytes = host;
     }
 

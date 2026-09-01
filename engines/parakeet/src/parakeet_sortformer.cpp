@@ -24,7 +24,6 @@
 #include <numeric>
 #include <utility>
 #include <vector>
-#include <vector>
 
 namespace parakeet {
 

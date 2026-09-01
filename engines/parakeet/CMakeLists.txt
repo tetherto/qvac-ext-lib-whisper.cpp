@@ -1020,6 +1020,24 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "${_qvp_sf_q8_gguf}"
         REQUIRES "${_qvp_sf_q8_gguf}")
 
+    # Model-free CLI-layer unit tests: strict parsers, saturating arithmetic,
+    # JSON escaping, and the parakeet-fit-params exit-code contract.
+    add_executable(test-fit-cli
+        test/test_fit_cli.cpp
+        src/fit_main.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_fit.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp)
+    target_link_libraries(test-fit-cli PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-fit-cli PRIVATE include src ggml/include)
+    parakeet_apply_backend_defs(test-fit-cli)
+    parakeet_register_test(test-fit-cli LABEL "unit")
+
     add_executable(test-eou-decoder-parity
         test/test_eou_decoder_parity.cpp
         src/parakeet_ctc.cpp

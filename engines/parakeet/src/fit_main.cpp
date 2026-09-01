@@ -8,63 +8,21 @@
 #include "parakeet/cli.h"
 #include "parakeet/fit.h"
 
+#include "fit_util.h"
+
 #include <cinttypes>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <string>
 
 namespace {
 
-// Strict numeric parsers: a preflight must fail loudly on garbage input, not
-// coerce it to 0 (atof) and report a misleading verdict.
-bool parse_f32_positive(const char * s, float & out) {
-    char * end = nullptr;
-    const double v = std::strtod(s, &end);
-    if (end == s || *end != '\0' || !std::isfinite(v) || v <= 0.0) return false;
-    out = (float) v;
-    return true;
-}
-
-bool parse_u64(const char * s, uint64_t & out) {
-    if (!s || *s == '-') return false;
-    char * end = nullptr;
-    const unsigned long long v = std::strtoull(s, &end, 10);
-    if (end == s || *end != '\0') return false;
-    out = (uint64_t) v;
-    return true;
-}
-
-// Escape a string for embedding in a JSON string literal. model_variant comes
-// from GGUF metadata and device_name from the backend/driver, so neither is
-// trusted to be JSON-clean; @qvac/model-fit JSON.parses this output.
-std::string json_escape(const std::string & s) {
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (const char ch : s) {
-        const unsigned char c = (unsigned char) ch;
-        switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b";  break;
-            case '\f': out += "\\f";  break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                if (c < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                    out += buf;
-                } else {
-                    out += ch;
-                }
-        }
-    }
-    return out;
-}
+using parakeet::fitutil::json_escape;
+using parakeet::fitutil::margin_mib_to_bytes;
+using parakeet::fitutil::parse_f32_positive;
+using parakeet::fitutil::parse_i32;
+using parakeet::fitutil::parse_u64;
 
 void print_usage(const char * argv0) {
     std::printf(
@@ -136,26 +94,34 @@ extern "C" int parakeet_fit_cli_main(int argc, char ** argv) {
                 return (int) parakeet::FitStatus::Error;
             }
         } else if (a == "--n-gpu-layers" && i + 1 < argc) {
-            opts.n_gpu_layers = std::atoi(argv[++i]);
+            // Strict like every numeric flag here: atoi would coerce a typo
+            // ('1x') to 0 and silently project the CPU backend instead.
+            if (!parse_i32(argv[++i], opts.n_gpu_layers)) {
+                std::fprintf(stderr, "--n-gpu-layers: '%s' is not an integer\n", argv[i]);
+                return (int) parakeet::FitStatus::Error;
+            }
         } else if (a == "--threads" && i + 1 < argc) {
-            opts.n_threads = std::atoi(argv[++i]);
+            if (!parse_i32(argv[++i], opts.n_threads)) {
+                std::fprintf(stderr, "--threads: '%s' is not an integer\n", argv[i]);
+                return (int) parakeet::FitStatus::Error;
+            }
         } else if (a == "--margin-mib" && i + 1 < argc) {
             uint64_t mib = 0;
             if (!parse_u64(argv[++i], mib)) {
                 std::fprintf(stderr, "--margin-mib: '%s' is not a non-negative integer\n", argv[i]);
                 return (int) parakeet::FitStatus::Error;
             }
-            // Saturate instead of wrapping: an absurd margin must make the
-            // verdict stricter, never overflow into a false FITS.
-            constexpr uint64_t kMaxMib =
-                std::numeric_limits<uint64_t>::max() / (1024ull * 1024ull);
-            opts.margin_bytes = mib > kMaxMib
-                                    ? std::numeric_limits<uint64_t>::max()
-                                    : mib * 1024ull * 1024ull;
+            opts.margin_bytes = margin_mib_to_bytes(mib);
         } else if (a == "--window-frames" && i + 1 < argc) {
-            opts.long_form_window_frames = std::atoi(argv[++i]);
+            if (!parse_i32(argv[++i], opts.long_form_window_frames)) {
+                std::fprintf(stderr, "--window-frames: '%s' is not an integer\n", argv[i]);
+                return (int) parakeet::FitStatus::Error;
+            }
         } else if (a == "--context-frames" && i + 1 < argc) {
-            opts.long_form_context_frames = std::atoi(argv[++i]);
+            if (!parse_i32(argv[++i], opts.long_form_context_frames)) {
+                std::fprintf(stderr, "--context-frames: '%s' is not an integer\n", argv[i]);
+                return (int) parakeet::FitStatus::Error;
+            }
         } else if (a == "--backends-dir" && i + 1 < argc) {
             opts.backends_dir = argv[++i];
         } else if (a == "--json") {
