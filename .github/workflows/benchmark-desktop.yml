@@ -1,23 +1,8 @@
 # Desktop-only speech benchmark workflow.
 #
-# WHY THIS EXISTS
-# Gustavo asked for a single workflow (QVAC-24274) that runs benchmarks across
-# every speech engine's model families on desktop runners, with a comma-list
-# selector at dispatch time and a summary table at the end. Mobile lanes are
-# out of scope; those live in the qvac monorepo's per-addon benchmarks.
-#
-# TRIGGER
-# workflow_dispatch only — never on push/PR. The full matrix downloads several
-# GB of GGUFs and pulls a self-hosted macOS runner, so it must be human-driven.
-#
-# STRUCTURE
-#   plan       — expand `model_families` (comma list or "all") into a matrix
-#                over (family, runner). Emits JSON consumed by `bench`.
-#   bench      — one job per matrix cell. Builds the engine, fetches models
-#                from s3://$MODEL_S3_BUCKET/qvac_models_compiled/ggml/, runs
-#                scripts/benchmarks/run-family.sh, uploads result.json.
-#   summarize  — always-run tail job. Downloads every result.json artifact
-#                and renders one markdown table via scripts/benchmarks/summarize.py.
+# workflow_dispatch only — never on push/PR. The full matrix downloads
+# several GB of GGUFs and pulls a self-hosted macOS runner, so it must be
+# human-driven.
 #
 # The per-family bench spec (S3 paths, build target, CLI args) lives in
 # scripts/benchmarks/families.json so editing a family doesn't touch this YAML.
