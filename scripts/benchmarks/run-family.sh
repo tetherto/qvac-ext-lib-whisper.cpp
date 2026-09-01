@@ -100,7 +100,7 @@ MODEL_DIR="$MODELS_ROOT/$FAMILY"
 mkdir -p "$MODEL_DIR"
 
 # ---- output-JSON emitter (used from every exit path) ------------------------
-BACKEND="unknown"     # populated after the first successful run parses stderr
+BACKEND="unknown"     # populated after the first successful run parses stderr / JSON
 PEAK_RSS_MIB="null"   # tracked across runs; max seen
 RTF_MEDIAN="null"     # from bench JSON (native) or computed (time-wrapped w/ audio_duration_seconds)
 
@@ -191,11 +191,22 @@ elif [[ $fetch_status -ne 0 ]]; then
   emit_json "fetch-failed"    null null null " (model fetch failed with status $fetch_status)"; exit 0
 fi
 
+# ---- native-mode bench JSON path (resolved before args expansion) ----------
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+JSON_OUT="$tmp_dir/native.json"
+
 # ---- expand args placeholders -----------------------------------------------
+# Native families put --runs/--warmup/--json-out (or the family-specific
+# spellings like --bench-runs / --bench-json) directly in their args string,
+# so the driver stays agnostic about the flag names each bench binary uses.
 EXPANDED_ARGS="${ARGS_TEMPLATE//\$\{MODEL_DIR\}/$MODEL_DIR}"
 EXPANDED_ARGS="${EXPANDED_ARGS//\$\{MODELS_ROOT\}/$MODELS_ROOT}"
 EXPANDED_ARGS="${EXPANDED_ARGS//\$\{AUDIO_DIR\}/$AUDIO_DIR}"
 EXPANDED_ARGS="${EXPANDED_ARGS//\$\{MODEL_PATH\}/${MODEL_PATH:-}}"
+EXPANDED_ARGS="${EXPANDED_ARGS//\$\{RUNS\}/$RUNS}"
+EXPANDED_ARGS="${EXPANDED_ARGS//\$\{WARMUP\}/$WARMUP}"
+EXPANDED_ARGS="${EXPANDED_ARGS//\$\{JSON_OUT\}/$JSON_OUT}"
 
 BINARY="$BUILD_DIR/$BINARY_REL"
 if ! [[ -x "$BINARY" ]]; then
@@ -213,7 +224,6 @@ have_gnu_time() {
 
 wrap_time() {
   # Prepend the correct time invocation. When neither is available, skip.
-  # $@ = the actual command + args.
   if [[ "$(uname -s)" == "Darwin" ]]; then
     /usr/bin/time -l "$@"
   elif have_gnu_time; then
@@ -243,13 +253,12 @@ parse_rss_from_time_stderr() {
   echo ""
 }
 
-# ---- backend extraction from stderr ---------------------------------------
-# Every speech engine logs one of:
-#   parakeet: using CUDA backend (RTX 4090)
-#   tts-cpp: using Vulkan backend (llvmpipe)
-#   audiogen: using Metal backend (Apple M3 Max)
-# Whisper's own bench prints 'whisper_backend_init_gpu: using <NAME> backend'
-# instead. The regex captures the token between 'using' and 'backend'.
+# ---- backend extraction ----------------------------------------------------
+# CPU-first default: unless we see a positive GPU-init marker, assume CPU.
+# Whisper's system_info line lists SIMD flags including "METAL = 0 | CUDA = 0"
+# even on CPU-only runs, which would false-match a plain substring grep; only
+# the specific "using <NAME> backend" line means a GPU backend was actually
+# selected.
 parse_backend_from_stderr() {
   local file="$1"
   local hit
@@ -257,26 +266,31 @@ parse_backend_from_stderr() {
   if [[ -n "$hit" ]]; then
     echo "$hit"; return
   fi
-  # Whisper's system_info line names the SIMD/vendor but no ggml backend key
-  # if the run stayed on CPU — surface CPU explicitly to avoid 'unknown'.
-  if grep -q "system_info: n_threads" "$file" 2>/dev/null && \
-     ! grep -q "GPU\|CUDA\|Metal\|Vulkan" "$file" 2>/dev/null; then
+  # No GPU-init marker: assume CPU when the process ran at all (either
+  # captured stderr from time or the child).
+  if [[ -s "$file" ]]; then
     echo "CPU"; return
   fi
   echo ""
 }
 
 # ---- native bench: one invocation, parse the emitted JSON ------------------
+# Native JSON schema tolerance — different bench binaries put the same
+# information in different keys. We fall back through the known layouts:
+#   * .stages.tot|.total|.e2e     -- supertonic/parler/cosyvoice
+#   * .inference_ms               -- parakeet-cli --bench
+#   * .end_to_end_ms              -- alternate parakeet naming (defensive)
+# RTF likewise: .rtf.median (supertonic-shape) vs .rtf_median (parakeet).
+# Backend likewise: .backend at top level (parakeet) — otherwise fall back
+# to stderr parsing.
 run_native() {
-  local native_json="$1"; shift    # path we ask the bench to write
+  local native_json="$1"; shift
   local stderr_log="$1"; shift
   local rss_log="$1"; shift
 
-  # Combine bench stderr and time stderr into one file; time's output starts
-  # after the child exits so it doesn't interleave with bench log lines.
-  if wrap_time "$BINARY" $EXPANDED_ARGS --runs "$RUNS" --warmup "$WARMUP" --json-out "$native_json" \
+  if wrap_time "$BINARY" $EXPANDED_ARGS \
       > "$stderr_log.stdout" 2> "$rss_log"; then
-    cat "$rss_log" >> "$stderr_log"          # for backend parsing
+    cat "$rss_log" >> "$stderr_log"
   else
     cat "$rss_log" >> "$stderr_log"
     return 1
@@ -287,16 +301,15 @@ run_native() {
     return 1
   fi
 
-  # Native bench JSON keys we care about: top-level `rtf.median`, and the
-  # 'total' / 'e2e' / 'tot' stage median_ms. Try the common names in order.
-  local median wmin wmax rtf
-  median="$(jq -r '(.stages.tot.median_ms // .stages.total.median_ms // .stages.e2e.median_ms // empty)' "$native_json" 2>/dev/null || true)"
-  wmin="$(jq   -r '(.stages.tot.min_ms    // .stages.total.min_ms    // .stages.e2e.min_ms    // empty)' "$native_json" 2>/dev/null || true)"
-  wmax="$(jq   -r '(.stages.tot.max_ms    // .stages.total.max_ms    // .stages.e2e.max_ms    // empty)' "$native_json" 2>/dev/null || true)"
-  rtf="$(jq    -r '(.rtf.median // empty)'                                                                  "$native_json" 2>/dev/null || true)"
+  local median wmin wmax rtf backend
+  median="$(jq -r '(.stages.tot.median_ms // .stages.total.median_ms // .stages.e2e.median_ms // .inference_ms.median // .end_to_end_ms.median // empty)' "$native_json" 2>/dev/null || true)"
+  wmin="$(jq   -r '(.stages.tot.min_ms    // .stages.total.min_ms    // .stages.e2e.min_ms    // .inference_ms.min    // .end_to_end_ms.min    // empty)' "$native_json" 2>/dev/null || true)"
+  wmax="$(jq   -r '(.stages.tot.max_ms    // .stages.total.max_ms    // .stages.e2e.max_ms    // .inference_ms.max    // .end_to_end_ms.max    // empty)' "$native_json" 2>/dev/null || true)"
+  rtf="$(jq    -r '(.rtf.median // .rtf_median // empty)' "$native_json" 2>/dev/null || true)"
+  backend="$(jq -r '(.backend // empty)' "$native_json" 2>/dev/null || true)"
 
-  # Echo back "median|min|max|rtf" (empty fields ok) for the caller to consume.
-  echo "${median}|${wmin}|${wmax}|${rtf}"
+  # Echo "median|min|max|rtf|backend" for the caller.
+  echo "${median}|${wmin}|${wmax}|${rtf}|${backend}"
 }
 
 # ---- time-wrapped bench: N invocations, we take the median ------------------
@@ -315,29 +328,31 @@ run_one_time_wrapped() {
 }
 
 # ---- run --------------------------------------------------------------------
-tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
-
 case "$BENCH_KIND" in
   native)
-    native_json="$tmp_dir/native.json"
     stderr_log="$tmp_dir/stderr.log"
     rss_log="$tmp_dir/rss.log"
     parsed=""
-    if ! parsed="$(run_native "$native_json" "$stderr_log" "$rss_log")"; then
+    if ! parsed="$(run_native "$JSON_OUT" "$stderr_log" "$rss_log")"; then
       BACKEND="$(parse_backend_from_stderr "$stderr_log")"
       BACKEND="${BACKEND:-unknown}"
       emit_json "run-failed" null null null " (native bench invocation failed)"
       exit 0
     fi
-    IFS='|' read -r n_med n_min n_max n_rtf <<< "$parsed"
+    IFS='|' read -r n_med n_min n_max n_rtf n_backend <<< "$parsed"
     [[ -n "$n_med" ]] || n_med="null"
     [[ -n "$n_min" ]] || n_min="null"
     [[ -n "$n_max" ]] || n_max="null"
     if [[ -n "$n_rtf" ]]; then RTF_MEDIAN="$n_rtf"; fi
 
-    BACKEND="$(parse_backend_from_stderr "$stderr_log")"
-    BACKEND="${BACKEND:-unknown}"
+    # Prefer the backend the bench JSON declared (parakeet reports the
+    # post-fallback active backend); fall back to stderr scraping.
+    if [[ -n "$n_backend" ]]; then
+      BACKEND="$n_backend"
+    else
+      BACKEND="$(parse_backend_from_stderr "$stderr_log")"
+      BACKEND="${BACKEND:-unknown}"
+    fi
     rss="$(parse_rss_from_time_stderr "$stderr_log")"
     [[ -n "$rss" ]] && PEAK_RSS_MIB="$rss"
     emit_json "ok" "$n_med" "$n_min" "$n_max"

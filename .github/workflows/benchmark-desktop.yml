@@ -44,6 +44,16 @@ permissions:
   contents: read
   id-token: write   # required for aws-actions/configure-aws-credentials OIDC.
 
+# Serialize dispatches. The self-hosted macOS runner cleans its workspace
+# at the start of each cell (rm -rf build ggml-src bench-models); two
+# concurrent dispatches would race and one would overwrite the other's
+# in-progress artefacts. cancel-in-progress: false so a running dispatch
+# always finishes — reviewers relying on a result won't have it silently
+# cancelled by the next person hitting Run.
+concurrency:
+  group: speech-benchmark-desktop
+  cancel-in-progress: false
+
 env:
   GGML_REPO: https://github.com/tetherto/qvac-ext-ggml.git
   GGML_BRANCH: speech
@@ -52,6 +62,10 @@ env:
 
 jobs:
   # ---------- 1. Expand inputs into a matrix ------------------------------
+  # SECURITY: every input token is whitelisted against ALL_FAMILIES /
+  # {linux,macos} / {tiny,base,small} before it enters the matrix. Values
+  # in the matrix are later interpolated into shell (see the bench job's
+  # steps), so untrusted strings could otherwise become command injection.
   plan:
     runs-on: ubuntu-24.04
     outputs:
@@ -72,6 +86,16 @@ jobs:
             families="$IN_FAMILIES"
           fi
 
+          valid_family() {
+            case "$1" in
+              whisper|parakeet|sortformer|chatterbox|supertonic|parler|cosyvoice|audio8|lavasr|acestep|minimax) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          valid_size() {
+            case "$1" in tiny|base|small) return 0 ;; *) return 1 ;; esac
+          }
+
           # Map runner labels -> matrix entries. `os` is the GHA `runs-on`
           # value; `label` is the friendly name we surface in the summary table.
           runners_json="[]"
@@ -81,19 +105,29 @@ jobs:
             case "$r_trim" in
               linux) runners_json="$(echo "$runners_json" | jq -c '. + [{"label":"linux","os":"ubuntu-24.04"}]')" ;;
               macos) runners_json="$(echo "$runners_json" | jq -c '. + [{"label":"macos","os":"qvac-macos26-arm64-gpu"}]')" ;;
-              *) echo "unknown runner label: $r_trim" >&2; exit 1 ;;
+              *) echo "rejected runner label: $r_trim (allowed: linux, macos)" >&2; exit 1 ;;
             esac
           done
 
-          # Whisper is fan-out on size; every other family collapses to one row.
-          IFS=',' read -ra sizes <<< "$IN_WHISPER"
-          whisper_sizes_json="$(printf '%s\n' "${sizes[@]}" | jq -R 'select(length>0) | . | ltrimstr(" ") | rtrimstr(" ")' | jq -s -c .)"
+          IFS=',' read -ra raw_sizes <<< "$IN_WHISPER"
+          whisper_sizes_json="[]"
+          for s in "${raw_sizes[@]}"; do
+            s_trim="$(echo "$s" | xargs)"
+            [[ -z "$s_trim" ]] && continue
+            if ! valid_size "$s_trim"; then
+              echo "rejected whisper size: $s_trim (allowed: tiny, base, small)" >&2; exit 1
+            fi
+            whisper_sizes_json="$(echo "$whisper_sizes_json" | jq -c --arg s "$s_trim" '. + [$s]')"
+          done
 
           cells="[]"
           IFS=',' read -ra flist <<< "$families"
           for f in "${flist[@]}"; do
             f_trim="$(echo "$f" | xargs)"
             [[ -z "$f_trim" ]] && continue
+            if ! valid_family "$f_trim"; then
+              echo "rejected family: $f_trim (allowed: $ALL_FAMILIES)" >&2; exit 1
+            fi
             for r in $(echo "$runners_json" | jq -c '.[]'); do
               if [[ "$f_trim" == "whisper" ]]; then
                 for s in $(echo "$whisper_sizes_json" | jq -r '.[]'); do
@@ -123,6 +157,14 @@ jobs:
     # continue-on-error so a single family failure doesn't skip the summary.
     continue-on-error: true
     timeout-minutes: 120
+    # Every step that touches user-influenced matrix values reads them via
+    # env instead of ${{ ... }} interpolation, so a malformed family/size
+    # never lands unquoted inside a shell string. (plan already whitelists,
+    # this is defence in depth.)
+    env:
+      FAMILY:       ${{ matrix.family }}
+      WHISPER_SIZE: ${{ matrix.whisper_size }}
+      RUNNER_LABEL: ${{ matrix.runner_label }}
     steps:
       - name: Clean self-hosted workspace
         if: runner.name != 'GitHub Actions'
@@ -134,6 +176,33 @@ jobs:
           mkdir -p artifacts
 
       - uses: actions/checkout@v4
+
+      # Seed a fallback result.json BEFORE the infrastructure steps run.
+      # If any of them (AWS OIDC, ggml build, cmake configure) fails, the
+      # upload-artifact step at the end still finds a row — otherwise the
+      # cell would silently disappear from the summary and a reader could
+      # not tell "we tried and failed" from "we skipped this family".
+      - name: Pre-flight seed result.json
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [[ "$FAMILY" == "whisper" ]]; then
+            model_label="whisper-$WHISPER_SIZE"
+          else
+            model_label="$FAMILY"
+          fi
+          jq -n \
+            --arg family "$FAMILY" \
+            --arg model  "$model_label" \
+            --arg runner "$RUNNER_LABEL" \
+            --arg os     "$(uname -s)" \
+            '{family:$family, model:$model, runner:$runner, os:$os,
+              backend:"unknown",
+              wall_ms_median:null, wall_ms_min:null, wall_ms_max:null,
+              rtf_median:null, peak_rss_mib:null,
+              runs:0, status:"infrastructure-failed",
+              notes:"pre-flight seed — an infrastructure step (AWS OIDC, ggml build, cmake configure) did not complete; the row was never overwritten by run-family.sh."}' \
+            > artifacts/result.json
 
       - name: Install jq (Linux — macOS ships it)
         if: runner.os == 'Linux'
@@ -167,11 +236,13 @@ jobs:
 
       - name: Cache ccache
         uses: actions/cache@v4
+        env:
+          CACHE_FAMILY: ${{ matrix.family }}
         with:
           path: .ccache
-          key: ccache-benchmark-${{ matrix.runner_os }}-${{ matrix.family }}-${{ github.sha }}
+          key: ccache-benchmark-${{ matrix.runner_os }}-${{ env.CACHE_FAMILY }}-${{ github.sha }}
           restore-keys: |
-            ccache-benchmark-${{ matrix.runner_os }}-${{ matrix.family }}-
+            ccache-benchmark-${{ matrix.runner_os }}-${{ env.CACHE_FAMILY }}-
             ccache-benchmark-${{ matrix.runner_os }}-
 
       - name: Build ggml (system ggml, qvac-ext-ggml@${{ env.GGML_BRANCH }})
@@ -200,12 +271,17 @@ jobs:
             -DSPEECH_BUILD_EXECUTABLES=ON \
             -DCMAKE_PREFIX_PATH="$PWD/ggml-install"
 
-      - name: Build bench target for family=${{ matrix.family }}
+      - name: Build bench target
         id: build
         continue-on-error: true
         run: |
           set -euo pipefail
-          target="$(jq -r --arg f "${{ matrix.family }}" '.[$f].cmake_target' scripts/benchmarks/families.json)"
+          # $FAMILY is validated by the plan job (whitelist) and comes in via
+          # env, so jq can lookup the target safely.
+          target="$(jq -r --arg f "$FAMILY" '.[$f].cmake_target' scripts/benchmarks/families.json)"
+          if [[ -z "$target" || "$target" == "null" ]]; then
+            echo "no cmake_target for family '$FAMILY'" >&2; exit 1
+          fi
           echo "building target: $target"
           # shellcheck disable=SC2086
           cmake --build build --target $target -j4
@@ -213,30 +289,25 @@ jobs:
       - name: Run bench
         env:
           MODEL_S3_BUCKET: ${{ secrets.MODEL_S3_BUCKET }}
+          RUNS_PER_BENCH: ${{ inputs.runs_per_bench }}
         run: |
           set -euo pipefail
-          mkdir -p artifacts
           extra_args=()
-          if [[ -n "${{ matrix.whisper_size }}" ]]; then
-            extra_args+=(--whisper-size "${{ matrix.whisper_size }}")
+          if [[ -n "$WHISPER_SIZE" ]]; then
+            extra_args+=(--whisper-size "$WHISPER_SIZE")
           fi
+          # run-family.sh handles all failure paths (missing binary, fetch
+          # error, warmup/run failure) by writing a result.json with the
+          # right `status` field — no post-hoc override needed here.
           scripts/benchmarks/run-family.sh \
-            --family "${{ matrix.family }}" \
-            --runs "${{ inputs.runs_per_bench }}" \
+            --family "$FAMILY" \
+            --runs "$RUNS_PER_BENCH" \
             --build-dir build \
             --models-root "$PWD/bench-models" \
             --audio-dir engines/parakeet/test/samples \
-            --runner "${{ matrix.runner_label }}" \
+            --runner "$RUNNER_LABEL" \
             "${extra_args[@]}" \
             --out "artifacts/result.json"
-
-          # If the build step above failed, run-family.sh will have written
-          # a `build-failed` row via its own error path.
-          if [[ "${{ steps.build.outcome }}" == "failure" ]]; then
-            jq '.status = "build-failed" | .notes = (.notes + " (cmake build failed)")' \
-              artifacts/result.json > artifacts/result.json.tmp
-            mv artifacts/result.json.tmp artifacts/result.json
-          fi
 
       # Include the whisper size in the artifact name so the fan-out cells
       # don't clobber each other's uploads.

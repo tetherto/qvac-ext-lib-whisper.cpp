@@ -130,7 +130,9 @@ def render_legend() -> str:
         "line. `unknown` means the log line was absent (usually a build-failed or "
         "CPU-only path that didn't emit it).\n"
         "- **Status** — `ok` / `not-in-registry` (whisper `small`) / `missing-model` "
-        "(minimax — no S3 path yet) / `build-failed` / `run-failed` / `fetch-failed`.\n"
+        "(minimax — no S3 path yet) / `build-failed` / `run-failed` / `fetch-failed` / "
+        "`infrastructure-failed` (a pre-bench workflow step — AWS OIDC, ggml build, "
+        "cmake configure — did not complete).\n"
     )
 
 
