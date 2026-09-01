@@ -161,6 +161,13 @@ struct GenerateParams {
     // NOTE: `lyrics` DEFAULTS to "[Instrumental]" — assign an empty string
     // explicitly for LM-written vocals, or every request stays instrumental.
     bool        simple_mode    = false;
+    // Synchronized lyric timestamps: after synthesis, one extra DiT forward at
+    // the final timestep captures the lyric cross-attention heads and DTW
+    // aligns each lyric line with the audio. The LRC text and its alignment
+    // score land in GenerateResult::metadata. Requires lyrics (with Simple
+    // Mode the LM-written lyrics are used) and is unavailable on the audio
+    // edit path.
+    bool        generate_lrc = false;
     // Official sampler-side Haar DCW "double" correction. Applied on turbo
     // DiTs only: the official preset disables DCW for base/sft models.
     bool        dcw_enabled     = true;
@@ -222,6 +229,10 @@ struct GenerateMetadata {
     int         timesignature = 0;
     long long   seed = 0;
     int         n_codes = 0;
+    // Filled when GenerateParams::generate_lrc is set: LRC-formatted lyric
+    // timestamps and the alignment confidence score in [0, 1].
+    std::string lrc;
+    double      lyrics_score = 0.0;
 };
 
 struct GenerateResult {

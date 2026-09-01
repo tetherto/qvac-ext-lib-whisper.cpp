@@ -161,6 +161,20 @@ path instead: it VAE-encodes `source_audio`, skips the LM and FSQ
 detokenizer, executes each `RepaintParams` or `FlowEditParams` operation in
 order, and VAE-decodes the final latent.
 
+### ACE-Step LRC generation
+
+With `GenerateParams::generate_lrc` set, the engine aligns the request lyrics
+with the generated audio and returns karaoke-style LRC timestamps in
+`GenerateResult::metadata.lrc`, plus an alignment confidence score in
+`metadata.lyrics_score` (`[0, 1]`). After sampling, one extra DiT forward at
+the final timestep runs with explicit softmax on the validated lyric
+cross-attention heads (the graph stops at the deepest captured layer), the
+captured matrices are converted from the ggml column-major layout, and DTW
+aligns each lyric line with the audio timeline. Requires lyrics — with Simple
+Mode the LM-written lyrics are aligned — and the official 24-layer/16-head
+DiT; the capture path is fully separate from the sampling graph, so normal
+inference is untouched when disabled.
+
 ### ACE-Step Simple Mode
 
 With `GenerateParams::simple_mode` set, `caption` is a short natural-language
@@ -552,6 +566,7 @@ combinations are rejected rather than silently ignored.
 | `--steps N`, `--shift F` | per variant | sampler overrides |
 | `--no-dcw` | DCW enabled | disable the official Haar low/high correction applied after each DiT step |
 | `--no-loudness` | normalization on | skip the percentile loudness normalization (99.999th percentile to 1.0, tail hard-clipped) applied to generation output; edits and lego stems are never normalized |
+| `--lrc out.lrc` | off | write synchronized lyric timestamps (LRC) next to the WAV; requires lyrics |
 | `--temp F`, `--topp F`, `--topk N`, `--cfg F` | `0.85`, `0.9`, off, `2.0` | LM sampling for the audio codes |
 | `--no-phase1` | off | skip the LM metadata auto-fill pass |
 | `--simple` | off | Simple Mode: expand `--caption` into a full request (lyrics regenerate unless `--lyrics "[Instrumental]"` is passed) |

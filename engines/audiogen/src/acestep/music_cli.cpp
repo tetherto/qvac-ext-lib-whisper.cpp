@@ -155,6 +155,7 @@ int main(int argc, char ** argv) {
                 "           DiT variant, turbo 8 / 3.0 / 1.0, base and sft 50 / 1.0 / 7.0)\n"
                 "           [--no-dcw]  (Haar DCW double mode is enabled by default)\n"
                 "           [--no-loudness]  (skip the percentile loudness normalization)\n"
+                "           [--lrc out.lrc]  (write synchronized lyric timestamps; needs lyrics)\n"
                 "  output:  [--normalize]  (peak-normalize edit output before PCM quantization)\n"
                 "           [--temp 0.85] [--cfg 2.0] [--topp 0.9] [--topk 0 (off)]\n"
                 "           [--no-phase1]  (values shown are the defaults)\n"
@@ -182,6 +183,7 @@ int main(int argc, char ** argv) {
     if (arg_flag(argc, argv, "--no-phase1")) p.lm_phase1 = false;
     if (arg_flag(argc, argv, "--no-dcw")) p.dcw_enabled = false;
     if (arg_flag(argc, argv, "--no-loudness")) p.normalize_loudness = false;
+    if (arg_val(argc, argv, "--lrc")) p.generate_lrc = true;
     if (arg_flag(argc, argv, "--simple")) {
         p.simple_mode = true;
         if (!arg_val(argc, argv, "--lyrics")) p.lyrics.clear();
@@ -304,5 +306,15 @@ int main(int argc, char ** argv) {
             r.metadata.seed, frames, (float) frames / r.sample_rate);
     wav_write(out_path, r.pcm, frames, r.sample_rate,
               should_normalize_output(argc, argv, p));
+    if (const char * lrc_path = arg_val(argc, argv, "--lrc")) {
+        FILE * lrc_file = fopen(lrc_path, "wb");
+        if (!lrc_file) {
+            fprintf(stderr, "[music-cli] cannot write %s\n", lrc_path);
+            return 1;
+        }
+        fwrite(r.metadata.lrc.data(), 1, r.metadata.lrc.size(), lrc_file);
+        fclose(lrc_file);
+        fprintf(stderr, "[music-cli] wrote %s (lyrics score %.4f)\n", lrc_path, r.metadata.lyrics_score);
+    }
     return 0;
 }
