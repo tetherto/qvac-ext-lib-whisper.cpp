@@ -358,12 +358,14 @@ const char * dev_reg_name(ggml_backend_dev_t dev) {
 
 
 // Pick a GPU backend using the same tier policy as llm-llamacpp's
-// BackendSelection: ggml-opencl is only used when an Adreno 700+
-// device is present (where its kernels are validated and faster than
-// Vulkan); every other GPU (Vulkan, Metal, CUDA, Mali, Intel iGPU,
-// ...) goes through the non-OpenCL preference. Adreno 6xx OpenCL is
-// known broken (incorrect outputs) and is force-skipped unless the
-// caller opts in via `PARAKEET_ALLOW_ADRENO_6XX=1`.
+// BackendSelection and engines/tts/src/backend_selection.cpp: ggml-opencl
+// is only used when an Adreno 700+ device is present (where its kernels
+// are validated and faster than Vulkan); CUDA is preferred over Vulkan on
+// the same NVIDIA card (vendor-native, measurably faster); and among the
+// remaining non-OpenCL GPUs, discrete adapters are preferred over integrated
+// (iGPU) ones, matching the discrete-first behavior already used by llm and
+// diffusion. Adreno 6xx OpenCL is known broken (incorrect outputs) and is
+// force-skipped unless the caller opts in via `PARAKEET_ALLOW_ADRENO_6XX=1`.
 //
 // Routed exclusively through the ggml-backend registry
 // (`ggml_backend_load_all` + `ggml_backend_dev_*`). No direct calls
@@ -382,7 +384,7 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
 
     ensure_backends_loaded();
 
-    // Collect GPU/IGPU devices into three buckets so we can apply the
+    // Collect GPU/IGPU devices into per-tier buckets so we can apply the
     // tier policy after the walk. We keep the device handles + their
     // human-readable names for both the policy decision and the final
     // log line.
@@ -393,8 +395,11 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
         const char *       reg_name;
     };
     std::vector<Cand> opencl_adreno_700plus;
-    std::vector<Cand> other_gpu;   // Vulkan / Metal / CUDA / Mali / Intel / ...
-    std::vector<Cand> opencl_other; // Non-Adreno OpenCL (e.g. desktop)
+    std::vector<Cand> cuda_gpu_discrete;      // CUDA on a dGPU (typical NVIDIA), preferred over Vulkan on the same card
+    std::vector<Cand> cuda_gpu_integrated;    // CUDA on an iGPU (Tegra/Jetson) — still CUDA-first, but ranks below cuda_gpu_discrete
+    std::vector<Cand> other_gpu_discrete;     // Discrete non-OpenCL GPUs (Vulkan/Metal on dGPU, ...)
+    std::vector<Cand> other_gpu_integrated;   // Integrated non-OpenCL GPUs (iGPU / UMA)
+    std::vector<Cand> opencl_other;           // Non-Adreno OpenCL (e.g. desktop)
     int max_adreno_version = -1;
 
     const size_t n_dev = ggml_backend_dev_count();
@@ -410,6 +415,8 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
         const char * desc     = ggml_backend_dev_description(dev);
         const char * reg_name = dev_reg_name(dev);
         const bool   is_opencl = std::strcmp(reg_name, "OpenCL") == 0;
+        const bool   is_cuda   = std::strcmp(reg_name, "CUDA")   == 0;
+        const bool   is_integrated = (type == GGML_BACKEND_DEVICE_TYPE_IGPU);
 
         const int adreno_v = std::max(parse_adreno_version(name),
                                       parse_adreno_version(desc));
@@ -438,22 +445,43 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
             } else {
                 opencl_other.push_back({dev, name, desc, reg_name});
             }
+        } else if (is_cuda) {
+            // CUDA — preferred over Vulkan on NVIDIA. Split by device type so
+            // a discrete NVIDIA CUDA adapter is tried before a Tegra/Jetson
+            // integrated one, matching the GpuTier ranking in backend_util.h
+            // (CudaDiscrete < CudaIntegrated). In practice a single host has
+            // only one CUDA device, but keeping the split honest lets the
+            // pure gpu_tier_for unit test guard the ordering.
+            if (is_integrated) cuda_gpu_integrated.push_back({dev, name, desc, reg_name});
+            else               cuda_gpu_discrete.push_back({dev, name, desc, reg_name});
         } else {
-            // Non-OpenCL GPUs (Vulkan, Metal, CUDA, Mali iGPU, Intel, ...). Mali
+            // Non-OpenCL GPUs (Vulkan, Metal, Mali iGPU, Intel, ...). Mali
             // (Valhall) Vulkan runs the encoder + CTC/TDT/EOU heads correctly;
             // only its Sortformer head is routed to CPU (see sortformer_force_cpu),
             // so unlike the Adreno-6xx skip above it is not guarded out here.
-            other_gpu.push_back({dev, name, desc, reg_name});
+            //
+            // Bucketed by ggml device type so the tier policy can prefer
+            // discrete GPUs over integrated ones, matching llm-llamacpp /
+            // diffusion selection behavior.
+            if (is_integrated) other_gpu_integrated.push_back({dev, name, desc, reg_name});
+            else               other_gpu_discrete.push_back({dev, name, desc, reg_name});
         }
     }
 
     // Tier policy:
     //   1. Adreno 700+: prefer OpenCL (validated, faster than Vulkan
     //      on Snapdragon 8 Gen 2/3/4 etc.).
-    //   2. Anything else with a non-OpenCL GPU: prefer that
-    //      (Vulkan on all non-Adreno Android, Metal on Apple, CUDA
-    //      on Linux/Windows desktop, Mali iGPU via Vulkan, ...).
-    //   3. Last resort: any other OpenCL device (e.g. desktop OpenCL
+    //   2. CUDA on a discrete GPU: vendor-native on NVIDIA, and measurably
+    //      faster than the same card's Vulkan adapter, so it outranks
+    //      Vulkan when a build carries both.
+    //   3. CUDA on an integrated GPU: Tegra/Jetson (CUDA reported as IGPU).
+    //      Still CUDA-first over Vulkan, but ranked below discrete CUDA.
+    //   4. Discrete non-OpenCL GPU: Vulkan on a dGPU, Metal on Apple,
+    //      Vulkan on Adreno (Android), etc. Preferred over iGPUs to
+    //      match the discrete-first behavior of llm/diffusion.
+    //   5. Integrated non-OpenCL GPU: iGPU / UMA Vulkan as the fallback
+    //      (Mali iGPU, Intel iGPU, ...).
+    //   6. Last resort: any other OpenCL device (e.g. desktop OpenCL
     //      or non-Adreno mobile when no Vulkan is registered).
     auto try_init = [&](const std::vector<Cand> & bucket) -> ggml_backend_t {
         for (const Cand & c : bucket) {
@@ -473,7 +501,10 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
     if (!opencl_adreno_700plus.empty()) {
         if (ggml_backend_t b = try_init(opencl_adreno_700plus)) return b;
     }
-    if (ggml_backend_t b = try_init(other_gpu)) return b;
+    if (ggml_backend_t b = try_init(cuda_gpu_discrete)) return b;
+    if (ggml_backend_t b = try_init(cuda_gpu_integrated)) return b;
+    if (ggml_backend_t b = try_init(other_gpu_discrete)) return b;
+    if (ggml_backend_t b = try_init(other_gpu_integrated)) return b;
     if (ggml_backend_t b = try_init(opencl_other)) return b;
 
     if (verbose) {

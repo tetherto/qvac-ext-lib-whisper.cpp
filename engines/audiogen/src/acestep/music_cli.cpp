@@ -134,6 +134,9 @@ int main(int argc, char ** argv) {
                 "   or: music-cli --dit dit.gguf --lm lm.gguf --text emb.gguf --vae vae.gguf\n"
                 "  prompt:  [--caption \"...\"] [--lyrics \"...\"] [--bpm 128] [--key \"C major\"]\n"
                 "           [--tsig 4/4] [--lang en] [--req request.json]\n"
+                "           [--simple]  (Simple Mode: expand --caption into a full request;\n"
+                "           the LM writes lyrics unless --lyrics \"[Instrumental]\" is given,\n"
+                "           and fills any metadata left unset, duration included with --dur 0)\n"
                 "  audio:   [--ref-audio <48-kHz PCM16 WAV>]  (timbre reference)\n"
                 "           [--src-audio <48-kHz PCM16 WAV>]  (cover source structure)\n"
                 "           [--task text2music|cover-nofsq|lego]   (default text2music)\n"
@@ -151,6 +154,7 @@ int main(int argc, char ** argv) {
                 "  sampler: [--steps N] [--shift F] [--guidance F]  (default: auto from the\n"
                 "           DiT variant, turbo 8 / 3.0 / 1.0, base and sft 50 / 1.0 / 7.0)\n"
                 "           [--no-dcw]  (Haar DCW double mode is enabled by default)\n"
+                "           [--no-loudness]  (skip the percentile loudness normalization)\n"
                 "  output:  [--normalize]  (peak-normalize edit output before PCM quantization)\n"
                 "           [--temp 0.85] [--cfg 2.0] [--topp 0.9] [--topk 0 (off)]\n"
                 "           [--no-phase1]  (values shown are the defaults)\n"
@@ -177,6 +181,11 @@ int main(int argc, char ** argv) {
     if (arg_val(argc, argv, "--topp")) p.lm_top_p = (float) atof(arg_val(argc, argv, "--topp"));
     if (arg_flag(argc, argv, "--no-phase1")) p.lm_phase1 = false;
     if (arg_flag(argc, argv, "--no-dcw")) p.dcw_enabled = false;
+    if (arg_flag(argc, argv, "--no-loudness")) p.normalize_loudness = false;
+    if (arg_flag(argc, argv, "--simple")) {
+        p.simple_mode = true;
+        if (!arg_val(argc, argv, "--lyrics")) p.lyrics.clear();
+    }
 
     // --req <json>: load caption/lyrics/metas and (if present) audio_codes to
     // bypass our LM — used for parity against acestep.cpp's ace-lm output.

@@ -48,21 +48,34 @@ public:
     metadata(const gguf_context * ctx, const std::string & prefix)
         : ctx_(ctx), prefix_(prefix) {}
 
+    // gguf_get_val_* / gguf_get_arr_* GGML_ABORT on a type mismatch, so a
+    // mistyped key would kill the process. Every reader here keeps its
+    // caller-supplied default when the stored type is not the one asked for.
     void u32(const char * key, int & out) {
         const int64_t id = find(key);
-        if (id >= 0) out = static_cast<int>(gguf_get_val_u32(ctx_, id));
+        if (id >= 0 && gguf_get_kv_type(ctx_, id) == GGUF_TYPE_UINT32) {
+            out = static_cast<int>(gguf_get_val_u32(ctx_, id));
+        }
     }
     void f32(const char * key, float & out) {
         const int64_t id = find(key);
-        if (id >= 0) out = gguf_get_val_f32(ctx_, id);
+        if (id >= 0 && gguf_get_kv_type(ctx_, id) == GGUF_TYPE_FLOAT32) {
+            out = gguf_get_val_f32(ctx_, id);
+        }
     }
     void boolean(const char * key, bool & out) {
         const int64_t id = find(key);
-        if (id >= 0) out = gguf_get_val_bool(ctx_, id);
+        if (id >= 0 && gguf_get_kv_type(ctx_, id) == GGUF_TYPE_BOOL) {
+            out = gguf_get_val_bool(ctx_, id);
+        }
     }
     void ints(const char * key, std::vector<int> & out) {
         const int64_t id = find(key);
         if (id < 0) return;
+        if (gguf_get_kv_type(ctx_, id) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(ctx_, id) != GGUF_TYPE_INT32) {
+            return;
+        }
         const int count = static_cast<int>(gguf_get_arr_n(ctx_, id));
         const int32_t * values = static_cast<const int32_t *>(gguf_get_arr_data(ctx_, id));
         out.assign(values, values + count);
@@ -70,6 +83,10 @@ public:
     void strings(const char * key, std::vector<std::string> & out) {
         const int64_t id = find(key);
         if (id < 0) return;
+        if (gguf_get_kv_type(ctx_, id) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(ctx_, id) != GGUF_TYPE_STRING) {
+            return;
+        }
         const int count = static_cast<int>(gguf_get_arr_n(ctx_, id));
         out.resize(count);
         for (int index = 0; index < count; ++index) {
@@ -78,7 +95,8 @@ public:
     }
     std::string text(const char * key) {
         const int64_t id = find(key);
-        return id >= 0 ? gguf_get_val_str(ctx_, id) : std::string();
+        if (id < 0 || gguf_get_kv_type(ctx_, id) != GGUF_TYPE_STRING) return std::string();
+        return gguf_get_val_str(ctx_, id);
     }
 
     bool ok() const { return error_.empty(); }
@@ -105,7 +123,8 @@ public:
 
 bool architecture_is(const gguf_file & file, const char * expected) {
     const int64_t id = gguf_find_key(file.ctx(), "general.architecture");
-    return id >= 0 && std::string(gguf_get_val_str(file.ctx(), id)) == expected;
+    if (id < 0 || gguf_get_kv_type(file.ctx(), id) != GGUF_TYPE_STRING) return false;
+    return std::string(gguf_get_val_str(file.ctx(), id)) == expected;
 }
 
 ggml_context * new_weight_context(int64_t n_tensors) {

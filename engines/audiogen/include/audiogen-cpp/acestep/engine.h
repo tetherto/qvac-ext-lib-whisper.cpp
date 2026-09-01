@@ -35,6 +35,8 @@
 //   [x] Informal parity vs acestep.cpp: synth correlation measured at 0.98-0.99
 //       on same codes; no reproducible result artifact is committed.
 //   [x] DiT sampler Haar DCW "double" correction (official ACE-Step defaults).
+//   [x] Simple Mode: LM inspire pass expands a short query into the full
+//       request (caption, lyrics, metadata) ahead of synthesis.
 // Deferred: DiT CFG/APG (guidance>1, base/sft only).
 
 #include "audiogen-cpp/export.h"
@@ -143,6 +145,22 @@ struct GenerateParams {
     int         lm_top_k       = 0;      // 0 = disabled (top_p only)
     float       lm_cfg_scale   = 2.0f;   // classifier-free guidance for codes
     bool        lm_phase1      = true;   // auto-fill missing metadata (FSM CoT)
+    // Percentile loudness normalization on the generation output PCM (the
+    // acestep.cpp export behavior): the 99.999th-percentile sample scales to
+    // 1.0 and the tail above it hard-clips, maximizing perceived loudness.
+    // Disable to get the raw VAE output. Audio-edit outputs and lego stems are
+    // never normalized: repaint preserves untouched source regions bit-for-bit
+    // and a stem keeps its mix gain relative to its source.
+    bool        normalize_loudness = true;
+    // Simple Mode: treat `caption` as a short natural-language query and let
+    // the LM inspire pass compose the full request before synthesis — detailed
+    // caption, lyrics, and any metadata left unset (bpm, key/scale, time
+    // signature, duration <= 0, vocal language). Set fields are kept. Requires
+    // text2music with no pre-supplied audio_codes; `lyrics` must be empty (the
+    // LM writes them) or "[Instrumental]" (forwarded as the instrumental hint).
+    // NOTE: `lyrics` DEFAULTS to "[Instrumental]" — assign an empty string
+    // explicitly for LM-written vocals, or every request stays instrumental.
+    bool        simple_mode    = false;
     // Official sampler-side Haar DCW "double" correction. Applied on turbo
     // DiTs only: the official preset disables DCW for base/sft models.
     bool        dcw_enabled     = true;

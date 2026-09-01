@@ -1140,6 +1140,15 @@ if (TTS_CPP_BUILD_TESTS)
         src/sched_dispatch.cpp
         src/log.cpp)
 
+    # Fail-closed GGUF header reading: synthesized metadata-only files with a
+    # wrong architecture and wrong-typed scalar/string keys. No fixtures.
+    add_executable(test-audio8-gguf-load test/audio8/test_gguf_load.cpp
+        ${_tcb_audio8_core_srcs})
+    target_link_libraries(test-audio8-gguf-load PRIVATE ggml)
+    target_include_directories(test-audio8-gguf-load PRIVATE include src)
+    tts_cpp_apply_ccache(test-audio8-gguf-load)
+    tts_cpp_register_test(test-audio8-gguf-load)
+
     add_executable(test-audio8-tokenizer test/audio8/test_tokenizer.cpp
         src/audio8/tokenizer.cpp src/audio8/unicode.cpp)
     target_link_libraries(test-audio8-tokenizer PRIVATE ggml)

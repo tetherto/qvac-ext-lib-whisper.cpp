@@ -16,10 +16,21 @@ namespace detail {
 
 namespace {
 
+// gguf_get_val_* GGML_ABORTs when the stored type differs from the requested
+// one, so a mistyped key would kill the host process instead of surfacing
+// through the error out-param. Check the type first and fail closed.
+bool kv_type_is(const gguf_context * g, int64_t id, gguf_type want) {
+    return gguf_get_kv_type(g, id) == want;
+}
+
 bool kv_u32(const gguf_context * g, const char * key, int & out, std::string * err) {
     const int64_t id = gguf_find_key(g, key);
     if (id < 0) {
         if (err) *err = std::string("missing GGUF key: ") + key;
+        return false;
+    }
+    if (!kv_type_is(g, id, GGUF_TYPE_UINT32)) {
+        if (err) *err = std::string("GGUF key is not uint32: ") + key;
         return false;
     }
     out = (int) gguf_get_val_u32(g, id);
@@ -32,6 +43,10 @@ bool kv_f32(const gguf_context * g, const char * key, float & out, std::string *
         if (err) *err = std::string("missing GGUF key: ") + key;
         return false;
     }
+    if (!kv_type_is(g, id, GGUF_TYPE_FLOAT32)) {
+        if (err) *err = std::string("GGUF key is not float32: ") + key;
+        return false;
+    }
     out = gguf_get_val_f32(g, id);
     return true;
 }
@@ -40,6 +55,10 @@ bool kv_bool(const gguf_context * g, const char * key, bool & out, std::string *
     const int64_t id = gguf_find_key(g, key);
     if (id < 0) {
         if (err) *err = std::string("missing GGUF key: ") + key;
+        return false;
+    }
+    if (!kv_type_is(g, id, GGUF_TYPE_BOOL)) {
+        if (err) *err = std::string("GGUF key is not bool: ") + key;
         return false;
     }
     out = gguf_get_val_bool(g, id);

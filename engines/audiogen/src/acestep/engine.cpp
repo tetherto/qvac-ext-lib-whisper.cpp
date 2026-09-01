@@ -9,9 +9,11 @@
 #include "acestep/dit_gguf.h"  // DitGGUF: read DiT config + validate GGUF headers at create()
 #include "acestep/lm_ggml.h"
 #include "acestep/lm_pipeline.h"
+#include "acestep/loudness.h"
 #include "acestep/philox.h"
 #include "acestep/textenc_ggml.h"
 
+#include "acestep/cancellation_scope.h"
 #include "acestep/backend_registry.h"
 #include "acestep/audio_edit.h"
 #include "acestep/cover_noise.h"
@@ -517,9 +519,6 @@ static constexpr int TEMPO_SLOW_BPM_MAX     = 80;
 static constexpr int TEMPO_MODERATE_BPM_MAX = 120;
 static constexpr int TEMPO_FAST_BPM_MAX     = 160;
 
-static constexpr const char * DEFAULT_VOCAL_LANGUAGE = "en";
-static constexpr const char * EDIT_VOCAL_LANGUAGE    = "unknown";
-static constexpr const char * INSTRUMENTAL_LYRICS    = "[Instrumental]";
 static constexpr const char * EDIT_STAGE_SOURCE    = "source";
 static constexpr const char * EDIT_STAGE_REFERENCE = "reference";
 static constexpr const char * EDIT_STAGE_REPAINT   = "repaint";
@@ -612,7 +611,7 @@ static AcePrompt make_prompt(const GenerateParams & params, const std::string & 
                                 ? build_conditioning_caption(
                                       params.caption, params.bpm, params.timesignature, params.keyscale)
                                 : params.caption;
-    prompt.lyrics         = params.lyrics.empty() ? INSTRUMENTAL_LYRICS : params.lyrics;
+    prompt.lyrics         = resolve_prompt_lyrics(params);
     prompt.duration       = params.duration;
     prompt.bpm            = params.bpm;
     prompt.keyscale       = params.keyscale;
@@ -738,10 +737,7 @@ static GenerationState make_generation_state(const GenerateParams & params, bool
     }
     state.plan = make_generation_plan(params, state.task);
     state.seed = resolve_seed(params.seed);
-    const bool language_neutral = !params.edit_plan.empty() || is_lego_task(state.task.type);
-    state.language = params.vocal_language.empty()
-                         ? (language_neutral ? EDIT_VOCAL_LANGUAGE : DEFAULT_VOCAL_LANGUAGE)
-                         : params.vocal_language;
+    state.language = resolve_prompt_language(params);
     if (params.augment_caption_with_metadata) {
         state.original_caption = params.caption;
     }
@@ -787,12 +783,46 @@ static LmSampleParams make_lm_sample_params(const GenerateParams & params, long 
     sample.cfg_scale = params.lm_cfg_scale;
     sample.seed = (uint32_t) seed;
     sample.verbose = verbose;
-    sample.on_step = [&](int current, int total) { report("lm", current, total); };
+    sample.on_step = [&](int current, int total) { return report("lm", current, total); };
     return sample;
 }
 
+static bool needs_lm_phase_one(const GenerateParams & params, const AcePrompt & prompt) {
+    if (params.simple_mode) return true;
+    return params.lm_phase1 && !has_complete_metadata(prompt);
+}
+
+// Fields simple mode left empty for the LM must never stay empty past Phase 1:
+// downstream prompt building and metadata reporting rely on them.
+static void finalize_simple_mode_prompt(GenerationState & state) {
+    if (state.prompt.lyrics.empty()) state.prompt.lyrics = INSTRUMENTAL_LYRICS;
+    if (state.prompt.vocal_language.empty()) state.prompt.vocal_language = DEFAULT_VOCAL_LANGUAGE;
+    state.language = state.prompt.vocal_language;
+}
+
+// Returns false only on cancellation. A plain Phase-1 failure falls back to the
+// provided/default metadata, except in simple mode, where the LM expansion is
+// the whole point of the request.
 template <typename EngineImpl>
-static void generate_audio_codes(EngineImpl & engine, const GenerateParams & params,
+static bool run_lm_phase_one(EngineImpl & engine, const GenerateParams & params,
+                             GenerationState & state, const LmSampleParams & sample) {
+    LmSampleParams phase_one = sample;
+    phase_one.max_new_tokens = 0;
+    if (lm_generate_phase1(engine.lm, engine.bpe_lm, state.prompt, phase_one,
+                           true, true, params.simple_mode)) {
+        if (params.simple_mode) finalize_simple_mode_prompt(state);
+        return true;
+    }
+    if (engine.cancel_flag.load()) return false;
+    if (params.simple_mode) {
+        throw std::runtime_error("acestep engine: simple_mode LM expansion failed");
+    }
+    fprintf(stderr, "[acestep-engine] Phase 1 failed; falling back to provided/default metas\n");
+    return true;
+}
+
+template <typename EngineImpl>
+static bool generate_audio_codes(EngineImpl & engine, const GenerateParams & params,
                                  GenerationState & state, const StageReporter & report,
                                  std::vector<int> & codes) {
     if (!params.audio_codes.empty()) {
@@ -800,22 +830,20 @@ static void generate_audio_codes(EngineImpl & engine, const GenerateParams & par
         if (engine.opts.verbose) {
             fprintf(stderr, "[acestep-engine] using %zu pre-supplied codes (LM skipped)\n", codes.size());
         }
-        return;
+        return true;
     }
 
     engine.ensure_lm();
     const LmSampleParams sample =
         make_lm_sample_params(params, state.seed, engine.opts.verbose, report);
-    if (params.lm_phase1 && !has_complete_metadata(state.prompt)) {
-        LmSampleParams phase_one = sample;
-        phase_one.max_new_tokens = 0;
-        if (!lm_generate_phase1(engine.lm, engine.bpe_lm, state.prompt, phase_one)) {
-            fprintf(stderr, "[acestep-engine] Phase 1 failed; falling back to provided/default metas\n");
-        }
+    if (needs_lm_phase_one(params, state.prompt)) {
+        if (!run_lm_phase_one(engine, params, state, sample)) return false;
     }
     if (!lm_generate_codes(engine.lm, engine.bpe_lm, state.prompt, sample, codes) || codes.empty()) {
+        if (engine.cancel_flag.load()) return false;
         throw std::runtime_error("acestep engine: LM produced no audio codes");
     }
+    return true;
 }
 
 template <typename EngineImpl>
@@ -823,7 +851,7 @@ static bool run_lm_stage(EngineImpl & engine, const GenerateParams & params,
                          GenerationState & state, const StageReporter & report,
                          StageDump & dump, StageTimes & timing, std::vector<int> & codes) {
     if (!report("lm", 0, 1)) return false;
-    generate_audio_codes(engine, params, state, report, codes);
+    if (!generate_audio_codes(engine, params, state, report, codes)) return false;
     if (!report("lm", 1, 1)) return false;
 
     if (state.low_memory) {
@@ -1840,7 +1868,7 @@ static void populate_metadata(const GenerationState & state, GenerateResult & re
 
 GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn & progress) const {
     Impl & engine = *impl_;
-    engine.cancel_flag.store(false);
+    CancellationScope cancellation_scope(engine.cancel_flag);
 
     GenerateResult result;
     result.sample_rate = engine.sr;
@@ -1881,6 +1909,9 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
         return result;
     }
     match_stem_to_source_length(params, state, result);
+    if (params.normalize_loudness && !is_lego_task(state.task.type)) {
+        normalize_loudness(result.pcm);
+    }
     populate_metadata(state, result);
     return result;
 }

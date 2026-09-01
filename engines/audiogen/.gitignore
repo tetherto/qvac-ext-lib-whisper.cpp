@@ -13,4 +13,6 @@ src/acestep/vae_decode_bin.cpp
 
 # macOS
 .DS_Store
+
+# Local generation and test artifacts
 output/

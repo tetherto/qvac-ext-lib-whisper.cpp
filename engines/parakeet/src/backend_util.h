@@ -15,6 +15,47 @@
 
 namespace parakeet {
 
+// Tier ranking for GPU selection (lower = preferred). Pure function so unit
+// tests can exercise the ordering against synthesised device topologies
+// without a live ggml-backend registry. The classification mirrors the
+// bucket-and-try_init walk in parakeet_ctc.cpp::init_gpu_backend so any
+// drift between them fails the unit test.
+//
+// The classification does NOT reason about Adreno-6xx-broken skips or the
+// PARAKEET_ALLOW_ADRENO_6XX override — those live in init_gpu_backend
+// because they are enumeration-side decisions (skip the device before it
+// enters a bucket at all), not tier-ranking decisions.
+enum class GpuTier {
+    AdrenoOpenCL700Plus  = 0, // Snapdragon 8 Gen 2/3/4 (validated + faster than Vulkan).
+    CudaDiscrete         = 1, // NVIDIA dGPU via CUDA; preferred over Vulkan on same card.
+    CudaIntegrated       = 2, // Tegra/Jetson (CUDA reported as IGPU); still CUDA-first.
+    OtherDiscrete        = 3, // Discrete Vulkan / Metal / etc.
+    OtherIntegrated      = 4, // UMA Vulkan (iGPU / Mali / Apple integrated).
+    OpenCLOther          = 5, // Non-Adreno OpenCL (desktop OpenCL, unrecognised Adreno).
+    NotSelectable        = 6,
+};
+
+inline GpuTier gpu_tier_for(const char *                     reg_name,
+                            enum ggml_backend_dev_type       dev_type,
+                            int                              adreno_version) {
+    if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+        dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        return GpuTier::NotSelectable;
+    }
+    const bool integrated = (dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU);
+    const bool is_opencl  = reg_name && std::strcmp(reg_name, "OpenCL") == 0;
+    const bool is_cuda    = reg_name && std::strcmp(reg_name, "CUDA")   == 0;
+    if (is_opencl) {
+        if (adreno_version >= 700) return GpuTier::AdrenoOpenCL700Plus;
+        return GpuTier::OpenCLOther;
+    }
+    if (is_cuda) {
+        return integrated ? GpuTier::CudaIntegrated : GpuTier::CudaDiscrete;
+    }
+    return integrated ? GpuTier::OtherIntegrated : GpuTier::OtherDiscrete;
+}
+
+
 inline const char * backend_reg_name(ggml_backend_t b) {
     if (!b) return "";
     ggml_backend_dev_t dev = ggml_backend_get_device(b);

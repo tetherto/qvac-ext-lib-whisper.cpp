@@ -20,6 +20,13 @@ namespace tts_cpp::acestep {
 static const char * LM_INSTRUCTION = "Generate audio semantic tokens based on the given conditions:";
 static const char * LM_INSPIRE_INSTRUCTION =
     "Expand the user's input into a more detailed and specific musical description:";
+static const char * LM_INSTRUMENTAL_LYRICS       = "[Instrumental]";
+static const char * LM_INSPIRE_INSTRUMENTAL_HINT = "\n\ninstrumental: true";
+
+std::string lm_inspire_user_message(const std::string & caption, const std::string & lyrics) {
+    if (lyrics == LM_INSTRUMENTAL_LYRICS) return caption + LM_INSPIRE_INSTRUMENTAL_HINT;
+    return caption;
+}
 
 struct TokenProb {
     int   id;
@@ -28,6 +35,19 @@ struct TokenProb {
 
 static double lm_ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// Phase 1 stops at <|im_end|> long before its token cap, so its length is
+// unknowable up front and its ticks report the engine's unknown-total marker.
+static constexpr int LM_PROGRESS_UNKNOWN_TOTAL = -1;
+
+// Throttled progress for the decode loops: every 8 tokens (each step is a full
+// LM forward, so this is cheap relative to the work) plus the final step.
+// Returns false when the hook requests cancellation.
+static bool lm_report_progress(const LmSampleParams & params, int step, int total, int shown_total) {
+    if (!params.on_step) return true;
+    if ((step & 7) != 0 && step != total - 1) return true;
+    return params.on_step(step + 1, shown_total);
 }
 
 // Phase timing prints: on with verbose or ACESTEP_LM_TIMING=1.
@@ -365,16 +385,16 @@ static std::vector<int> build_custom_prompt(const BpeTokenizer & bpe, const std:
 }
 
 bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & prompt, const LmSampleParams & params,
-                        bool use_fsm, bool use_cot_caption) {
+                        bool use_fsm, bool use_cot_caption, bool force_inspire) {
     const LMConfig & cfg = lm_model_config(m);
     const int        V   = cfg.vocab_size;
 
     const AcePrompt base        = prompt;
     const bool      need_lyrics = base.lyrics.empty();
-    const bool      gen_lyrics  = need_lyrics;
+    const bool      gen_lyrics  = need_lyrics || force_inspire;
     const bool      lyrics_mode = gen_lyrics;
     const bool      stop_at_reasoning = !gen_lyrics;
-    const bool      inspire     = need_lyrics;  // bare caption -> INSPIRE expansion
+    const bool      inspire     = need_lyrics || force_inspire;  // bare caption -> INSPIRE expansion
 
     // With the FSM active and the reasoning stop set, no sampled token can ever
     // reach the audio-code band, so the forward projects only the prefix head.
@@ -383,9 +403,8 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
 
     std::vector<int> prompt_tokens;
     if (inspire) {
-        std::string user_msg = base.caption;
-        prompt_tokens        = build_custom_prompt(bpe, std::string("# Instruction\n") + LM_INSPIRE_INSTRUCTION,
-                                                    user_msg);
+        prompt_tokens = build_custom_prompt(bpe, std::string("# Instruction\n") + LM_INSPIRE_INSTRUCTION,
+                                            lm_inspire_user_message(base.caption, base.lyrics));
     } else {
         prompt_tokens = build_lm_prompt_phase1(bpe, base);
     }
@@ -446,6 +465,10 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     const int max_new = params.max_new_tokens > 0 ? params.max_new_tokens : 2048;
     for (int step = 0; step < max_new && tok != TOKEN_IM_END; step++) {
         if (codes_phase && stop_at_reasoning) break;
+        if (!lm_report_progress(params, step, max_new, LM_PROGRESS_UNKNOWN_TOTAL)) {
+            fprintf(stderr, "[lm-phase1] cancelled at step %d\n", step);
+            return false;
+        }
         int32_t t        = (int32_t) tok;
         auto    t_decode = std::chrono::steady_clock::now();
         if (!lm_model_forward(m, &t, 1, lg, 0, nullptr, V_lim)) {
@@ -658,10 +681,9 @@ bool lm_generate_codes(LMModel *              m,
         if (params.verbose && (step + 1) % 100 == 0) {
             fprintf(stderr, "[lm-pipeline]   step %d, %zu codes\n", step + 1, codes_out.size());
         }
-        // Throttled progress: every 8 tokens (each step is a full LM forward, so
-        // this is cheap relative to the work) plus the final step.
-        if (params.on_step && ((step & 7) == 0 || step == max_tokens - 1)) {
-            params.on_step(step + 1, max_tokens);
+        if (!lm_report_progress(params, step, max_tokens, max_tokens)) {
+            fprintf(stderr, "[lm-pipeline] cancelled at step %d, %zu codes\n", step, codes_out.size());
+            return false;
         }
     }
 

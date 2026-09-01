@@ -7,14 +7,12 @@
 // truncated file, a missing general.architecture key, the other engine's
 // architecture, and a correct architecture with no weight tensors.
 //
-// Mistyped metadata is deliberately not exercised: the u32/f32 metadata
-// readers call gguf_get_val_u32 without a type check, so a mistyped key
-// GGML_ABORTs the process rather than failing closed. Same hazard the parler
-// loader has; see test_gguf_load.cpp in test/parler.
+// A mistyped metadata key is covered too: the readers check the stored GGUF
+// type before reading, so a wrong-typed key keeps its default instead of
+// aborting the process inside gguf_get_val_u32.
 
 #include "lavasr/denoiser_gguf.h"
 #include "lavasr/enhancer_gguf.h"
-#include "test_env_portable.h"
 
 #include "gguf.h"
 
@@ -149,6 +147,28 @@ void test_right_architecture_without_tensors() {
     fs::remove(enhancer);
 }
 
+// A wrong-typed key must not abort the process inside gguf_get_val_*. The
+// loader still rejects this file for having no tensors; reaching that verdict
+// at all is the assertion.
+void test_wrong_typed_metadata_does_not_abort() {
+    const std::string path = fixture_path("wrong-type");
+    gguf_context * g = gguf_init_empty();
+    gguf_set_val_str(g, "general.architecture", "lavasr-denoiser");
+    gguf_set_val_str(g, "lavasr.denoiser.n_fft", "not-a-number");
+    if (!gguf_write_to_file(g, path.c_str(), /*only_meta=*/ false)) {
+        fprintf(stderr, "FATAL: cannot write fixture %s\n", path.c_str());
+        exit(1);
+    }
+    gguf_free(g);
+
+    tts_cpp::lavasr::DenoiserWeights weights;
+    std::string err;
+    CHECK(!tts_cpp::lavasr::load_denoiser_gguf(path, weights, &err),
+          "a wrong-typed metadata key must not load");
+    CHECK(!err.empty(), "a rejected load must set an error message");
+    fs::remove(path);
+}
+
 void test_null_error_pointer_is_allowed() {
     const std::string path = fixture_path("null-err");
     write_metadata_gguf(path, "lavasr-denoiser");
@@ -166,6 +186,7 @@ int main() {
     test_missing_architecture_key();
     test_architecture_is_not_interchangeable();
     test_right_architecture_without_tensors();
+    test_wrong_typed_metadata_does_not_abort();
     test_null_error_pointer_is_allowed();
 
     if (g_failures) {

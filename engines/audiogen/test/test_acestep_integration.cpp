@@ -86,6 +86,12 @@ struct StageLog {
         return event.name == stage && event.total > 1 && event.step > 0;
       });
     }
+
+    bool contains_unknown_total_progress(const char *stage) const {
+      return std::any_of(events.begin(), events.end(), [&](const Event &event) {
+        return event.name == stage && event.total <= 0 && event.step > 0;
+      });
+    }
 };
 
 struct TensorDump {
@@ -405,11 +411,33 @@ void run_edit_vae_cancel_scenario(tts_cpp::acestep::Engine &engine,
   CHECK(result.pcm.empty());
 }
 
+// A cancel armed before generate() must cancel that run, not be erased at
+// entry and leave the caller waiting for the next one. Mirrors MiniMax's
+// verify_pre_armed_cancellation; the run after it must still succeed, proving
+// the flag was consumed rather than left latched.
+void run_pre_armed_cancel_scenario(tts_cpp::acestep::Engine & engine,
+                                   const EditFixture & fixture) {
+    engine.cancel();
+    bool progressed = false;
+    const tts_cpp::acestep::GenerateResult cancelled = engine.generate(
+        fixture.params, [&](const std::string &, int, int) {
+            progressed = true;
+            return true;
+        });
+    CHECK(cancelled.pcm.empty());
+    CHECK(!progressed);
+
+    const tts_cpp::acestep::GenerateResult subsequent =
+        engine.generate(fixture.params);
+    CHECK(!subsequent.pcm.empty());
+}
+
 void run_edit_scenarios(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir) {
     EditFixture fixture = make_edit_fixture();
     run_repaint_scenario(engine, dump_dir, fixture);
     run_flow_scenario(engine, dump_dir, fixture);
     run_edit_vae_cancel_scenario(engine, fixture);
+    run_pre_armed_cancel_scenario(engine, fixture);
 }
 
 tts_cpp::acestep::GenerateParams make_lego_params() {
@@ -519,6 +547,84 @@ void run_lm_generation_scenario(tts_cpp::acestep::Engine & engine, const fs::pat
     CHECK(second.pcm == first.pcm);
 }
 
+// Simple Mode end to end: a short query expands into a complete request (the
+// LM inspire pass writes lyrics and fills unset metadata) before synthesis.
+void run_simple_mode_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    GenerateParams params;
+    params.caption         = "a short upbeat electronic jingle with female vocals";
+    params.lyrics.clear();
+    params.simple_mode     = true;
+    params.duration        = 2.0f;
+    params.inference_steps = TEST_STEPS;
+    params.shift           = TEST_SHIFT;
+    params.seed            = TEST_SEED;
+
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(result.metadata.n_codes > 0);
+    CHECK(stages.contains(TEST_LM_STAGE));
+    CHECK(stages.contains_detailed_progress(TEST_LM_STAGE));
+    CHECK(stages.contains_unknown_total_progress(TEST_LM_STAGE));
+    CHECK(result.metadata.caption != params.caption);
+    CHECK(!result.metadata.caption.empty());
+    CHECK(!result.metadata.lyrics.empty());
+    CHECK(result.metadata.bpm > 0);
+    CHECK(!result.metadata.keyscale.empty());
+    CHECK(result.metadata.timesignature > 0);
+    CHECK(!result.metadata.vocal_language.empty());
+}
+
+tts_cpp::acestep::GenerateParams make_lm_cancel_params() {
+    tts_cpp::acestep::GenerateParams params;
+    params.caption         = "a cancelled simple mode request";
+    params.lyrics.clear();
+    params.simple_mode     = true;
+    params.duration        = 2.0f;
+    params.inference_steps = TEST_STEPS;
+    params.shift           = TEST_SHIFT;
+    params.seed            = TEST_SEED;
+    return params;
+}
+
+// Phase-1 inspire ticks report an unknown total; cancelling on the first one
+// must abort generation cleanly.
+void run_lm_phase1_cancel_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    bool cancelled_in_phase_one = false;
+    const GenerateResult result = engine.generate(
+        make_lm_cancel_params(), [&](const std::string & stage, int step, int total) {
+            if (stage == TEST_LM_STAGE && total <= 0 && step > 0) {
+                cancelled_in_phase_one = true;
+                return false;
+            }
+            return true;
+        });
+    CHECK(cancelled_in_phase_one);
+    CHECK(result.pcm.empty());
+}
+
+// Phase-2 code ticks carry the duration-derived total; cancelling mid-loop
+// must abort generation cleanly.
+void run_lm_phase2_cancel_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    bool cancelled_mid_codes = false;
+    const GenerateResult result = engine.generate(
+        make_lm_cancel_params(), [&](const std::string & stage, int step, int total) {
+            if (stage == TEST_LM_STAGE && total > 1 && step > 0) {
+                cancelled_mid_codes = true;
+                return false;
+            }
+            return true;
+        });
+    CHECK(cancelled_mid_codes);
+    CHECK(result.pcm.empty());
+}
+
 void run_cover_strength_scenario(tts_cpp::acestep::Engine & engine) {
     using namespace tts_cpp::acestep;
     GenerateParams params = make_generate_params();
@@ -558,6 +664,9 @@ int run_integration(const char * models_dir) {
         run_lego_scenario(*engine, dump_dir);
         run_lego_base_lane();
         run_lm_generation_scenario(*engine, dump_dir);
+        run_simple_mode_scenario(*engine);
+        run_lm_phase1_cancel_scenario(*engine);
+        run_lm_phase2_cancel_scenario(*engine);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "FAIL integration exception: %s\n", error.what());
         ++failures;

@@ -48,6 +48,52 @@ inline float clamp_strength(float value) {
     return std::clamp(value, 0.0f, 1.0f);
 }
 
+inline constexpr const char * DEFAULT_VOCAL_LANGUAGE = "en";
+inline constexpr const char * EDIT_VOCAL_LANGUAGE    = "unknown";
+inline constexpr const char * INSTRUMENTAL_LYRICS    = "[Instrumental]";
+
+// Simple mode keeps an unset language empty so the LM inspire pass picks it;
+// otherwise the engine defaults apply before the prompt is built, with the
+// neutral language for the edit path and lego (a single language token skews
+// 50-step CFG sampling toward vocals).
+inline std::string resolve_prompt_language(const GenerateParams & params) {
+    if (!params.vocal_language.empty()) return params.vocal_language;
+    if (params.simple_mode) return {};
+    const bool language_neutral = !params.edit_plan.empty() || is_lego_task(params.task_type);
+    return language_neutral ? EDIT_VOCAL_LANGUAGE : DEFAULT_VOCAL_LANGUAGE;
+}
+
+// Simple mode keeps unset lyrics empty so the LM inspire pass writes them
+// (the explicit "[Instrumental]" request still flows through as the hint).
+inline std::string resolve_prompt_lyrics(const GenerateParams & params) {
+    if (!params.lyrics.empty()) return params.lyrics;
+    if (params.simple_mode) return {};
+    return INSTRUMENTAL_LYRICS;
+}
+
+inline std::string validate_simple_mode(const GenerateParams & params, const std::string & task_type) {
+    if (!params.simple_mode) return {};
+    if (params.caption.empty()) {
+        return "acestep engine: simple_mode requires a caption query";
+    }
+    if (task_type != TASK_TEXT2MUSIC) {
+        return "acestep engine: simple_mode supports only task 'text2music', got '" + task_type + "'";
+    }
+    if (!params.audio_codes.empty()) {
+        return "acestep engine: simple_mode cannot take pre-supplied audio_codes";
+    }
+    if (!params.lyrics.empty() && params.lyrics != AUDIO_EDIT_DEFAULT_LYRICS) {
+        return "acestep engine: simple_mode lyrics must be empty (LM writes them) or \"[Instrumental]\"";
+    }
+    if (!params.edit_plan.empty()) {
+        return "acestep engine: simple_mode cannot be combined with edit_plan";
+    }
+    if (!params.lm_phase1) {
+        return "acestep engine: simple_mode requires lm_phase1";
+    }
+    return {};
+}
+
 inline constexpr float TURBO_GUIDANCE_SCALE    = 1.0f;
 inline constexpr float STANDARD_GUIDANCE_SCALE = 7.0f;
 
@@ -93,6 +139,9 @@ inline std::string resolve_generate_task(const GenerateParams & params, Generate
         return "acestep engine: unsupported task_type '" + task.type +
                "' (expected text2music|cover|cover-nofsq|lego)";
     }
+
+    const std::string simple_mode_error = validate_simple_mode(params, task.type);
+    if (!simple_mode_error.empty()) return simple_mode_error;
 
     if (!std::isfinite(params.audio_cover_strength)) {
         return "acestep engine: audio_cover_strength must be finite";

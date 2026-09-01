@@ -161,6 +161,20 @@ path instead: it VAE-encodes `source_audio`, skips the LM and FSQ
 detokenizer, executes each `RepaintParams` or `FlowEditParams` operation in
 order, and VAE-decodes the final latent.
 
+### ACE-Step Simple Mode
+
+With `GenerateParams::simple_mode` set, `caption` is a short natural-language
+query ("a romantic modern salsa with male lead vocals for a wedding") and the
+LM inspire pass composes the full request before synthesis: a detailed
+caption, complete lyrics, and every metadata field left unset — BPM,
+key/scale, time signature, vocal language, and duration when `duration <= 0`.
+Fields the caller sets are forced through the metadata FSM and kept. `lyrics`
+must be empty (the LM writes them) or `[Instrumental]`, which forwards the
+instrumental hint to the LM. Simple Mode requires the plain `text2music` task
+with no pre-supplied `audio_codes`; the composed request is reported back in
+`GenerateResult::metadata`. The inspire pass emits `lm` progress ticks and
+honors cancellation like every other stage.
+
 ## Model stages
 
 Four GGUF files provide six runtime weight sets. The DiT GGUF contains the
@@ -495,6 +509,12 @@ combinations are rejected rather than silently ignored.
                   --lyrics "[Instrumental]" --bpm 128 --key "C major" --tsig 4/4 \
                   --lang en --steps 8 --shift 3.0 --gpu --out song.wav
 
+# Simple Mode: one short query becomes a complete song (caption, lyrics and
+# metadata composed by the LM; --dur 0 lets the LM pick the duration too)
+./build/audiogen/music-cli --models models/acestep --simple \
+                  --caption "a romantic modern salsa with male lead vocals for a wedding" \
+                  --dur 0 --gpu --out salsa.wav
+
 # condition generation with a 48 kHz PCM16 WAV timbre reference
 ./build/music-cli --models models/acestep --ref-audio reference-48k.wav \
                   --caption "warm Latin pop with a male lead vocal" \
@@ -531,8 +551,10 @@ combinations are rejected rather than silently ignored.
 | `--bpm N`, `--key STR`, `--tsig STR`, `--lang CODE` | inferred | optional metadata hints |
 | `--steps N`, `--shift F` | per variant | sampler overrides |
 | `--no-dcw` | DCW enabled | disable the official Haar low/high correction applied after each DiT step |
+| `--no-loudness` | normalization on | skip the percentile loudness normalization (99.999th percentile to 1.0, tail hard-clipped) applied to generation output; edits and lego stems are never normalized |
 | `--temp F`, `--topp F`, `--topk N`, `--cfg F` | `0.85`, `0.9`, off, `2.0` | LM sampling for the audio codes |
 | `--no-phase1` | off | skip the LM metadata auto-fill pass |
+| `--simple` | off | Simple Mode: expand `--caption` into a full request (lyrics regenerate unless `--lyrics "[Instrumental]"` is passed) |
 | `--req FILE` | | request JSON; pre-supplied `audio_codes` skip the LM stage |
 | `--ref-audio FILE` | | 48 kHz PCM16 WAV used by ACE-Step's timbre-conditioning path |
 | `--src-audio FILE` | | 48 kHz PCM16 source WAV; required for editing |

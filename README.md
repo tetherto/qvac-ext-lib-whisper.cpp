@@ -49,6 +49,8 @@ tts       text -> LM (T3 / Llama / Qwen2.5) -> acoustic tokens -> CFM or flow ->
 audiogen  caption + lyrics -> ACE-Step LM -> FSQ detokenizer -> text encoder
                            -> condition encoder -> DiT flow matching
                            -> Oobleck VAE -> 48 kHz stereo
+          short query -> LM inspire (Simple Mode) -> caption + lyrics + metadata
+                           -> same ACE-Step pipeline
           caption + lyrics -> MiniMax Qwen3 LM -> RVQ depth decoder
                            -> condition encoder -> flow DiT -> vocoder -> stereo
 ```

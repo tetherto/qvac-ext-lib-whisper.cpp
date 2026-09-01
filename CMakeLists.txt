@@ -78,3 +78,21 @@ if (SPEECH_BUILD_AUDIOGEN)
     set(AUDIOGEN_BUILD_EXECUTABLES ${SPEECH_BUILD_EXECUTABLES})
     add_subdirectory(engines/audiogen)
 endif()
+
+# Whisper-caller GPU-picker helper (engines/whisper-gpu-picker.h) — header-only,
+# consumed by the packages/asr-ggml addon that wraps third_party/whisper.cpp.
+# From this repo we only own the header + its model-free unit test, gated on
+# SPEECH_BUILD_TESTS (no ggml backends actually loaded, no whisper model
+# required, runs on every host in the matrix).
+if (SPEECH_BUILD_TESTS)
+    add_executable(test-whisper-gpu-picker engines/whisper-gpu-picker.test.cpp)
+    target_link_libraries(test-whisper-gpu-picker PRIVATE ggml)
+    target_include_directories(test-whisper-gpu-picker PRIVATE engines)
+    # ggml-backend.h relies on C++11 attributes ([[noreturn]]) and
+    # std::initializer_list; Apple clang defaults to an older standard when the
+    # target does not declare one, so pin C++17 explicitly.
+    target_compile_features(test-whisper-gpu-picker PRIVATE cxx_std_17)
+    add_test(NAME test-whisper-gpu-picker
+             COMMAND $<TARGET_FILE:test-whisper-gpu-picker>)
+    set_property(TEST test-whisper-gpu-picker PROPERTY LABELS unit)
+endif()
