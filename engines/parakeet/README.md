@@ -445,13 +445,18 @@ The workload (`--audio-seconds`, default 300) sets the longest single
 transcribe input to project for. Device-side memory is bounded by the
 long-form encoder window, so the device projection saturates once the audio
 exceeds one window; host-side buffers (full-input mel, stitched encoder
-output) keep growing with it. Sortformer diarization does not window — its
-device projection grows with the full input (`O(T^2)` head attention).
+output) keep growing with it. The projection prices the encoder graph
+*cache*, not one graph: a windowed pass keeps up to three window graphs
+resident (`run_encoder`'s 3-slot LRU), and all of them are counted.
+Sortformer diarization does not window — its device projection grows with
+the full input (`O(T^2)` head attention).
 
 The projection is exact where it can be: `test-fit-params` asserts the
-projected weight and encoder-compute bytes equal what a real load/encode
-allocates, byte for byte. Streaming sessions are bounded above by the
-offline projection.
+projected weight, encoder-compute, and Sortformer-head bytes equal what a
+real load/encode/diarize allocates, byte for byte. The projection covers the
+offline paths; streaming sessions build smaller per-chunk graphs but rotate
+through the same graph cache with session-dependent keys, so treat the
+offline projection as a guide, not a proven bound, for streaming.
 
 ## Tests and NeMo parity
 

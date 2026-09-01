@@ -9,6 +9,7 @@
 
 #include "parakeet/fit.h"
 
+#include "backend_util.h"
 #include "long_form.h"
 #include "parakeet_ctc.h"
 #include "parakeet_eou.h"
@@ -58,6 +59,11 @@ int encoder_out_frames(const EncoderConfig & enc, long long n_mel_frames) {
     return (int) t;
 }
 
+uint64_t sat_add(uint64_t a, uint64_t b) {
+    const uint64_t s = a + b;
+    return s < a ? std::numeric_limits<uint64_t>::max() : s;
+}
+
 }  // namespace
 
 FitResult fit_params(const FitOptions & opts) {
@@ -100,6 +106,14 @@ FitResult fit_params(const FitOptions & opts) {
         return r;
     }
     r.device_is_cpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    // Unified-memory devices (CPU, integrated GPUs, Apple Metal) draw the
+    // "device" figure from the same physical RAM the host-side buffers live
+    // in, so the verdict must charge both against it. Discrete GPUs keep the
+    // pools separate.
+    r.device_shares_host_memory =
+        r.device_is_cpu ||
+        ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU ||
+        backend_is_metal(backend);
     {
         size_t free_b = 0, total_b = 0;
         ggml_backend_dev_memory(dev, &free_b, &total_b);
@@ -117,6 +131,19 @@ FitResult fit_params(const FitOptions & opts) {
     // long inputs (resolve_long_form_plan + run_encoder_windowed). Offline
     // diarize (Sortformer) runs the encoder AND the O(T^2) head over the full
     // input in one graph, so its projection must use the full length.
+    //
+    // The runtime does not hold ONE encoder graph: run_encoder keeps an LRU
+    // cache of up to Impl::k_encoder_graph_cache_max (3) graphs keyed by mel
+    // length, each owning its own persistent compute buffer. A windowed
+    // transcribe touches exactly three distinct lengths -- first =
+    // center + ctx (no left context), middles = center + 2*ctx, last =
+    // remainder + ctx <= first -- so all three buffers are resident together
+    // for the rest of the engine's life. Project the resident SET, bounding
+    // the input-dependent last window by the first so the projection is
+    // conservative and saturates with audio length. (EngineOptions::prewarm
+    // would occupy one more slot with a ~1 s graph; the cache cap keeps that
+    // within the same three buffers, evicting the smallest-value entry.)
+    std::vector<long long> resident_mel;
     long long worst_window_mel = total_mel;
     if (model.model_type != ParakeetModelType::SORTFORMER) {
         const LongFormPlan plan = resolve_long_form_plan_frames(
@@ -128,31 +155,53 @@ FitResult fit_params(const FitOptions & opts) {
             const int ctx_mel    = plan.context_frames * plan.sub;
             const int n_units    = (int) std::min<long long>(
                 total_mel, std::numeric_limits<int>::max());
-            worst_window_mel = 0;
-            for (const LongFormWindow & w :
-                 plan_long_form_windows(n_units, center_mel, ctx_mel)) {
-                worst_window_mel = std::max<long long>(worst_window_mel, w.window_len);
-            }
-            if (worst_window_mel <= 0) worst_window_mel = total_mel;
+            const size_t n_windows =
+                plan_long_form_windows(n_units, center_mel, ctx_mel).size();
+            const long long first_mel  = std::min<long long>(
+                total_mel, (long long) center_mel + ctx_mel);
+            const long long middle_mel = (long long) center_mel + 2 * ctx_mel;
+            worst_window_mel = n_windows >= 3 ? middle_mel : first_mel;
+            // Equal lengths kept adjacent so the measurement memoizer below
+            // prices each distinct length once.
+            resident_mel.push_back(first_mel);
+            if (n_windows >= 2) resident_mel.push_back(first_mel);  // last, bounded by first
+            if (n_windows >= 3) resident_mel.push_back(middle_mel);
         }
     }
+    if (resident_mel.empty()) {
+        resident_mel.push_back(total_mel);
+    }
     if (worst_window_mel > std::numeric_limits<int>::max()) {
-        r.reason = "invalid-arguments";  // absurd single-window projection
+        r.reason = "workload-too-large";  // a single window this size is not projectable
         return r;
     }
     const int window_mel      = (int) worst_window_mel;
     const int window_enc      = encoder_out_frames(model.encoder_cfg, window_mel);
     const int total_enc       = encoder_out_frames(model.encoder_cfg, total_mel);
 
-    // ── Encoder compute: build + size the real worst-case window graph ─────
-    size_t enc_compute = 0;
-    if (measure_encoder_compute(model, window_mel, mel.n_mels, enc_compute) != 0) {
-        r.reason = "measurement-failed";
-        return r;
+    // ── Encoder compute: build + size every graph the cache will hold ──────
+    uint64_t enc_compute = 0;
+    {
+        // Memoize by length: the resident set repeats the first-window length.
+        long long memo_mel   = -1;
+        size_t    memo_bytes = 0;
+        for (long long len : resident_mel) {
+            if (len != memo_mel) {
+                size_t bytes = 0;
+                if (measure_encoder_compute(model, (int) len, mel.n_mels, bytes) != 0) {
+                    r.reason = "measurement-failed";
+                    return r;
+                }
+                memo_mel   = len;
+                memo_bytes = bytes;
+            }
+            enc_compute = sat_add(enc_compute, memo_bytes);
+        }
     }
 
     // ── Decoder-side buffers, per model type ───────────────────────────────
     DecoderFitMeasure dm;
+    uint64_t extra_host = 0;  // decoder-side buffers that live in host RAM
     switch (model.model_type) {
         case ParakeetModelType::CTC:
             break;  // the CTC head lives inside the encoder graph, already measured
@@ -170,12 +219,22 @@ FitResult fit_params(const FitOptions & opts) {
             }
             break;
         case ParakeetModelType::SORTFORMER: {
-            size_t head_bytes = 0;
-            if (sortformer_measure_head(model, window_enc, head_bytes) != 0) {
+            size_t head_active = 0, head_cpu_fallback = 0;
+            if (sortformer_measure_head(model, window_enc,
+                                        head_active, head_cpu_fallback) != 0) {
                 r.reason = "measurement-failed";
                 return r;
             }
-            dm.device_compute_bytes = head_bytes;
+            // On Mali-Vulkan the head is force-routed to CPU: its compute
+            // buffer is host RAM, like the head weight copies already counted
+            // in lm.sortformer_cpu_bytes. The scheduler's per-op CPU fallback
+            // portion is host RAM on every backend.
+            if (model_sortformer_on_cpu(model)) {
+                extra_host = sat_add(extra_host, sat_add(head_active, head_cpu_fallback));
+            } else {
+                dm.device_compute_bytes = head_active;
+                extra_host = sat_add(extra_host, head_cpu_fallback);
+            }
             break;
         }
     }
@@ -192,17 +251,20 @@ FitResult fit_params(const FitOptions & opts) {
         if (model.model_type == ParakeetModelType::CTC) {
             host += (uint64_t) total_enc * model.vocab_size * sizeof(float);       // logits
         }
-        // EncoderGraph host mirrors at the worst window: relative positional
-        // encoding and (chunked-attention models) the T x T attention mask.
-        host += (uint64_t) (2 * (long long) window_enc - 1) *
-                model.encoder_cfg.d_model * sizeof(float);
+        // EncoderGraph host mirrors -- relative positional encoding and
+        // (chunked-attention models) the T x T attention mask -- are owned per
+        // cached graph, so one worst-window mirror per resident graph.
+        uint64_t mirrors = (uint64_t) (2 * (long long) window_enc - 1) *
+                           model.encoder_cfg.d_model * sizeof(float);
         if (model.encoder_cfg.att_chunked_limited &&
             model.encoder_cfg.att_context_left  >= 0 &&
             model.encoder_cfg.att_context_right >= 0) {
-            host += (uint64_t) window_enc * window_enc * sizeof(float);
+            mirrors += (uint64_t) window_enc * window_enc * sizeof(float);
         }
+        host += mirrors * resident_mel.size();
         host += dm.host_bytes;           // CPU decode path: dequantised f32 weights
         host += lm.sortformer_cpu_bytes; // Mali-Vulkan CPU head copy (host RAM)
+        host  = sat_add(host, extra_host);
         r.host_bytes = host;
     }
 
@@ -210,15 +272,18 @@ FitResult fit_params(const FitOptions & opts) {
     r.device.encoder_compute_bytes = enc_compute;
     r.device.decoder_state_bytes   = dm.device_state_bytes;
     r.device.decoder_compute_bytes = dm.device_compute_bytes;
-    r.device.total_bytes = r.device.weights_bytes + r.device.encoder_compute_bytes +
-                           r.device.decoder_state_bytes + r.device.decoder_compute_bytes;
+    r.device.total_bytes =
+        sat_add(sat_add(r.device.weights_bytes, r.device.encoder_compute_bytes),
+                sat_add(r.device.decoder_state_bytes, r.device.decoder_compute_bytes));
 
     // ── Verdict ────────────────────────────────────────────────────────────
-    // On a CPU device the "device" buffers and the host extras compete for
-    // the same physical RAM, so both count against the free figure.
-    uint64_t required = r.device.total_bytes + opts.margin_bytes;
-    if (r.device_is_cpu) {
-        required += r.host_bytes;
+    // On a unified-memory device (CPU, integrated GPU, Apple Metal) the
+    // "device" buffers and the host extras compete for the same physical RAM,
+    // so both count against the free figure. Saturating arithmetic: an
+    // overflow must surface as DOES-NOT-FIT, never wrap into a false FITS.
+    uint64_t required = sat_add(r.device.total_bytes, opts.margin_bytes);
+    if (r.device_shares_host_memory) {
+        required = sat_add(required, r.host_bytes);
     }
     r.fits   = required <= r.device_free_bytes;
     r.status = r.fits ? FitStatus::Success : FitStatus::Failure;
@@ -247,8 +312,9 @@ FitResult fit_params(const FitOptions & opts) {
         std::snprintf(line, sizeof(line), "  weights:         %14s\n",
                       fmt_mib(r.device.weights_bytes).c_str());
         s += line;
-        std::snprintf(line, sizeof(line), "  encoder compute: %14s\n",
-                      fmt_mib(r.device.encoder_compute_bytes).c_str());
+        std::snprintf(line, sizeof(line), "  encoder compute: %14s (%zu resident graph%s)\n",
+                      fmt_mib(r.device.encoder_compute_bytes).c_str(),
+                      resident_mel.size(), resident_mel.size() == 1 ? "" : "s");
         s += line;
         std::snprintf(line, sizeof(line), "  decoder state:   %14s\n",
                       fmt_mib(r.device.decoder_state_bytes).c_str());
@@ -261,7 +327,8 @@ FitResult fit_params(const FitOptions & opts) {
         s += line;
         std::snprintf(line, sizeof(line), "host extras:       %14s%s\n",
                       fmt_mib(r.host_bytes).c_str(),
-                      r.device_is_cpu ? " (same RAM pool as the device projection)" : "");
+                      r.device_shares_host_memory
+                          ? " (same RAM pool as the device projection)" : "");
         s += line;
         std::snprintf(line, sizeof(line), "margin:            %14s\n",
                       fmt_mib(opts.margin_bytes).c_str());

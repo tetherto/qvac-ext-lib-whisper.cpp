@@ -4,14 +4,20 @@
 // memory available right now, without reading any weight data.
 //
 // The fitter opens the GGUF metadata-only (`no_alloc`), wires the model's
-// tensor handles exactly as a real load would, and then *measures* every
-// allocation the runtime would make -- the weight buffers (including the
-// CPU-repack extra buffers on CPU runs), the worst-case offline encoder
-// compute graph for the requested workload, and the decoder-side state and
-// fixed-shape graphs -- using ggml's size-only allocator APIs. Nothing is
-// allocated on the device and no graph is executed, so a fit call is cheap
-// (milliseconds + one metadata read) and safe to run before committing to a
-// full Engine load.
+// tensor handles exactly as a real load would, and then *measures* the
+// peak-resident allocation set of one offline transcribe (or diarize) on a
+// fresh Engine -- the weight buffers (including the CPU-repack extra buffers
+// on CPU runs), every encoder compute graph the runtime's graph cache will
+// hold at once (a windowed long-form pass keeps up to three window graphs
+// resident, not one), and the decoder-side state and fixed-shape graphs --
+// using ggml's size-only allocator APIs. Nothing is allocated on the device
+// and no graph is executed, so a fit call is cheap (milliseconds + one
+// metadata read) and safe to run before committing to a full Engine load.
+//
+// Scope: the projection covers the offline paths. Streaming sessions build
+// smaller per-chunk graphs but rotate through the same 3-slot graph cache
+// with session-dependent keys, so the offline projection is a good guide but
+// not a proven upper bound for every streaming configuration.
 //
 // Status semantics follow the SDK's @qvac/model-fit contract:
 //   Success -- a projection was made and it fits (result.fits == true).
@@ -85,7 +91,7 @@ struct FitResult {
     FitStatus   status = FitStatus::Error;
     bool        fits   = false;  // status == Success
     // "fits" | "does-not-fit" | "model-unreadable" | "no-backend-device" |
-    // "measurement-failed" | "invalid-arguments"
+    // "measurement-failed" | "invalid-arguments" | "workload-too-large"
     std::string reason;
 
     std::string model_type;     // "ctc" | "rnnt" | "tdt" | "eou" | "sortformer"
@@ -95,6 +101,11 @@ struct FitResult {
     // real load applies (Adreno policy, Mali routing, missing GPU build, ...).
     std::string device_name;
     bool        device_is_cpu = false;
+    // True when the device's memory pool IS system RAM (the CPU backend,
+    // integrated GPUs, Apple Metal unified memory): host_bytes then competes
+    // with `device` for the same physical memory and the verdict charges
+    // both against the free figure. False only for discrete-VRAM devices.
+    bool        device_shares_host_memory = false;
     uint64_t    device_free_bytes  = 0;
     uint64_t    device_total_bytes = 0;
 
@@ -104,8 +115,8 @@ struct FitResult {
     // full-input mel spectrogram and encoder-output slabs (these scale with
     // audio_seconds, unlike the windowed device buffers), and the
     // host-dequantised decoder weights on CPU decode paths. When
-    // device_is_cpu these compete with `device` for the same physical RAM and
-    // the fit test accounts for both.
+    // device_shares_host_memory these compete with `device` for the same
+    // physical RAM and the fit test accounts for both.
     uint64_t host_bytes = 0;
 
     // Human-readable projection table (multi-line, suitable for logging).
