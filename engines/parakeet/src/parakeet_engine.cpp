@@ -257,6 +257,7 @@ struct Engine::Impl {
 
     TdtRuntimeWeights   transducer_rt;
     bool                transducer_ready = false;
+    int32_t             nemotron_prompt_id = -1;
 
     EouRuntimeWeights   eou_rt;
     bool                eou_ready = false;
@@ -370,7 +371,12 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(std::make_unique<Impl>()) {
                                  "' (rc=" + std::to_string(rc) + ")");
     }
 
-    if (is_transducer(pimpl_->model.model_type)) {
+    if (pimpl_->model.model_type == ParakeetModelType::NEMOTRON) {
+        pimpl_->nemotron_prompt_id = resolve_nemotron_prompt_id(
+            pimpl_->model, opts.language);
+    }
+    if (is_transducer(pimpl_->model.model_type) ||
+        pimpl_->model.model_type == ParakeetModelType::NEMOTRON) {
         if (tdt_prepare_runtime(pimpl_->model, pimpl_->transducer_rt) != 0) {
             throw std::runtime_error("Engine: transducer runtime preparation failed");
         }
@@ -412,7 +418,8 @@ bool Engine::is_transcription_model() const {
     return pimpl_->model.model_type == ParakeetModelType::CTC ||
            pimpl_->model.model_type == ParakeetModelType::RNNT ||
            pimpl_->model.model_type == ParakeetModelType::TDT  ||
-           pimpl_->model.model_type == ParakeetModelType::EOU;
+           pimpl_->model.model_type == ParakeetModelType::EOU  ||
+           pimpl_->model.model_type == ParakeetModelType::NEMOTRON;
 }
 
 BackendDevice Engine::backend_device() const {
@@ -465,7 +472,6 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
             "diarization model; call Engine::diarize() (or transcribe_with_speakers "
             "with a separate ASR engine) instead.");
     }
-
     pimpl_->cancel_flag.store(false);
 
     using clock = std::chrono::steady_clock;
@@ -527,11 +533,45 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
     const auto t_dec = clock::now();
     std::vector<int32_t> ids;
     std::string text;
-    if (is_transducer(pimpl_->model.model_type)) {
+    std::vector<float> conditioned_encoder;
+    const float * decoder_input = enc_out.encoder_out.data();
+    if (pimpl_->model.model_type == ParakeetModelType::NEMOTRON) {
+        if (int rc = run_nemotron_prompt_projection(
+                pimpl_->model,
+                enc_out.encoder_out.data(),
+                enc_out.n_enc_frames,
+                enc_out.d_model,
+                pimpl_->nemotron_prompt_id,
+                conditioned_encoder); rc != 0) {
+            throw std::runtime_error(
+                "parakeet::Engine::transcribe_samples: Nemotron prompt "
+                "projection failed (rc=" + std::to_string(rc) + ")");
+        }
+        decoder_input = conditioned_encoder.data();
+
+        RnntDecodeOptions options;
+        options.max_symbols_per_step =
+            pimpl_->model.nemotron_cfg.max_symbols_per_step;
+        RnntDecodeResult result;
+        if (int rc = rnnt_greedy_decode(
+                pimpl_->model,
+                pimpl_->transducer_rt,
+                decoder_input,
+                enc_out.n_enc_frames,
+                enc_out.d_model,
+                options,
+                result); rc != 0) {
+            throw std::runtime_error(
+                "parakeet::Engine::transcribe_samples: Nemotron RNNT decode "
+                "failed (rc=" + std::to_string(rc) + ")");
+        }
+        ids = std::move(result.token_ids);
+        text = std::move(result.text);
+    } else if (is_transducer(pimpl_->model.model_type)) {
         TdtDecodeResult  dres;
         if (int rc = decode_transducer(
                 pimpl_->model, pimpl_->transducer_rt,
-                enc_out.encoder_out.data(),
+                decoder_input,
                 enc_out.n_enc_frames, enc_out.d_model,
                 dres); rc != 0) {
             throw std::runtime_error("parakeet::Engine::transcribe_samples: transducer decode failed (rc=" +
@@ -614,6 +654,11 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
         throw std::runtime_error(
             "transcribe_samples_stream: streaming is for transcription models only; "
             "Sortformer is a diarization model. Use Engine::diarize().");
+    }
+    if (pimpl_->model.model_type == ParakeetModelType::NEMOTRON) {
+        throw std::runtime_error(
+            "parakeet::Engine::transcribe_samples_stream: Nemotron model loading "
+            "is available, but cache-aware streaming is not implemented yet");
     }
 
     pimpl_->cancel_flag.store(false);
@@ -1450,6 +1495,11 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
         throw std::runtime_error(
             "Engine::stream_start: streaming is for transcription models only; "
             "Sortformer is a diarization model. Use Engine::diarize().");
+    }
+    if (pimpl_->model.model_type == ParakeetModelType::NEMOTRON) {
+        throw std::runtime_error(
+            "Engine::stream_start: Nemotron model loading is available, but "
+            "cache-aware streaming is not implemented yet");
     }
 
     auto impl = std::make_unique<StreamSession::Impl>();
