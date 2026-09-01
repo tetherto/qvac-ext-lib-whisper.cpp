@@ -175,6 +175,21 @@ with no pre-supplied `audio_codes`; the composed request is reported back in
 `GenerateResult::metadata`. The inspire pass emits `lm` progress ticks and
 honors cancellation like every other stage.
 
+### ACE-Step quality scoring
+
+With `GenerateParams::compute_quality_score` set, the generated audio codes
+are teacher-forced back through the LM "understand" prompt and the request is
+scored: caption and lyrics earn a normalized PMI (their mean log-prob given
+the codes against the same text under a no-input prompt) and each set
+metadata field earns a rank-weighted top-k recall of its YAML line. The
+weight-normalized global score (caption 0.5, lyrics 0.3, metadata 0.2) lands
+in `GenerateResult::metadata.quality_score` in `[0, 1]` with the per-condition
+breakdown in `quality_report` — made for ranking a batch of takes (stem tasks
+on the base DiT vary strongly by seed) and keeping the best. Scoring runs
+extra LM forwards after code generation, reports `score` progress ticks, and
+honors cancellation; it requires the LM code path, so cover / lego tasks and
+the audio edit path reject it.
+
 ## Model stages
 
 Four GGUF files provide six runtime weight sets. The DiT GGUF contains the
@@ -555,6 +570,7 @@ combinations are rejected rather than silently ignored.
 | `--temp F`, `--topp F`, `--topk N`, `--cfg F` | `0.85`, `0.9`, off, `2.0` | LM sampling for the audio codes |
 | `--no-phase1` | off | skip the LM metadata auto-fill pass |
 | `--simple` | off | Simple Mode: expand `--caption` into a full request (lyrics regenerate unless `--lyrics "[Instrumental]"` is passed) |
+| `--score` | off | teacher-forced LM quality score of the generated codes, printed with its per-condition breakdown |
 | `--req FILE` | | request JSON; pre-supplied `audio_codes` skip the LM stage |
 | `--ref-audio FILE` | | 48 kHz PCM16 WAV used by ACE-Step's timbre-conditioning path |
 | `--src-audio FILE` | | 48 kHz PCM16 source WAV; required for editing |

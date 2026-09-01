@@ -171,7 +171,7 @@ int sample_top_k_p(float * logits, int V, float temperature, float top_p, int to
 
 // YAML CoT block (acestep.cpp prompt.h build_cot_yaml). Matches Python
 // yaml.dump(allow_unicode=True, sort_keys=True): break + 2-space indent past col 80.
-static std::string build_cot_yaml(const AcePrompt & prompt) {
+std::string lm_cot_yaml(const AcePrompt & prompt) {
     auto yaml_wrap = [](const std::string & key, const std::string & val) -> std::string {
         std::string result = key + ":";
         int         col    = (int) (key.size() + 1);
@@ -206,7 +206,7 @@ static std::string build_cot_yaml(const AcePrompt & prompt) {
 }
 
 std::vector<int> build_lm_prompt_with_cot(const BpeTokenizer & bpe, const AcePrompt & prompt) {
-    std::string      cot = build_cot_yaml(prompt);
+    std::string      cot = lm_cot_yaml(prompt);
     std::vector<int> ids;
     auto             append = [&](const std::string & text) {
         auto t = bpe_encode(bpe, text, false);

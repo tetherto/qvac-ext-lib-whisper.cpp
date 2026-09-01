@@ -39,6 +39,7 @@
 #include "lm_pipeline.h"
 #include "metadata_fsm.h"
 #include "philox.h"
+#include "quality_score.h"
 #include "quantize_gguf.h"
 #include "quantize_policy.h"
 #include "qwen3_block.h"
@@ -2482,6 +2483,141 @@ void test_bpe_decode_roundtrip() {
     CHECK(bpe_decode(tok, { TOKEN_THINK, 10, TOKEN_THINK_END }) == "<think>hello</think>");
 }
 
+// 13. quality scoring ----------------------------------------------------------
+// Weight-free coverage of the teacher-forced scoring math and target builders
+// (quality_score.h); the LM-backed end-to-end path runs in the integration test.
+
+bool quality_near(double a, double b) {
+    return std::fabs(a - b) < 1e-9;
+}
+
+void test_quality_normalized_pmi() {
+    using tts_cpp::acestep::quality_normalized_pmi;
+
+    CHECK(quality_near(quality_normalized_pmi(-1.0, -1.0, 0.1), 0.5));
+    CHECK(quality_near(quality_normalized_pmi(-0.9, -1.0, 0.1), 1.0 / (1.0 + std::exp(-1.0))));
+    CHECK(quality_near(quality_normalized_pmi(-1.1, -1.0, 0.1), 1.0 - 1.0 / (1.0 + std::exp(-1.0))));
+    CHECK(quality_normalized_pmi(0.0, -100.0, 0.1) > 0.999999);
+    CHECK(quality_normalized_pmi(-100.0, 0.0, 0.1) < 0.000001);
+}
+
+void test_quality_yaml_formatting() {
+    using tts_cpp::acestep::quality_yaml_plain_safe;
+    using tts_cpp::acestep::quality_yaml_string;
+
+    CHECK(quality_yaml_plain_safe("C major"));
+    CHECK(quality_yaml_plain_safe("4/4"));
+    CHECK(quality_yaml_plain_safe("d'or"));
+    CHECK(!quality_yaml_plain_safe(""));
+    CHECK(!quality_yaml_plain_safe("null"));
+    CHECK(!quality_yaml_plain_safe("Yes"));
+    CHECK(!quality_yaml_plain_safe("120"));
+    CHECK(!quality_yaml_plain_safe("-3.5"));
+    CHECK(!quality_yaml_plain_safe("key: value"));
+    CHECK(!quality_yaml_plain_safe(" padded"));
+    CHECK(!quality_yaml_plain_safe("[verse]"));
+
+    CHECK(quality_yaml_string("C major") == "C major");
+    CHECK(quality_yaml_string("null") == "'null'");
+    CHECK(quality_yaml_string("") == "''");
+    CHECK(quality_yaml_string("d''") == "d''");
+    CHECK(quality_yaml_string("it's: quoted") == "'it''s: quoted'");
+    CHECK(quality_yaml_string("two\nlines") == "'two\n  lines'");
+}
+
+void test_quality_targets() {
+    using tts_cpp::acestep::quality_caption_target;
+    using tts_cpp::acestep::quality_lyrics_target;
+    using tts_cpp::acestep::quality_metadata_target;
+
+    CHECK(quality_metadata_target("bpm", 120LL) == "<think>\nbpm: 120\n</think>\n");
+    CHECK(quality_metadata_target("keyscale", std::string("C major")) ==
+          "<think>\nkeyscale: C major\n</think>\n");
+    CHECK(quality_metadata_target("language", std::string("null")) ==
+          "<think>\nlanguage: 'null'\n</think>\n");
+    CHECK(quality_caption_target("test caption") == "<think>\ncaption: test caption\n</think>\n");
+    CHECK(quality_caption_target("") == "<think>\ncaption: ''\n</think>\n");
+    CHECK(quality_lyrics_target("[verse]\nhello") == "<think>\n</think>\n# Lyric\n[verse]\nhello\n");
+
+    const std::string long_caption(100, 'x');
+    const std::string wrapped = quality_caption_target(long_caption);
+    CHECK(wrapped.rfind("<think>\ncaption: ", 0) == 0);
+    CHECK(wrapped.find('\n', strlen("<think>\n")) != std::string::npos);
+}
+
+void test_quality_encode_target() {
+    using tts_cpp::acestep::quality_encode_target;
+    using tts_cpp::acestep::TOKEN_THINK;
+    using tts_cpp::acestep::TOKEN_THINK_END;
+
+    const tts_cpp::acestep::BpeTokenizer tok = make_test_bpe_tokenizer();
+    const std::vector<int> ids = quality_encode_target(tok, "hello<think>hello</think>");
+    CHECK(ids == std::vector<int>({ 10, TOKEN_THINK, 10, TOKEN_THINK_END }));
+    CHECK(quality_encode_target(tok, "<think></think>") ==
+          std::vector<int>({ TOKEN_THINK, TOKEN_THINK_END }));
+    CHECK(quality_encode_target(tok, "hello") == std::vector<int>({ 10 }));
+}
+
+void test_quality_weighted_global() {
+    using tts_cpp::acestep::QualityCondition;
+    using tts_cpp::acestep::QualityMetric;
+    using tts_cpp::acestep::QualityScoreParams;
+    using tts_cpp::acestep::quality_weighted_global;
+
+    std::map<std::string, QualityCondition> conditions;
+    conditions["caption"].score  = 0.8;
+    conditions["caption"].metric = QualityMetric::PmiNormalized;
+    conditions["lyrics"].score   = 0.6;
+    conditions["lyrics"].metric  = QualityMetric::PmiNormalized;
+    conditions["bpm"].score      = 1.0;
+    conditions["keyscale"].score = 0.5;
+
+    QualityScoreParams params;
+    double             global = 0.0;
+    std::string        report;
+    std::string        error;
+    CHECK(quality_weighted_global(conditions, params, global, report, error));
+    CHECK(quality_near(global, 0.8 * 0.5 + 0.6 * 0.3 + 0.75 * 0.2));
+    CHECK(report.find("caption") != std::string::npos);
+    CHECK(report.find("Per-condition scores") != std::string::npos);
+
+    conditions.erase("lyrics");
+    CHECK(quality_weighted_global(conditions, params, global, report, error));
+    CHECK(quality_near(global, (0.8 * 0.5 + 0.75 * 0.2) / 0.7));
+
+    QualityScoreParams zero_weights;
+    zero_weights.caption_weight  = 0.0;
+    zero_weights.lyrics_weight   = 0.0;
+    zero_weights.metadata_weight = 0.0;
+    CHECK(!quality_weighted_global(conditions, zero_weights, global, report, error));
+    CHECK(!error.empty());
+}
+
+void test_quality_score_request_policy() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::RepaintParams;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask   task;
+    params.compute_quality_score = true;
+    params.caption               = "a caption";
+    CHECK(resolve_generate_task(params, task).empty());
+
+    params.task_type = tts_cpp::acestep::TASK_COVER_NOFSQ;
+    params.source_audio.assign(96, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("LM code path") != std::string::npos);
+
+    params.task_type = tts_cpp::acestep::TASK_LEGO;
+    params.track     = "drums";
+    CHECK(resolve_generate_task(params, task).find("LM code path") != std::string::npos);
+
+    params.task_type = tts_cpp::acestep::TASK_TEXT2MUSIC;
+    params.edit_plan.push_back(RepaintParams{});
+    CHECK(resolve_generate_task(params, task).find("audio edit path") != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
@@ -2542,6 +2678,12 @@ int main() {
     test_bpe_encode_merges();
     test_bpe_encode_byte_fallback();
     test_bpe_decode_roundtrip();
+    test_quality_normalized_pmi();
+    test_quality_yaml_formatting();
+    test_quality_targets();
+    test_quality_encode_target();
+    test_quality_weighted_global();
+    test_quality_score_request_policy();
 
     std::fprintf(stderr, "[test-acestep-units] %d/%d checks passed\n", g_checks - g_failures, g_checks);
     return g_failures == 0 ? 0 : 1;
