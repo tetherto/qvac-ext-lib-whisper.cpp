@@ -627,6 +627,21 @@ if (PARAKEET_BUILD_TESTS)
     parakeet_apply_backend_defs(test-ctc-language-mask)
     parakeet_register_test(test-ctc-language-mask LABEL "unit")
 
+    # GPU-tier selection unit tests. Pure ranking function
+    # (parakeet::gpu_tier_for) against synthesised device tuples — no ggml
+    # backends actually loaded, no GGUF fixtures, no CUDA/Vulkan drivers
+    # required; runs on every host in the matrix.
+    #
+    # Target name is `test-parakeet-backend-selection` (not
+    # `test-backend-selection`) because engines/tts registers its own
+    # `test-backend-selection` and the two collide when the umbrella
+    # build pulls both engines into a single CMake tree.
+    add_executable(test-parakeet-backend-selection test/test_backend_selection.cpp)
+    target_link_libraries(test-parakeet-backend-selection PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-parakeet-backend-selection PRIVATE ggml/include src include)
+    parakeet_apply_ccache(test-parakeet-backend-selection)
+    parakeet_register_test(test-parakeet-backend-selection LABEL "unit")
+
     add_executable(test-parakeet-streaming test/test_streaming.cpp)
     target_link_libraries(test-parakeet-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-parakeet-streaming PRIVATE include src ggml/include)

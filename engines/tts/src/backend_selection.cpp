@@ -575,7 +575,8 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
         }
     }
 
-    // Tier policy:
+    // Tier policy (already discrete-first + CUDA-over-Vulkan; kept in sync
+    // with parakeet / audiogen / whisper-gpu-picker):
     //   1. Adreno 700+: prefer OpenCL (validated, faster than Vulkan
     //      on Snapdragon 8 Gen 2/3/4 etc.).
     //   2. CUDA: the vendor-native path on NVIDIA, and measurably faster
@@ -584,6 +585,8 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers,
     //   3. Anything else with a non-OpenCL GPU: prefer that
     //      (Adreno Vulkan on Android — non-Adreno is filtered out
     //      above; Metal on Apple; Vulkan on Linux/Windows desktop).
+    //      Discrete-over-integrated is enforced via the vulkan_device == -1
+    //      UMA bias in pick_vulkan_device_index above.
     //   4. Last resort: any other OpenCL device (e.g. desktop OpenCL,
     //      or Adreno OpenCL whose version string lacked a model number).
     auto try_init = [&](const std::vector<Cand> & bucket) -> ggml_backend_t {

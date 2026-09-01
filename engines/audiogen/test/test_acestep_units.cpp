@@ -25,6 +25,7 @@
 #include "backend_registry.h"
 #include "parallel_load.h"
 #include "audio_edit.h"
+#include "cancellation_scope.h"
 #include "bpe_tokenizer.h"
 #include "cover_noise.h"
 #include "dit_ggml.h"
@@ -649,6 +650,67 @@ void test_gpu_fallback_reason() {
     } else {
         CHECK(reason == GpuFallbackReason::no_devices || reason == GpuFallbackReason::init_failed);
     }
+}
+
+// 6c. GPU tier policy --------------------------------------------------------
+// Speech-engine GPU selection prefers CUDA over Vulkan on the same NVIDIA
+// card, and prefers discrete over integrated adapters. gpu_tier_for is the
+// pure ranking that captures that policy so a synthesised device topology can
+// be scored without a live ggml-backend registry.
+//
+// SCOPE: this test covers the classifier (what tier a device lands in) and
+// the enum-constant ordering (which tier outranks which). It does NOT
+// exercise backend_gpu_init's actual walk in backend_registry.h: that
+// function has its own parallel Adreno-OpenCL / CUDA-first / {require_validated,
+// {GPU, IGPU}} sequence and does not call gpu_tier_for today, so a reordering
+// of that walk would silently pass this test. Keeping the two in sync is a
+// code-review contract; the deeper fix (drive backend_gpu_init off
+// gpu_tier_for as the single source of truth) is tracked separately.
+void test_gpu_tier_policy() {
+    using tts_cpp::acestep::GpuTier;
+    using tts_cpp::acestep::gpu_tier_for;
+
+    // Adreno 700+ OpenCL wins outright — the OpenCL kernels are the validated
+    // path on Snapdragon 8 Gen 2+.
+    CHECK(gpu_tier_for("OpenCL", GGML_BACKEND_DEVICE_TYPE_GPU,  740) == GpuTier::AdrenoOpenCL700Plus);
+    CHECK(gpu_tier_for("OpenCL", GGML_BACKEND_DEVICE_TYPE_IGPU, 740) == GpuTier::AdrenoOpenCL700Plus);
+    // Adreno 6xx OpenCL is not routed to the OpenCL tier here (broken kernels)
+    // — the calling code separately skips it; the ranking treats it as generic OpenCL.
+    CHECK(gpu_tier_for("OpenCL", GGML_BACKEND_DEVICE_TYPE_GPU,  640) != GpuTier::AdrenoOpenCL700Plus);
+
+    // CUDA outranks Vulkan on the same NVIDIA card.
+    CHECK(gpu_tier_for("CUDA",   GGML_BACKEND_DEVICE_TYPE_GPU,  -1)  == GpuTier::CudaDiscrete);
+    CHECK(gpu_tier_for("Vulkan", GGML_BACKEND_DEVICE_TYPE_GPU,  -1)  == GpuTier::ValidatedDiscrete);
+    CHECK(static_cast<int>(GpuTier::CudaDiscrete) <
+          static_cast<int>(GpuTier::ValidatedDiscrete));
+
+    // Tegra / Jetson CUDA reports IGPU on some drivers — still preferred over
+    // a validated Vulkan discrete via the CUDA-first rule.
+    CHECK(gpu_tier_for("CUDA", GGML_BACKEND_DEVICE_TYPE_IGPU, -1) == GpuTier::CudaIntegrated);
+    CHECK(static_cast<int>(GpuTier::CudaIntegrated) <
+          static_cast<int>(GpuTier::ValidatedDiscrete));
+
+    // Discrete outranks integrated at every tier that has both — the
+    // other-addons behavior we are matching (llm/diffusion prefer dGPU).
+    CHECK(static_cast<int>(GpuTier::CudaDiscrete)      < static_cast<int>(GpuTier::CudaIntegrated));
+    CHECK(static_cast<int>(GpuTier::ValidatedDiscrete) < static_cast<int>(GpuTier::ValidatedIntegrated));
+    CHECK(static_cast<int>(GpuTier::OtherDiscrete)     < static_cast<int>(GpuTier::OtherIntegrated));
+
+    // Metal is validated; MTL is the new registry name for the same backend.
+    CHECK(gpu_tier_for("Metal", GGML_BACKEND_DEVICE_TYPE_GPU,  -1) == GpuTier::ValidatedDiscrete);
+    CHECK(gpu_tier_for("MTL",   GGML_BACKEND_DEVICE_TYPE_IGPU, -1) == GpuTier::ValidatedIntegrated);
+
+    // Non-GPU device types are not selectable — the ranking rejects them so
+    // the CPU/Accel devices never leak into the GPU pass.
+    CHECK(gpu_tier_for("Vulkan", GGML_BACKEND_DEVICE_TYPE_CPU,   -1) == GpuTier::NotSelectable);
+    CHECK(gpu_tier_for("BLAS",   GGML_BACKEND_DEVICE_TYPE_ACCEL, -1) == GpuTier::NotSelectable);
+    CHECK(gpu_tier_for(nullptr,  GGML_BACKEND_DEVICE_TYPE_CPU,   -1) == GpuTier::NotSelectable);
+
+    // A fake "ROCm" / "MUSA" registry lands in the Other tier — unvalidated
+    // but still a candidate below every validated GPU, matching the current
+    // {require_validated, ...} nest in backend_gpu_init.
+    CHECK(gpu_tier_for("ROCm", GGML_BACKEND_DEVICE_TYPE_GPU,  -1) == GpuTier::OtherDiscrete);
+    CHECK(gpu_tier_for("MUSA", GGML_BACKEND_DEVICE_TYPE_IGPU, -1) == GpuTier::OtherIntegrated);
 }
 
 // 7. stage placement ---------------------------------------------------------
@@ -2293,6 +2355,28 @@ tts_cpp::acestep::BpeTokenizer make_test_bpe_tokenizer() {
     return tok;
 }
 
+// A cancel armed before generate() must survive into the run that observes it
+// and be consumed on exit, so the next run starts clean. Pinned on the scope
+// itself: the engine-level path needs model weights.
+void test_cancellation_scope_consumes_on_exit() {
+    using tts_cpp::acestep::CancellationScope;
+
+    std::atomic<bool> cancelled{ true };
+    {
+        CancellationScope scope(cancelled);
+        CHECK(cancelled.load());
+    }
+    CHECK(!cancelled.load());
+
+    cancelled.store(false);
+    {
+        CancellationScope scope(cancelled);
+        CHECK(!cancelled.load());
+        cancelled.store(true);
+    }
+    CHECK(!cancelled.load());
+}
+
 void test_bpe_utf8_codepoint() {
     using tts_cpp::acestep::bpe_utf8_codepoint;
 
@@ -2309,12 +2393,21 @@ void test_bpe_utf8_codepoint() {
     const char invalid_lead[] = { (char) 0xFF, 0, 0, 0, 0 };
     CHECK(bpe_utf8_codepoint(invalid_lead, &adv) == 0xFF && adv == 1);
 
-    // Truncated sequences still advance by the declared width, reading the
-    // padding; the buffers are NUL-padded so the reads stay in bounds here.
+    // A sequence that runs into the terminator decodes as its raw lead byte
+    // rather than consuming the declared width and reading past the end.
+    const char truncated_two[] = { (char) 0xC3, 0, 0, 0, 0 };
+    CHECK(bpe_utf8_codepoint(truncated_two, &adv) == 0xC3 && adv == 1);
     const char truncated_three[] = { (char) 0xE4, 0, 0, 0, 0 };
-    CHECK(bpe_utf8_codepoint(truncated_three, &adv) == 0x4000 && adv == 3);
-    const char truncated_four[] = { (char) 0xF0, 0, 0, 0, 0 };
-    CHECK(bpe_utf8_codepoint(truncated_four, &adv) == 0 && adv == 4);
+    CHECK(bpe_utf8_codepoint(truncated_three, &adv) == 0xE4 && adv == 1);
+    const char truncated_three_partial[] = { (char) 0xE4, (char) 0xB8, 0, 0, 0 };
+    CHECK(bpe_utf8_codepoint(truncated_three_partial, &adv) == 0xE4 && adv == 1);
+    const char truncated_four[] = { (char) 0xF0, (char) 0x90, (char) 0x90, 0, 0 };
+    CHECK(bpe_utf8_codepoint(truncated_four, &adv) == 0xF0 && adv == 1);
+
+    // A lead byte at the very end of a buffer must not be read past: this is
+    // the case that motivated the clamp.
+    const char lead_at_end[] = { (char) 0xF0, 0 };
+    CHECK(bpe_utf8_codepoint(lead_at_end, &adv) == 0xF0 && adv == 1);
 }
 
 void test_bpe_encode_merges() {
@@ -2406,6 +2499,7 @@ int main() {
     test_vae_window_core();
     test_backend_device_types();
     test_gpu_fallback_reason();
+    test_gpu_tier_policy();
     test_stage_placement();
     test_placement_env();
     test_parallel_rows();
@@ -2443,6 +2537,7 @@ int main() {
     test_quantize_policy_mm3();
     test_quantize_gguf_roundtrip();
     test_quantize_gguf_roundtrip_mm3();
+    test_cancellation_scope_consumes_on_exit();
     test_bpe_utf8_codepoint();
     test_bpe_encode_merges();
     test_bpe_encode_byte_fallback();

@@ -13,6 +13,7 @@
 #include "acestep/philox.h"
 #include "acestep/textenc_ggml.h"
 
+#include "acestep/cancellation_scope.h"
 #include "acestep/backend_registry.h"
 #include "acestep/audio_edit.h"
 #include "acestep/cover_noise.h"
@@ -1867,7 +1868,7 @@ static void populate_metadata(const GenerationState & state, GenerateResult & re
 
 GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn & progress) const {
     Impl & engine = *impl_;
-    engine.cancel_flag.store(false);
+    CancellationScope cancellation_scope(engine.cancel_flag);
 
     GenerateResult result;
     result.sample_rate = engine.sr;

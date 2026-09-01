@@ -7,10 +7,9 @@
 // array, tokenizer payload), and a complete metadata set with no weight
 // tensors.
 //
-// Wrong-typed metadata is pinned through a re-exec of this binary, because
-// gguf_get_val_u32() on a mistyped key GGML_ABORTs rather than returning an
-// error; the parent only asserts the loader never reports success (the same
-// pattern as test_t3_sched_dispatch.cpp).
+// Wrong-typed metadata is asserted in process: the loader checks the stored
+// GGUF type before reading, so a mistyped key fails closed with an error
+// instead of aborting.
 
 #include "parler/internal.h"
 #include "../test_env_portable.h"
@@ -43,7 +42,6 @@ int g_failures = 0;
     }                                                          \
 } while (0)
 
-constexpr const char * WRONG_TYPE_CHILD_FLAG = "--wrong-type-child";
 constexpr uint32_t SCALAR_U32 = 1;
 constexpr float SCALAR_F32 = 0.5f;
 
@@ -200,49 +198,21 @@ void test_missing_tensors() {
     fs::remove(path);
 }
 
-int run_wrong_type_child(const char * path) {
-    parler_model model;
-    std::string err;
-    const bool ok = parler_load_gguf(path, model, /*n_gpu_layers=*/ 0, &err);
-    if (ok) {
-        parler_free_model(model);
-        fprintf(stderr, "ERROR: wrong-typed metadata loaded successfully\n");
-        return 0;  // clean exit = the load succeeded; the parent asserts against it
-    }
-    fprintf(stderr, "child: load rejected: %s\n", err.c_str());
-    return 1;
-}
-
-// Current behavior on a mistyped key is a GGML_ABORT inside gguf_get_val_u32,
-// so the check runs in a child process; graceful rejection would also pass.
-void test_wrong_typed_metadata_never_loads(const char * self) {
+void test_wrong_typed_metadata_fails_closed() {
     const std::string path = fixture_path("wrong-type");
     write_gguf(path, true, nullptr, "parler.t5.n_layer");
-    setenv("GGML_NO_BACKTRACE", "1", 1);
-    std::string cmd = std::string("\"") + self + "\" " + WRONG_TYPE_CHILD_FLAG +
-                      " \"" + path + "\"";
-#ifdef _WIN32
-    // cmd /c strips the first and last quote when the line holds more than
-    // two; an extra outer pair keeps both quoted paths intact.
-    cmd = "\"" + cmd + "\"";
-#endif
-    CHECK(std::system(cmd.c_str()) != 0,
-          "the loader must never report success on wrong-typed metadata");
+    expect_load_fails(path, "not uint32");
     fs::remove(path);
 }
 
 } // namespace
 
-int main(int argc, char ** argv) {
-    if (argc > 2 && std::strcmp(argv[1], WRONG_TYPE_CHILD_FLAG) == 0) {
-        return run_wrong_type_child(argv[2]);
-    }
-
+int main() {
     test_missing_arch_marker();
     test_truncated_file();
     test_missing_required_metadata();
     test_missing_tensors();
-    test_wrong_typed_metadata_never_loads(argv[0]);
+    test_wrong_typed_metadata_fails_closed();
 
     if (g_failures) {
         fprintf(stderr, "test-parler-gguf-load: %d FAILURE(S)\n", g_failures);

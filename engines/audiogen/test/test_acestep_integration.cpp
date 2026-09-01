@@ -411,11 +411,33 @@ void run_edit_vae_cancel_scenario(tts_cpp::acestep::Engine &engine,
   CHECK(result.pcm.empty());
 }
 
+// A cancel armed before generate() must cancel that run, not be erased at
+// entry and leave the caller waiting for the next one. Mirrors MiniMax's
+// verify_pre_armed_cancellation; the run after it must still succeed, proving
+// the flag was consumed rather than left latched.
+void run_pre_armed_cancel_scenario(tts_cpp::acestep::Engine & engine,
+                                   const EditFixture & fixture) {
+    engine.cancel();
+    bool progressed = false;
+    const tts_cpp::acestep::GenerateResult cancelled = engine.generate(
+        fixture.params, [&](const std::string &, int, int) {
+            progressed = true;
+            return true;
+        });
+    CHECK(cancelled.pcm.empty());
+    CHECK(!progressed);
+
+    const tts_cpp::acestep::GenerateResult subsequent =
+        engine.generate(fixture.params);
+    CHECK(!subsequent.pcm.empty());
+}
+
 void run_edit_scenarios(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir) {
     EditFixture fixture = make_edit_fixture();
     run_repaint_scenario(engine, dump_dir, fixture);
     run_flow_scenario(engine, dump_dir, fixture);
     run_edit_vae_cancel_scenario(engine, fixture);
+    run_pre_armed_cancel_scenario(engine, fixture);
 }
 
 tts_cpp::acestep::GenerateParams make_lego_params() {
