@@ -196,10 +196,8 @@ struct TdtRuntimeWeights {
     ggml_context * unroll_ctx        = nullptr;
     ggml_cgraph *  g_unroll          = nullptr;
     ggml_gallocr_t alloc_unroll      = nullptr;
-    ggml_tensor *  un_counters_in    = nullptr;  // f32[GGML_TDT_STEP_N_INS]
-    ggml_tensor *  un_frame_idx_in   = nullptr;  // i32[1]
-    std::vector<ggml_tensor *> un_token_out;     // i32 argmax per step
-    std::vector<ggml_tensor *> un_dur_out;       // i32 argmax per step, null when RNN-T
+    ggml_tensor *  un_counters_in    = nullptr;  // f32[GGML_TDT_STEP_N_INS], the only upload per launch
+    ggml_tensor *  un_out            = nullptr;  // i32[2 * unroll_steps]: (token, duration index) per step, one readback
     int            unroll_blank_id    = -1;
     int            unroll_max_symbols = 0;
 
