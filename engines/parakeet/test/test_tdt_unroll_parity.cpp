@@ -6,6 +6,7 @@
 #include "parakeet_ctc.h"
 #include "parakeet_tdt.h"
 #include "mel_preprocess.h"
+#include "backend_util.h"
 
 #include "ggml.h"
 
@@ -21,6 +22,7 @@ struct DecodeVariant {
     int  unroll_steps;
     bool unrolled_used = false;
     int  graph_nodes   = 0;
+    bool fused_backend = false; // CUDA or Metal: the unrolled path must exist there
     std::vector<int32_t> tokens;
 };
 
@@ -42,6 +44,7 @@ int decode_with(const parakeet::ParakeetCtcModel & model,
     // path actually ran for this decode.
     variant.unrolled_used = rt.g_unroll != nullptr;
     variant.graph_nodes   = rt.g_unroll ? ggml_graph_n_nodes(rt.g_unroll) : 0;
+    variant.fused_backend = backend_is_cuda(rt.backend) || backend_is_metal(rt.backend);
     variant.tokens = std::move(dres.token_ids);
     return 0;
 }
@@ -105,10 +108,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (!unroll1.unrolled_used || !unroll8.unrolled_used) {
-        if (require_unrolled) {
+        if (require_unrolled && unroll8.fused_backend) {
             std::fprintf(stderr, "[tdt-unroll-parity] FAIL: no unrolled decode graph on this backend"
                                  " (n_gpu_layers=%d)\n", n_gpu_layers);
             return 1;
+        }
+        if (require_unrolled) {
+            std::fprintf(stderr, "[tdt-unroll-parity] SKIP: this backend has no fused decode ops"
+                                 " (n_gpu_layers=%d)\n", n_gpu_layers);
+            return 3;
         }
         std::printf("[tdt-unroll-parity] PASS: backend has no graph decode path,"
                     " all three variants ran the sequential loop (%zu tokens)\n",

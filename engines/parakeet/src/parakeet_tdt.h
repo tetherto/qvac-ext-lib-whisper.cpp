@@ -232,6 +232,7 @@ struct TdtRuntimeWeights {
     TdtRuntimeWeights(TdtRuntimeWeights && other) noexcept;
     TdtRuntimeWeights & operator=(TdtRuntimeWeights && other) noexcept;
     ~TdtRuntimeWeights();
+    void release();
 
     bool ready() const { return weights != nullptr; }
 };

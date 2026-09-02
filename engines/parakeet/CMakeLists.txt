@@ -501,6 +501,8 @@ if (PARAKEET_BUILD_TESTS)
         add_test(NAME ${target}
                  COMMAND $<TARGET_FILE:${QPRT_EXE}> ${QPRT_ARGS})
         set_property(TEST ${target} PROPERTY LABELS ${QPRT_LABEL})
+        # A test that finds its backend without the feature under test exits 3.
+        set_property(TEST ${target} PROPERTY SKIP_RETURN_CODE 3)
         if (WIN32)
             # When ggml builds as shared (the clang-cl / MSVC default with
             # GGML_BACKEND_DL on), test exes link against import libs and
