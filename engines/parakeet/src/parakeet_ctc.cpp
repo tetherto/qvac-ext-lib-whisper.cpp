@@ -163,6 +163,12 @@ struct NemotronPromptGraph {
     ~NemotronPromptGraph() { clear(); }
 };
 
+#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN
+constexpr bool k_flash_attn_compiled = true;
+#else
+constexpr bool k_flash_attn_compiled = false;
+#endif
+
 struct ParakeetCtcModel::Impl {
     gguf_context         * gguf           = nullptr;
     ggml_context         * ctx            = nullptr;
@@ -182,10 +188,10 @@ struct ParakeetCtcModel::Impl {
     // conformer conv module. False falls back to the portable im2col lowering.
     bool                   dw_direct_planar   = false;
     bool                   dw_direct_channels = false;
-    // True when the active backend's fused attention accepts a per-head additive mask
-    // (the relative-position bias is one bias matrix per head); otherwise heads are
-    // folded into the batch dimension for the fused attention call.
-    bool                   fa_per_head_mask   = false;
+    // Fused or unfused attention for the active backend, and whether the fused
+    // kernel takes the relative-position bias as one mask per head (otherwise
+    // heads fold into the batch dimension).
+    AttnPath               attn;
     bool                   glu_fused          = false;
     // CPU-resident copies of the Sortformer head weights (Mali-Vulkan only), so
     // the CPU head graph reads them from the CPU backend instead of
@@ -1443,7 +1449,8 @@ int load_from_gguf(const std::string & gguf_path,
     // route only that head to CPU while the encoder + CTC/TDT/EOU heads stay on GPU.
     impl->sortformer_force_cpu =
         gpu_is_mali_vulkan && impl->backend_active == impl->backend_gpu;
-    impl->fa_per_head_mask = backend_runs_flash_attn_per_head_mask(
+    impl->attn.flash_attn    = flash_attn_allowed(k_flash_attn_compiled, impl->backend_active);
+    impl->attn.per_head_mask = impl->attn.flash_attn && backend_runs_flash_attn_per_head_mask(
         impl->backend_active, out_model.encoder_cfg.head_dim, out_model.encoder_cfg.n_heads);
     impl->glu_fused = !gpu_is_mali_vulkan && backend_runs_siglu(impl->backend_active, out_model.encoder_cfg.d_model);
     if (impl->backend_gpu && impl->backend_active == impl->backend_gpu && !gpu_is_mali_vulkan) {
@@ -2345,12 +2352,29 @@ ggml_tensor * rel_shift_view(ggml_context * ctx, ggml_tensor * bd, int T) {
     return ggml_view_3d(ctx, bd, T, T, bd->ne[2], (size_t) (2 * T - 2) * f, bd->nb[2], (size_t) (T - 1) * f);
 }
 
+struct RelPosAttnInputs {
+    ggml_tensor * q;
+    ggml_tensor * k;
+    ggml_tensor * v;
+    ggml_tensor * p;
+    ggml_tensor * u_bias;
+    ggml_tensor * v_bias;
+    float         scale;
+};
+
+ggml_tensor * rel_pos_mha_flash_graph(ggml_context * ctx, const RelPosAttnInputs & in,
+                                      ggml_tensor * att_mask, const BlockWeights & W,
+                                      int H, int HD, int T, bool per_head_mask);
+ggml_tensor * rel_pos_mha_unfused_graph(ggml_context * ctx, const RelPosAttnInputs & in,
+                                        ggml_tensor * att_mask, const BlockWeights & W,
+                                        int H, int HD, int T);
+
 ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
                                 ggml_tensor * pos_emb,
                                 ggml_tensor * att_mask,
                                 const BlockWeights & W,
                                 int H, int HD, int T,
-                                bool fa_per_head_mask) {
+                                const AttnPath & attn) {
     ggml_tensor * q;
     ggml_tensor * k;
     ggml_tensor * v;
@@ -2398,7 +2422,23 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
 
     const float scale = 1.0f / std::sqrt((float) HD);
 
-#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN
+    const RelPosAttnInputs in = { q, k, v, p, u_bias, v_bias, scale };
+    if (attn.flash_attn) {
+        return rel_pos_mha_flash_graph(ctx, in, att_mask, W, H, HD, T, attn.per_head_mask);
+    }
+    return rel_pos_mha_unfused_graph(ctx, in, att_mask, W, H, HD, T);
+}
+
+ggml_tensor * rel_pos_mha_flash_graph(ggml_context * ctx, const RelPosAttnInputs & in,
+                                      ggml_tensor * att_mask, const BlockWeights & W,
+                                      int H, int HD, int T, bool per_head_mask) {
+    ggml_tensor * q = in.q;
+    ggml_tensor * k = in.k;
+    ggml_tensor * v = in.v;
+    ggml_tensor * p = in.p;
+    ggml_tensor * u_bias = in.u_bias;
+    ggml_tensor * v_bias = in.v_bias;
+    const float   scale  = in.scale;
     // Head-major views feed the bias adds, the position mat-mul and the fused
     // attention directly; nothing is materialised. The relative-position term is
     // built pre-scaled so the attention mask is softmax(scale * qk + mask) with
@@ -2418,7 +2458,7 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
     ggml_tensor * fa_mask  = att_mask ? ggml_add(ctx, bd_shift, att_mask) : bd_shift;
     ggml_tensor * bd_mask  = ggml_cast(ctx, fa_mask, GGML_TYPE_F16);
     ggml_tensor * flat;
-    if (fa_per_head_mask) {
+    if (per_head_mask) {
         ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, q_u, kp, vp, bd_mask, scale, 0.0f, 0.0f);
         flat = ggml_reshape_2d(ctx, attn_out, HD * H, T);
     } else {
@@ -2433,8 +2473,18 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
         flat = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, heads, 0, 2, 1, 3)), HD * H, T);
     }
     return maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_out_w, flat), W.attn_out_b);
-#else
-    (void) fa_per_head_mask;
+}
+
+ggml_tensor * rel_pos_mha_unfused_graph(ggml_context * ctx, const RelPosAttnInputs & in,
+                                        ggml_tensor * att_mask, const BlockWeights & W,
+                                        int H, int HD, int T) {
+    ggml_tensor * q = in.q;
+    ggml_tensor * k = in.k;
+    ggml_tensor * v = in.v;
+    ggml_tensor * p = in.p;
+    ggml_tensor * u_bias = in.u_bias;
+    ggml_tensor * v_bias = in.v_bias;
+    const float   scale  = in.scale;
     ggml_tensor * q_perm = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
     ggml_tensor * k_perm = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
     ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
@@ -2473,7 +2523,6 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
     ggml_tensor * flat     = ggml_reshape_2d(ctx, merged, HD * H, T);
 
     return maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_out_w, flat), W.attn_out_b);
-#endif
 }
 
 // How the conformer depthwise conv is lowered on the backend that runs the graph.
@@ -2636,7 +2685,7 @@ ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,
                                     int d_model, int H, int HD, int T,
                                     int conv_kernel, float eps,
                                     DwConvLowering dw_lowering,
-                                    bool fa_per_head_mask,
+                                    const AttnPath & attn,
                                     bool glu_fused,
                                     ConvNormType conv_norm_type,
                                     bool conv_causal) {
@@ -2650,7 +2699,7 @@ ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,
 
     residual = x;
     ggml_tensor * xn = layer_norm_affine(ctx, x, W.norm_attn_w, W.norm_attn_b, eps);
-    y = rel_pos_mha_graph(ctx, xn, pos_emb, att_mask, W, H, HD, T, fa_per_head_mask);
+    y = rel_pos_mha_graph(ctx, xn, pos_emb, att_mask, W, H, HD, T, attn);
     x = ggml_add(ctx, residual, y);
 
     residual = x;
@@ -2973,7 +3022,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
 
             residual = x;
             ggml_tensor * xn = layer_norm_affine(gctx, x, W.norm_attn_w, W.norm_attn_b, eps);
-            y = rel_pos_mha_graph(gctx, xn, g.pe_in, g.att_mask, W, H, HD, T, model.impl->fa_per_head_mask);
+            y = rel_pos_mha_graph(gctx, xn, g.pe_in, g.att_mask, W, H, HD, T, model.impl->attn);
             x = ggml_add(gctx, residual, y);
             g.post_attn_0_node = x;
             ggml_set_name(g.post_attn_0_node, "block_0_post_attn");
@@ -3007,7 +3056,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
         } else {
             x = conformer_block_graph(gctx, x, g.pe_in, g.att_mask, model.blocks[i],
                                       d_model, H, HD, T, conv_kernel, eps,
-                                      dw_lowering, model.impl->fa_per_head_mask, model.impl->glu_fused,
+                                      dw_lowering, model.impl->attn, model.impl->glu_fused,
                                       enc.conv_norm_type, enc.conv_causal);
         }
         if (i == n_run_layers - 1) {
@@ -3571,7 +3620,7 @@ static int build_substage_graph(const ParakeetCtcModel & model,
         ggml_tensor * r = x;
         ggml_tensor * xn = layer_norm_affine(g.ctx, x, W.norm_attn_w, W.norm_attn_b, eps);
         ggml_tensor * y = rel_pos_mha_graph(g.ctx, xn, g.pe_in, /*att_mask=*/nullptr,
-                                            W, H, HD, T, model.impl->fa_per_head_mask);
+                                            W, H, HD, T, model.impl->attn);
         x = ggml_add(g.ctx, r, y);
     }
     if (stage == Substage::CONV || stage == Substage::FULL_BLOCK) {

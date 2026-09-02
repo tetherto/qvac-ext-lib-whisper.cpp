@@ -72,6 +72,19 @@ inline bool backend_is_cpu(ggml_backend_t b) {
     return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
+// Which attention graph the encoder builds. Fused attention is compiled in
+// per build (PARAKEET_FLASH_ATTN) but selected per backend: the CPU path keeps
+// the unfused graph, so CPU output never depends on which GPU backend the
+// binary carries.
+struct AttnPath {
+    bool flash_attn    = false;
+    bool per_head_mask = false; // the fused kernel accepts one additive mask per head
+};
+
+inline bool flash_attn_allowed(bool compiled_in, ggml_backend_t b) {
+    return compiled_in && b && !backend_is_cpu(b);
+}
+
 inline bool backend_is_metal(ggml_backend_t b) {
     // Upstream ggml registered the Metal backend as "Metal" until mid-2026,
     // when the registry name changed to "MTL" (GGML_METAL_NAME). The pinned

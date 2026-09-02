@@ -1146,6 +1146,13 @@ if (PARAKEET_BUILD_TESTS)
     parakeet_apply_ccache(test-lstm-input-concat)
     parakeet_register_test(test-lstm-input-concat LABEL "unit")
 
+    # Fused attention is a build option; the CPU path must ignore it.
+    add_executable(test-attn-path test/test_attn_path.cpp)
+    target_link_libraries(test-attn-path PRIVATE ggml)
+    target_include_directories(test-attn-path PRIVATE src ggml/include)
+    parakeet_apply_ccache(test-attn-path)
+    parakeet_register_test(test-attn-path LABEL "unit")
+
     # The fused LSTM cell op and the concatenated-input GEMV must both reproduce
     # the per-gate decoder graph token for token.
     add_executable(test-tdt-lstm-parity
