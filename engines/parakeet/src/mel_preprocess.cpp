@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <exception>
 #include <thread>
+#include <utility>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -220,19 +222,39 @@ int mel_thread_count(int n_frames, int requested) {
     return std::max(1, std::min({k_mel_max_threads, by_work, by_hw}));
 }
 
+// Joins every started worker on scope exit, so a throw anywhere never destroys
+// a joinable thread.
+struct JoinedThreads {
+    explicit JoinedThreads(int n) { threads.reserve((size_t) n); }
+    ~JoinedThreads() { for (std::thread & t : threads) t.join(); }
+    template <typename F> void start(F && f) { threads.emplace_back(std::forward<F>(f)); }
+    std::vector<std::thread> threads;
+};
+
 // fn(t0, t1) handles frames [t0, t1); the calling thread takes the last range.
+// A worker's exception is carried back and rethrown on the calling thread.
 template <typename Fn>
 void parallel_over_frames(int n_frames, int requested_threads, Fn && fn) {
     const int n_threads = mel_thread_count(n_frames, requested_threads);
     if (n_threads == 1) { fn(0, n_frames); return; }
     const int per = (n_frames + n_threads - 1) / n_threads;
-    std::vector<std::thread> workers;
-    workers.reserve(n_threads - 1);
-    for (int i = 0; i < n_threads - 1; ++i) {
-        workers.emplace_back([&fn, t0 = i * per, t1 = std::min(n_frames, (i + 1) * per)] { fn(t0, t1); });
+    std::vector<std::exception_ptr> errors((size_t) n_threads);
+    {
+        JoinedThreads workers(n_threads - 1);
+        for (int i = 0; i < n_threads - 1; ++i) {
+            workers.start([&fn, &errors, i, t0 = i * per, t1 = std::min(n_frames, (i + 1) * per)] {
+                try { fn(t0, t1); } catch (...) { errors[(size_t) i] = std::current_exception(); }
+            });
+        }
+        try {
+            fn(std::min(n_frames, (n_threads - 1) * per), n_frames);
+        } catch (...) {
+            errors[(size_t) n_threads - 1] = std::current_exception();
+        }
     }
-    fn(std::min(n_frames, (n_threads - 1) * per), n_frames);
-    for (std::thread & w : workers) w.join();
+    for (const std::exception_ptr & e : errors) {
+        if (e) std::rethrow_exception(e);
+    }
 }
 
 // Window + real FFT for frames [t0, t1) with this thread's own scratch.
