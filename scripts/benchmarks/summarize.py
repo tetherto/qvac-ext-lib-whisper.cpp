@@ -162,6 +162,21 @@ def main() -> int:
         with open(step_summary, "a") as f:
             f.write(body)
     print(f"wrote {args.out} ({len(results)} rows)")
+
+    # Loudness gate. `bench` runs with `continue-on-error: true` so one
+    # family failure doesn't skip the summary — but if EVERY cell failed
+    # (misconfigured S3 role, wrong binary paths, ggml build broken) the
+    # workflow would otherwise finish green with a table full of red
+    # statuses that nobody looks at. Failing the summarize job here makes
+    # the whole dispatch red so the reader has to look at the summary.
+    ok_rows = [r for r in results if r.get("status") == "ok"]
+    if results and not ok_rows:
+        print(
+            f"FAIL: {len(results)} rows collected but 0 have status=ok. "
+            "Every cell failed — see the row-level notes.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

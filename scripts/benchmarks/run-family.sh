@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Driver invoked by .github/workflows/benchmark-desktop.yml for one
+# Driver invoked by .github/workflows/speech-benchmark-desktop.yml for one
 # (family, runner) matrix cell. Also runnable locally:
 #
 #   scripts/benchmarks/run-family.sh \
@@ -13,7 +13,7 @@
 #     "model":          "whisper-tiny",
 #     "runner":         "linux",
 #     "os":             "Linux",
-#     "backend":        "CUDA" | "Metal" | "Vulkan" | "OpenCL" | "CPU" | "unknown",
+#     "backend":        "CUDA" | "Metal" | "Vulkan" | "OpenCL" | "unknown",
 #     "wall_ms_median": 1234.5,
 #     "wall_ms_min":    1210.0,
 #     "wall_ms_max":    1301.2,
@@ -88,7 +88,6 @@ spec_field_raw() {
 BENCH_KIND="$(spec_field bench_kind)"
 BINARY_REL="$(spec_field binary)"
 S3_PREFIX="$(spec_field s3_prefix)"
-ARGS_TEMPLATE="$(spec_field args)"
 NOTES="$(spec_field notes)"
 AUDIO_DURATION_S="$(spec_field_raw audio_duration_seconds)"   # "null" or a number
 
@@ -100,7 +99,7 @@ MODEL_DIR="$MODELS_ROOT/$FAMILY"
 mkdir -p "$MODEL_DIR"
 
 # ---- output-JSON emitter (used from every exit path) ------------------------
-BACKEND="unknown"     # populated after the first successful run parses stderr / JSON
+BACKEND="unknown"     # populated from JSON or stderr scrape on a successful run
 PEAK_RSS_MIB="null"   # tracked across runs; max seen
 RTF_MEDIAN="null"     # from bench JSON (native) or computed (time-wrapped w/ audio_duration_seconds)
 
@@ -199,17 +198,29 @@ tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 JSON_OUT="$tmp_dir/native.json"
 
-# ---- expand args placeholders -----------------------------------------------
-# Native families put --runs/--warmup/--json-out (or the family-specific
-# spellings like --bench-runs / --bench-json) directly in their args string,
-# so the driver stays agnostic about the flag names each bench binary uses.
-EXPANDED_ARGS="${ARGS_TEMPLATE//\$\{MODEL_DIR\}/$MODEL_DIR}"
-EXPANDED_ARGS="${EXPANDED_ARGS//\$\{MODELS_ROOT\}/$MODELS_ROOT}"
-EXPANDED_ARGS="${EXPANDED_ARGS//\$\{AUDIO_DIR\}/$AUDIO_DIR}"
-EXPANDED_ARGS="${EXPANDED_ARGS//\$\{MODEL_PATH\}/${MODEL_PATH:-}}"
-EXPANDED_ARGS="${EXPANDED_ARGS//\$\{RUNS\}/$RUNS}"
-EXPANDED_ARGS="${EXPANDED_ARGS//\$\{WARMUP\}/$WARMUP}"
-EXPANDED_ARGS="${EXPANDED_ARGS//\$\{JSON_OUT\}/$JSON_OUT}"
+# ---- build the argv array from the JSON-array `args` field -----------------
+# families.json stores `args` as a JSON array so multi-word values (e.g.
+# "benchmark run") stay a single argv token — a plain space-separated string
+# would be word-split by the shell into ['benchmark], [run'] on
+# expansion. Every element is passed through the same placeholder
+# substitution table.
+expand_placeholder() {
+  local s="$1"
+  s="${s//\$\{MODEL_DIR\}/$MODEL_DIR}"
+  s="${s//\$\{MODELS_ROOT\}/$MODELS_ROOT}"
+  s="${s//\$\{AUDIO_DIR\}/$AUDIO_DIR}"
+  s="${s//\$\{MODEL_PATH\}/${MODEL_PATH:-}}"
+  s="${s//\$\{RUNS\}/$RUNS}"
+  s="${s//\$\{WARMUP\}/$WARMUP}"
+  s="${s//\$\{JSON_OUT\}/$JSON_OUT}"
+  printf '%s' "$s"
+}
+
+BENCH_ARGS=()
+_line=""
+while IFS= read -r _line; do
+  BENCH_ARGS+=("$(expand_placeholder "$_line")")
+done < <(jq -r --arg family "$FAMILY" '.[$family].args[]?' "$FAMILIES_JSON")
 
 BINARY="$BUILD_DIR/$BINARY_REL"
 if ! [[ -x "$BINARY" ]]; then
@@ -257,11 +268,11 @@ parse_rss_from_time_stderr() {
 }
 
 # ---- backend extraction ----------------------------------------------------
-# CPU-first default: unless we see a positive GPU-init marker, assume CPU.
-# Whisper's system_info line lists SIMD flags including "METAL = 0 | CUDA = 0"
-# even on CPU-only runs, which would false-match a plain substring grep; only
-# the specific "using <NAME> backend" line means a GPU backend was actually
-# selected.
+# The engines log a `using <NAME> backend` line only when verbose/bench flags
+# are set (parakeet-cli --verbose, native *-bench binaries always). If the
+# marker is absent we return "unknown" rather than defaulting to "CPU" —
+# assuming CPU based on the mere presence of /usr/bin/time stderr would
+# mis-label every GPU run whose engine happened to log at a lower verbosity.
 parse_backend_from_stderr() {
   local file="$1"
   local hit
@@ -269,12 +280,14 @@ parse_backend_from_stderr() {
   if [[ -n "$hit" ]]; then
     echo "$hit"; return
   fi
-  # No GPU-init marker: assume CPU when the process ran at all (either
-  # captured stderr from time or the child).
-  if [[ -s "$file" ]]; then
-    echo "CPU"; return
-  fi
   echo ""
+}
+
+# Portable millisecond timestamp. `date +%s%N` is GNU-only — BSD/macOS
+# treats the %N as a literal N. Python's time_ns() is available on both
+# runner OSes and gives nanosecond precision consistently.
+now_ns() {
+  python3 -c 'import time; print(time.time_ns())'
 }
 
 # ---- native bench: one invocation, parse the emitted JSON ------------------
@@ -289,13 +302,15 @@ parse_backend_from_stderr() {
 run_native() {
   local native_json="$1"; shift
   local stderr_log="$1"; shift
-  local rss_log="$1"; shift
+  # Ensure stderr_log exists even if wrap_time fails to write it, so the
+  # caller can safely `parse_backend_from_stderr "$stderr_log"` on either
+  # success or failure paths.
+  : > "$stderr_log"
 
-  if wrap_time "$BINARY" $EXPANDED_ARGS \
-      > "$stderr_log.stdout" 2> "$rss_log"; then
-    cat "$rss_log" >> "$stderr_log"
+  if wrap_time "$BINARY" "${BENCH_ARGS[@]}" \
+      > "$stderr_log.stdout" 2>> "$stderr_log"; then
+    :
   else
-    cat "$rss_log" >> "$stderr_log"
     return 1
   fi
 
@@ -315,21 +330,19 @@ run_native() {
   echo "${median}|${wmin}|${wmax}|${rtf}|${backend}"
 }
 
-# Portable millisecond timestamp. `date +%s%N` is GNU-only — BSD/macOS
-# treats the %N as a literal N. Python's time_ns() is available on both
-# runner OSes and gives nanosecond precision.
-now_ns() {
-  python3 -c 'import time; print(time.time_ns())'
-}
-
 # ---- time-wrapped bench: N invocations, we take the median ------------------
 run_one_time_wrapped() {
   local iter="$1" stderr_log="$2" rss_log="$3"
+  # stderr_log MUST exist by function-exit — the caller cat's it into the
+  # combined log even on failure. Touch first, then let wrap_time's redirect
+  # append its stderr.
+  : > "$stderr_log"
+  : > "$rss_log"
   local start_ns end_ns
   start_ns="$(now_ns)"
-  # shellcheck disable=SC2086
-  if ! wrap_time "$BINARY" $EXPANDED_ARGS > "$stderr_log.stdout" 2> "$rss_log"; then
-    tail -20 "$rss_log" >&2
+  if ! wrap_time "$BINARY" "${BENCH_ARGS[@]}" > "$stderr_log.stdout" 2> "$rss_log"; then
+    cat "$rss_log" >> "$stderr_log"
+    tail -20 "$stderr_log" >&2
     return 1
   fi
   end_ns="$(now_ns)"
@@ -341,9 +354,8 @@ run_one_time_wrapped() {
 case "$BENCH_KIND" in
   native)
     stderr_log="$tmp_dir/stderr.log"
-    rss_log="$tmp_dir/rss.log"
     parsed=""
-    if ! parsed="$(run_native "$JSON_OUT" "$stderr_log" "$rss_log")"; then
+    if ! parsed="$(run_native "$JSON_OUT" "$stderr_log")"; then
       BACKEND="$(parse_backend_from_stderr "$stderr_log")"
       BACKEND="${BACKEND:-unknown}"
       emit_json "run-failed" null null null " (native bench invocation failed)"

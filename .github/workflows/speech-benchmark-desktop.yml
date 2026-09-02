@@ -45,12 +45,14 @@ on:
 permissions:
   contents: read
 
-# Serialize dispatches. The self-hosted macOS runner cleans its workspace
-# at the start of each cell (rm -rf $GITHUB_WORKSPACE); two concurrent
-# dispatches would race and one would overwrite the other's in-progress
-# artefacts. cancel-in-progress: false so a running dispatch always
-# finishes — reviewers relying on a result won't have it silently
-# cancelled by the next person hitting Run.
+# Serialize dispatches. `concurrency` only orders whole dispatches — the
+# matrix fan-out inside one dispatch is still parallel, but GHA queues
+# same-label jobs on the self-hosted runner sequentially anyway. The
+# guarantee this provides is that the workspace-wipe step at the start of
+# each dispatch can't overlap with another dispatch's bench in progress.
+# cancel-in-progress: false so a running dispatch always finishes —
+# reviewers relying on a result won't have it silently cancelled by the
+# next person hitting Run.
 concurrency:
   group: speech-benchmark-desktop
   cancel-in-progress: false
@@ -92,12 +94,19 @@ jobs:
           fi
           echo "runs_per_bench=$IN_RUNS" >> "$GITHUB_OUTPUT"
 
-          # "all" -> full family list; otherwise split the comma list and trim.
+          # "all" (or empty, since the dispatch UI can save an empty string as
+          # a default) → full family list; otherwise split the comma list.
           if [[ "$IN_FAMILIES" == "all" || -z "$IN_FAMILIES" ]]; then
             families="$ALL_FAMILIES"
           else
             families="$IN_FAMILIES"
           fi
+          # Empty runners / whisper_sizes: default to the same value the
+          # workflow_dispatch input shows so a Run-with-defaults dispatch
+          # never expands to an empty matrix (which passes the
+          # `matrix != ''` guard and then fails bench).
+          if [[ -z "$IN_RUNNERS" ]]; then IN_RUNNERS="linux,macos";     fi
+          if [[ -z "$IN_WHISPER" ]]; then IN_WHISPER="tiny,base,small"; fi
 
           valid_family() {
             case "$1" in
@@ -211,6 +220,13 @@ jobs:
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # jq is used by every step from Pre-flight seed onwards. macOS runners
+      # ship it; Linux hosted runners don't, so install it before anything
+      # else that needs it.
+      - name: Install jq (Linux — macOS ships it)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y jq
+
       # Seed a fallback result.json BEFORE the infrastructure steps run.
       # If any of them (AWS OIDC, ggml build, cmake configure) fails, the
       # upload-artifact step at the end still finds a row — otherwise the
@@ -238,10 +254,6 @@ jobs:
               notes:"pre-flight seed — an infrastructure step (AWS OIDC, ggml build, cmake configure) did not complete; the row was never overwritten by run-family.sh."}' \
             > artifacts/result.json
 
-      - name: Install jq (Linux — macOS ships it)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -q && sudo apt-get install -y jq
-
       - name: Install ccache
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then
@@ -259,14 +271,28 @@ jobs:
 
       - name: Resolve ggml pin (tip of ${{ env.GGML_BRANCH }})
         id: ggml
-        run: echo "sha=$(git ls-remote "$GGML_REPO" "refs/heads/$GGML_BRANCH" | cut -f1)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          # ls-remote can fail silently under pipefail-less shells; validate
+          # the resolved SHA looks like 40 hex chars before it flows into the
+          # cache key and the fetch below.
+          sha="$(git ls-remote "$GGML_REPO" "refs/heads/$GGML_BRANCH" | cut -f1)"
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "failed to resolve $GGML_REPO@$GGML_BRANCH (got: '$sha')" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Cache ggml install
         id: ggml-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ggml-install
-          key: ggml-install-portable-${{ matrix.runner_os }}-${{ steps.ggml.outputs.sha }}
+          # Key says `perf` (not `portable`) because the ggml build below
+          # enables the runner-native backend (Metal on macOS) plus
+          # GGML_NATIVE=ON, which is unsafe to reuse across differently
+          # configured machines. Same-runner reuse is fine.
+          key: ggml-install-perf-${{ matrix.runner_os }}-${{ steps.ggml.outputs.sha }}
 
       - name: Cache ccache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -279,8 +305,17 @@ jobs:
             ccache-benchmark-${{ matrix.runner_os }}-${{ env.CACHE_FAMILY }}-
             ccache-benchmark-${{ matrix.runner_os }}-
 
+      # This is a perf workflow, not correctness-CI — so unlike the sibling
+      # *-ci.yml lanes we want the runner-optimal ggml build:
+      #   * GGML_NATIVE=ON: -march=native on the compile line, so the CPU
+      #     backend gets the same AVX/NEON dispatch a local build would.
+      #   * GGML_METAL=ON on macOS runners: Metal is the whole point of
+      #     the qvac-macos26-arm64-gpu label; a Metal-less bench would
+      #     duplicate the linux CPU numbers.
       - name: Build ggml (system ggml, qvac-ext-ggml@${{ env.GGML_BRANCH }})
         if: steps.ggml-cache.outputs.cache-hit != 'true'
+        env:
+          GGML_METAL_FLAG: ${{ runner.os == 'macOS' && 'ON' || 'OFF' }}
         run: |
           set -euo pipefail
           git init -q ggml-src
@@ -290,7 +325,8 @@ jobs:
           cmake -S ggml-src -B ggml-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
-            -DGGML_NATIVE=OFF \
+            -DGGML_NATIVE=ON \
+            -DGGML_METAL="$GGML_METAL_FLAG" \
             -DGGML_BUILD_TESTS=OFF \
             -DGGML_BUILD_EXAMPLES=OFF \
             -DCMAKE_INSTALL_PREFIX="$PWD/ggml-install"
@@ -339,6 +375,10 @@ jobs:
           # run-family.sh handles all failure paths (missing binary, fetch
           # error, warmup/run failure) by writing a result.json with the
           # right `status` field — no post-hoc override needed here.
+          #
+          # `${extra_args[@]+"${extra_args[@]}"}` is the bash-3.2-safe way
+          # to expand an empty array under set -u — macOS system bash treats
+          # an empty `"${arr[@]}"` as an unbound-variable error.
           scripts/benchmarks/run-family.sh \
             --family "$FAMILY" \
             --runs "$RUNS_PER_BENCH" \
@@ -346,7 +386,7 @@ jobs:
             --models-root "$PWD/bench-models" \
             --audio-dir engines/parakeet/test/samples \
             --runner "$RUNNER_LABEL" \
-            "${extra_args[@]}" \
+            ${extra_args[@]+"${extra_args[@]}"} \
             --out "artifacts/result.json"
 
       # Include the whisper size in the artifact name so the fan-out cells
