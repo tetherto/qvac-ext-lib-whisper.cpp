@@ -145,7 +145,16 @@ def main() -> int:
     # the "cell died before writing its pre-flight seed" case, which the
     # `not ok_rows` gate below can't see because the missing row contributes
     # zero to `results`.
-    ap.add_argument("--expected-count", type=int, default=None)
+    #
+    # The workflow calls this with `--expected-count "$EXPECTED_COUNT"`; if
+    # the plan job failed before setting the output, EXPECTED_COUNT expands
+    # to an empty string. Accept "" as "unset" so summarize can still render
+    # whatever artifacts it does find (a plan-failed dispatch has already
+    # turned the workflow red — summarize failing on top would just be
+    # noise).
+    def _opt_int(v: str) -> int | None:
+        return int(v) if v else None
+    ap.add_argument("--expected-count", type=_opt_int, default=None)
     args = ap.parse_args()
 
     if not args.results_dir.is_dir():
