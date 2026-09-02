@@ -133,6 +133,12 @@ def render_legend() -> str:
         "(minimax — no S3 path yet) / `build-failed` / `run-failed` / `fetch-failed` / "
         "`infrastructure-failed` (a pre-bench workflow step — AWS OIDC, ggml build, "
         "cmake configure — did not complete).\n"
+        "- **Linux vs macOS ggml build**: hosted Linux is a portable ggml build "
+        "(no `-march=native`, no GPU backend) — its numbers are a **floor**, "
+        "not a runner-optimal peak. Self-hosted macOS gets Metal + native "
+        "codegen. Comparing the two columns as apples-to-apples is misleading; "
+        "compare each family's Linux row across dispatches for CPU perf, "
+        "the macOS row for Metal perf.\n"
     )
 
 

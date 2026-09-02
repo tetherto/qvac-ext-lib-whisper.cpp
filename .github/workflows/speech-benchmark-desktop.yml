@@ -302,11 +302,15 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ggml-install
-          # `perf` because the macOS build carries Metal; `runner.environment`
-          # in the key so the hosted-Linux (portable, no -march=native) and
-          # self-hosted-macOS (Metal + native) artefacts never collide, and
-          # a hosted-Linux cache save from CPU A can never restore on CPU B
-          # (they're both `ubuntu-24.04` but different silicon).
+          # Safe to share across the hosted ubuntu-24.04 runner pool ONLY
+          # because GGML_NATIVE=OFF there (see the ggml build step below) —
+          # the artefact carries no -march=native codegen, so a save from
+          # CPU A can restore on CPU B. If you ever enable native codegen
+          # on hosted Linux, you MUST add a CPU-model component to this
+          # key or restore-on-older-CPU will SIGILL. The `runner.environment`
+          # component below is defence in depth against a hosted/self-hosted
+          # mixup, NOT a per-silicon separator (all hosted Linux is
+          # `github-hosted` regardless of the underlying CPU generation).
           key: ggml-install-perf-${{ matrix.runner_os }}-${{ runner.environment }}-${{ steps.ggml.outputs.sha }}
 
       - name: Cache ccache

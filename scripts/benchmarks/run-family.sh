@@ -78,6 +78,18 @@ if ! command -v jq >/dev/null; then
   echo "jq is required" >&2; exit 1
 fi
 
+# Local-run guard: on pre-macOS-26 /bin/date's %N returns the literal "N"
+# rather than nanoseconds, awk parses only the leading digits, and every
+# time-wrapped measurement silently reports ~0.0 ms. Check once at start
+# and fail loudly instead — the runners are known-good, but the driver is
+# documented as locally runnable.
+if ! [[ "$(date +%N 2>/dev/null)" =~ ^[0-9]+$ ]]; then
+  echo "run-family.sh: this shell's \`date +%N\` does not return nanoseconds" >&2
+  echo "  (got: '$(date +%N 2>/dev/null)')." >&2
+  echo "  Time-wrapped bench timings would be silently zero. Bailing." >&2
+  exit 1
+fi
+
 spec_field() {
   jq -r --arg family "$FAMILY" --arg field "$1" '.[$family][$field] // ""' "$FAMILIES_JSON"
 }
@@ -286,10 +298,8 @@ parse_backend_from_stderr() {
 }
 
 # Nanosecond timestamp. macOS 26 / arm64's /bin/date does support %N despite
-# being a GNU extension — verified `/bin/date +%s%N` returns real nanoseconds
-# on both target runners. Shelling to `python3 -c ...` for each timestamp
-# added ~20-40 ms of interpreter-startup bias inside the measured window,
-# which is enough to shift RTF on a fast bench.
+# being a GNU extension; the script-start guard above bails loudly if we
+# land on an older date that would silently return zeros.
 now_ns() {
   date +%s%N
 }
