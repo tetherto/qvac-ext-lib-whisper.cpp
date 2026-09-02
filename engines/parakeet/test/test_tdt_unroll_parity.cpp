@@ -7,6 +7,8 @@
 #include "parakeet_tdt.h"
 #include "mel_preprocess.h"
 
+#include "ggml.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +20,7 @@ struct DecodeVariant {
     const char * name;
     int  unroll_steps;
     bool unrolled_used = false;
+    int  graph_nodes   = 0;
     std::vector<int32_t> tokens;
 };
 
@@ -38,6 +41,7 @@ int decode_with(const parakeet::ParakeetCtcModel & model,
     // Ground truth, not inference: the graph pointer says whether the unrolled
     // path actually ran for this decode.
     variant.unrolled_used = rt.g_unroll != nullptr;
+    variant.graph_nodes   = rt.g_unroll ? ggml_graph_n_nodes(rt.g_unroll) : 0;
     variant.tokens = std::move(dres.token_ids);
     return 0;
 }
@@ -114,6 +118,10 @@ int main(int argc, char ** argv) {
 
     if (int rc = compare_to_reference(sequential, unroll1); rc != 0) return rc;
     if (int rc = compare_to_reference(sequential, unroll8); rc != 0) return rc;
+
+    std::printf("[tdt-unroll-parity] graph nodes: K=1 %d, K=8 %d, per extra step %d\n",
+                unroll1.graph_nodes, unroll8.graph_nodes,
+                (unroll8.graph_nodes - unroll1.graph_nodes)/7);
 
     std::printf("[tdt-unroll-parity] PASS: %zu tokens identical for the sequential loop, K=1 and K=8\n",
                 sequential.tokens.size());

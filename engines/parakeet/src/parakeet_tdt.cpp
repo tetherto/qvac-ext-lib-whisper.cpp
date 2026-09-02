@@ -363,6 +363,13 @@ struct LstmCellOuts {
     std::vector<ggml_tensor *> c;
 };
 
+// Per-step select for the fused cell: a layer keeps rows[l] when `update` is
+// zero, so the state update needs no blend afterwards.
+struct LstmCellMask {
+    const std::vector<ggml_tensor *> * rows = nullptr;
+    ggml_tensor * update = nullptr;
+};
+
 LstmStateRows persist_state_rows(ggml_context * gctx, ggml_tensor * hc_persist, int H, int L) {
     LstmStateRows rows;
     for (int l = 0; l < L; ++l) {
@@ -387,7 +394,8 @@ LstmStateRows packed_state_rows(ggml_context * gctx,
 LstmCellOuts build_lstm_cells(TdtRuntimeWeights & rt,
                               ggml_context * gctx,
                               ggml_tensor * token_in,
-                              const LstmStateRows & prev) {
+                              const LstmStateRows & prev,
+                              const LstmCellMask & mask = {}) {
     const int H = rt.H_pred;
     const int L = rt.L;
 
@@ -408,7 +416,9 @@ LstmCellOuts build_lstm_cells(TdtRuntimeWeights & rt,
                                 : build_lstm_gates_split(gctx, w, x, h_l_in);
 
         if (rt.fused_lstm_cell) {
-            ggml_tensor * hc = ggml_lstm_cell(gctx, gates, c_l_in);
+            ggml_tensor * hc = mask.update
+                                 ? ggml_lstm_cell_masked(gctx, gates, (*mask.rows)[l], mask.update)
+                                 : ggml_lstm_cell(gctx, gates, c_l_in);
             outs.hc.push_back(hc);
             x = ggml_view_1d(gctx, hc, H, 0);
             continue;
@@ -646,7 +656,7 @@ void build_lstm_joint_graph(TdtRuntimeWeights & rt) {
 // emitted token -> ggml_tdt_step control -> masked state update. Chaining K of
 // them in one graph replaces K command-buffer commits and K host readbacks with
 // one of each; steps that fall past the window, and steps that decoded a blank,
-// multiply their LSTM result by a zero mask and leave the state as it was.
+// carry a zero update mask and leave the state as it was.
 
 // Slot budget per unrolled step. The joint body, LSTM body, control op and
 // state blend together stay well inside this.
@@ -678,9 +688,9 @@ std::vector<ggml_tensor *> pack_lstm_rows(TdtRuntimeWeights & rt, ggml_context *
     return rows;
 }
 
-// state = update * fresh + hold * held. Both masks are exactly 0.0 or 1.0 and
-// the LSTM result is finite, so a held step reproduces the previous state bit
-// for bit.
+// state = update * fresh + hold * held, for the decomposed cell that has no
+// masked form. Both masks are exactly 0.0 or 1.0 and the LSTM result is finite,
+// so a held step reproduces the previous state bit for bit.
 std::vector<ggml_tensor *> blend_state_rows(ggml_context * ctx,
                                             const std::vector<ggml_tensor *> & fresh,
                                             const std::vector<ggml_tensor *> & held,
@@ -713,6 +723,19 @@ struct UnrollStepOuts {
     std::vector<ggml_tensor *> state;       // packed [2H] per layer
 };
 
+// The fused cell selects held vs fresh itself; the decomposed cell has no masked
+// form and still blends the two afterwards.
+std::vector<ggml_tensor *> unroll_step_state(TdtRuntimeWeights & rt, ggml_context * ctx,
+                                             const LstmCellOuts & cells,
+                                             const std::vector<ggml_tensor *> & state_in,
+                                             ggml_tensor * ctl) {
+    std::vector<ggml_tensor *> fresh = pack_lstm_rows(rt, ctx, cells);
+    if (rt.fused_lstm_cell) return fresh;
+    return blend_state_rows(ctx, fresh, state_in,
+                            step_out_view(ctx, ctl, GGML_TDT_STEP_OUT_UPDATE),
+                            step_out_view(ctx, ctl, GGML_TDT_STEP_OUT_HOLD));
+}
+
 UnrollStepOuts build_unroll_step(TdtRuntimeWeights & rt, ggml_context * ctx,
                                  const std::vector<ggml_tensor *> & state_in,
                                  ggml_tensor * counters_in,
@@ -726,16 +749,20 @@ UnrollStepOuts build_unroll_step(TdtRuntimeWeights & rt, ggml_context * ctx,
     out.token    = joint.token;
     out.duration = joint.duration;
 
-    LstmCellOuts cells = build_lstm_cells(rt, ctx, out.token, packed_state_rows(ctx, state_in, H));
-
     ggml_tensor * ctl = ggml_tdt_step(ctx, out.token,
                                       out.duration ? out.duration : rt.zero_dur_idx,
                                       counters_in, rt.dur_table,
                                       blank_id, max_symbols, rt.rnnt_mode ? 1 : 0);
 
-    out.state = blend_state_rows(ctx, pack_lstm_rows(rt, ctx, cells), state_in,
-                                 step_out_view(ctx, ctl, GGML_TDT_STEP_OUT_UPDATE),
-                                 step_out_view(ctx, ctl, GGML_TDT_STEP_OUT_HOLD));
+    LstmCellMask mask;
+    if (rt.fused_lstm_cell) {
+        mask.rows   = &state_in;
+        mask.update = step_out_view(ctx, ctl, GGML_TDT_STEP_OUT_UPDATE);
+    }
+    LstmCellOuts cells = build_lstm_cells(rt, ctx, out.token,
+                                          packed_state_rows(ctx, state_in, H), mask);
+
+    out.state         = unroll_step_state(rt, ctx, cells, state_in, ctl);
     out.counters_next = ggml_view_1d(ctx, ctl, GGML_TDT_STEP_N_INS, 0);
     out.frame_next    = ggml_cast(ctx, step_out_view(ctx, ctl, GGML_TDT_STEP_OUT_FRAME),
                                   GGML_TYPE_I32);
