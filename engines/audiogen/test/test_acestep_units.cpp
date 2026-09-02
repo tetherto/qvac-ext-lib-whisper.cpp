@@ -1254,6 +1254,12 @@ void test_simple_mode_prompt_resolvers() {
     CHECK(resolve_prompt_lyrics(params).empty());
     CHECK(resolve_prompt_language(params).empty());
 
+    params.simple_mode   = false;
+    params.rewrite_query = true;
+    CHECK(resolve_prompt_language(params).empty());
+    params.rewrite_query = false;
+
+    params.simple_mode = true;
     params.lyrics = "[Instrumental]";
     params.vocal_language = "es";
     CHECK(resolve_prompt_lyrics(params) == "[Instrumental]");

@@ -798,9 +798,11 @@ static bool needs_lm_phase_one(const GenerateParams & params, const AcePrompt & 
     return params.lm_phase1 && !has_complete_metadata(prompt);
 }
 
-// Fields simple mode left empty for the LM must never stay empty past Phase 1:
-// downstream prompt building and metadata reporting rely on them.
-static void finalize_simple_mode_prompt(GenerationState & state) {
+// Fields the LM expansion (Inspire or Format) left empty must never stay
+// empty past Phase 1: downstream prompt building and metadata reporting rely
+// on them, and state.language must carry the LM-chosen language into
+// tokenize_prompt.
+static void finalize_lm_expanded_prompt(GenerationState & state) {
     if (state.prompt.lyrics.empty()) state.prompt.lyrics = INSTRUMENTAL_LYRICS;
     if (state.prompt.vocal_language.empty()) state.prompt.vocal_language = DEFAULT_VOCAL_LANGUAGE;
     state.language = state.prompt.vocal_language;
@@ -818,7 +820,7 @@ static bool run_lm_phase_one(EngineImpl & engine, const GenerateParams & params,
                               : params.rewrite_query ? LmPhase1Mode::Format
                                                      : LmPhase1Mode::Auto;
     if (lm_generate_phase1(engine.lm, engine.bpe_lm, state.prompt, phase_one, true, true, mode)) {
-        if (params.simple_mode) finalize_simple_mode_prompt(state);
+        if (params.simple_mode || params.rewrite_query) finalize_lm_expanded_prompt(state);
         return true;
     }
     if (engine.cancel_flag.load()) return false;

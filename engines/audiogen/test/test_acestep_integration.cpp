@@ -637,6 +637,8 @@ void run_query_rewrite_scenario(tts_cpp::acestep::Engine & engine) {
     CHECK(!result.metadata.lyrics.empty());
     CHECK(result.metadata.bpm > 0);
     CHECK(!result.metadata.keyscale.empty());
+    CHECK(result.metadata.timesignature > 0);
+    CHECK(!result.metadata.vocal_language.empty());
 }
 
 tts_cpp::acestep::GenerateParams make_lm_cancel_params() {

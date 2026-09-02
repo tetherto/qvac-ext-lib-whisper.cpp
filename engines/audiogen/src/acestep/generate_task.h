@@ -52,13 +52,13 @@ inline constexpr const char * DEFAULT_VOCAL_LANGUAGE = "en";
 inline constexpr const char * EDIT_VOCAL_LANGUAGE    = "unknown";
 inline constexpr const char * INSTRUMENTAL_LYRICS    = "[Instrumental]";
 
-// Simple mode keeps an unset language empty so the LM inspire pass picks it;
-// otherwise the engine defaults apply before the prompt is built, with the
-// neutral language for the edit path and lego (a single language token skews
-// 50-step CFG sampling toward vocals).
+// Simple mode and query rewriting keep an unset language empty so the LM
+// expansion pass picks it; otherwise the engine defaults apply before the
+// prompt is built, with the neutral language for the edit path and lego (a
+// single language token skews 50-step CFG sampling toward vocals).
 inline std::string resolve_prompt_language(const GenerateParams & params) {
     if (!params.vocal_language.empty()) return params.vocal_language;
-    if (params.simple_mode) return {};
+    if (params.simple_mode || params.rewrite_query) return {};
     const bool language_neutral = !params.edit_plan.empty() || is_lego_task(params.task_type);
     return language_neutral ? EDIT_VOCAL_LANGUAGE : DEFAULT_VOCAL_LANGUAGE;
 }
