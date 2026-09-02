@@ -284,6 +284,115 @@ int check_transcript(
     return 0;
 }
 
+int check_public_streaming(
+    const std::string & model_path,
+    const std::string & wav_path,
+    const std::string & reference_dir) {
+    parakeet::EngineOptions options;
+    options.model_gguf_path = model_path;
+    options.language = "en-US";
+    parakeet::Engine engine(options);
+
+    parakeet::StreamingOptions streaming_options;
+    streaming_options.sample_rate = 16000;
+    streaming_options.chunk_ms = 320;
+
+    const std::string expected_text =
+        load_text(reference_dir + "/transcript.txt");
+
+    int callback_index = 0;
+    bool callback_order_ok = true;
+    std::string callback_text;
+    const auto collect_segment =
+        [&](const parakeet::StreamingSegment & segment) {
+            if (segment.chunk_index != callback_index ||
+                segment.end_s < segment.start_s) {
+                callback_order_ok = false;
+            }
+            callback_text += segment.text;
+            ++callback_index;
+        };
+
+    const parakeet::EngineResult callback_result =
+        engine.transcribe_stream(
+            wav_path,
+            streaming_options,
+            collect_segment);
+    if (!callback_order_ok ||
+        callback_index == 0 ||
+        callback_text != expected_text ||
+        callback_result.text != expected_text) {
+        std::fprintf(
+            stderr,
+            "Nemotron callback streaming mismatch\n"
+            "chunks=%d order_ok=%d\n"
+            "actual:   %s\n"
+            "result:   %s\n"
+            "expected: %s\n",
+            callback_index,
+            callback_order_ok ? 1 : 0,
+            callback_text.c_str(),
+            callback_result.text.c_str(),
+            expected_text.c_str());
+        return 40;
+    }
+
+    std::vector<float> samples;
+    int sample_rate = 0;
+    if (int rc = parakeet::load_wav_mono_f32(
+            wav_path, samples, sample_rate); rc != 0) {
+        return rc;
+    }
+
+    callback_index = 0;
+    callback_order_ok = true;
+    callback_text.clear();
+    auto session = engine.stream_start(
+        streaming_options,
+        collect_segment);
+
+    const int burst_sizes[] = {
+        37, 997, 160, 4093, 511, 73, 2048,
+    };
+    size_t offset = 0;
+    size_t burst_index = 0;
+    while (offset < samples.size()) {
+        const size_t count = std::min(
+            samples.size() - offset,
+            static_cast<size_t>(burst_sizes[
+                burst_index %
+                (sizeof(burst_sizes) / sizeof(burst_sizes[0]))]));
+        session->feed_pcm_f32(
+            samples.data() + offset,
+            static_cast<int>(count));
+        offset += count;
+        ++burst_index;
+    }
+    session->finalize();
+
+    if (!callback_order_ok ||
+        callback_index == 0 ||
+        callback_text != expected_text) {
+        std::fprintf(
+            stderr,
+            "Nemotron live StreamSession mismatch\n"
+            "chunks=%d order_ok=%d\n"
+            "actual:   %s\n"
+            "expected: %s\n",
+            callback_index,
+            callback_order_ok ? 1 : 0,
+            callback_text.c_str(),
+            expected_text.c_str());
+        return 41;
+    }
+
+    std::fprintf(
+        stderr,
+        "Nemotron public streaming passed: %d chunks\n",
+        callback_index);
+    return 0;
+}
+
 }
 
 int main(int argc, char ** argv) {
@@ -303,6 +412,10 @@ int main(int argc, char ** argv) {
             argv[1], argv[2], "en-US", argv[3]); rc != 0) {
         return rc;
     }
+    if (int rc = check_public_streaming(
+            argv[1], argv[2], argv[3]); rc != 0) {
+        return rc;
+    }
     if (int rc = check_transcript(
             argv[1], argv[2], "", argv[4]); rc != 0) {
         return rc;
@@ -312,6 +425,6 @@ int main(int argc, char ** argv) {
         return rc;
     }
 
-    std::fprintf(stderr, "Nemotron offline parity tests passed\n");
+    std::fprintf(stderr, "Nemotron tests passed\n");
     return 0;
 }

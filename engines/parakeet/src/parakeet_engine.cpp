@@ -656,9 +656,52 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
             "Sortformer is a diarization model. Use Engine::diarize().");
     }
     if (pimpl_->model.model_type == ParakeetModelType::NEMOTRON) {
-        throw std::runtime_error(
-            "parakeet::Engine::transcribe_samples_stream: Nemotron model loading "
-            "is available, but cache-aware streaming is not implemented yet");
+        pimpl_->cancel_flag.store(false);
+
+        const auto started = std::chrono::steady_clock::now();
+        const double frame_stride_ms =
+            encoder_frame_stride_ms(pimpl_->model);
+
+        EngineResult result;
+        result.audio_samples = n_samples;
+        result.sample_rate = sample_rate;
+        result.mel_frames = std::max(
+            1,
+            n_samples / pimpl_->model.mel_cfg.hop_length);
+
+        StreamingOptions session_options = opts;
+        session_options.sample_rate = sample_rate;
+
+        auto session = stream_start(
+            session_options,
+            [&](const StreamingSegment & segment) {
+                result.token_ids.insert(
+                    result.token_ids.end(),
+                    segment.token_ids.begin(),
+                    segment.token_ids.end());
+
+                result.text = detokenize(
+                    pimpl_->model.vocab,
+                    result.token_ids);
+
+                result.encoder_ms += segment.encoder_ms;
+                result.decode_ms += segment.decode_ms;
+                result.encoder_frames = std::max(
+                    result.encoder_frames,
+                    static_cast<int>(std::llround(
+                        segment.end_s * 1000.0 /
+                        frame_stride_ms)));
+
+                if (on_segment) {
+                    on_segment(segment);
+                }
+            });
+
+        session->feed_pcm_f32(samples, n_samples);
+        session->finalize();
+
+        result.total_ms = ms_since(started);
+        return result;
     }
 
     pimpl_->cancel_flag.store(false);
@@ -1187,6 +1230,7 @@ struct StreamSession::Impl {
     int32_t prev_token     = -1;
     TdtDecodeState transducer_state;
     EouDecodeState eou_state;
+    std::unique_ptr<NemotronStreamState> nemotron_state;
 
     std::string             cumulative_text;
     std::vector<int32_t>    cumulative_token_ids;
@@ -1210,7 +1254,116 @@ struct StreamSession::Impl {
                         bool is_final_chunk);
     void try_emit_chunks();
     void flush_remainder();
+
+    void drain_nemotron(bool finalize);
+
+    void cancel_session() {
+        cancelled = true;
+
+        if (nemotron_state) {
+            cancel_nemotron_stream(*nemotron_state);
+        }
+    }
 };
+
+void StreamSession::Impl::drain_nemotron(bool finalize) {
+    if (!nemotron_state) {
+        throw std::runtime_error(
+            "StreamSession: Nemotron stream state is not initialized");
+    }
+
+    auto & model = engine_impl->model;
+    auto & state = *nemotron_state;
+
+    while (!cancelled) {
+        if (engine_impl->cancel_flag.load()) {
+            cancel_session();
+            break;
+        }
+
+        std::vector<float> processed_signal;
+        int n_mel_frames = 0;
+
+        const int ready = next_nemotron_processed_signal(
+            state,
+            model.mel_cfg.n_mels,
+            finalize,
+            processed_signal,
+            n_mel_frames);
+
+        if (ready < 0) {
+            throw std::runtime_error(
+                "StreamSession: preparing Nemotron chunk failed "
+                "(rc=" + std::to_string(ready) + ")");
+        }
+        if (ready == 0) {
+            break;
+        }
+
+        const int64_t start_encoder_frame =
+            state.emitted_encoder_frames;
+        const auto started = std::chrono::steady_clock::now();
+
+        const bool last_chunk =
+            finalize && nemotron_pending_mel_frames(state) == 0;
+
+        NemotronStreamStepResult result;
+        const int rc = run_nemotron_stream_step(
+            model,
+            engine_impl->transducer_rt,
+            processed_signal.data(),
+            n_mel_frames,
+            model.mel_cfg.n_mels,
+            last_chunk,
+            state,
+            result);
+
+        if (rc != 0) {
+            throw std::runtime_error(
+                "StreamSession: Nemotron stream step failed "
+                "(rc=" + std::to_string(rc) + ")");
+        }
+
+        const size_t previous_text_size = cumulative_text.size();
+        cumulative_token_ids.insert(
+            cumulative_token_ids.end(),
+            result.new_token_ids.begin(),
+            result.new_token_ids.end());
+        cumulative_text = result.text;
+
+        if (on_segment) {
+            const double frame_stride_s =
+                encoder_frame_stride_ms(model) / 1000.0;
+
+            StreamingSegment segment;
+            segment.text =
+                cumulative_text.substr(previous_text_size);
+            segment.token_ids = result.new_token_ids;
+            segment.start_s =
+                static_cast<double>(start_encoder_frame) *
+                frame_stride_s;
+            segment.end_s =
+                static_cast<double>(state.emitted_encoder_frames) *
+                frame_stride_s;
+            segment.chunk_index = chunk_index;
+            segment.is_final = true;
+            segment.starts_word = result.new_token_ids.empty()
+                ? true
+                : token_is_word_start(
+                    model.vocab, result.new_token_ids.front());
+            segment.encoder_ms = ms_since(started);
+            segment.decode_ms = 0.0;
+
+            on_segment(segment);
+        }
+
+        ++chunk_index;
+
+        if (last_chunk) {
+            break;
+        }
+    }
+}
 
 void StreamSession::Impl::process_window(const float * window_samples, int window_n,
                                          int center_start_sample,
@@ -1404,7 +1557,7 @@ StreamSession::StreamSession(std::unique_ptr<Impl> impl)
 
 StreamSession::~StreamSession() {
     if (pimpl_ && !pimpl_->finalized && !pimpl_->cancelled) {
-        try { pimpl_->cancelled = true; } catch (...) {}
+        try { pimpl_->cancel_session(); } catch (...) {}
     }
 }
 StreamSession::StreamSession(StreamSession &&) noexcept = default;
@@ -1432,17 +1585,49 @@ static void stream_drive_energy_vad(StreamSession::Impl & impl,
     impl.opts.on_event(ev);
 }
 
-void StreamSession::feed_pcm_f32(const float * samples, int n_samples) {
-    if (!pimpl_) throw std::runtime_error("StreamSession: moved-from session");
+void StreamSession::feed_pcm_f32(
+        const float * samples,
+        int n_samples) {
+    if (!pimpl_) {
+        throw std::runtime_error(
+            "StreamSession: moved-from session");
+    }
     if (pimpl_->finalized) {
-        throw std::runtime_error("StreamSession::feed_pcm_f32: session already finalized");
+        throw std::runtime_error(
+            "StreamSession::feed_pcm_f32: session already finalized");
     }
     if (pimpl_->cancelled) return;
     if (!samples || n_samples <= 0) return;
-    stream_drive_energy_vad(*pimpl_, samples, n_samples,
-                            pimpl_->total_pcm_seen);
+
+    stream_drive_energy_vad(
+        *pimpl_,
+        samples,
+        n_samples,
+        pimpl_->total_pcm_seen);
     pimpl_->total_pcm_seen += n_samples;
-    pimpl_->pending.insert(pimpl_->pending.end(), samples, samples + n_samples);
+
+    if (pimpl_->nemotron_state) {
+        const int rc = append_nemotron_pcm(
+            pimpl_->engine_impl->model,
+            *pimpl_->nemotron_state,
+            samples,
+            n_samples,
+            false);
+
+        if (rc != 0) {
+            throw std::runtime_error(
+                "StreamSession::feed_pcm_f32: appending Nemotron PCM failed "
+                "(rc=" + std::to_string(rc) + ")");
+        }
+
+        pimpl_->drain_nemotron(false);
+        return;
+    }
+
+    pimpl_->pending.insert(
+        pimpl_->pending.end(),
+        samples,
+        samples + n_samples);
     pimpl_->try_emit_chunks();
 }
 
@@ -1453,6 +1638,21 @@ void StreamSession::feed_pcm_i16(const int16_t * samples, int n_samples) {
     }
     if (pimpl_->cancelled) return;
     if (!samples || n_samples <= 0) return;
+
+    if (pimpl_->nemotron_state) {
+        std::vector<float> converted(
+            static_cast<size_t>(n_samples));
+
+        constexpr float inv = 1.0f / 32768.0f;
+        for (int i = 0; i < n_samples; ++i) {
+            converted[static_cast<size_t>(i)] =
+                static_cast<float>(samples[i]) * inv;
+        }
+
+        feed_pcm_f32(converted.data(), n_samples);
+        return;
+    }
+
     const size_t prev = pimpl_->pending.size();
     pimpl_->pending.resize(prev + n_samples);
     constexpr float inv = 1.0f / 32768.0f;
@@ -1468,14 +1668,60 @@ void StreamSession::feed_pcm_i16(const int16_t * samples, int n_samples) {
 void StreamSession::finalize() {
     if (!pimpl_) return;
     if (pimpl_->finalized) return;
+
     pimpl_->finalized = true;
+
+    if (pimpl_->cancelled) return;
+
+    if (pimpl_->nemotron_state) {
+        auto & model = pimpl_->engine_impl->model;
+        auto & state = *pimpl_->nemotron_state;
+
+        int rc = append_nemotron_pcm(
+            model,
+            state,
+            nullptr,
+            0,
+            true);
+
+        if (rc != 0) {
+            throw std::runtime_error(
+                "StreamSession::finalize: flushing Nemotron PCM failed "
+                "(rc=" + std::to_string(rc) + ")");
+        }
+
+        pimpl_->drain_nemotron(false);
+        pimpl_->drain_nemotron(true);
+
+        if (!state.finalized) {
+            NemotronStreamStepResult result;
+            rc = run_nemotron_stream_step(
+                model,
+                pimpl_->engine_impl->transducer_rt,
+                nullptr,
+                0,
+                model.mel_cfg.n_mels,
+                true,
+                state,
+                result);
+
+            if (rc != 0) {
+                throw std::runtime_error(
+                    "StreamSession::finalize: finalizing Nemotron state failed "
+                    "(rc=" + std::to_string(rc) + ")");
+            }
+        }
+
+        return;
+    }
+
     pimpl_->try_emit_chunks();
     pimpl_->flush_remainder();
 }
 
 void StreamSession::cancel() {
     if (!pimpl_) return;
-    pimpl_->cancelled = true;
+    pimpl_->cancel_session();
 }
 
 std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opts,
@@ -1496,16 +1742,48 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
             "Engine::stream_start: streaming is for transcription models only; "
             "Sortformer is a diarization model. Use Engine::diarize().");
     }
-    if (pimpl_->model.model_type == ParakeetModelType::NEMOTRON) {
-        throw std::runtime_error(
-            "Engine::stream_start: Nemotron model loading is available, but "
-            "cache-aware streaming is not implemented yet");
-    }
+
+    pimpl_->cancel_flag.store(false);
 
     auto impl = std::make_unique<StreamSession::Impl>();
     impl->engine_impl  = pimpl_.get();
     impl->opts         = opts;
     impl->on_segment   = std::move(on_segment);
+
+    if (pimpl_->model.model_type == ParakeetModelType::NEMOTRON) {
+        const auto & chunk_sizes =
+            pimpl_->model.nemotron_cfg.allowed_chunk_ms;
+        const auto & right_contexts =
+            pimpl_->model.nemotron_cfg.allowed_right_context_frames;
+        const auto chunk_it = std::find(
+            chunk_sizes.begin(), chunk_sizes.end(), opts.chunk_ms);
+
+        if (chunk_it == chunk_sizes.end() ||
+            chunk_sizes.size() != right_contexts.size()) {
+            throw std::runtime_error(
+                "Engine::stream_start: unsupported Nemotron chunk_ms; "
+                "supported values are 80, 160, 320, 560, and 1120");
+        }
+
+        const size_t operating_point = static_cast<size_t>(
+            chunk_it - chunk_sizes.begin());
+        const int right_context_frames =
+            right_contexts[operating_point];
+
+        impl->nemotron_state = std::make_unique<NemotronStreamState>();
+
+        const int rc = init_nemotron_stream_state(
+            pimpl_->model,
+            pimpl_->opts.language,
+            right_context_frames,
+            *impl->nemotron_state);
+
+        if (rc != 0) {
+            throw std::runtime_error(
+                "Engine::stream_start: Nemotron stream initialization failed "
+                "(rc=" + std::to_string(rc) + ")");
+        }
+    }
 
     const int sr = opts.sample_rate;
     impl->chunk_samples           = sr * opts.chunk_ms / 1000;
@@ -1521,7 +1799,8 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
             (int) pimpl_->model.blank_id,
             impl->transducer_state);
     }
-    // Optional EnergyVad for CTC/RNN-T/TDT only (EOU uses `<EOU>`; Sortformer uses SortformerStreamSession).
+    // Optional EnergyVad for CTC/RNN-T/TDT/Nemotron only (EOU uses `<EOU>`;
+    // Sortformer uses SortformerStreamSession).
     if (opts.enable_energy_vad &&
         pimpl_->model.model_type != ParakeetModelType::EOU) {
         impl->energy_vad = std::make_unique<EnergyVad>(

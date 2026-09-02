@@ -45,12 +45,13 @@ void print_usage(const char * argv0) {
         "  TDT 1.1B                                  -> English-only transcription, no PnC\n"
         "  EOU        (parakeet_realtime_eou_120m-v1) -> low-latency streaming ASR with\n"
         "                                                native end-of-utterance token\n"
-        "  Nemotron   (3.5 ASR Streaming 0.6B)       -> locale-conditioned offline ASR\n"
+        "  Nemotron   (3.5 ASR Streaming 0.6B)       -> locale-conditioned ASR with\n"
+        "                                                cache-aware streaming\n"
         "  Sortformer (diar_sortformer_4spk-v1, v2)   -> 4-speaker diarization\n"
         "Combined ASR + diarization (\"who said what\") via --diarization-model.\n"
         "\n"
         "options:\n"
-        "  --model PATH         path to a CTC, RNN-T, TDT, EOU, or Sortformer GGUF (required)\n"
+        "  --model PATH         path to a CTC, RNN-T, TDT, EOU, Nemotron, or Sortformer GGUF (required)\n"
         "  --wav PATH           path to a 16 kHz mono wav file\n"
         "  --pcm-in PATH        path to a raw PCM file (mono, format selected by --pcm-format)\n"
         "  --pcm-format FMT     raw PCM sample format: s16le (default) or f32le\n"
@@ -104,18 +105,20 @@ void print_usage(const char * argv0) {
         "\n"
         "  --stream             enable streaming. Without --stream-duplex this is Mode 2:\n"
         "                       runs the offline encoder once, then emits one segment per\n"
-        "                       --stream-chunk-ms window via callback. Transcript is\n"
-        "                       byte-equal to the non-streaming path.\n"
-        "  --stream-duplex      enable Mode 3 duplex rolling-context streaming: feeds the\n"
-        "                       audio into a StreamSession in blocks and re-encodes each\n"
-        "                       sliding window with left-context + right-lookahead; there\n"
-        "                       is no encoder KV or convolution cache. Emits segments\n"
+        "                       --stream-chunk-ms window via callback. Nemotron instead\n"
+        "                       uses its native cache-aware encoder in both modes.\n"
+        "  --stream-duplex      enable Mode 3 duplex streaming: feeds the audio into a\n"
+        "                       StreamSession in blocks. CTC/RNN-T/TDT/EOU re-encode each\n"
+        "                       sliding window with left-context + right-lookahead (no\n"
+        "                       encoder KV or convolution cache). Nemotron uses bounded\n"
+        "                       attention and convolution caches instead. Emits segments\n"
         "                       as soon as each chunk is processed. Incurs per-chunk\n"
         "                       encoder cost but first segment lands at ~chunk_ms +\n"
         "                       right_lookahead_ms. Typical WER: ~0 %% on short clean\n"
         "                       speech, ~4 %% on long sci-fi narration at the default\n"
         "                       context budget. Requires --stream.\n"
-        "  --stream-chunk-ms N  segment window stride in ms (default 1000 Mode 2 /\n"
+        "  --stream-chunk-ms N  segment window stride in ms (default 1000; Nemotron\n"
+        "                       defaults to 320 and supports 80, 160, 320, 560, 1120)\n"
         "                       2000 Mode 3 recommended; snaps to the encoder frame\n"
         "                       stride, which is 80 ms on every shipped GGUF -- a\n"
         "                       different mel hop or subsampling factor would change\n"
@@ -1043,7 +1046,10 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
 
         StreamingOptions sopts;
         sopts.sample_rate       = sr;
-        sopts.chunk_ms          = extra.stream_chunk_ms;
+        sopts.chunk_ms          = engine.model_type() == "nemotron" &&
+                                  extra.stream_chunk_ms == 1000
+                                ? 320
+                                : extra.stream_chunk_ms;
         if (extra.stream_left_ms  >= 0) sopts.left_context_ms    = extra.stream_left_ms;
         if (extra.stream_right_ms >= 0) sopts.right_lookahead_ms = extra.stream_right_ms;
 

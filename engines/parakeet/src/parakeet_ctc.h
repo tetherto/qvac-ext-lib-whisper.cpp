@@ -554,6 +554,7 @@ int run_nemotron_stream_step(
 
 void cancel_nemotron_stream(NemotronStreamState & state);
 void reset_nemotron_stream(NemotronStreamState & state);
+int nemotron_pending_mel_frames(const NemotronStreamState & state);
 
 // Run the conformer block stack on pre-subsampled embeddings, skipping the
 // subsampling/pre_encode block. Used by the v2.1 streaming (AOSC) path where

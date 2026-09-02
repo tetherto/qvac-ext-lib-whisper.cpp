@@ -644,6 +644,15 @@ void cancel_nemotron_stream(NemotronStreamState & state) {
     state.cancelled = true;
 }
 
+int nemotron_pending_mel_frames(const NemotronStreamState & state) {
+    if (!state.impl || state.impl->mel_width <= 0) {
+        return 0;
+    }
+    return static_cast<int>(
+        state.impl->pending_mel.size() /
+        static_cast<size_t>(state.impl->mel_width));
+}
+
 int init_nemotron_stream_state(
     const ParakeetCtcModel & model,
     const std::string & language,

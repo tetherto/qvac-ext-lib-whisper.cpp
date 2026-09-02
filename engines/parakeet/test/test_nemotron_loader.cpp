@@ -2,22 +2,12 @@
 #include "parakeet/streaming.h"
 #include "parakeet_ctc.h"
 
+#include <cstdint>
 #include <cstdio>
-#include <functional>
 #include <stdexcept>
 #include <string>
 
 namespace {
-
-bool throws_not_implemented(const std::function<void()> & action) {
-    try {
-        action();
-    } catch (const std::runtime_error & error) {
-        return std::string(error.what()).find("not implemented") !=
-            std::string::npos;
-    }
-    return false;
-}
 
 int check_loaded_model(const std::string & path) {
     parakeet::ParakeetCtcModel model;
@@ -87,7 +77,7 @@ int check_loaded_model(const std::string & path) {
     return 0;
 }
 
-int check_engine_guard(const std::string & path) {
+int check_engine_stream_creation(const std::string & path) {
     parakeet::EngineOptions options;
     options.model_gguf_path = path;
     options.prewarm = false;
@@ -98,22 +88,72 @@ int check_engine_guard(const std::string & path) {
         return 8;
     }
 
-    const float sample = 0.0f;
     parakeet::StreamingOptions streaming_options;
+    streaming_options.chunk_ms = 320;
     const parakeet::StreamingCallback callback =
         [](const parakeet::StreamingSegment &) {};
-    if (!throws_not_implemented([&]() {
-        (void) engine.transcribe_samples_stream(
-            &sample, 1, 16000, streaming_options, callback);
-    })) {
-        std::fprintf(stderr, "Nemotron streaming inference guard did not fire\n");
+
+    try {
+        auto session = engine.stream_start(streaming_options, callback);
+        const int16_t silence_i16 = 0;
+        session->feed_pcm_i16(&silence_i16, 1);
+        session->cancel();
+        const float silence = 0.0f;
+        session->feed_pcm_f32(&silence, 1);
+        session->finalize();
+    } catch (const std::runtime_error & error) {
+        std::fprintf(
+            stderr,
+            "Nemotron stream session creation failed: %s\n",
+            error.what());
         return 9;
     }
-    if (!throws_not_implemented([&]() {
+
+    bool rejected_chunk_size = false;
+    streaming_options.chunk_ms = 1000;
+    try {
         (void) engine.stream_start(streaming_options, callback);
-    })) {
-        std::fprintf(stderr, "Nemotron stream session guard did not fire\n");
+    } catch (const std::runtime_error & error) {
+        rejected_chunk_size =
+            std::string(error.what()).find("unsupported Nemotron chunk_ms") !=
+            std::string::npos;
+    }
+    if (!rejected_chunk_size) {
+        std::fprintf(stderr, "unsupported Nemotron chunk size was accepted\n");
         return 10;
+    }
+
+    const float sample = 0.0f;
+    bool rejected_callback_chunk_size = false;
+    try {
+        (void) engine.transcribe_samples_stream(
+            &sample, 1, 16000, streaming_options, callback);
+    } catch (const std::runtime_error & error) {
+        rejected_callback_chunk_size =
+            std::string(error.what()).find("unsupported Nemotron chunk_ms") !=
+            std::string::npos;
+    }
+    if (!rejected_callback_chunk_size) {
+        std::fprintf(
+            stderr,
+            "unsupported Nemotron callback chunk size was accepted\n");
+        return 11;
+    }
+
+    streaming_options.chunk_ms = 320;
+    auto finalized = engine.stream_start(streaming_options, callback);
+    finalized->finalize();
+    bool rejected_feed_after_finalize = false;
+    try {
+        finalized->feed_pcm_f32(&sample, 1);
+    } catch (const std::runtime_error & error) {
+        rejected_feed_after_finalize =
+            std::string(error.what()).find("already finalized") !=
+            std::string::npos;
+    }
+    if (!rejected_feed_after_finalize) {
+        std::fprintf(stderr, "feed after Nemotron finalize was accepted\n");
+        return 12;
     }
     return 0;
 }
@@ -129,7 +169,7 @@ int main(int argc, char ** argv) {
     if (const int rc = check_loaded_model(argv[1]); rc != 0) {
         return rc;
     }
-    if (const int rc = check_engine_guard(argv[1]); rc != 0) {
+    if (const int rc = check_engine_stream_creation(argv[1]); rc != 0) {
         return rc;
     }
 
