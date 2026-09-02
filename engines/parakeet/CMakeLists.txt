@@ -335,6 +335,12 @@ if (PARAKEET_BUILD_LIBRARY)
     #             supported set so the encoder path there is untouched
     #             (Sortformer uses `parakeet_sortformer.cpp` not
     #             `parakeet_ctc.cpp::rel_pos_mha_graph`).
+    #   - CUDA:   ON. The rel-pos attention feeds the flash-attn kernel
+    #             head-major views with the bias folded into the mask;
+    #             per-head masks are rejected there, so heads fold into
+    #             the batch dim (probed at load). RTX 3080, TDT q8_0:
+    #             encoder 30.0 -> 25.8 ms on 30 s audio, transcripts
+    #             unchanged, WER subset 2.1741 -> 2.1839 %.
     #   - CPU:    OFF. Cast-to-f16 of the BD mask before softmax
     #             measurably changed accumulator order and showed
     #             +3.1 % encoder regression on the CPU parity sweep;
@@ -345,12 +351,12 @@ if (PARAKEET_BUILD_LIBRARY)
     #             should flip and bench. Vulkan validation harness
     #             (test/test_vk_vs_cpu.cpp) is the natural home for
     #             that A/B once a non-Tegra Vulkan device is available.
-    if (GGML_METAL)
+    if (GGML_METAL OR GGML_CUDA)
         set(PARAKEET_FLASH_ATTN_DEFAULT ON)
     else()
         set(PARAKEET_FLASH_ATTN_DEFAULT OFF)
     endif()
-    option(PARAKEET_FLASH_ATTN "parakeet: enable fused flash-attn in MHA (default ON for Metal; OFF elsewhere pending per-backend A/B)" ${PARAKEET_FLASH_ATTN_DEFAULT})
+    option(PARAKEET_FLASH_ATTN "parakeet: enable fused flash-attn in MHA (default ON for Metal and CUDA; OFF elsewhere pending per-backend A/B)" ${PARAKEET_FLASH_ATTN_DEFAULT})
     if (PARAKEET_FLASH_ATTN)
         target_compile_definitions(qvac-parakeet PRIVATE PARAKEET_EXPERIMENTAL_FLASH_ATTN)
     endif()
@@ -1264,7 +1270,7 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
 
-    if (GGML_VULKAN OR GGML_METAL)
+    if (GGML_VULKAN OR GGML_METAL OR GGML_CUDA)
         add_executable(test-gpu-vs-cpu
             test/test_gpu_vs_cpu.cpp
             src/parakeet_ctc.cpp

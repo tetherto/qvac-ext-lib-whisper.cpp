@@ -177,6 +177,15 @@ struct ParakeetCtcModel::Impl {
     // routed to CPU there (its transformer block 0 miscomputes to NaN on the
     // Valhall driver) while the encoder + CTC/TDT/EOU heads stay on the Mali GPU.
     bool                   sortformer_force_cpu = false;
+    // Depthwise-conv lowering the active backend can run directly (GGML_OP_CONV_2D_DW):
+    // planar (W,H,C) input for the subsampler, channel-contiguous input for the
+    // conformer conv module. False falls back to the portable im2col lowering.
+    bool                   dw_direct_planar   = false;
+    bool                   dw_direct_channels = false;
+    // True when the active backend's fused attention accepts a per-head additive mask
+    // (the relative-position bias is one bias matrix per head); otherwise heads are
+    // folded into the batch dimension for the fused attention call.
+    bool                   fa_per_head_mask   = false;
     // CPU-resident copies of the Sortformer head weights (Mali-Vulkan only), so
     // the CPU head graph reads them from the CPU backend instead of
     // dereferencing the GPU-resident originals.
@@ -386,6 +395,27 @@ const char * dev_reg_name(ggml_backend_dev_t dev) {
 }
 
 
+// Ask the backend whether it runs GGML_OP_CONV_2D_DW on a representative F32 kernel/input
+// pair, for either the planar (W,H,C,N) input layout or the channel-contiguous one the
+// conformer conv module produces. Uses a throwaway no-alloc context; nothing is computed.
+bool backend_runs_conv_2d_dw(ggml_backend_t backend, bool channels_contiguous) {
+    if (!backend) return false;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    const int K = 3, C = 8, W = 16, Hh = 4;
+    ggml_tensor * kernel = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, K, K, 1, C);
+    ggml_tensor * input  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, Hh, C, 1);
+    if (channels_contiguous) {
+        kernel = ggml_permute(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, C, K, K, 1), 3, 0, 1, 2);
+        input  = ggml_permute(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, C, W, Hh, 1), 2, 0, 1, 3);
+    }
+    ggml_tensor * out = ggml_conv_2d_dw_direct(ctx, kernel, input, 1, 1, 1, 1, 1, 1);
+    const bool ok = ggml_backend_supports_op(backend, out);
+    ggml_free(ctx);
+    return ok;
+}
+
 // Pick a GPU backend using the same tier policy as llm-llamacpp's
 // BackendSelection and engines/tts/src/backend_selection.cpp: ggml-opencl
 // is only used when an Adreno 700+ device is present (where its kernels
@@ -404,6 +434,23 @@ const char * dev_reg_name(ggml_backend_dev_t dev) {
 // with, those entry points live in separate shared libraries that
 // are dlopen()'d at runtime and are not linkable from libqvac-parakeet.
 // The registry walk reaches the same backends in both modes.
+// Ask the backend whether ggml_flash_attn_ext accepts a mask with one slice per head.
+bool backend_runs_flash_attn_per_head_mask(ggml_backend_t backend, int HD, int H) {
+    if (!backend) return false;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    const int T = 64;
+    ggml_tensor * q    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, T, H);
+    ggml_tensor * k    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, T, H);
+    ggml_tensor * v    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, T, H);
+    ggml_tensor * mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, T, T, H);
+    ggml_tensor * out  = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f, 0.0f, 0.0f);
+    const bool ok = ggml_backend_supports_op(backend, out);
+    ggml_free(ctx);
+    return ok;
+}
+
 ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
                                 bool & out_skipped_unsupported_gpu,
                                 bool & out_is_mali_vulkan) {
@@ -1381,6 +1428,17 @@ int load_from_gguf(const std::string & gguf_path,
     // route only that head to CPU while the encoder + CTC/TDT/EOU heads stay on GPU.
     impl->sortformer_force_cpu =
         gpu_is_mali_vulkan && impl->backend_active == impl->backend_gpu;
+    impl->fa_per_head_mask = backend_runs_flash_attn_per_head_mask(
+        impl->backend_active, out_model.encoder_cfg.head_dim, out_model.encoder_cfg.n_heads);
+    if (impl->backend_gpu && impl->backend_active == impl->backend_gpu && !gpu_is_mali_vulkan) {
+        impl->dw_direct_planar   = backend_runs_conv_2d_dw(impl->backend_gpu, false);
+        impl->dw_direct_channels = backend_runs_conv_2d_dw(impl->backend_gpu, true);
+        if (verbose) {
+            PARAKEET_LOG_INFO("parakeet: depthwise conv lowering: subsampler %s, conformer %s\n",
+                              impl->dw_direct_planar   ? "direct" : "im2col",
+                              impl->dw_direct_channels ? "direct" : "im2col");
+        }
+    }
     if (impl->sortformer_force_cpu && verbose) {
         PARAKEET_LOG_INFO(
             "parakeet: Sortformer diarization head -> CPU on Mali-Vulkan "
@@ -2037,7 +2095,8 @@ ggml_tensor * subsampling_graph(ggml_context    * gctx,
                                 ggml_tensor     * mask_t2,
                                 ggml_tensor     * mask_t3,
                                 bool              all_valid,
-                                bool              causal_downsampling) {
+                                bool              causal_downsampling,
+                                bool              dw_direct) {
     ggml_tensor * x = mel_in;
 
     auto maybe_mask = [&](ggml_tensor * xin, ggml_tensor * m) {
@@ -2073,6 +2132,10 @@ ggml_tensor * subsampling_graph(ggml_context    * gctx,
     auto conv_2d_dw_f32 = [&](ggml_tensor * a, ggml_tensor * b,
                               int s0, int s1, int p0, int p1, int d0, int d1) -> ggml_tensor * {
         ggml_tensor * kf32 = a->type == GGML_TYPE_F32 ? a : ggml_cast(gctx, a, GGML_TYPE_F32);
+        if (dw_direct) {
+            ggml_tensor * k4 = ggml_reshape_4d(gctx, kf32, kf32->ne[0], kf32->ne[1], 1, kf32->ne[2] * kf32->ne[3]);
+            return ggml_conv_2d_dw_direct(gctx, k4, b, s0, s1, p0, p1, d0, d1);
+        }
         ggml_tensor * new_a = ggml_reshape_4d(gctx, kf32, kf32->ne[0], kf32->ne[1], 1, kf32->ne[2] * kf32->ne[3]);
         ggml_tensor * im2col = ggml_im2col(gctx, new_a,
                                   ggml_reshape_4d(gctx, b, b->ne[0], b->ne[1], 1, b->ne[2] * b->ne[3]),
@@ -2247,11 +2310,20 @@ ggml_tensor * conformer_ff_graph(ggml_context * ctx, ggml_tensor * x,
     return x;
 }
 
+// Transformer-XL relative shift as a view: bd is [2T-1 (position), T (query), H] and the
+// score bias for (key j, query i) is bd[T-1-i+j, i]. Reading each query row with a stride of
+// 2T-2 elements from offset T-1 lands exactly on that element, so no padding or copies.
+ggml_tensor * rel_shift_view(ggml_context * ctx, ggml_tensor * bd, int T) {
+    const size_t f = sizeof(float);
+    return ggml_view_3d(ctx, bd, T, T, bd->ne[2], (size_t) (2 * T - 2) * f, bd->nb[2], (size_t) (T - 1) * f);
+}
+
 ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
                                 ggml_tensor * pos_emb,
                                 ggml_tensor * att_mask,
                                 const BlockWeights & W,
-                                int H, int HD, int T) {
+                                int H, int HD, int T,
+                                bool fa_per_head_mask) {
     ggml_tensor * q;
     ggml_tensor * k;
     ggml_tensor * v;
@@ -2294,13 +2366,52 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
     ggml_tensor * p = ggml_mul_mat(ctx, W.attn_pos_w, pos_emb);
     p = ggml_reshape_3d(ctx, p, HD, H, pos_emb->ne[1]);
 
+    ggml_tensor * u_bias = ggml_reshape_3d(ctx, W.pos_bias_u, HD, 1, H);
+    ggml_tensor * v_bias = ggml_reshape_3d(ctx, W.pos_bias_v, HD, 1, H);
+
+    const float scale = 1.0f / std::sqrt((float) HD);
+
+#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN
+    // Head-major views feed the bias adds, the position mat-mul and the fused
+    // attention directly; nothing is materialised. The relative-position term is
+    // built pre-scaled so the attention mask is softmax(scale * qk + mask) with
+    //   mask = rel_shift(scale * (q + v_bias) . p) [+ att_mask]
+    // and the Transformer-XL shift is a strided view (see rel_shift_view).
+    ggml_tensor * qp = ggml_permute(ctx, q, 0, 2, 1, 3);
+    ggml_tensor * kp = ggml_permute(ctx, k, 0, 2, 1, 3);
+    ggml_tensor * vp = ggml_permute(ctx, v, 0, 2, 1, 3);
+    ggml_tensor * pp = ggml_permute(ctx, p, 0, 2, 1, 3);
+    ggml_tensor * q_u = ggml_add(ctx, qp, u_bias);
+    ggml_tensor * q_v = ggml_scale(ctx, ggml_add(ctx, qp, v_bias), scale);
+
+    ggml_tensor * bd       = ggml_mul_mat(ctx, pp, q_v);
+    ggml_tensor * bd_shift = rel_shift_view(ctx, bd, T);
+    // Mode 2 / 3 streaming windows pass a (T_k, T_q, 1, 1) f32 additive mask that
+    // must be folded in, otherwise attention leaks outside the window.
+    ggml_tensor * fa_mask  = att_mask ? ggml_add(ctx, bd_shift, att_mask) : bd_shift;
+    ggml_tensor * bd_mask  = ggml_cast(ctx, fa_mask, GGML_TYPE_F16);
+    ggml_tensor * flat;
+    if (fa_per_head_mask) {
+        ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, q_u, kp, vp, bd_mask, scale, 0.0f, 0.0f);
+        flat = ggml_reshape_2d(ctx, attn_out, HD * H, T);
+    } else {
+        // Backends whose fused attention only broadcasts the mask over heads (CUDA)
+        // see H independent single-head sequences instead: heads move to dim 3.
+        ggml_tensor * q4 = ggml_view_4d(ctx, q_u, HD, T, 1, H, q_u->nb[1], q_u->nb[2], q_u->nb[2], 0);
+        ggml_tensor * k4 = ggml_view_4d(ctx, kp,  HD, T, 1, H, kp->nb[1],  kp->nb[2],  kp->nb[2],  0);
+        ggml_tensor * v4 = ggml_view_4d(ctx, vp,  HD, T, 1, H, vp->nb[1],  vp->nb[2],  vp->nb[2],  0);
+        ggml_tensor * m4 = ggml_reshape_4d(ctx, bd_mask, T, T, 1, H);
+        ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, q4, k4, v4, m4, scale, 0.0f, 0.0f);
+        ggml_tensor * heads = ggml_reshape_3d(ctx, attn_out, HD, T, H);
+        flat = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, heads, 0, 2, 1, 3)), HD * H, T);
+    }
+    return maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_out_w, flat), W.attn_out_b);
+#else
+    (void) fa_per_head_mask;
     ggml_tensor * q_perm = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
     ggml_tensor * k_perm = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
     ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
     ggml_tensor * p_perm = ggml_cont(ctx, ggml_permute(ctx, p, 0, 2, 1, 3));
-
-    ggml_tensor * u_bias = ggml_reshape_3d(ctx, W.pos_bias_u, HD, 1, H);
-    ggml_tensor * v_bias = ggml_reshape_3d(ctx, W.pos_bias_v, HD, 1, H);
     ggml_tensor * q_u = ggml_add(ctx, q_perm, u_bias);
     ggml_tensor * q_v = ggml_add(ctx, q_perm, v_bias);
 
@@ -2315,33 +2426,6 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
                                              bd_reshaped->nb[1], bd_reshaped->nb[2], 0);
     bd_final = ggml_cont(ctx, bd_final);
 
-    const float scale = 1.0f / std::sqrt((float) HD);
-
-#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN
-    // Non-flash path computes:
-    //   attn = softmax(scale * (q*k^T + bd_final) + att_mask)
-    //        = softmax(scale * q*k^T + scale * bd_final + att_mask)
-    // ggml_flash_attn_ext computes:
-    //   attn = softmax(scale * q*k^T + mask)
-    // so the equivalent mask is `scale * bd_final + att_mask`. Mode 1
-    // (full-window) sets att_mask = nullptr so the fall-through to
-    // bd_scaled alone is byte-exact vs the non-flash path. Mode 2 / 3
-    // streaming windows pass a non-null (T_k, T_q, 1, 1) f32 chunked
-    // mask that must be folded in here, otherwise FA attends to
-    // positions outside the streaming window and produces token
-    // duplication / EOU-detection failures (test-streaming Mode 3
-    // chunk=1000 right=500 -> WER 10.5 % regression; test-eou-streaming
-    // Mode 2 -> no is_eou_boundary). Broadcast: bd_scaled is
-    // (T, T, H, 1); att_mask is (T, T, 1, 1); ggml_can_repeat(att_mask,
-    // bd_scaled) holds so the sum is (T, T, H, 1).
-    ggml_tensor * bd_scaled = ggml_scale(ctx, bd_final, scale);
-    ggml_tensor * fa_mask   = att_mask ? ggml_add(ctx, bd_scaled, att_mask) : bd_scaled;
-    ggml_tensor * bd_mask   = ggml_cast(ctx, fa_mask, GGML_TYPE_F16);
-    ggml_tensor * attn_out  = ggml_flash_attn_ext(ctx, q_u, k_perm, v_perm, bd_mask,
-                                                  scale, 0.0f, 0.0f);
-    ggml_tensor * flat      = ggml_reshape_2d(ctx, attn_out, HD * H, T);
-    return maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_out_w, flat), W.attn_out_b);
-#else
     ggml_tensor * ac     = ggml_mul_mat(ctx, k_perm, q_u);
     ggml_tensor * scores = ggml_add(ctx, ac, bd_final);
 
@@ -2365,10 +2449,53 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
 #endif
 }
 
+// How the conformer depthwise conv is lowered on the backend that runs the graph.
+enum class DwConvLowering {
+    Im2col,         // ggml_conv_1d_dw: im2col + batched mat-mul, portable
+    DirectPlanar,   // GGML_OP_CONV_2D_DW on a (T, d_model) transposed copy
+    DirectChannels, // GGML_OP_CONV_2D_DW straight on the (d_model, T) activations, no transposes
+};
+
+// Channel-contiguous view of a (d_model, T) activation: logical (W=T, H=1, C=d_model, N=1)
+// with the channel stride equal to the element size, which ggml_conv_2d_dw_direct treats
+// as CWHN and answers in the same layout.
+ggml_tensor * channels_first_view(ggml_context * ctx, ggml_tensor * y, int d_model) {
+    ggml_tensor * y4 = ggml_reshape_4d(ctx, y, d_model, y->ne[1], 1, 1);
+    return ggml_permute(ctx, y4, 2, 0, 1, 3);
+}
+
+// Depthwise kernel [K, C] re-laid as CWHN: a [K, 1, 1, C] logical view over a [C, K] copy.
+ggml_tensor * channels_first_kernel(ggml_context * ctx, ggml_tensor * w_f32, int conv_kernel, int d_model) {
+    ggml_tensor * w2 = ggml_reshape_2d(ctx, w_f32, conv_kernel, d_model);
+    ggml_tensor * wt = ggml_cont(ctx, ggml_transpose(ctx, w2));
+    return ggml_permute(ctx, ggml_reshape_4d(ctx, wt, d_model, conv_kernel, 1, 1), 3, 0, 1, 2);
+}
+
+ggml_tensor * depthwise_conv_channels_first(ggml_context * ctx, ggml_tensor * y,
+                                            const BlockWeights & W,
+                                            int d_model, int conv_kernel, int pad) {
+    const int T = (int) y->ne[1];
+    ggml_tensor * w_f32 = W.conv_dw_w->type == GGML_TYPE_F32
+                        ? W.conv_dw_w
+                        : ggml_cast(ctx, W.conv_dw_w, GGML_TYPE_F32);
+    ggml_tensor * kernel = channels_first_kernel(ctx, w_f32, conv_kernel, d_model);
+    ggml_tensor * out    = ggml_conv_2d_dw_direct(ctx, kernel, channels_first_view(ctx, y, d_model),
+                                                  1, 1, pad, 0, 1, 1);
+    return ggml_view_2d(ctx, out, d_model, T, (size_t) d_model * sizeof(float), 0);
+}
+
+// CPU keeps its transposed direct kernel; a GPU backend that answered the CONV_2D_DW
+// probe runs the depthwise conv in place, anything else uses the portable im2col lowering.
+DwConvLowering select_dw_lowering(const ParakeetCtcModel & model, ggml_backend_t backend) {
+    if (backend_is_cpu(backend))        return DwConvLowering::DirectPlanar;
+    if (model.impl->dw_direct_channels) return DwConvLowering::DirectChannels;
+    return DwConvLowering::Im2col;
+}
+
 ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
                                    const BlockWeights & W,
                                    int d_model, int /*T*/, int conv_kernel,
-                                   bool use_conv2d_dw,
+                                   DwConvLowering dw_lowering,
                                    ConvNormType conv_norm_type,
                                    bool conv_causal,
                                    float layer_norm_eps) {
@@ -2402,11 +2529,25 @@ ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
                      (size_t) d_model * y->nb[0]));
     y = ggml_mul(ctx, half1, ggml_sigmoid(ctx, half2));
 
-    ggml_tensor * yt = ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));
-
     const int pad_left  = conv_causal ? (conv_kernel - 1) : ((conv_kernel - 1) / 2);
     const int pad_right = conv_causal ? 0                 : ((conv_kernel - 1) / 2);
-    if (use_conv2d_dw) {
+
+    if (dw_lowering == DwConvLowering::DirectChannels && !conv_causal) {
+        y = depthwise_conv_channels_first(ctx, y, W, d_model, conv_kernel, pad_left);
+        y = maybe_add_bias(ctx, y, W.conv_dw_b);
+        if (conv_norm_type == ConvNormType::LayerNorm) {
+            y = layer_norm_affine(ctx, y, W.conv_norm_w, W.conv_norm_b, layer_norm_eps);
+        } else {
+            y = ggml_mul(ctx, y, W.conv_bn_scale);
+            y = ggml_add(ctx, y, W.conv_bn_shift);
+        }
+        y = ggml_silu(ctx, y);
+        return maybe_add_bias(ctx, ggml_mul_mat(ctx, W.conv_pw2_w, y), W.conv_pw2_b);
+    }
+
+    ggml_tensor * yt = ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));
+
+    if (dw_lowering == DwConvLowering::DirectPlanar) {
         const int T_local = (int) yt->ne[0];
         ggml_tensor * yt_4d = ggml_reshape_4d(ctx, yt, T_local, 1, d_model, 1);
         if (conv_causal && pad_left > 0) {
@@ -2464,7 +2605,8 @@ ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,
                                     const BlockWeights & W,
                                     int d_model, int H, int HD, int T,
                                     int conv_kernel, float eps,
-                                    bool use_conv2d_dw,
+                                    DwConvLowering dw_lowering,
+                                    bool fa_per_head_mask,
                                     ConvNormType conv_norm_type,
                                     bool conv_causal) {
     ggml_tensor * residual = x;
@@ -2477,12 +2619,12 @@ ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,
 
     residual = x;
     ggml_tensor * xn = layer_norm_affine(ctx, x, W.norm_attn_w, W.norm_attn_b, eps);
-    y = rel_pos_mha_graph(ctx, xn, pos_emb, att_mask, W, H, HD, T);
+    y = rel_pos_mha_graph(ctx, xn, pos_emb, att_mask, W, H, HD, T, fa_per_head_mask);
     x = ggml_add(ctx, residual, y);
 
     residual = x;
     xn = layer_norm_affine(ctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-    y = conformer_conv_graph(ctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw,
+    y = conformer_conv_graph(ctx, xn, W, d_model, T, conv_kernel, dw_lowering,
                              conv_norm_type, conv_causal, eps);
     x = ggml_add(ctx, residual, y);
 
@@ -2570,7 +2712,7 @@ int run_subsampling(ParakeetCtcModel   & model,
 
     ggml_tensor * out = subsampling_graph(gctx, mel_in, model.subsampling, C_sub, d_model,
                                           mask_t0, mask_t1, mask_t2, mask_t3, false,
-                                          causal_ds);
+                                          causal_ds, model.impl->dw_direct_planar);
     ggml_set_name(out, "sub_out");
     ggml_set_output(out);
 
@@ -2654,9 +2796,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     const int conv_kernel = enc.conv_kernel;
     const float eps = enc.layer_norm_eps;
 
-    // Metal / CUDA / Vulkan don't implement CONV_2D_DW yet; use the
-    // im2col+matmul lowering on any non-CPU backend.
-    const bool use_conv2d_dw = backend_is_cpu(backend);
+    const DwConvLowering dw_lowering = select_dw_lowering(model, backend);
 
     auto sub_out_len = [&](int Lin) {
         return enc.causal_downsampling ? (Lin / 2 + 1) : _conv_out_len(Lin, 3, 2, 1);
@@ -2766,7 +2906,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     } else {
         x = subsampling_graph(gctx, g.mel_in, model.subsampling, C_sub, d_model,
                               g.mask_t0, g.mask_t1, g.mask_t2, g.mask_t3, all_valid,
-                              enc.causal_downsampling);
+                              enc.causal_downsampling, dw_lowering != DwConvLowering::Im2col);
         g.sub_out_node = x;
         ggml_set_name(g.sub_out_node, "subsampling_out");
         ggml_set_output(g.sub_out_node);
@@ -2802,7 +2942,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
 
             residual = x;
             ggml_tensor * xn = layer_norm_affine(gctx, x, W.norm_attn_w, W.norm_attn_b, eps);
-            y = rel_pos_mha_graph(gctx, xn, g.pe_in, g.att_mask, W, H, HD, T);
+            y = rel_pos_mha_graph(gctx, xn, g.pe_in, g.att_mask, W, H, HD, T, model.impl->fa_per_head_mask);
             x = ggml_add(gctx, residual, y);
             g.post_attn_0_node = x;
             ggml_set_name(g.post_attn_0_node, "block_0_post_attn");
@@ -2810,7 +2950,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
 
             residual = x;
             xn = layer_norm_affine(gctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-            y = conformer_conv_graph(gctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw,
+            y = conformer_conv_graph(gctx, xn, W, d_model, T, conv_kernel, dw_lowering,
                                      enc.conv_norm_type, enc.conv_causal, eps);
             x = ggml_add(gctx, residual, y);
             g.post_conv_0_node = x;
@@ -2836,7 +2976,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
         } else {
             x = conformer_block_graph(gctx, x, g.pe_in, g.att_mask, model.blocks[i],
                                       d_model, H, HD, T, conv_kernel, eps,
-                                      use_conv2d_dw,
+                                      dw_lowering, model.impl->fa_per_head_mask,
                                       enc.conv_norm_type, enc.conv_causal);
         }
         if (i == n_run_layers - 1) {
@@ -3400,14 +3540,14 @@ static int build_substage_graph(const ParakeetCtcModel & model,
         ggml_tensor * r = x;
         ggml_tensor * xn = layer_norm_affine(g.ctx, x, W.norm_attn_w, W.norm_attn_b, eps);
         ggml_tensor * y = rel_pos_mha_graph(g.ctx, xn, g.pe_in, /*att_mask=*/nullptr,
-                                            W, H, HD, T);
+                                            W, H, HD, T, model.impl->fa_per_head_mask);
         x = ggml_add(g.ctx, r, y);
     }
     if (stage == Substage::CONV || stage == Substage::FULL_BLOCK) {
         ggml_tensor * r = x;
         ggml_tensor * xn = layer_norm_affine(g.ctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-        const bool use_conv2d_dw = backend_is_cpu(backend);
-        ggml_tensor * y = conformer_conv_graph(g.ctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw,
+        ggml_tensor * y = conformer_conv_graph(g.ctx, xn, W, d_model, T, conv_kernel,
+                                               select_dw_lowering(model, backend),
                                                enc.conv_norm_type, enc.conv_causal, eps);
         x = ggml_add(g.ctx, r, y);
     }
