@@ -448,7 +448,9 @@ float incremental_sample_at(
     int64_t sample_index,
     bool finalized) {
     if (sample_index < 0) {
-        sample_index = -sample_index;
+        sample_index = std::min<int64_t>(
+            -sample_index,
+            state.total_samples - 1);
     } else if (sample_index >= state.total_samples && finalized) {
         sample_index = std::max<int64_t>(
             0, 2 * state.total_samples - 2 - sample_index);
@@ -606,7 +608,9 @@ int append_log_mel(
         float * destination =
             out_mel.data() + out_mel.size() - config.n_mels;
         const int64_t valid_frames =
-            state.impl->total_samples / config.hop_length;
+            std::max<int64_t>(
+                1,
+                state.impl->total_samples / config.hop_length);
         if (finalize &&
             state.impl->next_frame >= valid_frames) {
             std::fill(

@@ -183,6 +183,63 @@ int section_stateful_vs_stateless_parity(const parakeet::MelConfig & cfg,
     return 0;
 }
 
+int section_incremental_short_input_parity(const parakeet::MelConfig & cfg) {
+    using namespace parakeet;
+
+    MelConfig incremental_cfg = cfg;
+    incremental_cfg.normalize = MelNormalize::None;
+    const int sample_counts[] = {
+        1,
+        incremental_cfg.hop_length - 1,
+        incremental_cfg.hop_length,
+        incremental_cfg.n_fft / 2 - 1,
+        incremental_cfg.n_fft / 2,
+        incremental_cfg.n_fft / 2 + 1,
+    };
+
+    for (const int sample_count : sample_counts) {
+        const std::vector<float> signal = make_signal(sample_count);
+        std::vector<float> offline_mel;
+        int offline_frames = 0;
+        if (compute_log_mel(
+                signal.data(), sample_count, incremental_cfg,
+                offline_mel, offline_frames) != 0) {
+            std::fprintf(stderr,
+                "[incremental-short] offline mel failed for %d samples\n",
+                sample_count);
+            return 1;
+        }
+
+        IncrementalMelState state;
+        std::vector<float> incremental_mel;
+        int incremental_frames = 0;
+        if (append_log_mel(
+                signal.data(), sample_count, true, incremental_cfg,
+                state, incremental_mel, incremental_frames) != 0) {
+            std::fprintf(stderr,
+                "[incremental-short] incremental mel failed for %d samples\n",
+                sample_count);
+            return 1;
+        }
+        if (incremental_frames != offline_frames) {
+            std::fprintf(stderr,
+                "[incremental-short] FAIL: frame count for %d samples "
+                "(%d vs %d)\n",
+                sample_count, incremental_frames, offline_frames);
+            return 1;
+        }
+        if (!bit_equal(incremental_mel, offline_mel)) {
+            report_first_diff(
+                offline_mel, incremental_mel, "incremental-short");
+            return 1;
+        }
+    }
+
+    std::fprintf(stderr,
+        "[incremental-short] PASS  finalized short inputs match offline mel\n");
+    return 0;
+}
+
 // Reference radix-2 complex FFT (textbook, no twiddle cache, no
 // trig precomputation). Used to derive a known-good power spectrum
 // for the FFT correctness gate. Decoupled from `mel_preprocess.cpp`
@@ -430,6 +487,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     rc |= section_real_fft_parity(cfg, signal);
     rc |= section_stateful_vs_stateless_parity(cfg, signal);
     rc |= section_repeated_call_invariance(cfg, signal);
+    rc |= section_incremental_short_input_parity(cfg);
     rc |= section_per_feature_cmvn();
 
     if (rc != 0) {
