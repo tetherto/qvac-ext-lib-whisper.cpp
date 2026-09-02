@@ -541,21 +541,27 @@ Source: [workflow run 31603189415](https://github.com/tetherto/qvac/actions/runs
 The fused decoder ops, the unrolled greedy loop and the per-backend lowerings
 were measured against the engine as published before them, on the same
 machine in the same session: parakeet-tdt-0.6b-v3, `n_gpu_layers 1`,
-`--bench --bench-warmup 2 --bench-runs 7`, the two builds alternated over N
-rounds, and the smallest per-run inference time of each build kept. Cells read
-`before -> after ms (speedup)`.
+`--bench --bench-warmup 10 --bench-runs 20`, the two builds alternated, the
+median run time of each build kept. Cells read `before -> after ms (speedup)`.
+Ten warmup runs matter on Metal: the first two or three timed runs of a
+process are up to 30 % faster than the rest, so a short warmup reports a
+transient, not the sustained rate.
 
-| Backend, rounds | Quant | 11 s clip | 30 s clip | 90 s clip | 306 s clip |
-|---|---|---:|---:|---:|---:|
-| CUDA, RTX 3080, N=3 | q8_0 | 31.7 -> 14.7 (2.16x) | 79.5 -> 31.7 (2.51x) | 306 -> 117 (2.60x) | 1292 -> 495 (2.61x) |
-| CUDA, RTX 3080, N=3 | q4_0 | 31.1 -> 14.1 (2.21x) | 79.1 -> 30.4 (2.60x) | 303 -> 115 (2.65x) | 1275 -> 484 (2.64x) |
-| Metal, Apple M5, N=10 | q8_0 | 143 -> 65 (2.19x) | 473 -> 177 (2.67x) | 2326 -> 879 (2.65x) | 14265 -> 4743 (3.01x) |
-| Metal, Apple M5, N=10 | q4_0 | 134 -> 70 (1.92x) | 434 -> 163 (2.65x) | 2106 -> 895 (2.35x) | 13460 -> 4937 (2.73x) |
+| Backend | Quant | 30 s clip | 90 s clip | 306 s clip |
+|---|---|---:|---:|---:|
+| CUDA, RTX 3080, CUDA graphs on | q8_0 | 80.0 -> 32.0 (2.50x) | 308 -> 119 (2.59x) | 1292 -> 495 (2.61x) |
+| CUDA, RTX 3080, CUDA graphs on | q4_0 | 79.4 -> 30.8 (2.58x) | 305 -> 116 (2.63x) | 1275 -> 484 (2.64x) |
+| CUDA, RTX 3080, CUDA graphs off | q8_0 | 80.0 -> 34.9 (2.29x) | 308 -> 127 (2.42x) | not measured |
+| CUDA, RTX 3080, CUDA graphs off | q4_0 | 79.4 -> 33.5 (2.37x) | 305 -> 125 (2.45x) | not measured |
+| Metal, Apple M5 | q8_0 | 518 -> 281 (1.84x) | 2561 -> 1095 (2.34x) | 18130 -> 5531 (3.28x) |
+| Metal, Apple M5 | q4_0 | 486 -> 254 (1.91x) | 2416 -> 1020 (2.37x) | 17559 -> 5216 (3.37x) |
 
-The CUDA rows ran with ggml CUDA graphs on. The Metal rows ran on a shared
-host whose 1-minute load sat between 2 and 18 across the ten rounds (between
-2 and 4 for the last six), so the M5 numbers are a lower bound; the 11 s Metal
-cells come from the first four rounds only.
+The 306 s cells come from an earlier run with two warmups and seven timed
+runs, medians over six rounds; that clip's run-to-run drift is under 2 %, so
+the shorter warmup does not move it. CUDA graphs are a ggml build option
+(`GGML_CUDA_GRAPHS`) that is off by default; the 11 s clip lands between
+2.2x and 2.3x on CUDA and around 2x on Metal. The Metal host carried a
+1-minute load between 2 and 3 during these runs.
 
 Word error rate on the same 500-utterance LibriSpeech subset, Whisper text
 normalisation: CPU 2.22 %, CUDA q8_0 2.21 % and q4_0 2.28 %, Metal q8_0
