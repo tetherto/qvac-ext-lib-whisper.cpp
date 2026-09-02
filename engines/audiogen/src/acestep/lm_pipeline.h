@@ -98,11 +98,17 @@ bool lm_generate_codes(LMModel *              m,
 std::vector<int> lm_understand_prompt(const BpeTokenizer & bpe, const int * codes, int n_codes);
 std::vector<int> lm_understand_unconditional_prompt(const BpeTokenizer & bpe);
 
-// Reverse pipeline decode: describe FSQ audio codes as metadata + caption
-// (+ lyrics, which the caller may discard). FSM-constrained CoT for the
-// metadata block; a non-empty language_hint is forced into the FSM and echoed
-// to the output. Honors params.on_step for progress/cancellation. Returns
-// false on failure or cancellation.
+// Decode-token budget for lm_understand: the caller's request (or the 2048
+// default) capped to the KV room left after the prompt, never negative.
+// Pure; exposed for unit testing.
+int lm_understand_token_budget(int max_seq_len, size_t prompt_tokens, int requested);
+
+// Reverse pipeline decode: describe FSQ audio codes as metadata + caption.
+// FSM-constrained CoT for the metadata block; decoding stops at </think> (the
+// caption lives inside the CoT block and the reference's post-think lyric
+// text is unused here). A non-empty language_hint is forced into the FSM and
+// echoed to the output. Honors params.on_step for progress/cancellation.
+// Returns false on failure or cancellation.
 bool lm_understand(LMModel *              m,
                    const BpeTokenizer &   bpe,
                    const std::vector<int> & codes,

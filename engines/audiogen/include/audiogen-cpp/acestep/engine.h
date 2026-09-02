@@ -281,8 +281,9 @@ struct UnderstandResult {
 };
 
 // Optional progress callback: stage name
-// ("reference"|"source"|"lm"|"score"|"dit"|"vae"), current step, total steps
-// (total <= 0 when unknown). Return false to request cancellation.
+// ("reference"|"source"|"lm"|"score"|"tok"|"understand"|"dit"|"vae"),
+// current step, total steps (total <= 0 when unknown). Return false to
+// request cancellation.
 using ProgressFn = std::function<bool(const std::string & stage, int step, int total)>;
 
 class AUDIOGEN_API Engine {
@@ -307,7 +308,8 @@ public:
     // std::runtime_error on invalid input or a failed stage.
     UnderstandResult understand(const UnderstandParams & params, const ProgressFn & progress = {}) const;
 
-    // Cooperative cancel for an in-flight generate() on another thread.
+    // Cooperative cancel for an in-flight generate() or understand() on
+    // another thread.
     void cancel() const;
 
     int         sample_rate() const;  // 48000

@@ -43,6 +43,9 @@ static double lm_ms_since(std::chrono::steady_clock::time_point t0) {
 // unknowable up front and its ticks report the engine's unknown-total marker.
 static constexpr int LM_PROGRESS_UNKNOWN_TOTAL = -1;
 
+// Understand decode cap when the caller sets none; matches Phase 1's default.
+static constexpr int LM_UNDERSTAND_DEFAULT_MAX_NEW = 2048;
+
 // Throttled progress for the decode loops: every 8 tokens (each step is a full
 // LM forward, so this is cheap relative to the work) plus the final step.
 // Returns false when the hook requests cancellation.
@@ -733,16 +736,19 @@ std::vector<int> lm_understand_unconditional_prompt(const BpeTokenizer & bpe) {
                                "NO USER INPUT");
 }
 
-static int lm_understand_sample(MetadataFSM & fsm, bool past_think, float * logits, int V,
+static int lm_understand_sample(MetadataFSM & fsm, float * logits, int V,
                                 const LmSampleParams & params, std::mt19937 & rng) {
-    if (past_think) {
-        for (int v = AUDIO_CODE_BASE; v < V; v++) logits[v] = -1e9f;
-        return sample_top_k_p(logits, V, params.temperature, params.top_p, params.top_k, rng);
-    }
     const int forced = fsm.enabled ? fsm.forced_token() : -1;
     if (forced >= 0) return lm_consume_forced(forced, params.temperature, rng);
     if (fsm.enabled) fsm.apply_mask(logits);
     return sample_top_k_p(logits, V, params.temperature, params.top_p, params.top_k, rng);
+}
+
+int lm_understand_token_budget(int max_seq_len, size_t prompt_tokens, int requested) {
+    const int room = max_seq_len - (int) prompt_tokens;
+    if (room <= 0) return 0;
+    const int wanted = requested > 0 ? requested : LM_UNDERSTAND_DEFAULT_MAX_NEW;
+    return wanted < room ? wanted : room;
 }
 
 bool lm_understand(LMModel * m, const BpeTokenizer & bpe, const std::vector<int> & codes,
@@ -780,19 +786,24 @@ bool lm_understand(LMModel * m, const BpeTokenizer & bpe, const std::vector<int>
 
     std::mt19937     rng(params.seed);
     std::vector<int> gen_tokens;
-    bool             past_think = false;
-    const int        max_new    = params.max_new_tokens > 0 ? params.max_new_tokens : 4096;
+    // The description lives entirely inside the CoT block (caption included),
+    // so decoding stops at </think>: the lyric text the reference generates
+    // afterwards is unused here and would only burn KV budget. The budget is
+    // capped to the KV room left after the prompt — a long clip's code prompt
+    // can leave far less than the default.
+    const int max_new = lm_understand_token_budget(lm_model_config(m).max_seq_len, prompt.size(),
+                                                   params.max_new_tokens);
 
     for (int step = 0; step < max_new; step++) {
         if (!lm_report_progress(params, step, max_new, LM_PROGRESS_UNKNOWN_TOTAL)) {
             fprintf(stderr, "[lm-understand] cancelled at step %d\n", step);
             return false;
         }
-        const int tok = lm_understand_sample(fsm, past_think, logits.data(), V, params, rng);
+        const int tok = lm_understand_sample(fsm, logits.data(), V, params, rng);
         if (tok == TOKEN_IM_END) break;
-        if (fsm.enabled && !past_think) fsm.update(tok);
-        if (tok == TOKEN_THINK_END) past_think = true;
+        if (fsm.enabled) fsm.update(tok);
         gen_tokens.push_back(tok);
+        if (tok == TOKEN_THINK_END) break;
 
         const int32_t t = (int32_t) tok;
         if (!lm_model_forward(m, &t, 1, logits)) {

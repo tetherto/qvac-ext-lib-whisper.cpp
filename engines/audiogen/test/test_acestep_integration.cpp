@@ -587,6 +587,14 @@ void run_understand_scenario(tts_cpp::acestep::Engine & engine) {
     const UnderstandResult forced = engine.understand(hinted);
     CHECK(forced.vocal_language == "es");
 
+    // Generated audio is always a whole number of latent groups; a clip of 51
+    // latent frames (not a multiple of 5) forces the tokenizer to pad the tail
+    // group with silence: ceil(51 / 5) = 11 codes.
+    UnderstandParams truncated = up;
+    truncated.audio.resize(51 * 1920 * 2);
+    const UnderstandResult padded = engine.understand(truncated);
+    CHECK((int) padded.audio_codes.size() == (51 + 4) / 5);
+
     engine.cancel();
     const UnderstandResult cancelled = engine.understand(up);
     CHECK(cancelled.audio_codes.empty());

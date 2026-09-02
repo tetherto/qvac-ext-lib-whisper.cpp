@@ -274,6 +274,21 @@ void test_understand_prompt() {
     CHECK(std::equal(prompt.begin(), first_code, unconditional.begin()));
 }
 
+// Understand decode budget: capped by the KV room left after the prompt, so a
+// long clip's code prompt (the historical 4096 default vs the LM's 2048
+// max_seq) can never overflow the context mid-decode.
+void test_understand_token_budget() {
+    using tts_cpp::acestep::lm_understand_token_budget;
+
+    CHECK(lm_understand_token_budget(2048, 100, 0) == 1948);
+    CHECK(lm_understand_token_budget(2048, 1220, 0) == 828);
+    CHECK(lm_understand_token_budget(2048, 2047, 0) == 1);
+    CHECK(lm_understand_token_budget(2048, 2048, 0) == 0);
+    CHECK(lm_understand_token_budget(2048, 3000, 0) == 0);
+    CHECK(lm_understand_token_budget(2048, 100, 4096) == 1948);
+    CHECK(lm_understand_token_budget(2048, 100, 500) == 500);
+}
+
 // 4. sample_top_k_p ----------------------------------------------------------
 void test_sampler() {
     using tts_cpp::acestep::sample_top_k_p;
@@ -2852,6 +2867,7 @@ int main() {
     test_fsq();
     test_fsq_encode();
     test_understand_prompt();
+    test_understand_token_budget();
     test_sampler();
     test_sampler_compact_equivalence();
     test_sampler_r0_edge();
