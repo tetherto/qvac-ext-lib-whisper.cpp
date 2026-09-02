@@ -782,6 +782,16 @@ if (PARAKEET_BUILD_TESTS)
     parakeet_apply_backend_defs(test-mel-fft-parity)
     parakeet_register_test(test-mel-fft-parity LABEL "unit")
 
+    # Threaded mel front-end must be byte-equal to the single-thread result.
+    add_executable(test-mel-threads
+        test/test_mel_threads.cpp
+        src/mel_preprocess.cpp
+        src/parakeet_log.cpp)
+    target_link_libraries(test-mel-threads PRIVATE ggml)
+    target_include_directories(test-mel-threads PRIVATE ggml/include src include)
+    parakeet_apply_backend_defs(test-mel-threads)
+    parakeet_register_test(test-mel-threads LABEL "unit")
+
     # test_rnnt.cpp exercises internal decoder entry points
     # (rnnt_decode_window, build_transducer_argmax_outputs) that are not
     # exported from the shared library (CXX_VISIBILITY_PRESET hidden), so
