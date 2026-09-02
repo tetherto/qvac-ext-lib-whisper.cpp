@@ -1331,6 +1331,18 @@ void test_lyrics_dtw() {
     path = dtw(rectangular);
     CHECK(path.token_indices.front() == 0 && path.token_indices.back() == 1);
     CHECK(path.frame_indices.front() == 0 && path.frame_indices.back() == 4);
+
+    // Reference-parity tie-break (_dtw.py): with diagonal == vertical <
+    // horizontal at the last cell, the strict comparison chain falls through
+    // to horizontal, so the path detours through (1, 0) instead of stepping
+    // diagonally.
+    const Matrix tie(2, 2, {
+        0.0f, 0.0f,
+        1.0f, 0.0f,
+    });
+    path = dtw(tie);
+    CHECK(path.token_indices == std::vector<int32_t>({ 0, 1, 1 }));
+    CHECK(path.frame_indices == std::vector<int32_t>({ 0, 0, 1 }));
 }
 
 void test_lyrics_preprocessing() {

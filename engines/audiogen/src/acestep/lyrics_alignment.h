@@ -71,8 +71,11 @@ struct AlignmentMetrics {
 
 using TokenDecoder = std::function<std::string(const std::vector<int> &)>;
 
-// Dynamic time warping with the same strict tie-breaking as the Python
-// reference: diagonal, then vertical, with horizontal winning every tie.
+// Dynamic time warping with the reference's exact comparison chain
+// (acestep/core/scoring/_dtw.py): a direction is taken only when it is
+// STRICTLY smaller than both others, so horizontal absorbs every tie —
+// including diagonal == vertical < horizontal, where the strictly larger
+// horizontal cost is accumulated. Kept bug-for-bug for timestamp parity.
 DtwPath dtw(const Matrix & costs);
 
 // Reflect-padded median filtering along the frame axis.
