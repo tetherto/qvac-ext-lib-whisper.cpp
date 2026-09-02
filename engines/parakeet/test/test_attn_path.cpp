@@ -29,13 +29,36 @@ ggml_backend_t init_first_gpu() {
     return nullptr;
 }
 
+// The policy keys on registry names; a backend that renames itself would make the
+// engine and this test agree on "unfused" silently, so every GPU name must be known.
+bool known_gpu_backend_name(const char * name) {
+    static const char * const known[] = {"CUDA", "MTL", "Metal", "Vulkan", "OpenCL", "HIP", "SYCL"};
+    for (const char * k : known) {
+        if (std::strcmp(name, k) == 0) return true;
+    }
+    return false;
+}
+
+int check_gpu_backend_names() {
+    int failures = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+        const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+        std::printf("[attn-path] GPU device %zu registry name %s\n", i, name ? name : "(null)");
+        failures += check(name && known_gpu_backend_name(name), "GPU registry name is one the attention policy knows");
+    }
+    return failures;
+}
+
 int check_policy() {
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!cpu) {
         std::printf("[attn-path] no CPU backend registered\n");
         return 1;
     }
-    int failures = 0;
+    int failures = check_gpu_backend_names();
     failures += check(!parakeet::flash_attn_allowed(true, cpu),     "CPU keeps the unfused graph when flash-attn is compiled in");
     failures += check(!parakeet::flash_attn_allowed(false, cpu),    "CPU keeps the unfused graph when flash-attn is compiled out");
     failures += check(!parakeet::flash_attn_allowed(true, nullptr), "no backend means no fused graph");
