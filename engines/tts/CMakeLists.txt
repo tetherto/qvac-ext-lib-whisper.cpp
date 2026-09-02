@@ -345,6 +345,8 @@ set(TTS_CPP_LIB_SOURCES
     src/fit_common.cpp
     src/audio8/fit.cpp
     src/audio8/fit_main.cpp
+    src/chatterbox_fit.cpp
+    src/chatterbox_fit_main.cpp
 )
 
 if (TTS_CPP_BUILD_LIBRARY)
@@ -588,6 +590,9 @@ if (TTS_CPP_BUILD_EXECUTABLES)
     target_link_libraries(audio8-fit-params PRIVATE tts-cpp)
     tts_cpp_apply_ccache(audio8-fit-params)
 
+    add_executable(chatterbox-fit-params src/chatterbox_fit_params.cpp)
+    target_link_libraries(chatterbox-fit-params PRIVATE tts-cpp)
+    tts_cpp_apply_ccache(chatterbox-fit-params)
 endif()
 
 if (TTS_CPP_BUILD_TESTS)
@@ -2469,6 +2474,14 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_register_test(test-kv-cache-type LABEL "unit")
 
     # ---- Memory-fit preflight (include/tts-cpp/fit.h + *-fit-params) ----
+    # Model-free: strict CLI parsers, saturating math, JSON escaping, and the
+    # exit-code contract of both fit CLIs.
+    add_executable(test-fit-cli test/test_fit_cli.cpp)
+    target_link_libraries(test-fit-cli PRIVATE tts-cpp ggml)
+    target_include_directories(test-fit-cli PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-fit-cli)
+    tts_cpp_register_test(test-fit-cli LABEL "unit")
+
     # Audio8 fit parity.  The no-argument form synthesizes a tiny audio8-lm
     # GGUF on the fly, so the LM-side byte-parity gates (weights, KV slabs,
     # slow/fast graph arenas vs a real load + run) need no fixture at all;
@@ -2483,6 +2496,23 @@ if (TTS_CPP_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}"
         REQUIRES "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}")
+
+    # Chatterbox fit parity: metadata-only projection vs a real T3 load +
+    # eval and a real S3Gen synthesis, byte for byte per buffer/arena.
+    add_executable(test-chatterbox-fit-params test/test_chatterbox_fit_params.cpp)
+    target_link_libraries(test-chatterbox-fit-params PRIVATE tts-cpp ggml tts-cpp-backend-defs)
+    target_include_directories(test-chatterbox-fit-params PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-chatterbox-fit-params)
+    tts_cpp_register_test(test-chatterbox-fit-params-turbo
+        EXE      test-chatterbox-fit-params
+        LABEL    "fixture"
+        ARGS     "${_tcb_t3_turbo_gguf}" "${_tcb_s3gen_gguf}"
+        REQUIRES "${_tcb_t3_turbo_gguf}" "${_tcb_s3gen_gguf}")
+    tts_cpp_register_test(test-chatterbox-fit-params-mtl
+        EXE      test-chatterbox-fit-params
+        LABEL    "fixture"
+        ARGS     "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}"
+        REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}")
 
     add_executable(test-s3gen-cfg-rate test/test_s3gen_cfg_rate.cpp)
     target_link_libraries(test-s3gen-cfg-rate PRIVATE tts-cpp ggml)
