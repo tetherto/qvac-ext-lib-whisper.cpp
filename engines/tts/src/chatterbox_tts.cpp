@@ -269,7 +269,7 @@ static void s3gen_model_cache_release() {
     // Vulkan (or Metal/CUDA) buffers allocated against the soon-to-be-
     // freed backend; gallocr_free against
     // a dangling vk_device asserts inside ggml-vulkan.  Same constraint as
-    // the existing thread_local time_mlp_cache documents.
+    // the backend-keyed time_mlp graph cache documents.
     s3gen_release_synth_caches();
     if (!g_s3gen_cache_entry) return;
     model_ctx * m = g_s3gen_cache_entry->m.get();
