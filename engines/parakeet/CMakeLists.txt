@@ -1139,7 +1139,15 @@ if (PARAKEET_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}" "${_qvp_tdt_ref}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
-    # The fused LSTM cell op must reproduce the per-gate decoder graph token for token.
+    # Load-time [w_ih | w_hh] row stacking, independent of any GGUF fixture.
+    add_executable(test-lstm-input-concat test/test_lstm_input_concat.cpp)
+    target_link_libraries(test-lstm-input-concat PRIVATE ggml)
+    target_include_directories(test-lstm-input-concat PRIVATE src ggml/include)
+    parakeet_apply_ccache(test-lstm-input-concat)
+    parakeet_register_test(test-lstm-input-concat LABEL "unit")
+
+    # The fused LSTM cell op and the concatenated-input GEMV must both reproduce
+    # the per-gate decoder graph token for token.
     add_executable(test-tdt-lstm-parity
         test/test_tdt_lstm_parity.cpp
         src/parakeet_ctc.cpp

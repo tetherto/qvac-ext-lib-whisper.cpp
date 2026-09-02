@@ -200,24 +200,152 @@ void host_joint_step(const TdtRuntimeWeights & W,
              logits.data(), Vo, H);
 }
 
+// A layer can share one GEMV only when both matrices agree on type and shape
+// and the input width is a whole number of quantisation blocks (otherwise the
+// row-wise stack would need requantisation).
+bool lstm_layer_concatenable(const TdtLstmLayer & w, int H) {
+    if (!w.w_ih || !w.w_hh || !w.b_ih || !w.b_hh) return false;
+    if (w.w_ih->type != w.w_hh->type) return false;
+    if (!ggml_is_contiguous(w.w_ih) || !ggml_is_contiguous(w.w_hh)) return false;
+    if (w.w_ih->ne[0] != H || w.w_hh->ne[0] != H) return false;
+    if (w.w_ih->ne[1] != 4 * (int64_t) H || w.w_hh->ne[1] != 4 * (int64_t) H) return false;
+    if (ggml_nelements(w.b_ih) != 4 * (int64_t) H) return false;
+    if (ggml_nelements(w.b_hh) != 4 * (int64_t) H) return false;
+    return H % ggml_blck_size(w.w_ih->type) == 0;
+}
+
+void upload_lstm_cat_weight(ggml_tensor * dst, const TdtLstmLayer & src) {
+    std::vector<uint8_t> ih(ggml_nbytes(src.w_ih));
+    std::vector<uint8_t> hh(ggml_nbytes(src.w_hh));
+    ggml_backend_tensor_get(src.w_ih, ih.data(), 0, ih.size());
+    ggml_backend_tensor_get(src.w_hh, hh.data(), 0, hh.size());
+
+    std::vector<uint8_t> packed(ggml_nbytes(dst));
+    pack_lstm_input_rows(src.w_ih->ne[1],
+                         ggml_row_size(src.w_ih->type, src.w_ih->ne[0]),
+                         ggml_row_size(src.w_hh->type, src.w_hh->ne[0]),
+                         ih.data(), hh.data(), packed.data());
+    ggml_backend_tensor_set(dst, packed.data(), 0, packed.size());
+}
+
+void upload_lstm_cat_bias(ggml_tensor * dst, const TdtLstmLayer & src) {
+    std::vector<float> b_ih;
+    std::vector<float> b_hh;
+    dequantize_to_f32(src.b_ih, b_ih);
+    dequantize_to_f32(src.b_hh, b_hh);
+    for (size_t i = 0; i < b_ih.size(); ++i) b_ih[i] += b_hh[i];
+    ggml_backend_tensor_set(dst, b_ih.data(), 0, b_ih.size() * sizeof(float));
+}
+
+// Allocate and fill the per-layer [w_ih | w_hh] stacks on the active backend.
+// Returns false (leaving concat disabled) when any layer is ineligible.
+bool build_lstm_input_concat(TdtRuntimeWeights & W) {
+    const int H = W.H_pred;
+    for (int l = 0; l < W.L; ++l) {
+        if (!lstm_layer_concatenable(W.weights->lstm[l], H)) return false;
+    }
+
+    ggml_init_params p = {};
+    p.mem_size   = ggml_tensor_overhead() * (size_t) (2 * W.L + 2);
+    p.mem_buffer = nullptr;
+    p.no_alloc   = true;
+    W.lstm_cat_ctx = ggml_init(p);
+    if (!W.lstm_cat_ctx) return false;
+
+    W.lstm_cat.resize(W.L);
+    for (int l = 0; l < W.L; ++l) {
+        const TdtLstmLayer & src = W.weights->lstm[l];
+        W.lstm_cat[l].w = ggml_new_tensor_2d(W.lstm_cat_ctx, src.w_ih->type, 2 * H, 4 * H);
+        W.lstm_cat[l].b = ggml_new_tensor_1d(W.lstm_cat_ctx, GGML_TYPE_F32, 4 * H);
+        const std::string base = "tdt.lstm_cat." + std::to_string(l);
+        ggml_set_name(W.lstm_cat[l].w, (base + ".w").c_str());
+        ggml_set_name(W.lstm_cat[l].b, (base + ".b").c_str());
+    }
+
+    W.lstm_cat_buffer = ggml_backend_alloc_ctx_tensors(W.lstm_cat_ctx, W.backend);
+    if (!W.lstm_cat_buffer) return false;
+
+    for (int l = 0; l < W.L; ++l) {
+        upload_lstm_cat_weight(W.lstm_cat[l].w, W.weights->lstm[l]);
+        upload_lstm_cat_bias  (W.lstm_cat[l].b, W.weights->lstm[l]);
+    }
+    return true;
+}
+
+// Offsets into the packed [h | c] state row of layer `l`.
+size_t state_row_offset(int H, int l)   { return (size_t) l * 2 * H * sizeof(float); }
+size_t state_c_offset  (int H, int l)   { return state_row_offset(H, l) + (size_t) H * sizeof(float); }
+
 // Append the LSTM body to `gctx` and return:
-//   - cpy nodes that write the freshly computed h, c into rt.h_persist /
-//     rt.c_persist in place, and
-//   - the cpy node aliasing rt.pred_persist (last-layer h_new).
+//   - cpy nodes that write the freshly computed state into rt.hc_persist in
+//     place, and
+//   - the last layer's h write, which the joint reads as the fresh pred.
 //
 // `token_in` must be an i32[1] input tensor in `gctx`. The graph builder
 // is shared between the init-only `g_lstm` graph and the fused
 // `g_lstm_joint` graph so they stay numerically identical.
 struct LstmBodyOuts {
     ggml_tensor * pred_cpy;
-    // ALL layers' h/c state-write cpy nodes. Every one must be marked as a graph
+    // ALL layers' state-write cpy nodes. Every one must be marked as a graph
     // output and forward-expanded, otherwise ggml_build_forward_expand prunes the
     // writes for layers whose result no downstream node reads (i.e. every layer
-    // except the last): those layers' h_persist/c_persist never update on the
+    // except the last): those layers' hc_persist rows never update on the
     // device path and the predictor loses its recurrence -> dropped word-final
     // subwords. The host path loops all layers, which is why it stays correct.
     std::vector<ggml_tensor *> state_cpy;
 };
+
+// gates = w_ih @ x + b_ih + b_hh + w_hh @ h_prev   ->  [4H]
+ggml_tensor * build_lstm_gates_split(ggml_context * gctx,
+                                     const TdtLstmLayer & w,
+                                     ggml_tensor * x,
+                                     ggml_tensor * h_l_in) {
+    ggml_tensor * gates = ggml_mul_mat(gctx, w.w_ih, x);
+    gates = ggml_add(gctx, gates, w.b_ih);
+    gates = ggml_add(gctx, gates, w.b_hh);
+    return ggml_add(gctx, gates, ggml_mul_mat(gctx, w.w_hh, h_l_in));
+}
+
+// Same gates from one GEMV over the load-time [w_ih | w_hh] stack and the
+// pre-summed bias. Cuts three nodes per layer; float summation order differs
+// from build_lstm_gates_split, so it is not bit-exact with it.
+ggml_tensor * build_lstm_gates_concat(ggml_context * gctx,
+                                      const TdtLstmCatWeights & w,
+                                      ggml_tensor * x,
+                                      ggml_tensor * h_l_in) {
+    ggml_tensor * xh = ggml_concat(gctx, x, h_l_in, 0);
+    return ggml_add(gctx, ggml_mul_mat(gctx, w.w, xh), w.b);
+}
+
+// One ggml_cpy per layer: ggml_lstm_cell already returns [h | c], which is
+// exactly the packed state row.
+std::vector<ggml_tensor *> write_back_fused_state(ggml_context * gctx,
+                                                  ggml_tensor * hc_persist,
+                                                  const std::vector<ggml_tensor *> & hc_per_layer,
+                                                  int H) {
+    std::vector<ggml_tensor *> cpy;
+    for (size_t l = 0; l < hc_per_layer.size(); ++l) {
+        ggml_tensor * dst = ggml_view_1d(gctx, hc_persist, 2 * H, state_row_offset(H, (int) l));
+        cpy.push_back(ggml_cpy(gctx, hc_per_layer[l], dst));
+    }
+    return cpy;
+}
+
+// Decomposed path: h and c land in the two halves of the layer's state row.
+std::vector<ggml_tensor *> write_back_split_state(ggml_context * gctx,
+                                                  ggml_tensor * hc_persist,
+                                                  const std::vector<ggml_tensor *> & h_per_layer,
+                                                  const std::vector<ggml_tensor *> & c_per_layer,
+                                                  int H) {
+    std::vector<ggml_tensor *> cpy;
+    for (size_t l = 0; l < h_per_layer.size(); ++l) {
+        ggml_tensor * h_dst = ggml_view_1d(gctx, hc_persist, H, state_row_offset(H, (int) l));
+        ggml_tensor * c_dst = ggml_view_1d(gctx, hc_persist, H, state_c_offset(H, (int) l));
+        cpy.push_back(ggml_cpy(gctx, h_per_layer[l], h_dst));
+        cpy.push_back(ggml_cpy(gctx, c_per_layer[l], c_dst));
+    }
+    return cpy;
+}
 
 LstmBodyOuts build_lstm_body(TdtRuntimeWeights & rt,
                              ggml_context * gctx,
@@ -230,26 +358,23 @@ LstmBodyOuts build_lstm_body(TdtRuntimeWeights & rt,
     ggml_tensor * x = ggml_get_rows(gctx, rt.weights->predict_embed, token_in);
     x = ggml_reshape_1d(gctx, x, H);
 
-    std::vector<ggml_tensor *> h_new_per_layer(L);
-    std::vector<ggml_tensor *> c_new_per_layer(L);
+    std::vector<ggml_tensor *> hc_per_layer;
+    std::vector<ggml_tensor *> h_new_per_layer;
+    std::vector<ggml_tensor *> c_new_per_layer;
 
     for (int l = 0; l < L; ++l) {
         const auto & w = rt.weights->lstm[l];
-        ggml_tensor * h_l_in = ggml_view_1d(gctx, rt.h_persist, H, (size_t) l * H * sizeof(float));
-        ggml_tensor * c_l_in = ggml_view_1d(gctx, rt.c_persist, H, (size_t) l * H * sizeof(float));
+        ggml_tensor * h_l_in = ggml_view_1d(gctx, rt.hc_persist, H, state_row_offset(H, l));
+        ggml_tensor * c_l_in = ggml_view_1d(gctx, rt.hc_persist, H, state_c_offset(H, l));
 
-        // gates = w_ih @ x + b_ih + b_hh + w_hh @ h_prev   ->  [4H]
-        ggml_tensor * gates = ggml_mul_mat(gctx, w.w_ih, x);
-        gates = ggml_add(gctx, gates, w.b_ih);
-        gates = ggml_add(gctx, gates, w.b_hh);
-        ggml_tensor * gates_h = ggml_mul_mat(gctx, w.w_hh, h_l_in);
-        gates = ggml_add(gctx, gates, gates_h);
+        ggml_tensor * gates = rt.concat_lstm_input
+                                ? build_lstm_gates_concat(gctx, rt.lstm_cat[l], x, h_l_in)
+                                : build_lstm_gates_split(gctx, w, x, h_l_in);
 
         if (rt.fused_lstm_cell) {
             ggml_tensor * hc = ggml_lstm_cell(gctx, gates, c_l_in);
-            h_new_per_layer[l] = ggml_view_1d(gctx, hc, H, 0);
-            c_new_per_layer[l] = ggml_view_1d(gctx, hc, H, (size_t) H * sizeof(float));
-            x = h_new_per_layer[l];
+            hc_per_layer.push_back(hc);
+            x = ggml_view_1d(gctx, hc, H, 0);
             continue;
         }
 
@@ -276,21 +401,23 @@ LstmBodyOuts build_lstm_body(TdtRuntimeWeights & rt,
         h_new = ggml_cont(gctx, h_new);
         c_new = ggml_cont(gctx, c_new);
 
-        h_new_per_layer[l] = h_new;
-        c_new_per_layer[l] = c_new;
+        h_new_per_layer.push_back(h_new);
+        c_new_per_layer.push_back(c_new);
 
         // Next layer feeds on this layer's hidden output.
         x = h_new;
     }
 
     LstmBodyOuts out{};
-    for (int l = 0; l < L; ++l) {
-        ggml_tensor * h_dst = ggml_view_1d(gctx, rt.h_persist, H, (size_t) l * H * sizeof(float));
-        ggml_tensor * c_dst = ggml_view_1d(gctx, rt.c_persist, H, (size_t) l * H * sizeof(float));
-        out.state_cpy.push_back(ggml_cpy(gctx, h_new_per_layer[l], h_dst));
-        out.state_cpy.push_back(ggml_cpy(gctx, c_new_per_layer[l], c_dst));
-    }
-    out.pred_cpy = ggml_cpy(gctx, h_new_per_layer[L - 1], rt.pred_persist);
+    out.state_cpy = rt.fused_lstm_cell
+                      ? write_back_fused_state(gctx, rt.hc_persist, hc_per_layer, H)
+                      : write_back_split_state(gctx, rt.hc_persist, h_new_per_layer, c_new_per_layer, H);
+    // The joint must read pred through the write-back node, not through
+    // rt.pred_persist, so gallocr orders the LSTM update before the joint
+    // mat_muls inside one compute_graph.
+    out.pred_cpy = rt.fused_lstm_cell
+                     ? ggml_view_1d(gctx, out.state_cpy.back(), H, 0)
+                     : out.state_cpy[out.state_cpy.size() - 2];
     return out;
 }
 
@@ -374,22 +501,14 @@ void build_lstm_graph(TdtRuntimeWeights & rt) {
 
     LstmBodyOuts outs = build_lstm_body(rt, gctx, rt.lstm_token_in);
     rt.lstm_pred_out = outs.pred_cpy;
-    // state_cpy is the single source of truth for the state write-backs; its last
-    // two entries are the final layer's h,c writes, kept here only for debug names.
-    rt.lstm_h_out    = outs.state_cpy[outs.state_cpy.size() - 2];
-    rt.lstm_c_out    = outs.state_cpy.back();
-    ggml_set_name(rt.lstm_h_out,    "lstm.h_out");
-    ggml_set_name(rt.lstm_c_out,    "lstm.c_out");
     ggml_set_name(rt.lstm_pred_out, "lstm.pred_out");
-    ggml_set_output(rt.lstm_pred_out);
-    // Mark EVERY layer's h/c state write as an output (not just the last), else
+    // Mark EVERY layer's state write as an output (not just the last), else
     // forward_expand prunes the non-last layers' writes and their state never
     // advances. See LstmBodyOuts::state_cpy.
     for (ggml_tensor * n : outs.state_cpy) ggml_set_output(n);
 
     rt.g_lstm = ggml_new_graph_custom(gctx, /*size*/ 256, /*grads*/ false);
     for (ggml_tensor * n : outs.state_cpy) ggml_build_forward_expand(rt.g_lstm, n);
-    ggml_build_forward_expand(rt.g_lstm, rt.lstm_pred_out);
 }
 
 // (2) Joint-only graph. Used after a blank emission, when pred_persist
@@ -459,9 +578,9 @@ void build_lstm_joint_graph(TdtRuntimeWeights & rt) {
         ggml_set_name(rt.lj_dur_out, rt.argmax_on_gpu ? "lstm_joint.dur_argmax" : "lstm_joint.dur_logits");
         ggml_set_output(rt.lj_dur_out);
     }
-    // Mark EVERY layer's h/c state write as an output so gallocr keeps them alive
-    // (their memory IS h_persist / c_persist). Without this, forward_expand prunes
-    // the dead-end intermediate writes for all but the last layer, so those layers'
+    // Mark EVERY layer's state write as an output so gallocr keeps them alive
+    // (their memory IS hc_persist). Without this, forward_expand prunes the
+    // dead-end intermediate writes for all but the last layer, so those layers'
     // recurrent state never advances on the device path -> dropped word-final
     // subwords. See LstmBodyOuts::state_cpy.
     for (ggml_tensor * n : lstm_outs.state_cpy) ggml_set_output(n);
@@ -586,6 +705,8 @@ TdtRuntimeWeights & TdtRuntimeWeights::operator=(TdtRuntimeWeights && o) noexcep
     backend      = o.backend;        o.backend = nullptr;
     n_threads    = o.n_threads;
     use_graphs   = o.use_graphs;
+    fused_lstm_cell = o.fused_lstm_cell;
+    argmax_on_gpu   = o.argmax_on_gpu;
     embed        = std::move(o.embed);
     host_lstm    = std::move(o.host_lstm);
     host_joint_enc_w  = std::move(o.host_joint_enc_w);
@@ -594,19 +715,21 @@ TdtRuntimeWeights & TdtRuntimeWeights::operator=(TdtRuntimeWeights && o) noexcep
     host_joint_pred_b = std::move(o.host_joint_pred_b);
     host_joint_out_w  = std::move(o.host_joint_out_w);
     host_joint_out_b  = std::move(o.host_joint_out_b);
+    concat_lstm_input = o.concat_lstm_input;
     gctx         = o.gctx;           o.gctx = nullptr;
+    lstm_cat_ctx    = o.lstm_cat_ctx;    o.lstm_cat_ctx    = nullptr;
+    lstm_cat_buffer = o.lstm_cat_buffer; o.lstm_cat_buffer = nullptr;
+    lstm_cat        = std::move(o.lstm_cat);
+    o.lstm_cat.clear();
     persist_ctx     = o.persist_ctx;     o.persist_ctx = nullptr;
     persist_buffer  = o.persist_buffer;  o.persist_buffer = nullptr;
-    h_persist        = o.h_persist;        o.h_persist = nullptr;
-    c_persist        = o.c_persist;        o.c_persist = nullptr;
+    hc_persist       = o.hc_persist;       o.hc_persist = nullptr;
     pred_persist     = o.pred_persist;     o.pred_persist = nullptr;
     enc_proj_persist = o.enc_proj_persist; o.enc_proj_persist = nullptr;
     enc_proj_T_max   = o.enc_proj_T_max;
     g_lstm       = o.g_lstm;         o.g_lstm = nullptr;
     alloc_lstm   = o.alloc_lstm;     o.alloc_lstm = nullptr;
     lstm_token_in = o.lstm_token_in; o.lstm_token_in = nullptr;
-    lstm_h_out   = o.lstm_h_out;     o.lstm_h_out = nullptr;
-    lstm_c_out   = o.lstm_c_out;     o.lstm_c_out = nullptr;
     lstm_pred_out = o.lstm_pred_out; o.lstm_pred_out = nullptr;
     g_joint      = o.g_joint;        o.g_joint = nullptr;
     alloc_joint  = o.alloc_joint;    o.alloc_joint = nullptr;
@@ -629,6 +752,9 @@ TdtRuntimeWeights::~TdtRuntimeWeights() {
         free_enc_proj_graph(g);
     }
     enc_proj_cache.clear();
+    lstm_cat.clear();
+    if (lstm_cat_buffer) { ggml_backend_buffer_free(lstm_cat_buffer); lstm_cat_buffer = nullptr; }
+    if (lstm_cat_ctx)    { ggml_free(lstm_cat_ctx);                  lstm_cat_ctx    = nullptr; }
     if (alloc_lstm_joint) { ggml_gallocr_free(alloc_lstm_joint); alloc_lstm_joint = nullptr; }
     if (alloc_joint) { ggml_gallocr_free(alloc_joint); alloc_joint = nullptr; }
     if (alloc_lstm)  { ggml_gallocr_free(alloc_lstm);  alloc_lstm  = nullptr; }
@@ -650,7 +776,20 @@ bool backend_runs_lstm_cell(ggml_backend_t backend, int H) {
     return ok;
 }
 
-int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W, bool allow_fused_lstm) {
+bool backend_runs_concat(ggml_backend_t backend, int H) {
+    if (!backend) return false;
+    ggml_init_params ip = { ggml_tensor_overhead() * 4, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+    ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+    const bool ok = ggml_backend_supports_op(backend, ggml_concat(ctx, a, b, 0));
+    ggml_free(ctx);
+    return ok;
+}
+
+int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W,
+                        bool allow_fused_lstm, bool allow_concat_lstm) {
     W = TdtRuntimeWeights{};
 
     const bool is_nemotron =
@@ -768,12 +907,13 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W, b
         const int L       = W.L;
         const int T_max   = TdtRuntimeWeights::k_enc_proj_T_max;
 
-        W.h_persist        = ggml_new_tensor_2d(W.persist_ctx, GGML_TYPE_F32, H_pred,  L);
-        W.c_persist        = ggml_new_tensor_2d(W.persist_ctx, GGML_TYPE_F32, H_pred,  L);
-        W.pred_persist     = ggml_new_tensor_1d(W.persist_ctx, GGML_TYPE_F32, H_pred);
+        W.hc_persist       = ggml_new_tensor_2d(W.persist_ctx, GGML_TYPE_F32, 2 * H_pred, L);
+        // Pred is the last layer's h, so it is a view rather than its own tensor:
+        // the LSTM write-back updates it for free.
+        W.pred_persist     = ggml_view_1d(W.persist_ctx, W.hc_persist, H_pred,
+                                          (size_t) (L - 1) * 2 * H_pred * sizeof(float));
         W.enc_proj_persist = ggml_new_tensor_2d(W.persist_ctx, GGML_TYPE_F32, H_joint, T_max);
-        ggml_set_name(W.h_persist,        "tdt.h_persist");
-        ggml_set_name(W.c_persist,        "tdt.c_persist");
+        ggml_set_name(W.hc_persist,       "tdt.hc_persist");
         ggml_set_name(W.pred_persist,     "tdt.pred_persist");
         ggml_set_name(W.enc_proj_persist, "tdt.enc_proj_persist");
 
@@ -798,6 +938,11 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W, b
         std::fprintf(stderr, "tdt_prepare_runtime: ggml_init failed\n");
         return 5;
     }
+
+    W.concat_lstm_input = allow_concat_lstm &&
+                          backend_runs_concat(W.backend, W.H_pred) &&
+                          build_lstm_input_concat(W);
+    if (!W.concat_lstm_input) W.lstm_cat.clear();
 
     build_lstm_graph(W);
     build_joint_graph(W);
@@ -944,7 +1089,7 @@ void tdt_init_state(TdtRuntimeWeights & W, int blank_id, TdtDecodeState & state)
     state.carry_frames      = 0;
 
     if (W.use_graphs) {
-        // Zero h, c on-device (~5 KB memset), then run one blank-token
+        // Zero the LSTM state on-device (~10 KB memset), then run one blank-token
         // LSTM step so pred_persist holds the canonical "no tokens yet"
         // prediction (matches NeMo's RNNT_TDT init).
         //
@@ -958,12 +1103,9 @@ void tdt_init_state(TdtRuntimeWeights & W, int blank_id, TdtDecodeState & state)
         // tdt_decode_window call (~5 KB upload) and only paid when the
         // backend doesn't accelerate the memset path -- negligible vs
         // the ~150 us-per-step Metal command-buffer cost.
-        const size_t h_bytes = ggml_nbytes(W.h_persist);
-        const size_t c_bytes = ggml_nbytes(W.c_persist);
-        std::vector<uint8_t> zeros;
-        zeros.assign(std::max(h_bytes, c_bytes), 0);
-        ggml_backend_tensor_set(W.h_persist, zeros.data(), 0, h_bytes);
-        ggml_backend_tensor_set(W.c_persist, zeros.data(), 0, c_bytes);
+        const size_t hc_bytes = ggml_nbytes(W.hc_persist);
+        std::vector<uint8_t> zeros(hc_bytes, 0);
+        ggml_backend_tensor_set(W.hc_persist, zeros.data(), 0, hc_bytes);
         if (!run_lstm_init_step(W, blank_id)) {
             throw std::runtime_error("tdt_init_state: LSTM graph compute failed");
         }

@@ -13,6 +13,7 @@
 #include "parakeet_ctc.h"
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,29 @@ TransducerGraphOutputs build_transducer_argmax_outputs(ggml_context * ctx,
                                                        ggml_tensor * logits,
                                                        int token_count,
                                                        int duration_count);
+
+// Load-time [w_ih | w_hh] stack plus the pre-summed bias, so one GEMV per LSTM
+// layer replaces the separate input and recurrent matmuls on the graph path.
+struct TdtLstmCatWeights {
+    ggml_tensor * w = nullptr;  // [2 * H_pred, 4 * H_pred], same type as w_ih
+    ggml_tensor * b = nullptr;  // f32 [4 * H_pred], b_ih + b_hh
+};
+
+// Stack two weight matrices row-wise: row r of `dst` is w_ih row r followed by
+// w_hh row r, so mul_mat(dst, concat(x, h)) == w_ih @ x + w_hh @ h. Quantised
+// rows are whole blocks whenever the input width is a multiple of the block
+// size, so this is a byte copy with no requantisation.
+inline void pack_lstm_input_rows(int64_t n_rows,
+                                 size_t ih_row_bytes, size_t hh_row_bytes,
+                                 const uint8_t * w_ih, const uint8_t * w_hh,
+                                 uint8_t * dst) {
+    const size_t dst_row_bytes = ih_row_bytes + hh_row_bytes;
+    for (int64_t r = 0; r < n_rows; ++r) {
+        uint8_t * row = dst + (size_t) r * dst_row_bytes;
+        std::memcpy(row,                w_ih + (size_t) r * ih_row_bytes, ih_row_bytes);
+        std::memcpy(row + ih_row_bytes, w_hh + (size_t) r * hh_row_bytes, hh_row_bytes);
+    }
+}
 
 // Per-layer host-dequantised LSTM weights, used by the CPU fallback path
 // (per-step ggml-graph dispatch on the CPU backend has too much overhead
@@ -75,6 +99,10 @@ struct TdtRuntimeWeights {
     // for the host to argmax; true elsewhere keeps the argmax on-device.
     bool               argmax_on_gpu = true;
     bool               fused_lstm_cell = false;   // GGML_OP_LSTM_CELL replaces the per-gate graph
+    // One GEMV over the [w_ih | w_hh] stack replaces the two per-layer matmuls
+    // and the two bias adds. Changes float summation order, so it is not
+    // bit-exact with the split form; the gate is token-stream equality.
+    bool               concat_lstm_input = false;
 
     // ---- CPU-fallback host weights (populated only when !use_graphs) ----
     std::vector<float>             embed;
@@ -89,18 +117,25 @@ struct TdtRuntimeWeights {
     // ---- GPU graph scaffolding (populated only when use_graphs) ----
     ggml_context * gctx = nullptr;
 
+    // Derived [w_ih | w_hh] stacks, built once at prepare time from the GGUF
+    // tensors and owned here (populated only when concat_lstm_input).
+    ggml_context *              lstm_cat_ctx    = nullptr;
+    ggml_backend_buffer_t       lstm_cat_buffer = nullptr;
+    std::vector<TdtLstmCatWeights> lstm_cat;
+
     // Persistent decoder state on the GPU backend (Metal/CUDA/Vulkan).
     //
     // Each emission step pays command-buffer submit/wait overhead; splitting
     // joint and LSTM into separate graphs per step doubled that cost. Here
-    // h, c, pred, and full-window enc_proj stay in persist_buffer, wired with
-    // ggml_cpy, plus a fused `g_lstm_joint` graph after non-blank emissions
+    // the LSTM state and the full-window enc_proj stay in persist_buffer, wired
+    // with ggml_cpy, plus a fused `g_lstm_joint` graph after non-blank emissions
     // so LSTM update and joint run in one graph commit when possible.
     ggml_context *           persist_ctx    = nullptr;
     ggml_backend_buffer_t    persist_buffer = nullptr;
-    ggml_tensor *            h_persist        = nullptr;  // [H_pred, L]
-    ggml_tensor *            c_persist        = nullptr;  // [H_pred, L]
-    ggml_tensor *            pred_persist     = nullptr;  // [H_pred]
+    // Row l is the layer's [h | c] pair, matching ggml_lstm_cell's [2H] result
+    // so the fused path writes both halves back with a single ggml_cpy.
+    ggml_tensor *            hc_persist       = nullptr;  // [2 * H_pred, L]
+    ggml_tensor *            pred_persist     = nullptr;  // view of hc_persist row L-1, h half
     ggml_tensor *            enc_proj_persist = nullptr;  // [H_joint, T_max]
     int                      enc_proj_T_max   = 0;
 
@@ -109,9 +144,7 @@ struct TdtRuntimeWeights {
     ggml_cgraph *  g_lstm     = nullptr;
     ggml_gallocr_t alloc_lstm = nullptr;
     ggml_tensor *  lstm_token_in = nullptr;
-    ggml_tensor *  lstm_h_out    = nullptr;  // ggml_cpy result aliasing h_persist
-    ggml_tensor *  lstm_c_out    = nullptr;  // ggml_cpy result aliasing c_persist
-    ggml_tensor *  lstm_pred_out = nullptr;  // ggml_cpy result aliasing pred_persist
+    ggml_tensor *  lstm_pred_out = nullptr;  // last layer's state write, h half
 
     // (2) Joint-only graph: used after a blank emission (pred unchanged
     //     from previous iteration). Reads pred_persist + enc_proj_persist
@@ -201,8 +234,10 @@ using RnntDecodeOptions = TdtDecodeOptions;
 using RnntDecodeResult = TdtDecodeResult;
 using RnntDecodeState = TdtDecodeState;
 
-// allow_fused_lstm = false keeps the decomposed per-gate LSTM graph (parity tests).
-int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & out, bool allow_fused_lstm = true);
+// allow_fused_lstm = false keeps the decomposed per-gate LSTM graph, and
+// allow_concat_lstm = false keeps the separate input/recurrent matmuls (parity tests).
+int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & out,
+                        bool allow_fused_lstm = true, bool allow_concat_lstm = true);
 
 void tdt_init_state(TdtRuntimeWeights & W,
                     int blank_id,
