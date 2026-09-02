@@ -16,7 +16,7 @@
   "whisper": {
     "cmake_target": "whisper-bench",
     "bench_kind":   "time-wrapped",
-    "binary":       "third_party/whisper.cpp/bin/whisper-bench",
+    "binary":       "bin/whisper-bench",
     "s3_prefix":    "whisper",
     "models_by_size": {
       "tiny":  ["2026-01-01/tiny-ggml-model.bin"],
@@ -31,7 +31,7 @@
   "parakeet": {
     "cmake_target": "parakeet-cli",
     "bench_kind":   "native",
-    "binary":       "engines/parakeet/parakeet-cli",
+    "binary":       "engines/parakeet/parakeet",
     "s3_prefix":    "parakeet",
     "models": [
       "2026-08-13/parakeet-unified-en-0.6b.q8_0.gguf",
@@ -45,7 +45,7 @@
   "sortformer": {
     "cmake_target": "parakeet-cli",
     "bench_kind":   "native",
-    "binary":       "engines/parakeet/parakeet-cli",
+    "binary":       "engines/parakeet/parakeet",
     "s3_prefix":    "parakeet",
     "models": [
       "2026-05-20/diar_streaming_sortformer_4spk-v2.1.q8_0.gguf",

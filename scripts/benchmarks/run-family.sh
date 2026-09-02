@@ -145,16 +145,19 @@ fetch_models() {
     return 0
   fi
 
+  # `mapfile -t` is bash 4+, so the macOS self-hosted runner would break if
+  # /usr/bin/env bash resolved to the system 3.2. Use a portable read loop.
   local -a keys=()
+  local line
   if [[ "$FAMILY" == "whisper" ]]; then
-    mapfile -t keys < <(jq -r --arg size "$WHISPER_SIZE" \
+    while IFS= read -r line; do keys+=("$line"); done < <(jq -r --arg size "$WHISPER_SIZE" \
       '.whisper.models_by_size[$size][]?' "$FAMILIES_JSON")
     if [[ ${#keys[@]} -eq 0 ]]; then
       echo "$FAMILY-$WHISPER_SIZE: no S3 key in registry (not-in-registry)"
       return 66
     fi
   else
-    mapfile -t keys < <(jq -r --arg family "$FAMILY" \
+    while IFS= read -r line; do keys+=("$line"); done < <(jq -r --arg family "$FAMILY" \
       '.[$family].models[]?' "$FAMILIES_JSON")
     if [[ ${#keys[@]} -eq 0 ]]; then
       return 65      # minimax shape: no S3 path
@@ -312,17 +315,24 @@ run_native() {
   echo "${median}|${wmin}|${wmax}|${rtf}|${backend}"
 }
 
+# Portable millisecond timestamp. `date +%s%N` is GNU-only — BSD/macOS
+# treats the %N as a literal N. Python's time_ns() is available on both
+# runner OSes and gives nanosecond precision.
+now_ns() {
+  python3 -c 'import time; print(time.time_ns())'
+}
+
 # ---- time-wrapped bench: N invocations, we take the median ------------------
 run_one_time_wrapped() {
   local iter="$1" stderr_log="$2" rss_log="$3"
   local start_ns end_ns
-  start_ns="$(date +%s%N)"
+  start_ns="$(now_ns)"
   # shellcheck disable=SC2086
   if ! wrap_time "$BINARY" $EXPANDED_ARGS > "$stderr_log.stdout" 2> "$rss_log"; then
     tail -20 "$rss_log" >&2
     return 1
   fi
-  end_ns="$(date +%s%N)"
+  end_ns="$(now_ns)"
   cat "$rss_log" >> "$stderr_log"
   awk -v s="$start_ns" -v e="$end_ns" 'BEGIN { printf "%.1f", (e - s) / 1000000.0 }'
 }
