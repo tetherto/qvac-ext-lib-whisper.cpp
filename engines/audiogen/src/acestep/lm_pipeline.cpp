@@ -20,12 +20,18 @@ namespace tts_cpp::acestep {
 static const char * LM_INSTRUCTION = "Generate audio semantic tokens based on the given conditions:";
 static const char * LM_INSPIRE_INSTRUCTION =
     "Expand the user's input into a more detailed and specific musical description:";
+static const char * LM_FORMAT_INSTRUCTION =
+    "Format the user's input into a more detailed and specific musical description:";
 static const char * LM_INSTRUMENTAL_LYRICS       = "[Instrumental]";
 static const char * LM_INSPIRE_INSTRUMENTAL_HINT = "\n\ninstrumental: true";
 
 std::string lm_inspire_user_message(const std::string & caption, const std::string & lyrics) {
     if (lyrics == LM_INSTRUMENTAL_LYRICS) return caption + LM_INSPIRE_INSTRUMENTAL_HINT;
     return caption;
+}
+
+std::string lm_format_user_message(const std::string & caption, const std::string & lyrics) {
+    return "# Caption\n" + caption + "\n\n# Lyric\n" + lyrics;
 }
 
 struct TokenProb {
@@ -385,16 +391,17 @@ static std::vector<int> build_custom_prompt(const BpeTokenizer & bpe, const std:
 }
 
 bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & prompt, const LmSampleParams & params,
-                        bool use_fsm, bool use_cot_caption, bool force_inspire) {
+                        bool use_fsm, bool use_cot_caption, LmPhase1Mode mode) {
     const LMConfig & cfg = lm_model_config(m);
     const int        V   = cfg.vocab_size;
 
     const AcePrompt base        = prompt;
+    const bool      format      = mode == LmPhase1Mode::Format;
     const bool      need_lyrics = base.lyrics.empty();
-    const bool      gen_lyrics  = need_lyrics || force_inspire;
+    const bool      inspire     = !format && (need_lyrics || mode == LmPhase1Mode::Inspire);
+    const bool      gen_lyrics  = format || inspire || need_lyrics;
     const bool      lyrics_mode = gen_lyrics;
     const bool      stop_at_reasoning = !gen_lyrics;
-    const bool      inspire     = need_lyrics || force_inspire;  // bare caption -> INSPIRE expansion
 
     // With the FSM active and the reasoning stop set, no sampled token can ever
     // reach the audio-code band, so the forward projects only the prefix head.
@@ -402,7 +409,10 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     const int V_eff = V_lim > 0 ? V_lim : V;
 
     std::vector<int> prompt_tokens;
-    if (inspire) {
+    if (format) {
+        prompt_tokens = build_custom_prompt(bpe, std::string("# Instruction\n") + LM_FORMAT_INSTRUCTION,
+                                            lm_format_user_message(base.caption, base.lyrics));
+    } else if (inspire) {
         prompt_tokens = build_custom_prompt(bpe, std::string("# Instruction\n") + LM_INSPIRE_INSTRUCTION,
                                             lm_inspire_user_message(base.caption, base.lyrics));
     } else {
@@ -413,7 +423,7 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     MetadataFSM fsm;
     if (use_fsm) {
         fsm.init(bpe, V_eff, params.verbose);
-        fsm.skip_caption = !use_cot_caption && !inspire;
+        fsm.skip_caption = !use_cot_caption && !inspire && !format;
         if (base.bpm > 0)               fsm.force_field(bpe, MetadataFSM::BPM_VALUE, std::to_string(base.bpm));
         if (base.duration > 0)          fsm.force_field(bpe, MetadataFSM::DURATION_VALUE,
                                                         std::to_string((int) base.duration));

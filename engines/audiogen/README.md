@@ -189,6 +189,18 @@ with no pre-supplied `audio_codes`; the composed request is reported back in
 `GenerateResult::metadata`. The inspire pass emits `lm` progress ticks and
 honors cancellation like every other stage.
 
+### ACE-Step Query Rewriting
+
+With `GenerateParams::rewrite_query` set, the LM FORMAT pass reworks a full
+request before synthesis: the caption is rewritten into a detailed musical
+description and the lyrics are regenerated preserving their content, with any
+unset metadata filled through the same FSM the inspire pass uses. Unlike
+Simple Mode — which expands a bare query and writes lyrics from scratch —
+Query Rewriting takes caption AND lyrics as input, so both are required; the
+two modes are mutually exclusive. The rewritten request is reported back in
+`GenerateResult::metadata`. Faithful rewriting needs the 1.7B LM
+(`acestep-5Hz-lm-1.7B`): the 0.6B drifts genre, voice, and language.
+
 ### ACE-Step quality scoring
 
 With `GenerateParams::compute_quality_score` set, the generated audio codes
@@ -585,6 +597,7 @@ combinations are rejected rather than silently ignored.
 | `--temp F`, `--topp F`, `--topk N`, `--cfg F` | `0.85`, `0.9`, off, `2.0` | LM sampling for the audio codes |
 | `--no-phase1` | off | skip the LM metadata auto-fill pass |
 | `--simple` | off | Simple Mode: expand `--caption` into a full request (lyrics regenerate unless `--lyrics "[Instrumental]"` is passed) |
+| `--rewrite` | off | Query Rewriting: the LM formats `--caption` and `--lyrics` into a detailed request, preserving the lyric content (needs the 1.7B LM) |
 | `--score` | off | teacher-forced LM quality score of the generated codes, printed with its per-condition breakdown |
 | `--req FILE` | | request JSON; pre-supplied `audio_codes` skip the LM stage |
 | `--ref-audio FILE` | | 48 kHz PCM16 WAV used by ACE-Step's timbre-conditioning path |

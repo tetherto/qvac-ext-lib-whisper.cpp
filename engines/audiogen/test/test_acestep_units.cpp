@@ -1455,6 +1455,59 @@ void test_lrc_request_policy() {
     CHECK(resolve_generate_task(params, task).find("audio edit path") != std::string::npos);
 }
 
+void test_format_user_message() {
+    using tts_cpp::acestep::lm_format_user_message;
+
+    CHECK(lm_format_user_message("a salsa song", "[verse]\nhello") ==
+          "# Caption\na salsa song\n\n# Lyric\n[verse]\nhello");
+    CHECK(lm_format_user_message("a groove", "[Instrumental]") ==
+          "# Caption\na groove\n\n# Lyric\n[Instrumental]");
+}
+
+void test_rewrite_query_policy() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::RepaintParams;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask   task;
+    params.rewrite_query = true;
+    params.caption       = "a salsa song";
+    params.lyrics        = "[verse]\nhello";
+    CHECK(resolve_generate_task(params, task).empty());
+
+    params.simple_mode = true;
+    CHECK(resolve_generate_task(params, task).find("cannot be combined with simple_mode") !=
+          std::string::npos);
+    params.simple_mode = false;
+
+    params.caption.clear();
+    CHECK(resolve_generate_task(params, task).find("requires a caption") != std::string::npos);
+    params.caption = "a salsa song";
+
+    params.lyrics.clear();
+    CHECK(resolve_generate_task(params, task).find("requires lyrics to format") != std::string::npos);
+    params.lyrics = "[verse]\nhello";
+
+    params.task_type = tts_cpp::acestep::TASK_COVER_NOFSQ;
+    params.source_audio.assign(96, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("only task 'text2music'") != std::string::npos);
+    params.task_type = tts_cpp::acestep::TASK_TEXT2MUSIC;
+    params.source_audio.clear();
+
+    params.audio_codes.assign(4, 1);
+    CHECK(resolve_generate_task(params, task).find("pre-supplied audio_codes") != std::string::npos);
+    params.audio_codes.clear();
+
+    params.edit_plan.push_back(RepaintParams{});
+    CHECK(resolve_generate_task(params, task).find("edit_plan") != std::string::npos);
+    params.edit_plan.clear();
+
+    params.lm_phase1 = false;
+    CHECK(resolve_generate_task(params, task).find("requires lm_phase1") != std::string::npos);
+}
+
 void test_inspire_user_message() {
     using tts_cpp::acestep::lm_inspire_user_message;
 
@@ -2816,6 +2869,8 @@ int main() {
     test_lyrics_timestamps_and_lrc();
     test_lrc_request_policy();
     test_inspire_user_message();
+    test_format_user_message();
+    test_rewrite_query_policy();
     test_cover_conditioning_switch();
     test_generation_plans();
     test_lego_task_kinds();

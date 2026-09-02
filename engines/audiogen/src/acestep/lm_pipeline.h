@@ -73,15 +73,33 @@ std::vector<int> build_lm_prompt_with_cot(const BpeTokenizer & bpe, const AcePro
 // when the caller explicitly requested "[Instrumental]" lyrics.
 std::string lm_inspire_user_message(const std::string & caption, const std::string & lyrics);
 
+// Phase-1 expansion mode.
+enum class LmPhase1Mode {
+    // Gap-fill: only empty fields are generated; a bare caption (no lyrics)
+    // runs the INSPIRE expansion.
+    Auto,
+    // Simple Mode: always run the INSPIRE expansion — the caption is rewritten
+    // and lyrics are written even when metadata is complete. "[Instrumental]"
+    // lyrics forward the instrumental hint.
+    Inspire,
+    // Query Rewriting: FORMAT the request — the caption is rewritten into a
+    // detailed musical description and the lyrics are regenerated preserving
+    // their content ("# Caption / # Lyric" user message).
+    Format,
+};
+
+// User message for the FORMAT prompt (Query Rewriting).
+std::string lm_format_user_message(const std::string & caption, const std::string & lyrics);
+
 // Phase 1: auto-generate missing metadata (bpm/keyscale/duration/timesignature/
 // language) — and lyrics for a bare caption — via FSM-constrained decoding.
-// Mutates `prompt` in place (gap-fill: only empty fields are overwritten).
-// use_fsm=false lets the LM free-run (lower reliability). force_inspire runs
-// the INSPIRE expansion even when lyrics are present: "[Instrumental]" lyrics
-// forward the instrumental hint and the caption is always rewritten (Simple
-// Mode). Returns false on failure or cancellation via params.on_step.
+// Mutates `prompt` in place (gap-fill: only empty fields are overwritten;
+// Inspire/Format also rewrite the caption and lyrics). use_fsm=false lets the
+// LM free-run (lower reliability). Returns false on failure or cancellation
+// via params.on_step.
 bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & prompt, const LmSampleParams & params,
-                        bool use_fsm = true, bool use_cot_caption = true, bool force_inspire = false);
+                        bool use_fsm = true, bool use_cot_caption = true,
+                        LmPhase1Mode mode = LmPhase1Mode::Auto);
 
 // Phase 2: generate FSQ audio semantic codes for a fully-specified prompt.
 // Single sequence, no CFG. Returns the raw codes (already offset-subtracted,

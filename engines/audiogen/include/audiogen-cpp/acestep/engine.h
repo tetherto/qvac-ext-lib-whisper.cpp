@@ -161,6 +161,14 @@ struct GenerateParams {
     // NOTE: `lyrics` DEFAULTS to "[Instrumental]" — assign an empty string
     // explicitly for LM-written vocals, or every request stays instrumental.
     bool        simple_mode    = false;
+    // Query Rewriting: the LM FORMAT pass rewrites `caption` into a detailed
+    // musical description and regenerates `lyrics` preserving their content,
+    // filling any unset metadata, before synthesis. Unlike simple_mode, the
+    // full request (caption AND lyrics) is the input — use simple_mode for a
+    // bare query. Requires text2music with no pre-supplied audio_codes and
+    // lm_phase1; mutually exclusive with simple_mode. Faithful rewriting
+    // needs the 1.7B LM; the 0.6B drifts genre/voice/language.
+    bool        rewrite_query = false;
     // Synchronized lyric timestamps: after synthesis, one extra DiT forward at
     // the final timestep captures the lyric cross-attention heads and DTW
     // aligns each lyric line with the audio. The LRC text and its alignment

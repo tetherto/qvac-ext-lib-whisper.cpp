@@ -611,6 +611,34 @@ void run_simple_mode_scenario(tts_cpp::acestep::Engine & engine) {
     CHECK(!result.metadata.vocal_language.empty());
 }
 
+// Query Rewriting end to end: the FORMAT pass must rewrite the caption and
+// regenerate lyrics before synthesis. Content fidelity needs the 1.7B LM, so
+// the fixture-sized LM is asserted on structure only.
+void run_query_rewrite_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    GenerateParams params;
+    params.caption         = "a short salsa idea";
+    params.lyrics          = "[verse]\nhello rewrite world";
+    params.rewrite_query   = true;
+    params.duration        = 2.0f;
+    params.inference_steps = TEST_STEPS;
+    params.shift           = TEST_SHIFT;
+    params.seed            = TEST_SEED;
+
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(result.metadata.n_codes > 0);
+    CHECK(stages.contains(TEST_LM_STAGE));
+    CHECK(stages.contains_unknown_total_progress(TEST_LM_STAGE));
+    CHECK(!result.metadata.caption.empty());
+    CHECK(result.metadata.caption != params.caption);
+    CHECK(!result.metadata.lyrics.empty());
+    CHECK(result.metadata.bpm > 0);
+    CHECK(!result.metadata.keyscale.empty());
+}
+
 tts_cpp::acestep::GenerateParams make_lm_cancel_params() {
     tts_cpp::acestep::GenerateParams params;
     params.caption         = "a cancelled simple mode request";
@@ -724,6 +752,7 @@ int run_integration(const char * models_dir) {
         run_lm_generation_scenario(*engine, dump_dir);
         run_quality_score_scenario(*engine);
         run_simple_mode_scenario(*engine);
+        run_query_rewrite_scenario(*engine);
         run_lm_phase1_cancel_scenario(*engine);
         run_lm_phase2_cancel_scenario(*engine);
         run_lrc_scenario(*engine);

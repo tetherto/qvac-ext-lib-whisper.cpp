@@ -137,6 +137,8 @@ int main(int argc, char ** argv) {
                 "           [--simple]  (Simple Mode: expand --caption into a full request;\n"
                 "           the LM writes lyrics unless --lyrics \"[Instrumental]\" is given,\n"
                 "           and fills any metadata left unset, duration included with --dur 0)\n"
+                "           [--rewrite]  (Query Rewriting: the LM formats --caption and --lyrics\n"
+                "           into a detailed request, preserving the lyric content; needs the 1.7B LM)\n"
                 "  audio:   [--ref-audio <48-kHz PCM16 WAV>]  (timbre reference)\n"
                 "           [--src-audio <48-kHz PCM16 WAV>]  (cover source structure)\n"
                 "           [--task text2music|cover-nofsq|lego]   (default text2music)\n"
@@ -190,6 +192,7 @@ int main(int argc, char ** argv) {
         if (!arg_val(argc, argv, "--lyrics")) p.lyrics.clear();
     }
     if (arg_flag(argc, argv, "--score")) p.compute_quality_score = true;
+    if (arg_flag(argc, argv, "--rewrite")) p.rewrite_query = true;
 
     // --req <json>: load caption/lyrics/metas and (if present) audio_codes to
     // bypass our LM — used for parity against acestep.cpp's ace-lm output.
