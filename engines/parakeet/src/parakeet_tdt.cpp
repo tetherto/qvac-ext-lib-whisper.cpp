@@ -245,6 +245,14 @@ LstmBodyOuts build_lstm_body(TdtRuntimeWeights & rt,
         ggml_tensor * gates_h = ggml_mul_mat(gctx, w.w_hh, h_l_in);
         gates = ggml_add(gctx, gates, gates_h);
 
+        if (rt.fused_lstm_cell) {
+            ggml_tensor * hc = ggml_lstm_cell(gctx, gates, c_l_in);
+            h_new_per_layer[l] = ggml_view_1d(gctx, hc, H, 0);
+            c_new_per_layer[l] = ggml_view_1d(gctx, hc, H, (size_t) H * sizeof(float));
+            x = h_new_per_layer[l];
+            continue;
+        }
+
         const size_t H_bytes = (size_t) H * sizeof(float);
         ggml_tensor * i_part = ggml_view_1d(gctx, gates, H, 0 * H_bytes);
         ggml_tensor * f_part = ggml_view_1d(gctx, gates, H, 1 * H_bytes);
@@ -630,7 +638,19 @@ TdtRuntimeWeights::~TdtRuntimeWeights() {
     // backend is owned by ParakeetCtcModel::Impl; don't free here.
 }
 
-int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
+bool backend_runs_lstm_cell(ggml_backend_t backend, int H) {
+    if (!backend) return false;
+    ggml_init_params ip = { ggml_tensor_overhead() * 4, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    ggml_tensor * gates = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4 * H);
+    ggml_tensor * c     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+    const bool ok = ggml_backend_supports_op(backend, ggml_lstm_cell(ctx, gates, c));
+    ggml_free(ctx);
+    return ok;
+}
+
+int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W, bool allow_fused_lstm) {
     W = TdtRuntimeWeights{};
 
     const bool is_nemotron =
@@ -700,6 +720,7 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
     if (W.use_graphs && std::strcmp(backend_reg_name(W.backend), "OpenCL") == 0) {
         W.use_graphs = false;
     }
+    W.fused_lstm_cell = W.use_graphs && allow_fused_lstm && backend_runs_lstm_cell(W.backend, W.H_pred);
 
     if (!W.use_graphs) {
         // ---- CPU fallback: dequantise weights to host f32 ----

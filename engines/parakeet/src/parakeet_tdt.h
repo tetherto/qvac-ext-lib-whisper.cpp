@@ -74,6 +74,7 @@ struct TdtRuntimeWeights {
     // false on ggml-opencl (no ARGMAX kernel): the joint graph emits raw logits
     // for the host to argmax; true elsewhere keeps the argmax on-device.
     bool               argmax_on_gpu = true;
+    bool               fused_lstm_cell = false;   // GGML_OP_LSTM_CELL replaces the per-gate graph
 
     // ---- CPU-fallback host weights (populated only when !use_graphs) ----
     std::vector<float>             embed;
@@ -200,7 +201,8 @@ using RnntDecodeOptions = TdtDecodeOptions;
 using RnntDecodeResult = TdtDecodeResult;
 using RnntDecodeState = TdtDecodeState;
 
-int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & out);
+// allow_fused_lstm = false keeps the decomposed per-gate LSTM graph (parity tests).
+int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & out, bool allow_fused_lstm = true);
 
 void tdt_init_state(TdtRuntimeWeights & W,
                     int blank_id,

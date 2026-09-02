@@ -1139,6 +1139,27 @@ if (PARAKEET_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}" "${_qvp_tdt_ref}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+    # The fused LSTM cell op must reproduce the per-gate decoder graph token for token.
+    add_executable(test-tdt-lstm-parity
+        test/test_tdt_lstm_parity.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-tdt-lstm-parity PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-tdt-lstm-parity PRIVATE include src ggml/include)
+    parakeet_apply_backend_defs(test-tdt-lstm-parity)
+    parakeet_register_test(test-tdt-lstm-parity-gpu
+        LABEL    "gpu"
+        EXE      test-tdt-lstm-parity
+        ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}" "--n-gpu-layers" "1"
+        REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
     # Multi-piece French guard for the on-device predictor (QVAC-21005): the gpu0
     # scalar path and the gpu1 graph path must produce identical token IDs on a
     # word with multiple word-final sub-words (e.g. "analyses"). English jfk does

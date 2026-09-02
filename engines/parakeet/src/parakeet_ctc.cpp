@@ -186,6 +186,7 @@ struct ParakeetCtcModel::Impl {
     // (the relative-position bias is one bias matrix per head); otherwise heads are
     // folded into the batch dimension for the fused attention call.
     bool                   fa_per_head_mask   = false;
+    bool                   glu_fused          = false;
     // CPU-resident copies of the Sortformer head weights (Mali-Vulkan only), so
     // the CPU head graph reads them from the CPU backend instead of
     // dereferencing the GPU-resident originals.
@@ -435,6 +436,20 @@ bool backend_runs_conv_2d_dw(ggml_backend_t backend, bool channels_contiguous) {
 // are dlopen()'d at runtime and are not linkable from libqvac-parakeet.
 // The registry walk reaches the same backends in both modes.
 // Ask the backend whether ggml_flash_attn_ext accepts a mask with one slice per head.
+// Whether the backend runs the sigmoid-gated GLU on a [2C, T] tensor (the conformer conv module's
+// a * sigmoid(b) over the two channel halves) without materialising the halves.
+bool backend_runs_siglu(ggml_backend_t backend, int C) {
+    if (!backend) return false;
+    ggml_init_params ip = { ggml_tensor_overhead() * 4, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    const int T = 8;
+    ggml_tensor * out = ggml_siglu(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * C, T));
+    const bool ok = ggml_backend_supports_op(backend, out);
+    ggml_free(ctx);
+    return ok;
+}
+
 bool backend_runs_flash_attn_per_head_mask(ggml_backend_t backend, int HD, int H) {
     if (!backend) return false;
     ggml_init_params ip = { ggml_tensor_overhead() * 8, nullptr, true };
@@ -1430,6 +1445,7 @@ int load_from_gguf(const std::string & gguf_path,
         gpu_is_mali_vulkan && impl->backend_active == impl->backend_gpu;
     impl->fa_per_head_mask = backend_runs_flash_attn_per_head_mask(
         impl->backend_active, out_model.encoder_cfg.head_dim, out_model.encoder_cfg.n_heads);
+    impl->glu_fused = !gpu_is_mali_vulkan && backend_runs_siglu(impl->backend_active, out_model.encoder_cfg.d_model);
     if (impl->backend_gpu && impl->backend_active == impl->backend_gpu && !gpu_is_mali_vulkan) {
         impl->dw_direct_planar   = backend_runs_conv_2d_dw(impl->backend_gpu, false);
         impl->dw_direct_channels = backend_runs_conv_2d_dw(impl->backend_gpu, true);
@@ -2507,6 +2523,7 @@ ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
                                    const BlockWeights & W,
                                    int d_model, int /*T*/, int conv_kernel,
                                    DwConvLowering dw_lowering,
+                                   bool glu_fused,
                                    ConvNormType conv_norm_type,
                                    bool conv_causal,
                                    float layer_norm_eps) {
@@ -2524,21 +2541,23 @@ ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
     y = maybe_add_bias(ctx, y, W.conv_pw1_b);
 
     // Conformer GLU: split (2*d_model, T, B) along the channel axis into two
-    // halves, then y = half1 * sigmoid(half2). The two halves are strided
-    // views over the same source tensor and ggml-vulkan miscomputes the
-    // sigmoid / mul kernels when fed strided inputs (validated on RTX 5060;
-    // see test-vk-vs-cpu bisect: block0_conv_post_glu rel jumps from 1e-3
-    // to ~0.8 without the contig). Materialising each half with ggml_cont
-    // before the elementwise ops fixes the divergence on Vulkan and is a
-    // no-op-cheap memcpy on CPU.
-    ggml_tensor * half1 = ggml_cont(ctx,
-        ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
-                     y->nb[1], y->nb[2], 0));
-    ggml_tensor * half2 = ggml_cont(ctx,
-        ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
-                     y->nb[1], y->nb[2],
-                     (size_t) d_model * y->nb[0]));
-    y = ggml_mul(ctx, half1, ggml_sigmoid(ctx, half2));
+    // halves, then y = half1 * sigmoid(half2). The gated op reads both halves
+    // in place; where the backend lacks it, the halves are materialised first
+    // because ggml-vulkan miscomputes the sigmoid / mul kernels on strided
+    // inputs (validated on RTX 5060; see test-vk-vs-cpu bisect:
+    // block0_conv_post_glu rel jumps from 1e-3 to ~0.8 without the contig).
+    if (glu_fused) {
+        y = ggml_siglu(ctx, y);
+    } else {
+        ggml_tensor * half1 = ggml_cont(ctx,
+            ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
+                         y->nb[1], y->nb[2], 0));
+        ggml_tensor * half2 = ggml_cont(ctx,
+            ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
+                         y->nb[1], y->nb[2],
+                         (size_t) d_model * y->nb[0]));
+        y = ggml_mul(ctx, half1, ggml_sigmoid(ctx, half2));
+    }
 
     const int pad_left  = conv_causal ? (conv_kernel - 1) : ((conv_kernel - 1) / 2);
     const int pad_right = conv_causal ? 0                 : ((conv_kernel - 1) / 2);
@@ -2618,6 +2637,7 @@ ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,
                                     int conv_kernel, float eps,
                                     DwConvLowering dw_lowering,
                                     bool fa_per_head_mask,
+                                    bool glu_fused,
                                     ConvNormType conv_norm_type,
                                     bool conv_causal) {
     ggml_tensor * residual = x;
@@ -2635,7 +2655,7 @@ ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,
 
     residual = x;
     xn = layer_norm_affine(ctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-    y = conformer_conv_graph(ctx, xn, W, d_model, T, conv_kernel, dw_lowering,
+    y = conformer_conv_graph(ctx, xn, W, d_model, T, conv_kernel, dw_lowering, glu_fused,
                              conv_norm_type, conv_causal, eps);
     x = ggml_add(ctx, residual, y);
 
@@ -2962,7 +2982,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
             residual = x;
             xn = layer_norm_affine(gctx, x, W.norm_conv_w, W.norm_conv_b, eps);
             y = conformer_conv_graph(gctx, xn, W, d_model, T, conv_kernel, dw_lowering,
-                                     enc.conv_norm_type, enc.conv_causal, eps);
+                                     model.impl->glu_fused, enc.conv_norm_type, enc.conv_causal, eps);
             x = ggml_add(gctx, residual, y);
             g.post_conv_0_node = x;
             ggml_set_name(g.post_conv_0_node, "block_0_post_conv");
@@ -2987,7 +3007,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
         } else {
             x = conformer_block_graph(gctx, x, g.pe_in, g.att_mask, model.blocks[i],
                                       d_model, H, HD, T, conv_kernel, eps,
-                                      dw_lowering, model.impl->fa_per_head_mask,
+                                      dw_lowering, model.impl->fa_per_head_mask, model.impl->glu_fused,
                                       enc.conv_norm_type, enc.conv_causal);
         }
         if (i == n_run_layers - 1) {
@@ -3558,7 +3578,7 @@ static int build_substage_graph(const ParakeetCtcModel & model,
         ggml_tensor * r = x;
         ggml_tensor * xn = layer_norm_affine(g.ctx, x, W.norm_conv_w, W.norm_conv_b, eps);
         ggml_tensor * y = conformer_conv_graph(g.ctx, xn, W, d_model, T, conv_kernel,
-                                               select_dw_lowering(model, backend),
+                                               select_dw_lowering(model, backend), model.impl->glu_fused,
                                                enc.conv_norm_type, enc.conv_causal, eps);
         x = ggml_add(g.ctx, r, y);
     }
