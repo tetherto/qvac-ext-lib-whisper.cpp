@@ -61,6 +61,10 @@ int sample_top_k_p(float * logits, int V, float temperature, float top_p, int to
 // running sample_top_k_p, including its RNG consumption and r==0 edge case.
 int lm_consume_forced(int token, float temperature, std::mt19937 & rng);
 
+// YAML CoT block for the prompt's set fields (Python yaml.dump parity:
+// sorted keys, captions wrapped past column 80). Shared with quality scoring.
+std::string lm_cot_yaml(const AcePrompt & prompt);
+
 // Build the Qwen3 chat prompt with an injected CoT metadata block (Phase 2).
 // The assistant turn stays open so the LM emits audio codes then <|im_end|>.
 std::vector<int> build_lm_prompt_with_cot(const BpeTokenizer & bpe, const AcePrompt & prompt);

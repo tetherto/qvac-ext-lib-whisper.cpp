@@ -51,6 +51,7 @@ audiogen  caption + lyrics -> ACE-Step LM -> FSQ detokenizer -> text encoder
                            -> Oobleck VAE -> 48 kHz stereo
           short query -> LM inspire (Simple Mode) -> caption + lyrics + metadata
                            -> same ACE-Step pipeline
+          generated codes + request -> teacher-forced LM -> quality score
           caption + lyrics -> MiniMax Qwen3 LM -> RVQ depth decoder
                            -> condition encoder -> flow DiT -> vocoder -> stereo
 ```
