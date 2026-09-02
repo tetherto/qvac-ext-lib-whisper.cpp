@@ -140,6 +140,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--results-dir", required=True, type=pathlib.Path)
     ap.add_argument("--out", required=True, type=pathlib.Path)
+    # `expected_count` is emitted by the workflow's `plan` job. When set, we
+    # also fail if fewer rows than planned made it to the summary — that's
+    # the "cell died before writing its pre-flight seed" case, which the
+    # `not ok_rows` gate below can't see because the missing row contributes
+    # zero to `results`.
+    ap.add_argument("--expected-count", type=int, default=None)
     args = ap.parse_args()
 
     if not args.results_dir.is_dir():
@@ -169,11 +175,27 @@ def main() -> int:
     # workflow would otherwise finish green with a table full of red
     # statuses that nobody looks at. Failing the summarize job here makes
     # the whole dispatch red so the reader has to look at the summary.
+    #
+    # Two independent trip conditions:
+    #   (a) rows are collected but none succeeded — every cell wrote a
+    #       failure result.
+    #   (b) fewer rows than planned — a cell died before its pre-flight
+    #       seed could write result.json (workflow env / harness bug).
+    #       Needs --expected-count from the workflow's plan job.
     ok_rows = [r for r in results if r.get("status") == "ok"]
     if results and not ok_rows:
         print(
             f"FAIL: {len(results)} rows collected but 0 have status=ok. "
             "Every cell failed — see the row-level notes.",
+            file=sys.stderr,
+        )
+        return 1
+    if args.expected_count is not None and len(results) < args.expected_count:
+        print(
+            f"FAIL: expected {args.expected_count} rows from the plan "
+            f"but only {len(results)} arrived. "
+            f"{args.expected_count - len(results)} cell(s) died before "
+            "writing a result.json.",
             file=sys.stderr,
         )
         return 1

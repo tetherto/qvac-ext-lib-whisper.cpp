@@ -83,13 +83,14 @@
       "2026-06-01/chatterbox-s3gen-q8_0.gguf"
     ],
     "args": [
+      "--verbose",
       "--model",       "${MODEL_DIR}/chatterbox-t3-turbo-q8_0.gguf",
       "--s3gen-gguf",  "${MODEL_DIR}/chatterbox-s3gen-q8_0.gguf",
       "--text",        "benchmark run",
       "--out",         "/dev/null"
     ],
     "audio_duration_seconds":  null,
-    "notes": "Chatterbox has no dedicated -bench; wall-clock via tts-cli for a fixed 'benchmark run' prompt. Engine is auto-detected from the T3 GGUF metadata (chatterbox.arch)."
+    "notes": "Chatterbox has no dedicated -bench; wall-clock via tts-cli for a fixed 'benchmark run' prompt. Engine is auto-detected from the T3 GGUF metadata. --verbose surfaces the 'using <backend>' line the driver scrapes to fill the Backend column."
   },
 
   "supertonic": {
@@ -160,13 +161,14 @@
       "2026-08-12/audio8-codec-decoder-q8_0.gguf"
     ],
     "args": [
+      "--verbose",
       "--lm",             "${MODEL_DIR}/audio8-lm-q8_0.gguf",
       "--codec-decoder",  "${MODEL_DIR}/audio8-codec-decoder-q8_0.gguf",
       "--text",           "benchmark run",
       "--out",            "/dev/null"
     ],
     "audio_duration_seconds":  null,
-    "notes": "audio8-cli has no --bench flag; wall-clock via time. RTF omitted (text-driven variable output)."
+    "notes": "audio8-cli has no --bench flag; wall-clock via time. --verbose surfaces the 'using <backend>' marker. RTF omitted (text-driven variable output)."
   },
 
   "lavasr": {

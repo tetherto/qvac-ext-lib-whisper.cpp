@@ -76,6 +76,7 @@ jobs:
     outputs:
       matrix: ${{ steps.expand.outputs.matrix }}
       runs_per_bench: ${{ steps.expand.outputs.runs_per_bench }}
+      expected_count: ${{ steps.expand.outputs.expected_count }}
     steps:
       - id: expand
         env:
@@ -165,7 +166,13 @@ jobs:
 
           matrix="$(jq -c -n --argjson include "$cells" '{include: $include}')"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-          echo "planned matrix:"
+          # expected_count feeds summarize.py's absent-row check. A cell that
+          # dies before its pre-flight seed writes result.json contributes no
+          # artifact — comparing against the plan count lets summarize.py
+          # notice the gap instead of finishing green with a half-empty table.
+          expected="$(echo "$cells" | jq 'length')"
+          echo "expected_count=$expected" >> "$GITHUB_OUTPUT"
+          echo "planned matrix ($expected cells):"
           echo "$matrix" | jq .
 
   # ---------- 2. Bench a single (family, runner) cell ---------------------
@@ -198,10 +205,12 @@ jobs:
       WHISPER_SIZE: ${{ matrix.whisper_size }}
       RUNNER_LABEL: ${{ matrix.runner_label }}
     steps:
-      # Hardened-runner audit mode. Egress is monitored but not blocked
-      # until the observed traffic (S3 model fetch + qvac-ext-ggml clone +
-      # actions/*) is characterized on a real dispatch. Flip to
-      # egress-policy: block once the baseline is stable.
+      # Hardened-runner audit mode. Actual coverage is narrower than it
+      # looks: harden-runner is a no-op on self-hosted runners without a
+      # StepSecurity Enterprise plan, and audit-only on hosted macOS —
+      # so the egress baseline it collects here is effectively the
+      # hosted-Linux lane. Still worth including; flip to
+      # egress-policy: block once the Linux-lane baseline is stable.
       - name: Harden runner (audit)
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -220,12 +229,17 @@ jobs:
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # jq is used by every step from Pre-flight seed onwards. macOS runners
-      # ship it; Linux hosted runners don't, so install it before anything
-      # else that needs it.
-      - name: Install jq (Linux — macOS ships it)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -q && sudo apt-get install -y jq
+      # jq is used by every step from Pre-flight seed onwards. Neither
+      # runner image is guaranteed to ship it (contrary to the previous
+      # comment: macOS does NOT ship jq by default), so install
+      # unconditionally with the per-OS package manager, no-op if present.
+      - name: Install jq
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            command -v jq >/dev/null || brew install jq
+          else
+            command -v jq >/dev/null || (sudo apt-get update -q && sudo apt-get install -y jq)
+          fi
 
       # Seed a fallback result.json BEFORE the infrastructure steps run.
       # If any of them (AWS OIDC, ggml build, cmake configure) fails, the
@@ -288,11 +302,12 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ggml-install
-          # Key says `perf` (not `portable`) because the ggml build below
-          # enables the runner-native backend (Metal on macOS) plus
-          # GGML_NATIVE=ON, which is unsafe to reuse across differently
-          # configured machines. Same-runner reuse is fine.
-          key: ggml-install-perf-${{ matrix.runner_os }}-${{ steps.ggml.outputs.sha }}
+          # `perf` because the macOS build carries Metal; `runner.environment`
+          # in the key so the hosted-Linux (portable, no -march=native) and
+          # self-hosted-macOS (Metal + native) artefacts never collide, and
+          # a hosted-Linux cache save from CPU A can never restore on CPU B
+          # (they're both `ubuntu-24.04` but different silicon).
+          key: ggml-install-perf-${{ matrix.runner_os }}-${{ runner.environment }}-${{ steps.ggml.outputs.sha }}
 
       - name: Cache ccache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -306,16 +321,20 @@ jobs:
             ccache-benchmark-${{ matrix.runner_os }}-
 
       # This is a perf workflow, not correctness-CI — so unlike the sibling
-      # *-ci.yml lanes we want the runner-optimal ggml build:
-      #   * GGML_NATIVE=ON: -march=native on the compile line, so the CPU
-      #     backend gets the same AVX/NEON dispatch a local build would.
+      # *-ci.yml lanes we want the runner-optimal ggml build where it's safe:
       #   * GGML_METAL=ON on macOS runners: Metal is the whole point of
       #     the qvac-macos26-arm64-gpu label; a Metal-less bench would
       #     duplicate the linux CPU numbers.
+      #   * GGML_NATIVE=ON only on self-hosted (single-machine). `-march=native`
+      #     bakes the build host's ISA into the artefact, and the hosted
+      #     `ubuntu-24.04` label is a POOL spanning CPU generations —
+      #     a later cell restoring that cache on an older CPU would SIGILL.
+      #     Hosted Linux stays on the portable ggml default.
       - name: Build ggml (system ggml, qvac-ext-ggml@${{ env.GGML_BRANCH }})
         if: steps.ggml-cache.outputs.cache-hit != 'true'
         env:
-          GGML_METAL_FLAG: ${{ runner.os == 'macOS' && 'ON' || 'OFF' }}
+          GGML_METAL_FLAG:  ${{ runner.os == 'macOS' && 'ON' || 'OFF' }}
+          GGML_NATIVE_FLAG: ${{ runner.environment != 'github-hosted' && 'ON' || 'OFF' }}
         run: |
           set -euo pipefail
           git init -q ggml-src
@@ -325,7 +344,7 @@ jobs:
           cmake -S ggml-src -B ggml-src/build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
-            -DGGML_NATIVE=ON \
+            -DGGML_NATIVE="$GGML_NATIVE_FLAG" \
             -DGGML_METAL="$GGML_METAL_FLAG" \
             -DGGML_BUILD_TESTS=OFF \
             -DGGML_BUILD_EXAMPLES=OFF \
@@ -356,16 +375,17 @@ jobs:
           # shellcheck disable=SC2086
           cmake --build build --target $target -j4
 
-      # LD_LIBRARY_PATH / DYLD_LIBRARY_PATH point the loader at the shared
-      # ggml install directory. Without this, Linux binaries linked against
-      # libggml.so from ggml-install/lib fail to load at bench time. The
-      # whisper-ci.yml lane sets the same env on its own binary invocations.
+      # LD_LIBRARY_PATH points the Linux loader at the shared ggml install
+      # directory — Linux binaries linked against libggml.so otherwise fail
+      # to load at bench time. Not set on macOS: SIP strips DYLD_* env vars
+      # when spawning through /bin/bash, so a `DYLD_LIBRARY_PATH:` env here
+      # would silently be a no-op. The macOS binaries resolve libggml via
+      # RPATH baked in at link time.
       - name: Run bench
         env:
           MODEL_S3_BUCKET: ${{ secrets.MODEL_S3_BUCKET }}
           RUNS_PER_BENCH:  ${{ needs.plan.outputs.runs_per_bench }}
-          LD_LIBRARY_PATH:  ${{ github.workspace }}/ggml-install/lib
-          DYLD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/ggml-install/lib
         run: |
           set -euo pipefail
           extra_args=()
@@ -414,10 +434,13 @@ jobs:
           path: all-results
 
       - name: Render summary table
+        env:
+          EXPECTED_COUNT: ${{ needs.plan.outputs.expected_count }}
         run: |
           set -euo pipefail
           python3 scripts/benchmarks/summarize.py \
             --results-dir all-results \
+            --expected-count "$EXPECTED_COUNT" \
             --out speech-benchmark-findings.md
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

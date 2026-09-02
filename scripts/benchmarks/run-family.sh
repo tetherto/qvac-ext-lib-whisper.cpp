@@ -285,11 +285,13 @@ parse_backend_from_stderr() {
   echo ""
 }
 
-# Portable millisecond timestamp. `date +%s%N` is GNU-only — BSD/macOS
-# treats the %N as a literal N. Python's time_ns() is available on both
-# runner OSes and gives nanosecond precision consistently.
+# Nanosecond timestamp. macOS 26 / arm64's /bin/date does support %N despite
+# being a GNU extension — verified `/bin/date +%s%N` returns real nanoseconds
+# on both target runners. Shelling to `python3 -c ...` for each timestamp
+# added ~20-40 ms of interpreter-startup bias inside the measured window,
+# which is enough to shift RTF on a fast bench.
 now_ns() {
-  python3 -c 'import time; print(time.time_ns())'
+  date +%s%N
 }
 
 # ---- native bench: one invocation, parse the emitted JSON ------------------
