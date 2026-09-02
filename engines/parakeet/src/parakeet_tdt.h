@@ -103,6 +103,14 @@ struct TdtRuntimeWeights {
     // and the two bias adds. Changes float summation order, so it is not
     // bit-exact with the split form; the gate is token-stream equality.
     bool               concat_lstm_input = false;
+    bool               rnnt_mode = false;  // no duration head: advance one frame per step
+
+    // Greedy steps unrolled into one decoder graph on the GPU path. Each step
+    // costs one command-buffer commit and one host readback when run alone, so
+    // running several per graph amortises that fixed cost. 1 keeps one step per
+    // graph, 0 or less falls back to the sequential per-step loop.
+    static constexpr int k_unroll_steps_default = 8;
+    int                unroll_steps = k_unroll_steps_default;
 
     // ---- CPU-fallback host weights (populated only when !use_graphs) ----
     std::vector<float>             embed;
@@ -173,6 +181,28 @@ struct TdtRuntimeWeights {
     ggml_tensor *  lj_token_out       = nullptr;  // i32 argmax, or f32 token logits when !argmax_on_gpu
     ggml_tensor *  lj_dur_out         = nullptr;  // i32 argmax, or f32 dur logits when !argmax_on_gpu
 
+    // Frame advance per duration index and the RNN-T placeholder index, both
+    // uploaded once with the persistent state and read by the control op.
+    ggml_tensor *  dur_table    = nullptr;  // f32[num_durations]
+    ggml_tensor *  zero_dur_idx = nullptr;  // i32[1], always 0
+
+    // (4) Unrolled decode graph: `unroll_steps` greedy steps (joint -> argmax ->
+    //     LSTM -> ggml_tdt_step control -> masked state update) in one commit,
+    //     with the host reading back the (token, duration index) pairs at the
+    //     end and replaying the same integer rules. Blank id and
+    //     max_symbols_per_step only arrive with the decode call, so the graph is
+    //     built lazily and rebuilt when either changes. It owns its context so
+    //     a rebuild does not consume gctx slots.
+    ggml_context * unroll_ctx        = nullptr;
+    ggml_cgraph *  g_unroll          = nullptr;
+    ggml_gallocr_t alloc_unroll      = nullptr;
+    ggml_tensor *  un_counters_in    = nullptr;  // f32[GGML_TDT_STEP_N_INS]
+    ggml_tensor *  un_frame_idx_in   = nullptr;  // i32[1]
+    std::vector<ggml_tensor *> un_token_out;     // i32 argmax per step
+    std::vector<ggml_tensor *> un_dur_out;       // i32 argmax per step, null when RNN-T
+    int            unroll_blank_id    = -1;
+    int            unroll_max_symbols = 0;
+
     struct EncProjGraph {
         // Each cached graph owns its own ggml_context for the cgraph + tensor
         // metadata.  Previous design parented these on `gctx` (the long-lived
@@ -238,6 +268,11 @@ using RnntDecodeState = TdtDecodeState;
 // allow_concat_lstm = false keeps the separate input/recurrent matmuls (parity tests).
 int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & out,
                         bool allow_fused_lstm = true, bool allow_concat_lstm = true);
+
+// Greedy steps per decoder graph on the GPU path: 8 by default, 1 for one step
+// per graph, 0 or less for the sequential per-step loop. Drops any built graph
+// so the next decode rebuilds it.
+void tdt_set_unroll_steps(TdtRuntimeWeights & W, int steps);
 
 void tdt_init_state(TdtRuntimeWeights & W,
                     int blank_id,

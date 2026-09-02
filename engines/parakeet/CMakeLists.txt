@@ -1168,6 +1168,35 @@ if (PARAKEET_BUILD_TESTS)
         EXE      test-tdt-lstm-parity
         ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}" "--n-gpu-layers" "1"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+    # The unrolled decode graph (K greedy steps per commit) must reproduce the
+    # sequential per-step loop token for token, at K=1 and K=8.
+    add_executable(test-tdt-unroll-parity
+        test/test_tdt_unroll_parity.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-tdt-unroll-parity PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-tdt-unroll-parity PRIVATE include src ggml/include)
+    parakeet_apply_backend_defs(test-tdt-unroll-parity)
+    parakeet_register_test(test-tdt-unroll-parity-gpu
+        LABEL    "gpu"
+        EXE      test-tdt-unroll-parity
+        ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}" "--n-gpu-layers" "1" "--require-unrolled"
+        REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+    # CPU decode has no graph path, so this one guards that the unroll setter
+    # leaves the sequential loop alone.
+    parakeet_register_test(test-tdt-unroll-parity
+        LABEL    "fixture"
+        EXE      test-tdt-unroll-parity
+        ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
     # Multi-piece French guard for the on-device predictor (QVAC-21005): the gpu0
     # scalar path and the gpu1 graph path must produce identical token IDs on a
     # word with multiple word-final sub-words (e.g. "analyses"). English jfk does
