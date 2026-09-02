@@ -108,8 +108,11 @@ engine-specific guides qualify model-level validation.
 | `nvidia/diar_streaming_sortformer_4spk-v2` | parakeet | diarization, up to 4 speakers | 117 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA | streaming-trained encoder |
 | `nvidia/diar_streaming_sortformer_4spk-v2.1` | parakeet | diarization, up to 4 speakers | 117 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA | Audio-Online Speaker Cache, stable slots across gaps |
 
-Parakeet's CUDA path is implemented but is not yet covered by hardware decoder
-parity CI. CUDA in these rows denotes availability, not completed validation.
+Parakeet's CUDA path was validated on an RTX 3080 (TDT q8_0 and q4_0
+transcripts, Sortformer and streaming output byte-equal to the previous build,
+LibriSpeech WER within noise of the CPU reference) but is not yet covered by
+hardware decoder parity CI. CUDA in these rows denotes hardware-validated
+availability, not CI coverage.
 
 Pair any CTC, TDT, or EOU GGUF with a Sortformer GGUF via `--diarization-model` for an attributed "who said what" transcript. See the [Parakeet backend, Core ML, streaming, conversion, and package guide](engines/parakeet/README.md).
 

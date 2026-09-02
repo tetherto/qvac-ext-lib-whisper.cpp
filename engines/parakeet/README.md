@@ -101,7 +101,7 @@ defaults follow `SPEECH_BUILD_EXECUTABLES` and `SPEECH_BUILD_TESTS`, and force
 | `PARAKEET_GGML_LIB_PREFIX` | `ON` | no effect with system ggml | Name bundled libraries `speech-ggml-*` |
 | `PARAKEET_COREML` | `OFF` | `OFF` | Apple-only offline TDT encoder sidecar |
 | `PARAKEET_OPENMP` | `ON` | `ON` | Link OpenMP when available; auto-disabled on Windows non-MinGW unless explicitly overridden |
-| `PARAKEET_FLASH_ATTN` | Metal `ON`, otherwise `OFF` | same | Fused encoder attention |
+| `PARAKEET_FLASH_ATTN` | Metal and CUDA `ON`, otherwise `OFF` | same | Fused encoder attention with the rel-pos bias folded into the mask; selected per backend at load, the CPU path always keeps the unfused graph |
 | `PARAKEET_CCACHE` | `ON` | `ON` | Use ccache for Parakeet targets when available |
 
 ### Installed package
@@ -180,8 +180,29 @@ CUDA. CPU and OpenCL use the scalar decoder path; OpenCL lacks the graph
 operation support required by this decoder path. The EOU encoder can still run
 on OpenCL while its decoder runs scalar.
 
-The CUDA path is implemented, but hardware decoder parity is not yet covered by
-CI. Treat CUDA as available but not fully validated until that coverage lands.
+The graph decoder adapts to what the active backend reports through
+`ggml_backend_supports_op`, probed once at load. Where the backend runs the
+fused LSTM cell (`GGML_OP_LSTM_CELL`) and the transducer step control
+(`GGML_OP_TDT_STEP`), which ggml-speech implements for CPU, CUDA and Metal, the
+TDT decoder runs up to eight greedy steps per graph: the joint, argmax, LSTM
+update, duration bookkeeping and state selection stay on the device and the
+host reads the emitted tokens back once per graph. A backend without those
+ops keeps one graph per step. Either path produces the same token sequence as
+the sequential loop; the `test-tdt-unroll-parity` and `test-tdt-lstm-parity`
+harnesses guard that. The encoder applies the same rule to the conformer's
+depthwise convolution (`GGML_OP_CONV_2D_DW` in place where the backend
+reports it, `im2col` and matmul elsewhere; the subsampler switches only on a
+GPU that passed the probe, CPU keeps its previous lowering) and to the gated
+GLU (`a * sigmoid(b)` as one op where the backend reports it). Fused attention
+is a build option (`PARAKEET_FLASH_ATTN`) that only CUDA and Metal take, and
+only after the backend accepts the exact node the encoder builds; CPU, Vulkan
+and OpenCL keep the unfused graph in every build. The mel front-end runs on up
+to eight host threads with output byte-equal to the single-thread result.
+
+The CUDA path was validated on an RTX 3080 (TDT q8_0 and q4_0 transcripts,
+Sortformer and streaming output byte-equal to the pre-change build, LibriSpeech
+WER within noise of the CPU reference) but hardware decoder parity is not yet
+covered by CI.
 
 `GGML_BACKEND_DL=ON` builds load backend modules at runtime. Android defaults
 this on and builds Vulkan, OpenCL, and CPU variants. Pass a module directory via
@@ -514,6 +535,32 @@ Source: [workflow run 31603189415](https://github.com/tetherto/qvac/actions/runs
 12 August 2026, runner `qvac-ubuntu2204-x64-gpu`, benchmarking the published
 `@qvac/asr-ggml@0.1.1` addon (released 2026-08-03, pinning `parakeet-cpp`
 2026-08-03).
+
+### TDT decode on CUDA and Metal
+
+The fused decoder ops, the unrolled greedy loop and the per-backend lowerings
+were measured against the engine as published before them, on the same
+machine in the same session: parakeet-tdt-0.6b-v3, `n_gpu_layers 1`,
+`--bench --bench-warmup 2 --bench-runs 7`, the two builds alternated over N
+rounds, and the smallest per-run inference time of each build kept. Cells read
+`before -> after ms (speedup)`.
+
+| Backend, rounds | Quant | 11 s clip | 30 s clip | 90 s clip | 306 s clip |
+|---|---|---:|---:|---:|---:|
+| CUDA, RTX 3080, N=3 | q8_0 | 31.7 -> 14.7 (2.16x) | 79.5 -> 31.7 (2.51x) | 306 -> 117 (2.60x) | 1292 -> 495 (2.61x) |
+| CUDA, RTX 3080, N=3 | q4_0 | 31.1 -> 14.1 (2.21x) | 79.1 -> 30.4 (2.60x) | 303 -> 115 (2.65x) | 1275 -> 484 (2.64x) |
+| Metal, Apple M5, N=10 | q8_0 | 143 -> 65 (2.19x) | 473 -> 177 (2.67x) | 2326 -> 879 (2.65x) | 14265 -> 4743 (3.01x) |
+| Metal, Apple M5, N=10 | q4_0 | 134 -> 70 (1.92x) | 434 -> 163 (2.65x) | 2106 -> 895 (2.35x) | 13460 -> 4937 (2.73x) |
+
+The CUDA rows ran with ggml CUDA graphs on. The Metal rows ran on a shared
+host whose 1-minute load sat between 2 and 18 across the ten rounds (between
+2 and 4 for the last six), so the M5 numbers are a lower bound; the 11 s Metal
+cells come from the first four rounds only.
+
+Word error rate on the same 500-utterance LibriSpeech subset, Whisper text
+normalisation: CPU 2.22 %, CUDA q8_0 2.21 % and q4_0 2.28 %, Metal q8_0
+2.15 % and q4_0 2.24 %. Sortformer, streaming and ASR-plus-diarization
+outputs are byte-equal to the previous build on both backends.
 
 ## Repository layout
 
