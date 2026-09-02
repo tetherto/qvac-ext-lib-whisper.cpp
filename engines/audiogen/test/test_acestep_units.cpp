@@ -31,6 +31,7 @@
 #include "dit_ggml.h"
 #include "dit_gguf.h"
 #include "detok_ggml.h"
+#include "tok_ggml.h"
 #include "generate_task.h"
 #include "generation_conditioning.h"
 #include "generation_plan.h"
@@ -207,6 +208,70 @@ void test_fsq() {
         fsq_decode_index(idx, out);
         for (int d = 0; d < 6; ++d) CHECK(out[d] >= -1.0f - slack && out[d] <= 1.0f + slack);
     }
+}
+
+// FSQ encode: the tokenizer-side inverse of fsq_decode_index.
+void test_fsq_encode() {
+    using tts_cpp::acestep::fsq_decode_index;
+    using tts_cpp::acestep::fsq_encode_index;
+
+    // Saturated projector outputs land on the level extremes.
+    const float low[6]  = { -100.0f, -100.0f, -100.0f, -100.0f, -100.0f, -100.0f };
+    const float high[6] = { 100.0f, 100.0f, 100.0f, 100.0f, 100.0f, 100.0f };
+    CHECK(fsq_encode_index(low) == 0);
+    CHECK(fsq_encode_index(high) == 8 * 8 * 8 * 5 * 5 * 5 - 1);
+
+    // Zero raw values quantize to the middle level of every dim:
+    // codes {4,4,4,2,2,2} with strides {1,8,64,512,2560,12800}.
+    const float mid[6] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    CHECK(fsq_encode_index(mid) == 4 + 4 * 8 + 4 * 64 + 2 * 512 + 2 * 2560 + 2 * 12800);
+
+    // Roundtrip through the decoder: interior indices survive
+    // decode -> atanh -> encode exactly (the extremes would need atanh(1)).
+    for (int idx = 0; idx < 64000; idx += 1237) {
+        float decoded[6];
+        fsq_decode_index(idx, decoded);
+        bool interior = true;
+        for (float v : decoded) {
+            if (v <= -0.999f || v >= 0.999f) interior = false;
+        }
+        if (!interior) continue;
+        float raw[6];
+        for (int d = 0; d < 6; ++d) raw[d] = std::atanh(decoded[d]);
+        CHECK(fsq_encode_index(raw) == idx);
+    }
+}
+
+tts_cpp::acestep::BpeTokenizer make_test_bpe_tokenizer();
+
+// Understand ("listener") prompt framing.
+void test_understand_prompt() {
+    using tts_cpp::acestep::AUDIO_CODE_BASE;
+    using tts_cpp::acestep::lm_understand_prompt;
+    using tts_cpp::acestep::lm_understand_unconditional_prompt;
+    using tts_cpp::acestep::TOKEN_IM_END;
+    using tts_cpp::acestep::TOKEN_IM_START;
+
+    const tts_cpp::acestep::BpeTokenizer tok = make_test_bpe_tokenizer();
+    const int codes[3] = { 7, 0, 63999 };
+
+    const std::vector<int> prompt = lm_understand_prompt(tok, codes, 3);
+    CHECK(prompt.front() == TOKEN_IM_START);
+    CHECK(std::count(prompt.begin(), prompt.end(), TOKEN_IM_START) == 3);
+    CHECK(std::count(prompt.begin(), prompt.end(), TOKEN_IM_END) == 2);
+    const auto first_code = std::find(prompt.begin(), prompt.end(), AUDIO_CODE_BASE + 7);
+    CHECK(first_code != prompt.end());
+    CHECK(*(first_code + 1) == AUDIO_CODE_BASE + 0);
+    CHECK(*(first_code + 2) == AUDIO_CODE_BASE + 63999);
+    CHECK(*(first_code + 3) == TOKEN_IM_END);
+
+    const std::vector<int> unconditional = lm_understand_unconditional_prompt(tok);
+    CHECK(unconditional.front() == TOKEN_IM_START);
+    CHECK(std::count(unconditional.begin(), unconditional.end(), TOKEN_IM_START) == 3);
+    for (int id : unconditional) CHECK(id < AUDIO_CODE_BASE);
+
+    // Identical framing up to the user turn's content.
+    CHECK(std::equal(prompt.begin(), first_code, unconditional.begin()));
 }
 
 // 4. sample_top_k_p ----------------------------------------------------------
@@ -2785,6 +2850,8 @@ int main() {
     test_haar_dcw();
     test_philox();
     test_fsq();
+    test_fsq_encode();
+    test_understand_prompt();
     test_sampler();
     test_sampler_compact_equivalence();
     test_sampler_r0_edge();

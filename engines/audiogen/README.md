@@ -204,6 +204,21 @@ extra LM forwards after code generation, reports `score` progress ticks, and
 honors cancellation; it requires the LM code path, so cover / lego tasks and
 the audio edit path reject it.
 
+### ACE-Step audio understanding
+
+`Engine::understand` runs the reverse pipeline: 48 kHz stereo audio is
+VAE-encoded, the FSQ tokenizer (an attention pooler in the DiT GGUF under
+`tokenizer.*`) turns the latents into 5 Hz semantic codes, and the LM
+"listener" describes them — a descriptive caption plus BPM, key/scale, time
+signature, duration estimate, and vocal language, decoded through the same
+FSM-constrained metadata block generation uses. `UnderstandResult` also
+returns the recovered codes, directly reusable as
+`GenerateParams::audio_codes`. Lyrics are intentionally NOT reported: the
+LM's transcription hallucinates on real songs, so the field is unsupported.
+An optional `vocal_language` hint is forced through the FSM instead of the
+LM's guess. Stages report as `source`, `tok`, and `understand` (unknown
+total), all cancellable.
+
 ## Model stages
 
 Four GGUF files provide six runtime weight sets. The DiT GGUF contains the
@@ -586,6 +601,7 @@ combinations are rejected rather than silently ignored.
 | `--no-phase1` | off | skip the LM metadata auto-fill pass |
 | `--simple` | off | Simple Mode: expand `--caption` into a full request (lyrics regenerate unless `--lyrics "[Instrumental]"` is passed) |
 | `--score` | off | teacher-forced LM quality score of the generated codes, printed with its per-condition breakdown |
+| `--understand FILE` | | reverse pipeline: describe a 48 kHz PCM16 WAV (metadata + caption + recovered codes) instead of generating |
 | `--req FILE` | | request JSON; pre-supplied `audio_codes` skip the LM stage |
 | `--ref-audio FILE` | | 48 kHz PCM16 WAV used by ACE-Step's timbre-conditioning path |
 | `--src-audio FILE` | | 48 kHz PCM16 source WAV; required for editing |

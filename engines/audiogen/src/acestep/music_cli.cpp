@@ -137,6 +137,9 @@ int main(int argc, char ** argv) {
                 "           [--simple]  (Simple Mode: expand --caption into a full request;\n"
                 "           the LM writes lyrics unless --lyrics \"[Instrumental]\" is given,\n"
                 "           and fills any metadata left unset, duration included with --dur 0)\n"
+
+                "  reverse: [--understand <48-kHz PCM16 WAV>]  (describe audio: metadata +\n"
+                "           caption + recovered codes; --lang forces the language field)\n"
                 "  audio:   [--ref-audio <48-kHz PCM16 WAV>]  (timbre reference)\n"
                 "           [--src-audio <48-kHz PCM16 WAV>]  (cover source structure)\n"
                 "           [--task text2music|cover-nofsq|lego]   (default text2music)\n"
@@ -292,6 +295,44 @@ int main(int argc, char ** argv) {
         }
         return true;
     };
+
+    if (const char * understand_path = arg_val(argc, argv, "--understand")) {
+        UnderstandParams up;
+        int frames = 0;
+        int rate   = 0;
+        up.audio = wav_read(understand_path, &frames, &rate);
+        if (up.audio.empty()) return 1;
+        if (rate != kRequiredAudioSampleRate) {
+            fprintf(stderr, "[music-cli] understand WAV is %d Hz; convert it to 48 kHz first\n", rate);
+            return 1;
+        }
+        if (arg_val(argc, argv, "--lang")) up.vocal_language = arg_val(argc, argv, "--lang");
+        if (arg_val(argc, argv, "--seed")) up.seed = atoll(arg_val(argc, argv, "--seed"));
+        if (arg_val(argc, argv, "--temp")) up.lm_temperature = (float) atof(arg_val(argc, argv, "--temp"));
+        if (arg_val(argc, argv, "--topp")) up.lm_top_p = (float) atof(arg_val(argc, argv, "--topp"));
+        if (arg_val(argc, argv, "--topk")) up.lm_top_k = atoi(arg_val(argc, argv, "--topk"));
+
+        UnderstandResult u;
+        try {
+            u = eng->understand(up, progress);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "[music-cli] understand failed: %s\n", e.what());
+            return 1;
+        }
+        if (u.caption.empty() && u.audio_codes.empty()) {
+            fprintf(stderr, "[music-cli] no result (cancelled?)\n");
+            return 1;
+        }
+        printf("caption: %s\n", u.caption.c_str());
+        if (u.bpm > 0) printf("bpm: %d\n", u.bpm);
+        if (u.duration > 0) printf("duration: %.0f\n", u.duration);
+        if (!u.keyscale.empty()) printf("keyscale: %s\n", u.keyscale.c_str());
+        if (!u.timesignature.empty()) printf("timesignature: %s\n", u.timesignature.c_str());
+        if (!u.vocal_language.empty()) printf("language: %s\n", u.vocal_language.c_str());
+        printf("audio_codes: %zu (%.1fs @ 5Hz)\n", u.audio_codes.size(),
+               (float) u.audio_codes.size() / 5.0f);
+        return 0;
+    }
 
     GenerateResult r;
     try {

@@ -20,6 +20,8 @@ namespace tts_cpp::acestep {
 static const char * LM_INSTRUCTION = "Generate audio semantic tokens based on the given conditions:";
 static const char * LM_INSPIRE_INSTRUCTION =
     "Expand the user's input into a more detailed and specific musical description:";
+static const char * LM_UNDERSTAND_INSTRUCTION =
+    "Understand the given musical conditions and describe the audio semantics accordingly:";
 static const char * LM_INSTRUMENTAL_LYRICS       = "[Instrumental]";
 static const char * LM_INSPIRE_INSTRUMENTAL_HINT = "\n\ninstrumental: true";
 
@@ -699,6 +701,113 @@ bool lm_generate_codes(LMModel *              m,
             csv += std::to_string(codes_out[i]);
         }
         fprintf(stderr, "[lm-pipeline] codes: %s\n", csv.c_str());
+    }
+    return true;
+}
+
+std::vector<int> lm_understand_prompt(const BpeTokenizer & bpe, const int * codes, int n_codes) {
+    std::vector<int> ids;
+    auto             append = [&](const std::string & text) {
+        auto t = bpe_encode(bpe, text, false);
+        ids.insert(ids.end(), t.begin(), t.end());
+    };
+    ids.push_back(TOKEN_IM_START);
+    append(std::string("system\n# Instruction\n") + LM_UNDERSTAND_INSTRUCTION + "\n\n");
+    ids.push_back(TOKEN_IM_END);
+    append("\n");
+    ids.push_back(TOKEN_IM_START);
+    append("user\n");
+    for (int i = 0; i < n_codes; i++) ids.push_back(AUDIO_CODE_BASE + codes[i]);
+    ids.push_back(TOKEN_IM_END);
+    append("\n");
+    ids.push_back(TOKEN_IM_START);
+    append("assistant\n");
+    return ids;
+}
+
+std::vector<int> lm_understand_unconditional_prompt(const BpeTokenizer & bpe) {
+    // The trailing newline matters: the reference's system text ends "\n\n"
+    // before <|im_end|>, and the conditional understand prompt does too. A
+    // single "\n" here would silently shift the quality-score baseline.
+    return build_custom_prompt(bpe, std::string("# Instruction\n") + LM_UNDERSTAND_INSTRUCTION + "\n",
+                               "NO USER INPUT");
+}
+
+static int lm_understand_sample(MetadataFSM & fsm, bool past_think, float * logits, int V,
+                                const LmSampleParams & params, std::mt19937 & rng) {
+    if (past_think) {
+        for (int v = AUDIO_CODE_BASE; v < V; v++) logits[v] = -1e9f;
+        return sample_top_k_p(logits, V, params.temperature, params.top_p, params.top_k, rng);
+    }
+    const int forced = fsm.enabled ? fsm.forced_token() : -1;
+    if (forced >= 0) return lm_consume_forced(forced, params.temperature, rng);
+    if (fsm.enabled) fsm.apply_mask(logits);
+    return sample_top_k_p(logits, V, params.temperature, params.top_p, params.top_k, rng);
+}
+
+bool lm_understand(LMModel * m, const BpeTokenizer & bpe, const std::vector<int> & codes,
+                   const LmSampleParams & params, const std::string & language_hint,
+                   AcePrompt & out) {
+    out = {};
+    if (!m || codes.empty()) return false;
+
+    const int V = lm_model_config(m).vocab_size;
+
+    MetadataFSM fsm;
+    fsm.init(bpe, V, params.verbose);
+    if (!language_hint.empty() && language_hint != "unknown") {
+        fsm.force_field(bpe, MetadataFSM::LANGUAGE_VALUE, language_hint);
+    }
+
+    const std::vector<int>     prompt = lm_understand_prompt(bpe, codes.data(), (int) codes.size());
+    const std::vector<int32_t> prompt32(prompt.begin(), prompt.end());
+    if (prompt.size() + 1 > (size_t) lm_model_config(m).max_seq_len) {
+        fprintf(stderr, "[lm-understand] prompt needs %zu tokens, exceeding LM max_seq %d\n",
+                prompt.size(), lm_model_config(m).max_seq_len);
+        return false;
+    }
+
+    std::vector<float> logits;
+    lm_reset(m, 0);
+    if (!lm_model_forward(m, prompt32.data(), (int) prompt32.size(), logits)) {
+        fprintf(stderr, "[lm-understand] prefill failed\n");
+        return false;
+    }
+    if (params.verbose) {
+        fprintf(stderr, "[lm-understand] prefill %zu tokens (%zu codes + framing)\n", prompt.size(),
+                codes.size());
+    }
+
+    std::mt19937     rng(params.seed);
+    std::vector<int> gen_tokens;
+    bool             past_think = false;
+    const int        max_new    = params.max_new_tokens > 0 ? params.max_new_tokens : 4096;
+
+    for (int step = 0; step < max_new; step++) {
+        if (!lm_report_progress(params, step, max_new, LM_PROGRESS_UNKNOWN_TOTAL)) {
+            fprintf(stderr, "[lm-understand] cancelled at step %d\n", step);
+            return false;
+        }
+        const int tok = lm_understand_sample(fsm, past_think, logits.data(), V, params, rng);
+        if (tok == TOKEN_IM_END) break;
+        if (fsm.enabled && !past_think) fsm.update(tok);
+        if (tok == TOKEN_THINK_END) past_think = true;
+        gen_tokens.push_back(tok);
+
+        const int32_t t = (int32_t) tok;
+        if (!lm_model_forward(m, &t, 1, logits)) {
+            fprintf(stderr, "[lm-understand] decode step %d failed\n", step);
+            return false;
+        }
+    }
+
+    const std::string text = bpe_decode(bpe, gen_tokens);
+    if (params.verbose) {
+        fprintf(stderr, "[lm-understand] generated %zu tokens:\n%s\n", gen_tokens.size(), text.c_str());
+    }
+    parse_cot_and_lyrics(text, out);
+    if (!language_hint.empty() && language_hint != "unknown") {
+        out.vocal_language = language_hint;
     }
     return true;
 }
