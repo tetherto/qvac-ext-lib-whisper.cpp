@@ -16,6 +16,9 @@
 #include "audio8/codec_ops.h"
 #include "audio8/graph.h"
 
+#include "fit_price.h"
+#include "fit_util.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <vector>
@@ -392,6 +395,50 @@ bool decode_codes(codec_model & model, const int32_t * codes, int n_frames,
     stage_timer measure(clock.synthesis_ms);
     return run_synthesis_blocks(model, post, n_frames, n_threads, cancel, pcm_out, taps,
                                 clock, error);
+}
+
+// Fit measurement (include/tts-cpp/audio8/fit.h): price what one decode_codes
+// leaves resident, without allocating. The latent graph is the full-sequence
+// pass run_latents makes; the synthesis block is the width the runtime's own
+// planner (plan_blocks, itself already size-only) would settle on against the
+// device memory available right now, priced through the same dual-path
+// dispatch prepare_graph allocates with. The two arenas (model.allocr /
+// model.block_allocr) are separate and both stay resident, so they sum.
+bool measure_decode_memory(codec_model & model, int n_frames, codec_fit_measure & out) {
+    using ::tts_cpp::fitutil::sat_add;
+    out = codec_fit_measure{};
+    if (!model.has_decoder || n_frames <= 0) return false;
+
+    {
+        scratch work(AUDIO8_MAX_NODES);
+        if (!work.ok()) return false;
+        const latent_graph built = build_latents(work.ctx, model, n_frames);
+        mark_output(work.graph, built.post);
+        ::tts_cpp::detail::fit_graph_price price;
+        if (!fit_price_graph(model.backend, work.graph, 2 * AUDIO8_MAX_NODES, price)) {
+            return false;
+        }
+        out.device_bytes = sat_add(out.device_bytes, price.device_bytes);
+        out.host_bytes   = sat_add(out.host_bytes, price.host_bytes);
+    }
+
+    const int context = synthesis_context(model);
+    const block_plan plan = plan_blocks(model, context, n_frames, /*with_taps=*/false);
+    out.block_frames = plan.frames;
+    out.block_span   = span_of(plan.frames, n_frames, context);
+    {
+        scratch work(AUDIO8_MAX_NODES);
+        if (!work.ok()) return false;
+        const synthesis_graph built = build_synthesis(work.ctx, model, out.block_span);
+        mark_output(work.graph, built.pcm);
+        ::tts_cpp::detail::fit_graph_price price;
+        if (!fit_price_graph(model.backend, work.graph, 2 * AUDIO8_MAX_NODES, price)) {
+            return false;
+        }
+        out.device_bytes = sat_add(out.device_bytes, price.device_bytes);
+        out.host_bytes   = sat_add(out.host_bytes, price.host_bytes);
+    }
+    return true;
 }
 
 }  // namespace detail

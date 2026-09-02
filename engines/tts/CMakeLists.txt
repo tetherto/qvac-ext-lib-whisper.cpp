@@ -341,6 +341,10 @@ set(TTS_CPP_LIB_SOURCES
     src/audio8/codec_encode.cpp
     src/audio8/sampling.cpp
     src/audio8/engine.cpp
+    # Memory-fit preflight (include/tts-cpp/fit.h + the *-fit-params tools).
+    src/fit_common.cpp
+    src/audio8/fit.cpp
+    src/audio8/fit_main.cpp
 )
 
 if (TTS_CPP_BUILD_LIBRARY)
@@ -576,6 +580,14 @@ if (TTS_CPP_BUILD_EXECUTABLES)
     target_link_libraries(audio8-cli PRIVATE tts-cpp)
     target_include_directories(audio8-cli PRIVATE src)
     tts_cpp_apply_ccache(audio8-cli)
+
+    # Memory-fit preflight CLIs: project a model set against the free device
+    # memory without loading weights.  See src/audio8/fit_main.cpp and
+    # src/chatterbox_fit_main.cpp.
+    add_executable(audio8-fit-params src/audio8_fit_params.cpp)
+    target_link_libraries(audio8-fit-params PRIVATE tts-cpp)
+    tts_cpp_apply_ccache(audio8-fit-params)
+
 endif()
 
 if (TTS_CPP_BUILD_TESTS)
@@ -2455,6 +2467,22 @@ if (TTS_CPP_BUILD_TESTS)
     target_include_directories(test-kv-cache-type PRIVATE ggml/include src include)
     tts_cpp_apply_ccache(test-kv-cache-type)
     tts_cpp_register_test(test-kv-cache-type LABEL "unit")
+
+    # ---- Memory-fit preflight (include/tts-cpp/fit.h + *-fit-params) ----
+    # Audio8 fit parity.  The no-argument form synthesizes a tiny audio8-lm
+    # GGUF on the fly, so the LM-side byte-parity gates (weights, KV slabs,
+    # slow/fast graph arenas vs a real load + run) need no fixture at all;
+    # the fixture form adds the full-pipeline + codec-arena gates.
+    add_executable(test-audio8-fit-params test/audio8/test_fit_params.cpp)
+    target_link_libraries(test-audio8-fit-params PRIVATE tts-cpp ggml)
+    target_include_directories(test-audio8-fit-params PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-audio8-fit-params)
+    tts_cpp_register_test(test-audio8-fit-params LABEL "unit")
+    tts_cpp_register_test(test-audio8-fit-params-fixture
+        EXE      test-audio8-fit-params
+        LABEL    "fixture"
+        ARGS     "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}"
+        REQUIRES "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}")
 
     add_executable(test-s3gen-cfg-rate test/test_s3gen_cfg_rate.cpp)
     target_link_libraries(test-s3gen-cfg-rate PRIVATE tts-cpp ggml)
