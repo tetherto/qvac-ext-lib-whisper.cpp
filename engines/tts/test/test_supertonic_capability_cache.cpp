@@ -195,13 +195,18 @@ void test_forwarders_idempotent() {
     ggml_backend_free(cpu);
 }
 
-// Test 5 — Two backends get independent cache entries.
+// Test 5 — Backends on the same device share one cache entry.
 //
-// Construct two CPU backends (different handles) and verify that
-// each gets its own cache entry: a cold call on the second
-// backend must advance the probe-call counter even though the
-// first backend's entry is already cached.
-void test_per_backend_cache_independence() {
+// The cache is keyed by the backend's DEVICE (a backend-registry
+// singleton), not by the transient backend handle: every probe is a
+// per-device property, and pointer-keying was a real bug — a freed
+// handle's heap address recycled by a later backend of a DIFFERENT
+// type replayed the dead backend's capabilities (fused_supertonic_ops
+// from CPU onto CUDA aborted the qvac linux-x64 CUDA lane on the
+// unimplemented GGML_OP_SUPERTONIC_DEPTHWISE_1D).  Two live CPU
+// backends resolve to the same device, so the second query must HIT
+// the first one's entry.
+void test_same_device_backends_share_cache_entry() {
     ggml_backend_t cpu_a = ggml_backend_cpu_init();
     ggml_backend_t cpu_b = ggml_backend_cpu_init();
     if (!cpu_a || !cpu_b) {
@@ -216,16 +221,46 @@ void test_per_backend_cache_independence() {
 
     const uint64_t before_b = supertonic_capability_probe_call_count();
     (void) supertonic_backend_supports_f16_kv_flash_attn(cpu_b);
-    // Different backend handle → separate cache entry → counter
-    // must advance.
-    CHECK(supertonic_capability_probe_call_count() == before_b + 1);
+    // Same device → shared cache entry → counter must NOT advance.
+    CHECK(supertonic_capability_probe_call_count() == before_b);
 
-    // Re-querying the first backend still hits its cache entry.
+    // Re-querying the first backend still hits the shared entry.
     const uint64_t before_a = supertonic_capability_probe_call_count();
     (void) supertonic_backend_supports_f16_kv_flash_attn(cpu_a);
     CHECK(supertonic_capability_probe_call_count() == before_a);
 
     ggml_backend_free(cpu_a);
+    ggml_backend_free(cpu_b);
+}
+
+// Test 5b — Capabilities survive backend-instance recycling.
+//
+// Regression shape for the pointer-keying bug: probe a backend, free
+// it, create a fresh backend (whose handle MAY land on the recycled
+// heap address — the exact hazard), and query again.  Device-keying
+// makes the answer independent of instance identity: no re-probe runs
+// and the result is the correct one for the device, so a recycled
+// address can never replay a dead backend's capabilities.
+void test_capability_survives_instance_recycling() {
+    ggml_backend_t cpu_a = ggml_backend_cpu_init();
+    if (!cpu_a) {
+        std::fprintf(stderr, "skip: CPU backend init failed\n");
+        return;
+    }
+    supertonic_clear_capability_cache();
+    const bool f16_a = supertonic_backend_supports_f16_mul_mat(cpu_a);
+    CHECK(f16_a == true);
+    ggml_backend_free(cpu_a);
+
+    ggml_backend_t cpu_b = ggml_backend_cpu_init();
+    if (!cpu_b) {
+        std::fprintf(stderr, "skip: CPU backend re-init failed\n");
+        return;
+    }
+    const uint64_t before = supertonic_capability_probe_call_count();
+    const bool f16_b = supertonic_backend_supports_f16_mul_mat(cpu_b);
+    CHECK(supertonic_capability_probe_call_count() == before);
+    CHECK(f16_b == f16_a);
     ggml_backend_free(cpu_b);
 }
 
@@ -409,7 +444,8 @@ int main() {
     test_cache_short_circuits_on_hit();
     test_clear_cache_forces_reprobe();
     test_forwarders_idempotent();
-    test_per_backend_cache_independence();
+    test_same_device_backends_share_cache_entry();
+    test_capability_survives_instance_recycling();
     test_f16_mul_mat_probe_returns_true_on_cpu();
     test_q8_0_kv_flash_attn_probe_smoke();
     test_bf16_kv_flash_attn_probe_smoke();
