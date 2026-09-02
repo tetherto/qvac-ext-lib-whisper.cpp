@@ -273,7 +273,7 @@ jobs:
           if [ "$RUNNER_OS" = "macOS" ]; then
             command -v ccache >/dev/null || brew install ccache
           else
-            sudo apt-get install -y ccache
+            command -v ccache >/dev/null || (sudo apt-get update -q && sudo apt-get install -y ccache)
           fi
           echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
 
@@ -424,7 +424,12 @@ jobs:
 
   # ---------- 3. Aggregate + render summary table -------------------------
   summarize:
-    needs: bench
+    # `plan` in needs is not just for ordering — summarize reads
+    # `needs.plan.outputs.expected_count`, and GHA's `needs.*` context only
+    # exposes DIRECT dependencies. Without `plan` here, that output
+    # interpolates to the empty string and summarize.py's absent-row
+    # loudness gate goes silently dead.
+    needs: [plan, bench]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

@@ -78,14 +78,15 @@ if ! command -v jq >/dev/null; then
   echo "jq is required" >&2; exit 1
 fi
 
-# Local-run guard: on pre-macOS-26 /bin/date's %N returns the literal "N"
-# rather than nanoseconds, awk parses only the leading digits, and every
+# Local-run guard: on pre-macOS-26 the system date's %N returns the literal
+# "N" rather than nanoseconds, awk parses only the leading digits, and every
 # time-wrapped measurement silently reports ~0.0 ms. Check once at start
-# and fail loudly instead — the runners are known-good, but the driver is
-# documented as locally runnable.
-if ! [[ "$(date +%N 2>/dev/null)" =~ ^[0-9]+$ ]]; then
-  echo "run-family.sh: this shell's \`date +%N\` does not return nanoseconds" >&2
-  echo "  (got: '$(date +%N 2>/dev/null)')." >&2
+# with the absolute /bin/date path (matches the invocation in now_ns()
+# below) and fail loudly instead — the runners are known-good, but the
+# driver is documented as locally runnable.
+if ! [[ "$(/bin/date +%N 2>/dev/null)" =~ ^[0-9]+$ ]]; then
+  echo "run-family.sh: /bin/date +%N does not return nanoseconds on this host" >&2
+  echo "  (got: '$(/bin/date +%N 2>/dev/null)')." >&2
   echo "  Time-wrapped bench timings would be silently zero. Bailing." >&2
   exit 1
 fi
@@ -299,9 +300,11 @@ parse_backend_from_stderr() {
 
 # Nanosecond timestamp. macOS 26 / arm64's /bin/date does support %N despite
 # being a GNU extension; the script-start guard above bails loudly if we
-# land on an older date that would silently return zeros.
+# land on an older date that would silently return zeros. Invokes /bin/date
+# by absolute path (matching the guard) so a stray coreutils `date` earlier
+# on PATH can't diverge from what the guard actually verified.
 now_ns() {
-  date +%s%N
+  /bin/date +%s%N
 }
 
 # ---- native bench: one invocation, parse the emitted JSON ------------------
