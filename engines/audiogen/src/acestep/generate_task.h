@@ -143,6 +143,18 @@ inline std::string validate_lrc_request(const GenerateParams & params) {
     return {};
 }
 
+inline std::string validate_quality_score_request(const GenerateParams & params, const std::string & task_type) {
+    if (!params.compute_quality_score) return {};
+    if (!params.edit_plan.empty()) {
+        return "acestep engine: compute_quality_score is unavailable on the audio edit path";
+    }
+    if (is_source_task(task_type)) {
+        return "acestep engine: compute_quality_score requires the LM code path, unavailable on task '" +
+               task_type + "'";
+    }
+    return {};
+}
+
 inline std::string resolve_generate_task(const GenerateParams & params, GenerateTask & task) {
     task.type = params.task_type.empty() ? TASK_TEXT2MUSIC : params.task_type;
 
@@ -157,6 +169,9 @@ inline std::string resolve_generate_task(const GenerateParams & params, Generate
 
     const std::string lrc_error = validate_lrc_request(params);
     if (!lrc_error.empty()) return lrc_error;
+
+    const std::string quality_score_error = validate_quality_score_request(params, task.type);
+    if (!quality_score_error.empty()) return quality_score_error;
 
     if (!std::isfinite(params.audio_cover_strength)) {
         return "acestep engine: audio_cover_strength must be finite";

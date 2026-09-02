@@ -12,6 +12,7 @@
 #include "acestep/loudness.h"
 #include "acestep/lyrics_alignment.h"
 #include "acestep/philox.h"
+#include "acestep/quality_score.h"
 #include "acestep/textenc_ggml.h"
 
 #include "acestep/cancellation_scope.h"
@@ -692,6 +693,8 @@ struct GenerationState {
     int code_frames = 0;
     int latent_frames = 0;
     bool low_memory = false;
+    double quality_score = 0.0;
+    std::string quality_report;
 };
 
 struct PromptEncoding {
@@ -850,12 +853,40 @@ static bool generate_audio_codes(EngineImpl & engine, const GenerateParams & par
 }
 
 template <typename EngineImpl>
+static bool run_quality_score_stage(EngineImpl & engine, const GenerateParams & params,
+                                    GenerationState & state, const StageReporter & report,
+                                    StageTimes & timing, const std::vector<int> & codes) {
+    if (!params.compute_quality_score) return true;
+
+    engine.ensure_lm();
+    QualityScoreParams score_params;
+    score_params.on_step = [&](int cur, int total) { return report("score", cur, total); };
+
+    QualityScoreResult score;
+    std::string        error;
+    if (!compute_quality_score(engine.lm, engine.bpe_lm, state.prompt, codes, score_params, score,
+                               error)) {
+        if (engine.cancel_flag.load()) return false;
+        throw std::runtime_error("acestep engine: quality scoring failed: " + error);
+    }
+    state.quality_score  = score.global_score;
+    state.quality_report = score.report;
+    timing.mark("score");
+    if (engine.opts.verbose) {
+        fprintf(stderr, "[acestep-engine] quality score %.4f\n%s\n", score.global_score,
+                score.report.c_str());
+    }
+    return true;
+}
+
+template <typename EngineImpl>
 static bool run_lm_stage(EngineImpl & engine, const GenerateParams & params,
                          GenerationState & state, const StageReporter & report,
                          StageDump & dump, StageTimes & timing, std::vector<int> & codes) {
     if (!report("lm", 0, 1)) return false;
     if (!generate_audio_codes(engine, params, state, report, codes)) return false;
     if (!report("lm", 1, 1)) return false;
+    if (!run_quality_score_stage(engine, params, state, report, timing, codes)) return false;
 
     if (state.low_memory) {
         if (engine.lm && engine.opts.verbose) fprintf(stderr, "[acestep-engine] freeing LM (low-mem)\n");
@@ -2033,6 +2064,8 @@ static void populate_metadata(const GenerationState & state, GenerateResult & re
         state.prompt.timesignature.empty() ? 0 : atoi(state.prompt.timesignature.c_str());
     result.metadata.seed = state.seed;
     result.metadata.n_codes = state.code_frames;
+    result.metadata.quality_score = state.quality_score;
+    result.metadata.quality_report = state.quality_report;
 }
 
 GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn & progress) const {

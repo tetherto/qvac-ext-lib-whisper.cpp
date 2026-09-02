@@ -53,6 +53,7 @@ audiogen  caption + lyrics -> ACE-Step LM -> FSQ detokenizer -> text encoder
                            -> same ACE-Step pipeline
           lyrics + generated audio -> DiT cross-attention probe -> DTW
                            -> synchronized LRC timestamps
+          generated codes + request -> teacher-forced LM -> quality score
           caption + lyrics -> MiniMax Qwen3 LM -> RVQ depth decoder
                            -> condition encoder -> flow DiT -> vocoder -> stereo
 ```

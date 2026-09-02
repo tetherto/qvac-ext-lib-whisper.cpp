@@ -168,6 +168,12 @@ struct GenerateParams {
     // Mode the LM-written lyrics are used) and is unavailable on the audio
     // edit path.
     bool        generate_lrc = false;
+    // Teacher-forced LM quality scoring of the generated audio codes against
+    // the resolved request (Simple Mode scores what the LM composed). Fills
+    // GenerateMetadata::quality_score / quality_report at the cost of extra
+    // LM forwards after code generation. Requires the LM code path, so it is
+    // rejected for cover / lego tasks and on the audio edit path.
+    bool        compute_quality_score = false;
     // Official sampler-side Haar DCW "double" correction. Applied on turbo
     // DiTs only: the official preset disables DCW for base/sft models.
     bool        dcw_enabled     = true;
@@ -233,6 +239,11 @@ struct GenerateMetadata {
     // timestamps and the alignment confidence score in [0, 1].
     std::string lrc;
     double      lyrics_score = 0.0;
+    // Populated only when GenerateParams::compute_quality_score was set:
+    // weighted global quality in [0, 1] (caption/lyrics PMI + metadata
+    // recall) and its human-readable per-condition breakdown.
+    double      quality_score = 0.0;
+    std::string quality_report;
 };
 
 struct GenerateResult {
@@ -243,7 +254,7 @@ struct GenerateResult {
 };
 
 // Optional progress callback: stage name
-// ("reference"|"source"|"lm"|"dit"|"vae"), current step, total steps
+// ("reference"|"source"|"lm"|"score"|"dit"|"vae"), current step, total steps
 // (total <= 0 when unknown). Return false to request cancellation.
 using ProgressFn = std::function<bool(const std::string & stage, int step, int total)>;
 
