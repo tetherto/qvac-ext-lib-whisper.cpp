@@ -1146,12 +1146,41 @@ if (PARAKEET_BUILD_TESTS)
     parakeet_apply_ccache(test-lstm-input-concat)
     parakeet_register_test(test-lstm-input-concat LABEL "unit")
 
-    # Fused attention is a build option; the CPU path must ignore it.
-    add_executable(test-attn-path test/test_attn_path.cpp)
-    target_link_libraries(test-attn-path PRIVATE ggml)
-    target_include_directories(test-attn-path PRIVATE src ggml/include)
-    parakeet_apply_ccache(test-attn-path)
+    # Fused attention is a build option; only CUDA and Metal take it, and the
+    # encoder graph built on CPU must never contain the fused node.
+    add_executable(test-attn-path
+        test/test_attn_path.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-attn-path PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-attn-path PRIVATE include src ggml/include)
+    parakeet_apply_backend_defs(test-attn-path)
     parakeet_register_test(test-attn-path LABEL "unit")
+    parakeet_register_test(test-attn-path-graph
+        LABEL    "fixture"
+        EXE      test-attn-path
+        ARGS     "${_qvp_tdt_q8_gguf}"
+        REQUIRES "${_qvp_tdt_q8_gguf}")
+    parakeet_register_test(test-attn-path-graph-gpu
+        LABEL    "gpu"
+        EXE      test-attn-path
+        ARGS     "${_qvp_tdt_q8_gguf}" "--n-gpu-layers" "1"
+        REQUIRES "${_qvp_tdt_q8_gguf}")
+
+    # The channel-contiguous depthwise-conv view needs two or more frames.
+    add_executable(test-conv-channels-view test/test_conv_channels_view.cpp)
+    target_link_libraries(test-conv-channels-view PRIVATE ggml)
+    target_include_directories(test-conv-channels-view PRIVATE src ggml/include)
+    parakeet_apply_ccache(test-conv-channels-view)
+    parakeet_register_test(test-conv-channels-view LABEL "unit")
 
     # The fused LSTM cell op and the concatenated-input GEMV must both reproduce
     # the per-gate decoder graph token for token.

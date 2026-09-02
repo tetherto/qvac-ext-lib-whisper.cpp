@@ -472,6 +472,42 @@ bool backend_runs_flash_attn_per_head_mask(ggml_backend_t backend, int HD, int H
     return ok;
 }
 
+// The fused attention node exactly as rel_pos_mha_flash_graph emits it: head-major
+// views for k and v, the f16 mask per head or, with heads folded into the batch, as
+// [T, T, 1, H].
+bool backend_runs_flash_attn(ggml_backend_t backend, int HD, int H, bool per_head_mask) {
+    if (!backend) return false;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    const int T = 64;
+    ggml_tensor * q    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, T, H);
+    ggml_tensor * kp   = ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, H, T), 0, 2, 1, 3);
+    ggml_tensor * vp   = ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, H, T), 0, 2, 1, 3);
+    ggml_tensor * mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, T, T, H);
+    ggml_tensor * out;
+    if (per_head_mask) {
+        out = ggml_flash_attn_ext(ctx, q, kp, vp, mask, 1.0f, 0.0f, 0.0f);
+    } else {
+        ggml_tensor * q4 = ggml_view_4d(ctx, q,  HD, T, 1, H, q->nb[1],  q->nb[2],  q->nb[2],  0);
+        ggml_tensor * k4 = ggml_view_4d(ctx, kp, HD, T, 1, H, kp->nb[1], kp->nb[2], kp->nb[2], 0);
+        ggml_tensor * v4 = ggml_view_4d(ctx, vp, HD, T, 1, H, vp->nb[1], vp->nb[2], vp->nb[2], 0);
+        ggml_tensor * m4 = ggml_reshape_4d(ctx, mask, T, T, 1, H);
+        out = ggml_flash_attn_ext(ctx, q4, k4, v4, m4, 1.0f, 0.0f, 0.0f);
+    }
+    const bool ok = ggml_backend_supports_op(backend, out);
+    ggml_free(ctx);
+    return ok;
+}
+
+AttnPath select_attn_path(ggml_backend_t backend, int HD, int H) {
+    AttnPath attn;
+    if (!flash_attn_allowed(k_flash_attn_compiled, backend)) return attn;
+    attn.per_head_mask = backend_runs_flash_attn_per_head_mask(backend, HD, H);
+    attn.flash_attn    = backend_runs_flash_attn(backend, HD, H, attn.per_head_mask);
+    return attn;
+}
+
 ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
                                 bool & out_skipped_unsupported_gpu,
                                 bool & out_is_mali_vulkan) {
@@ -1449,9 +1485,8 @@ int load_from_gguf(const std::string & gguf_path,
     // route only that head to CPU while the encoder + CTC/TDT/EOU heads stay on GPU.
     impl->sortformer_force_cpu =
         gpu_is_mali_vulkan && impl->backend_active == impl->backend_gpu;
-    impl->attn.flash_attn    = flash_attn_allowed(k_flash_attn_compiled, impl->backend_active);
-    impl->attn.per_head_mask = impl->attn.flash_attn && backend_runs_flash_attn_per_head_mask(
-        impl->backend_active, out_model.encoder_cfg.head_dim, out_model.encoder_cfg.n_heads);
+    impl->attn = select_attn_path(impl->backend_active, out_model.encoder_cfg.head_dim,
+                                  out_model.encoder_cfg.n_heads);
     impl->glu_fused = !gpu_is_mali_vulkan && backend_runs_siglu(impl->backend_active, out_model.encoder_cfg.d_model);
     if (impl->backend_gpu && impl->backend_active == impl->backend_gpu && !gpu_is_mali_vulkan) {
         impl->dw_direct_planar   = backend_runs_conv_2d_dw(impl->backend_gpu, false);
@@ -2560,6 +2595,10 @@ ggml_tensor * depthwise_conv_channels_first(ggml_context * ctx, ggml_tensor * y,
     return ggml_view_2d(ctx, out, d_model, T, (size_t) d_model * sizeof(float), 0);
 }
 
+// The channel-contiguous view of a [d_model, T] activation is only distinguishable
+// from a plain contiguous tensor with two or more frames (nb[1] > nb[0]).
+constexpr int64_t k_channels_first_min_frames = 2;
+
 // CPU keeps its transposed direct kernel; a GPU backend that answered the CONV_2D_DW
 // probe runs the depthwise conv in place, anything else uses the portable im2col lowering.
 DwConvLowering select_dw_lowering(const ParakeetCtcModel & model, ggml_backend_t backend) {
@@ -2611,7 +2650,9 @@ ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
     const int pad_left  = conv_causal ? (conv_kernel - 1) : ((conv_kernel - 1) / 2);
     const int pad_right = conv_causal ? 0                 : ((conv_kernel - 1) / 2);
 
-    if (dw_lowering == DwConvLowering::DirectChannels && !conv_causal) {
+    const bool channels_first = dw_lowering == DwConvLowering::DirectChannels && !conv_causal &&
+                                y->ne[1] >= k_channels_first_min_frames;
+    if (channels_first) {
         y = depthwise_conv_channels_first(ctx, y, W, d_model, conv_kernel, pad_left);
         y = maybe_add_bias(ctx, y, W.conv_dw_b);
         if (conv_norm_type == ConvNormType::LayerNorm) {
@@ -2986,7 +3027,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     } else {
         x = subsampling_graph(gctx, g.mel_in, model.subsampling, C_sub, d_model,
                               g.mask_t0, g.mask_t1, g.mask_t2, g.mask_t3, all_valid,
-                              enc.causal_downsampling, dw_lowering != DwConvLowering::Im2col);
+                              enc.causal_downsampling, model.impl->dw_direct_planar);
         g.sub_out_node = x;
         ggml_set_name(g.sub_out_node, "subsampling_out");
         ggml_set_output(g.sub_out_node);
@@ -3840,6 +3881,25 @@ void ctc_greedy_decode_window(const float * logits,
         prev = best;
     }
     inout_prev_token = prev;
+}
+
+
+bool flash_attn_compiled() { return k_flash_attn_compiled; }
+
+// Builds one encoder block on the model's active backend and reports whether the
+// graph contains `op`: lets a test see which attention path the loader chose.
+bool encoder_graph_uses_op(const ParakeetCtcModel & model, enum ggml_op op) {
+    constexpr int probe_mel_frames = 128;
+    EncoderGraph g;
+    if (build_encoder_graph_cached(model, g, probe_mel_frames, model.mel_cfg.n_mels,
+                                   /*n_run_layers_override=*/1, /*all_valid=*/true,
+                                   model.impl->backend_active) != 0) {
+        return false;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(g.cgraph); ++i) {
+        if (ggml_graph_node(g.cgraph, i)->op == op) return true;
+    }
+    return false;
 }
 
 }

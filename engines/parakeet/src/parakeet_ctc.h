@@ -4,6 +4,7 @@
 //
 // Holds shared configuration and tensor handles for CTC, RNN-T, TDT, EOU, and Sortformer GGUFs.
 
+#include "ggml.h"
 #include "mel_preprocess.h"
 #include "sentencepiece_bpe.h"
 
@@ -625,5 +626,10 @@ int profile_block_substages(ParakeetCtcModel & model,
                             int warmup_runs,
                             int timed_runs,
                             BlockSubstageTimes & out);
+
+// Test diagnostics: whether fused attention is compiled in, and whether the encoder
+// graph built for this model contains a given op.
+bool flash_attn_compiled();
+bool encoder_graph_uses_op(const ParakeetCtcModel & model, enum ggml_op op);
 
 }
