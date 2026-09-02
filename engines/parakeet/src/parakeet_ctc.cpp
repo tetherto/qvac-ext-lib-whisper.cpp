@@ -2085,6 +2085,17 @@ ggml_tensor * apply_time_mask(ggml_context * ctx, ggml_tensor * x, ggml_tensor *
     return ggml_mul(ctx, x, mask);
 }
 
+// ggml_conv_2d's trailing permute+cont only reorders the batch dim, so for N == 1 the matmul
+// result already has the [OW, OH, OC, 1] layout and the copy is skipped.
+ggml_tensor * conv_2d_im2col(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b, int s, int p) {
+    if (b->ne[3] != 1) return ggml_conv_2d(ctx, a, b, s, s, p, p, 1, 1);
+    ggml_tensor * im2col = ggml_im2col(ctx, a, b, s, s, p, p, 1, 1, true, a->type);
+    ggml_tensor * cols   = ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[1] * im2col->ne[2]);
+    ggml_tensor * kernel = ggml_reshape_2d(ctx, a, a->ne[0] * a->ne[1] * a->ne[2], a->ne[3]);
+    ggml_tensor * y = ggml_mul_mat(ctx, cols, kernel);
+    return ggml_reshape_4d(ctx, y, im2col->ne[1], im2col->ne[2], a->ne[3], 1);
+}
+
 ggml_tensor * subsampling_graph(ggml_context    * gctx,
                                 ggml_tensor     * mel_in,
                                 const SubsamplingWeights & S,
@@ -2149,7 +2160,7 @@ ggml_tensor * subsampling_graph(ggml_context    * gctx,
 
     x = maybe_mask(x, mask_t0);
     x = causal_pad(x);
-    x = ggml_conv_2d(gctx, S.conv0_w, x, 2, 2, conv_pad, conv_pad, 1, 1);
+    x = conv_2d_im2col(gctx, S.conv0_w, x, 2, conv_pad);
     x = ggml_add(gctx, x, conv_bias_bcast(gctx, S.conv0_b, subsampling_channels));
     x = maybe_mask(x, mask_t1);
     x = ggml_relu(gctx, x);
@@ -2159,7 +2170,7 @@ ggml_tensor * subsampling_graph(ggml_context    * gctx,
     x = conv_2d_dw_f32(S.conv1_dw_w, x, 2, 2, conv_pad, conv_pad, 1, 1);
     x = ggml_add(gctx, x, conv_bias_bcast(gctx, S.conv1_dw_b, subsampling_channels));
     x = maybe_mask(x, mask_t2);
-    x = ggml_conv_2d(gctx, S.conv1_pw_w, x, 1, 1, 0, 0, 1, 1);
+    x = conv_2d_im2col(gctx, S.conv1_pw_w, x, 1, 0);
     x = ggml_add(gctx, x, conv_bias_bcast(gctx, S.conv1_pw_b, subsampling_channels));
     x = maybe_mask(x, mask_t2);
     x = ggml_relu(gctx, x);
@@ -2169,7 +2180,7 @@ ggml_tensor * subsampling_graph(ggml_context    * gctx,
     x = conv_2d_dw_f32(S.conv2_dw_w, x, 2, 2, conv_pad, conv_pad, 1, 1);
     x = ggml_add(gctx, x, conv_bias_bcast(gctx, S.conv2_dw_b, subsampling_channels));
     x = maybe_mask(x, mask_t3);
-    x = ggml_conv_2d(gctx, S.conv2_pw_w, x, 1, 1, 0, 0, 1, 1);
+    x = conv_2d_im2col(gctx, S.conv2_pw_w, x, 1, 0);
     x = ggml_add(gctx, x, conv_bias_bcast(gctx, S.conv2_pw_b, subsampling_channels));
     x = maybe_mask(x, mask_t3);
     x = ggml_relu(gctx, x);
