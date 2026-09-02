@@ -21,7 +21,9 @@
 #     "peak_rss_mib":   1024.5,       # null on runners without /usr/bin/time -v/-l
 #     "runs":           3,
 #     "status":         "ok" | "not-in-registry" | "missing-model"
-#                       | "build-failed" | "run-failed" | "fetch-failed",
+#                       | "build-failed" | "run-failed" | "fetch-failed"
+#                       | "infrastructure-failed" (only written by the
+#                         workflow's pre-flight seed, never by this driver),
 #     "notes":          "..."
 #   }
 #
