@@ -1,5 +1,6 @@
 #include "lm_ggml.h"
 
+#include "fit_measure.h"
 #include "qwen3_block.h"  // shared Qwen3 loaders + builders + DitGGUF IO
 
 #include "ggml.h"
@@ -90,6 +91,8 @@ struct LMModel {
     std::vector<ggml_tensor *> kv_v;
     std::vector<int>           kv_pos;  // per set
     bool                       use_flash_attn = false;
+
+    bool measuring = false;  // metadata-only load: weights/KV sized, never read
 
     LMGraphCache graph_cache;
 };
@@ -268,8 +271,11 @@ bool lm_load_layer_fused(const DitGGUF & g, const std::string & prefix, Qwen3Lay
            lm_load_row_block(gateup, off, g, prefix + ".mlp.up_proj.weight");
 }
 
-LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int max_seq_len, bool verbose,
-                        int n_kv_sets) {
+// Shared body of lm_model_load and lm_model_load_metadata_only. When `measure`
+// is non-null the load is metadata-only: the weight and KV allocations are
+// sized into `measure` instead of performed and no tensor data is read.
+static LMModel * lm_model_load_impl(const std::string & path, ggml_backend_t backend, int max_seq_len, bool verbose,
+                                    int n_kv_sets, AcestepStageMeasure * measure) {
     DitGGUF g;
     if (!dit_gguf_open(g, path)) {
         fprintf(stderr, "[acestep-lm] failed to parse %s\n", path.c_str());
@@ -360,41 +366,57 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
         }
     }
 
-    // NB: ggml_backend_alloc_ctx_tensors returns NULL if EVERY tensor is already
-    // allocated (i.e. all mapped). Safe to treat as failure here because each
-    // stage always has F32 norms that need real allocation; revisit this guard if
-    // an all-quantised stage is ever added.
-    m->weight_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (!m->weight_buf) {
-        fprintf(stderr, "[acestep-lm] failed to allocate weight buffer\n");
-        if (map_buf) ggml_backend_buffer_free(map_buf);
-        ggml_free(ctx);
-        dit_gguf_close(g);
-        delete m;
-        return nullptr;
-    }
+    if (measure) {
+        measure->weights_alloc_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            ctx, ggml_backend_get_default_buffer_type(backend));
+        m->measuring = true;
+    } else {
+        // NB: ggml_backend_alloc_ctx_tensors returns NULL if EVERY tensor is already
+        // allocated (i.e. all mapped). Safe to treat as failure here because each
+        // stage always has F32 norms that need real allocation; revisit this guard if
+        // an all-quantised stage is ever added.
+        m->weight_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (!m->weight_buf) {
+            fprintf(stderr, "[acestep-lm] failed to allocate weight buffer\n");
+            if (map_buf) ggml_backend_buffer_free(map_buf);
+            ggml_free(ctx);
+            dit_gguf_close(g);
+            delete m;
+            return nullptr;
+        }
 
-    q3_load_raw(m->embed_tokens, g, "model.embed_tokens.weight");
-    q3_load_f32(m->final_norm, g, "model.norm.weight");
-    for (int i = 0; i < c.n_layers; i++) {
-        const std::string prefix = "model.layers." + std::to_string(i);
-        if (fuse) {
-            if (!lm_load_layer_fused(g, prefix, m->layers[i], m->qkv_fused[i], m->gateup_fused[i])) {
-                fprintf(stderr, "[acestep-lm] fused weight load failed (layer %d)\n", i);
-                if (map_buf) ggml_backend_buffer_free(map_buf);
-                ggml_backend_buffer_free(m->weight_buf);  // ggml_free(ctx) drops descriptors, not the buffer
-                ggml_free(ctx);
-                dit_gguf_close(g);
-                delete m;
-                return nullptr;
+        q3_load_raw(m->embed_tokens, g, "model.embed_tokens.weight");
+        q3_load_f32(m->final_norm, g, "model.norm.weight");
+        for (int i = 0; i < c.n_layers; i++) {
+            const std::string prefix = "model.layers." + std::to_string(i);
+            if (fuse) {
+                if (!lm_load_layer_fused(g, prefix, m->layers[i], m->qkv_fused[i], m->gateup_fused[i])) {
+                    fprintf(stderr, "[acestep-lm] fused weight load failed (layer %d)\n", i);
+                    if (map_buf) ggml_backend_buffer_free(map_buf);
+                    ggml_backend_buffer_free(m->weight_buf);  // ggml_free(ctx) drops descriptors, not the buffer
+                    ggml_free(ctx);
+                    dit_gguf_close(g);
+                    delete m;
+                    return nullptr;
+                }
+            } else {
+                q3_load_layer(g, prefix, m->layers[i]);
             }
-        } else {
-            q3_load_layer(g, prefix, m->layers[i]);
         }
     }
     // Exact mmapped weight footprint (see dit_gguf_mapped_bytes); reported by
     // lm_model_weight_bytes below so mapped loads don't look like a few-MB stub.
     m->mapped_bytes = mapped ? dit_gguf_mapped_bytes(ctx, g) : 0;
+    if (measure) {
+        measure->weights_mapped_bytes = m->mapped_bytes;
+        // Mark still-unallocated weights externally-allocated so graph sizing
+        // excludes them (see textenc_model_load_impl). No data is read after.
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data && !t->view_src) {
+                t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+            }
+        }
+    }
 
     // KV cache: n_sets * n_layers tensors.
     const int D = c.head_dim, Nkv = c.n_kv_heads, S = c.max_seq_len, Lc = c.n_layers, NS = m->n_sets;
@@ -422,24 +444,36 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
             ggml_set_name(m->kv_v[idx], ("kv_v_" + std::to_string(s) + "_" + std::to_string(l)).c_str());
         }
     }
-    m->kv_buf = ggml_backend_alloc_ctx_tensors(m->kv_ctx, backend);
-    if (!m->kv_buf) {
-        fprintf(stderr, "[acestep-lm] failed to allocate KV cache\n");
-        if (map_buf) ggml_backend_buffer_free(map_buf);
-        if (m->weight_buf) ggml_backend_buffer_free(m->weight_buf);  // ggml_free(ctx) drops descriptors, not the buffer
-        ggml_free(ctx);
-        ggml_free(m->kv_ctx);
-        dit_gguf_close(g);
-        delete m;
-        return nullptr;
-    }
-    {
-        const auto t0 = std::chrono::steady_clock::now();
-        ggml_backend_buffer_clear(m->kv_buf, 0);
-        if (std::getenv("ACESTEP_LM_TIMING"))
-            fprintf(stderr, "[lm-timing] kv-clear %.1f ms (%.1f MB)\n",
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
-                    ggml_backend_buffer_get_size(m->kv_buf) / 1048576.0);
+    if (measure) {
+        measure->kv_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            m->kv_ctx, ggml_backend_get_default_buffer_type(backend));
+        // Mark the KV bases externally-allocated so measure graphs can view
+        // them; the per-set views keep view_src and are resolved through it.
+        for (ggml_tensor * t = ggml_get_first_tensor(m->kv_ctx); t; t = ggml_get_next_tensor(m->kv_ctx, t)) {
+            if (!t->data && !t->view_src) {
+                t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+            }
+        }
+    } else {
+        m->kv_buf = ggml_backend_alloc_ctx_tensors(m->kv_ctx, backend);
+        if (!m->kv_buf) {
+            fprintf(stderr, "[acestep-lm] failed to allocate KV cache\n");
+            if (map_buf) ggml_backend_buffer_free(map_buf);
+            if (m->weight_buf) ggml_backend_buffer_free(m->weight_buf);  // ggml_free(ctx) drops descriptors, not the buffer
+            ggml_free(ctx);
+            ggml_free(m->kv_ctx);
+            dit_gguf_close(g);
+            delete m;
+            return nullptr;
+        }
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            ggml_backend_buffer_clear(m->kv_buf, 0);
+            if (std::getenv("ACESTEP_LM_TIMING"))
+                fprintf(stderr, "[lm-timing] kv-clear %.1f ms (%.1f MB)\n",
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                        ggml_backend_buffer_get_size(m->kv_buf) / 1048576.0);
+        }
     }
     m->kv_pos.assign(NS, 0);
 
@@ -459,6 +493,38 @@ LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int ma
         dit_gguf_close(g);
     }
     return m;
+}
+
+LMModel * lm_model_load(const std::string & path, ggml_backend_t backend, int max_seq_len, bool verbose,
+                        int n_kv_sets) {
+    return lm_model_load_impl(path, backend, max_seq_len, verbose, n_kv_sets, /*measure=*/nullptr);
+}
+
+LMModel * lm_model_load_metadata_only(const std::string & path, ggml_backend_t backend, int max_seq_len,
+                                      bool verbose, int n_kv_sets, AcestepStageMeasure & measure) {
+    measure = AcestepStageMeasure{};
+    return lm_model_load_impl(path, backend, max_seq_len, verbose, n_kv_sets, &measure);
+}
+
+size_t lm_model_kv_bytes(const LMModel * m) {
+    return (m && m->kv_buf) ? ggml_backend_buffer_get_size(m->kv_buf) : 0;
+}
+
+size_t lm_model_compute_buffer_bytes(const LMModel * m) {
+    return (m && m->graph_cache.ga) ? ggml_gallocr_get_buffer_size(m->graph_cache.ga, 0) : 0;
+}
+
+size_t lm_measure_partial_head_bytes(const LMModel * m, int count) {
+    if (!m || !m->embed_tokens || count <= 0) return 0;
+    // Same tensor lm_build_partial_head creates, sized instead of allocated.
+    ggml_init_params hp{ ggml_tensor_overhead() * 3 + 16, nullptr, /*no_alloc=*/true };
+    ggml_context *   ctx = ggml_init(hp);
+    if (!ctx) return 0;
+    ggml_new_tensor_2d(ctx, m->embed_tokens->type, m->cfg.hidden_size, count);
+    const size_t bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+        ctx, ggml_backend_get_default_buffer_type(m->backend));
+    ggml_free(ctx);
+    return bytes;
 }
 
 void lm_model_free(LMModel * m) {
@@ -569,7 +635,7 @@ static ggml_tensor * lm_attn(ggml_context * ctx, ggml_cgraph * gf, const Qwen3Co
 }
 
 bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std::vector<float> & logits_out, int set,
-                      std::vector<float> * layer_states_out, int logit_limit) {
+                      std::vector<float> * layer_states_out, int logit_limit, size_t * measure_compute) {
     const Qwen3Config & c   = m->q3;
     const LMConfig &    lc  = m->cfg;
     const int           H   = c.hidden_size;
@@ -590,18 +656,24 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
 
     // Prefix head [0, logit_limit): reads fewer tied-head rows when the caller
     // (FSM-constrained phase 1) can never select tokens past the limit.
+    // Measure mode never builds (or copies into) the real compact head; it
+    // stands a same-shape descriptor into the measure graph instead (below).
     ggml_tensor * head_w = m->embed_tokens;
     int           out_V  = lc.vocab_size;
     if (logit_limit > 0 && logit_limit < lc.vocab_size) {
-        if (!lm_build_partial_head(m, 0, logit_limit)) {
+        if (measure_compute) {
+            head_w = nullptr;  // created in the graph ctx below
+            out_V  = logit_limit;
+        } else if (!lm_build_partial_head(m, 0, logit_limit)) {
             fprintf(stderr, "[acestep-lm] failed to build prefix head (limit=%d)\n", logit_limit);
             return false;
+        } else {
+            head_w = m->lm_head_partial;
+            out_V  = logit_limit;
         }
-        head_w = m->lm_head_partial;
-        out_V  = logit_limit;
     }
 
-    const bool     cacheable = layer_states_out == nullptr;
+    const bool     cacheable = layer_states_out == nullptr && measure_compute == nullptr;
     LMGraphCache & gc        = m->graph_cache;
     const bool     cache_hit = cacheable && gc.ctx != nullptr && !gc.batch && gc.S == S &&
                                gc.n_kv_pad == n_kv_pad && gc.set0 == set && gc.head == head_w;
@@ -634,6 +706,14 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
         mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv_pad, S);
         ggml_set_input(mask);
 
+        if (measure_compute && !head_w) {
+            // Same shape/type as the compact head lm_build_partial_head would
+            // allocate; marked externally-allocated so graph sizing excludes
+            // it from the compute buffer, like every other weight.
+            head_w       = ggml_new_tensor_2d(ctx, m->embed_tokens->type, H, out_V);
+            head_w->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+        }
+
         gf                   = ggml_new_graph_custom(ctx, nodes, false);
         ggml_tensor * hidden = ggml_get_rows(ctx, m->embed_tokens, t_ids);  // [H, S]
         for (int l = 0; l < c.n_layers; l++) {
@@ -663,9 +743,22 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
         ggml_build_forward_expand(gf, lgt);
 
         ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
-        if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
+        if (!ga) {
+            fprintf(stderr, "[acestep-lm] forward gallocr init failed (n=%d)\n", S);
+            ggml_free(ctx);
+            return false;
+        }
+        if (measure_compute) {
+            // Size-only twin of the alloc below; KV positions stay untouched.
+            *measure_compute = 0;
+            ggml_gallocr_reserve_n_size(ga, gf, nullptr, nullptr, measure_compute);
+            ggml_gallocr_free(ga);
+            ggml_free(ctx);
+            return true;
+        }
+        if (!ggml_gallocr_alloc_graph(ga, gf)) {
             fprintf(stderr, "[acestep-lm] forward alloc failed (n=%d)\n", S);
-            if (ga) ggml_gallocr_free(ga);
+            ggml_gallocr_free(ga);
             ggml_free(ctx);
             return false;
         }
@@ -727,7 +820,8 @@ bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std:
 }
 
 bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * sets, int N,
-                            std::vector<float> & logits_out, int logit_offset) {
+                            std::vector<float> & logits_out, int logit_offset,
+                            size_t * measure_compute) {
     if (!m || !m->use_flash_attn || N < 1 || N > m->n_sets || logit_offset < 0 ||
         logit_offset >= m->cfg.vocab_size) {
         return false;
@@ -742,8 +836,14 @@ bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * 
     const LMConfig & lc = m->cfg;
     const int H = c.hidden_size, D = c.head_dim, Nh = c.n_heads, Nkv = c.n_kv_heads;
     const int requested_out_V = lc.vocab_size - logit_offset;
+    // Measure mode assumes the compact head builds (the real path only falls
+    // back to the full tied head when its allocation fails, and the verdict
+    // this measurement feeds exists to prevent exactly that situation); the
+    // head weights themselves are priced via lm_measure_partial_head_bytes.
     const bool compact_head =
-        logit_offset > 0 && lm_build_partial_head(m, logit_offset, m->cfg.vocab_size - logit_offset);
+        logit_offset > 0 &&
+        (measure_compute != nullptr ||
+         lm_build_partial_head(m, logit_offset, m->cfg.vocab_size - logit_offset));
     const int graph_out_V = compact_head ? requested_out_V : lc.vocab_size;
     int max_kv_len = 0;
     for (int i = 0; i < N; i++) {
@@ -755,8 +855,10 @@ bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * 
     if (n_kv_pad > lc.max_seq_len) n_kv_pad = lc.max_seq_len;
 
     LMGraphCache & gc        = m->graph_cache;
-    ggml_tensor *  lm_weight = compact_head ? m->lm_head_partial : m->embed_tokens;
-    const bool     cache_hit = gc.ctx != nullptr && gc.batch && gc.n_kv_pad == n_kv_pad &&
+    ggml_tensor *  lm_weight = compact_head ? (measure_compute ? nullptr : m->lm_head_partial)
+                                            : m->embed_tokens;
+    const bool     cache_hit = !measure_compute &&
+                               gc.ctx != nullptr && gc.batch && gc.n_kv_pad == n_kv_pad &&
                                gc.set0 == s0 && gc.n_batch == N && gc.head == lm_weight;
 
     ggml_context * ctx = nullptr;
@@ -771,7 +873,7 @@ bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * 
         t_ids = gc.t_ids; positions = gc.positions; kv_rows = gc.kv_rows;
         mask  = gc.mask;  lgt = gc.lgt;
     } else {
-        gc.release();
+        if (!measure_compute) gc.release();
 
         const size_t nodes = 16384;
         ggml_init_params gp{ ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(nodes, false), nullptr, true };
@@ -785,6 +887,13 @@ bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * 
         ggml_set_input(kv_rows);
         mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv_pad, 1, 1, N);
         ggml_set_input(mask);
+
+        if (measure_compute && !lm_weight) {
+            // Same shape/type as the compact head lm_build_partial_head would
+            // allocate; externally-allocated so graph sizing excludes it.
+            lm_weight       = ggml_new_tensor_2d(ctx, m->embed_tokens->type, H, graph_out_V);
+            lm_weight->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+        }
 
         gf = ggml_new_graph_custom(ctx, nodes, false);
         ggml_tensor * hidden = ggml_get_rows(ctx, m->embed_tokens, t_ids);  // [H, N]
@@ -846,8 +955,20 @@ bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * 
         ggml_build_forward_expand(gf, lgt);
 
         ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
-        if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
-            if (ga) ggml_gallocr_free(ga);
+        if (!ga) {
+            ggml_free(ctx);
+            return false;
+        }
+        if (measure_compute) {
+            // Size-only twin of the alloc below; KV positions stay untouched.
+            *measure_compute = 0;
+            ggml_gallocr_reserve_n_size(ga, gf, nullptr, nullptr, measure_compute);
+            ggml_gallocr_free(ga);
+            ggml_free(ctx);
+            return true;
+        }
+        if (!ggml_gallocr_alloc_graph(ga, gf)) {
+            ggml_gallocr_free(ga);
             ggml_free(ctx);
             return false;
         }
@@ -898,6 +1019,48 @@ bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * 
     }
     for (int i = 0; i < N; i++) m->kv_pos[sets[i]]++;
     return true;
+}
+
+// ── Size-only measure wrappers (memory-fit preflight) ───────────────────────
+// The graph shape depends on the KV position, so each wrapper stages the
+// projected position, runs the measure-mode forward (which never advances or
+// writes the cache), and restores it.
+
+bool lm_model_measure_prefill(LMModel * m, int n_tokens, int logit_limit, size_t & compute_bytes) {
+    if (!m || n_tokens < 1 || n_tokens > m->cfg.max_seq_len) return false;
+    const int saved  = m->kv_pos[0];
+    m->kv_pos[0]     = 0;
+    std::vector<float> dummy;
+    const bool ok = lm_model_forward(m, /*token_ids=*/nullptr, n_tokens, dummy, /*set=*/0,
+                                     /*layer_states_out=*/nullptr, logit_limit, &compute_bytes);
+    m->kv_pos[0] = saved;
+    return ok;
+}
+
+bool lm_model_measure_decode(LMModel * m, int kv_len, int logit_limit, size_t & compute_bytes) {
+    if (!m || kv_len < 1 || kv_len > m->cfg.max_seq_len) return false;
+    const int saved = m->kv_pos[0];
+    m->kv_pos[0]    = kv_len - 1;  // the decode step that reaches kv_len
+    std::vector<float> dummy;
+    const bool ok = lm_model_forward(m, /*token_ids=*/nullptr, 1, dummy, /*set=*/0,
+                                     /*layer_states_out=*/nullptr, logit_limit, &compute_bytes);
+    m->kv_pos[0] = saved;
+    return ok;
+}
+
+bool lm_model_measure_decode_batch(LMModel * m, int N, int kv_len, int logit_offset, size_t & compute_bytes) {
+    if (!m || N < 1 || N > m->n_sets || kv_len < 1 || kv_len > m->cfg.max_seq_len) return false;
+    std::vector<int> saved(m->kv_pos);
+    std::vector<int> sets((size_t) N);
+    for (int i = 0; i < N; i++) {
+        sets[i]        = i;
+        m->kv_pos[i]   = kv_len - 1;
+    }
+    std::vector<float> dummy;
+    const bool ok = lm_model_forward_batch(m, /*token_ids=*/nullptr, sets.data(), N, dummy,
+                                           logit_offset, &compute_bytes);
+    m->kv_pos = saved;
+    return ok;
 }
 
 } // namespace tts_cpp::acestep
