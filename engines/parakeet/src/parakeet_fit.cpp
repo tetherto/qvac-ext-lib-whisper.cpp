@@ -156,8 +156,19 @@ FitResult fit_params(const FitOptions & opts) {
             model.encoder_cfg.pos_emb_max_len, model.encoder_cfg.subsampling_factor,
             total_mel);
         if (plan.enabled) {
-            const int center_mel = plan.center_frames  * plan.sub;
-            const int ctx_mel    = plan.context_frames * plan.sub;
+            // Widen before multiplying: with pos_emb_max_len == 0 nothing
+            // clamps an absurd --window-frames, and center_frames * sub in int
+            // would be signed-overflow UB. Out-of-range projects as
+            // workload-too-large, mirroring the worst_window_mel guard below.
+            const long long center_mel_ll = (long long) plan.center_frames  * plan.sub;
+            const long long ctx_mel_ll    = (long long) plan.context_frames * plan.sub;
+            if (center_mel_ll > std::numeric_limits<int>::max() ||
+                ctx_mel_ll    > std::numeric_limits<int>::max()) {
+                r.reason = "workload-too-large";
+                return r;
+            }
+            const int center_mel = (int) center_mel_ll;
+            const int ctx_mel    = (int) ctx_mel_ll;
             const int n_units    = (int) std::min<long long>(
                 total_mel, std::numeric_limits<int>::max());
             const size_t n_windows =
