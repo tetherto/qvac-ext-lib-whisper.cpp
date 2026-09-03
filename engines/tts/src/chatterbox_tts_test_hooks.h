@@ -31,6 +31,15 @@ namespace tts_cpp::chatterbox::test_hooks {
 // distinct t-values per process; Turbo = up to 3 (t_span = [0, 0.5, 1]).
 size_t time_mlp_result_cache_size();
 
+// Number of entries in the process-wide time_mlp GRAPH cache (backend
+// scaffolding: ctx + graph + gallocr), keyed by backend pointer.  One
+// entry per live backend that ran compute_time_mlp; 0 before any synth
+// and 0 again after s3gen_unload().  The cache is deliberately not
+// thread_local: a thread_local destructor freeing backend memory at
+// worker-thread exit runs under the Windows loader lock, where CUDA
+// frees fail with cudaErrorInitializationError and abort the process.
+size_t time_mlp_graph_cache_size();
+
 // Number of ((t_val, r_val)) entries in the time_mixed result cache used
 // only by the Turbo meanflow path.  Multilingual never populates this.
 size_t time_emb_result_cache_size();

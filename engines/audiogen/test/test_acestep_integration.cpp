@@ -547,6 +547,40 @@ void run_lm_generation_scenario(tts_cpp::acestep::Engine & engine, const fs::pat
     CHECK(second.pcm == first.pcm);
 }
 
+// Quality scoring end to end: the generated codes are teacher-forced back
+// through the LM and the request earns a weighted score with a breakdown.
+void run_quality_score_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    GenerateParams params;
+    params.caption               = "acoustic quality scoring integration test";
+    params.lyrics                = "[verse]\nhello quality world";
+    params.duration              = 1.0f;
+    params.bpm                   = 120;
+    params.keyscale              = "C major";
+    params.inference_steps       = TEST_STEPS;
+    params.shift                 = TEST_SHIFT;
+    params.seed                  = TEST_SEED;
+    params.lm_phase1             = false;
+    params.compute_quality_score = true;
+
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(result.metadata.quality_score >= 0.0);
+    CHECK(result.metadata.quality_score <= 1.0);
+    CHECK(!result.metadata.quality_report.empty());
+    CHECK(result.metadata.quality_report.find("caption") != std::string::npos);
+    CHECK(result.metadata.quality_report.find("bpm") != std::string::npos);
+    CHECK(stages.contains_detailed_progress("score"));
+
+    GenerateParams unscored = params;
+    unscored.compute_quality_score = false;
+    const GenerateResult baseline  = engine.generate(unscored);
+    CHECK(baseline.metadata.quality_report.empty());
+    CHECK(baseline.pcm == result.pcm);
+}
+
 // Simple Mode end to end: a short query expands into a complete request (the
 // LM inspire pass writes lyrics and fills unset metadata) before synthesis.
 void run_simple_mode_scenario(tts_cpp::acestep::Engine & engine) {
@@ -625,6 +659,30 @@ void run_lm_phase2_cancel_scenario(tts_cpp::acestep::Engine & engine) {
     CHECK(result.pcm.empty());
 }
 
+// Generates with known lyrics and asserts the LRC stage aligns them: LRC text
+// present, mm:ss.xx line stamps, and a confidence score inside [0, 1].
+void run_lrc_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    GenerateParams params;
+    params.caption         = "acoustic ballad integration test";
+    params.lyrics          = "[verse]\nhello world tonight\nsinging by the light";
+    params.duration        = 2.0f;
+    params.inference_steps = TEST_STEPS;
+    params.shift           = TEST_SHIFT;
+    params.seed            = TEST_SEED;
+    params.lm_phase1       = false;
+    params.generate_lrc    = true;
+
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(!result.metadata.lrc.empty());
+    CHECK(result.metadata.lrc.rfind("[00:", 0) == 0);
+    CHECK(result.metadata.lyrics_score >= 0.0);
+    CHECK(result.metadata.lyrics_score <= 1.0);
+}
+
 void run_cover_strength_scenario(tts_cpp::acestep::Engine & engine) {
     using namespace tts_cpp::acestep;
     GenerateParams params = make_generate_params();
@@ -664,9 +722,11 @@ int run_integration(const char * models_dir) {
         run_lego_scenario(*engine, dump_dir);
         run_lego_base_lane();
         run_lm_generation_scenario(*engine, dump_dir);
+        run_quality_score_scenario(*engine);
         run_simple_mode_scenario(*engine);
         run_lm_phase1_cancel_scenario(*engine);
         run_lm_phase2_cancel_scenario(*engine);
+        run_lrc_scenario(*engine);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "FAIL integration exception: %s\n", error.what());
         ++failures;

@@ -25,7 +25,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <regex>
 #include <stdexcept>
@@ -135,6 +137,38 @@ struct EncoderGraph {
     ~EncoderGraph() { free_(); }
 };
 
+struct NemotronPromptGraph {
+    ggml_context * context = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_gallocr_t allocator = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * output = nullptr;
+    int n_frames = 0;
+
+    void clear() {
+        if (allocator) {
+            ggml_gallocr_free(allocator);
+            allocator = nullptr;
+        }
+        if (context) {
+            ggml_free(context);
+            context = nullptr;
+        }
+        graph = nullptr;
+        input = nullptr;
+        output = nullptr;
+        n_frames = 0;
+    }
+
+    ~NemotronPromptGraph() { clear(); }
+};
+
+#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN
+constexpr bool k_flash_attn_compiled = true;
+#else
+constexpr bool k_flash_attn_compiled = false;
+#endif
+
 struct ParakeetCtcModel::Impl {
     gguf_context         * gguf           = nullptr;
     ggml_context         * ctx            = nullptr;
@@ -149,6 +183,16 @@ struct ParakeetCtcModel::Impl {
     // routed to CPU there (its transformer block 0 miscomputes to NaN on the
     // Valhall driver) while the encoder + CTC/TDT/EOU heads stay on the Mali GPU.
     bool                   sortformer_force_cpu = false;
+    // Depthwise-conv lowering the active backend can run directly (GGML_OP_CONV_2D_DW):
+    // planar (W,H,C) input for the subsampler, channel-contiguous input for the
+    // conformer conv module. False falls back to the portable im2col lowering.
+    bool                   dw_direct_planar   = false;
+    bool                   dw_direct_channels = false;
+    // Fused or unfused attention for the active backend, and whether the fused
+    // kernel takes the relative-position bias as one mask per head (otherwise
+    // heads fold into the batch dimension).
+    AttnPath               attn;
+    bool                   glu_fused          = false;
     // CPU-resident copies of the Sortformer head weights (Mali-Vulkan only), so
     // the CPU head graph reads them from the CPU backend instead of
     // dereferencing the GPU-resident originals.
@@ -164,6 +208,7 @@ struct ParakeetCtcModel::Impl {
     ggml_backend_sched_t   sched          = nullptr;
     std::vector<std::unique_ptr<EncoderGraph>> encoder_graphs;
     static constexpr size_t k_encoder_graph_cache_max = 3;
+    std::unique_ptr<NemotronPromptGraph> nemotron_prompt_graph;
 
 #ifdef PARAKEET_USE_COREML
     // Optional Apple Neural Engine encoder sidecar. Non-null only on
@@ -181,6 +226,7 @@ struct ParakeetCtcModel::Impl {
             if (g) g->free_();
         }
         encoder_graphs.clear();
+        nemotron_prompt_graph.reset();
         if (sched)          ggml_backend_sched_free(sched);
         if (weights_buffer) ggml_backend_buffer_free(weights_buffer);
         for (ggml_backend_buffer_t b : weights_extra_buffers) {
@@ -356,6 +402,27 @@ const char * dev_reg_name(ggml_backend_dev_t dev) {
 }
 
 
+// Ask the backend whether it runs GGML_OP_CONV_2D_DW on a representative F32 kernel/input
+// pair, for either the planar (W,H,C,N) input layout or the channel-contiguous one the
+// conformer conv module produces. Uses a throwaway no-alloc context; nothing is computed.
+bool backend_runs_conv_2d_dw(ggml_backend_t backend, bool channels_contiguous) {
+    if (!backend) return false;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    const int K = 3, C = 8, W = 16, Hh = 4;
+    ggml_tensor * kernel = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, K, K, 1, C);
+    ggml_tensor * input  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, Hh, C, 1);
+    if (channels_contiguous) {
+        kernel = ggml_permute(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, C, K, K, 1), 3, 0, 1, 2);
+        input  = ggml_permute(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, C, W, Hh, 1), 2, 0, 1, 3);
+    }
+    ggml_tensor * out = ggml_conv_2d_dw_direct(ctx, kernel, input, 1, 1, 1, 1, 1, 1);
+    const bool ok = ggml_backend_supports_op(backend, out);
+    ggml_free(ctx);
+    return ok;
+}
+
 // Pick a GPU backend using the same tier policy as llm-llamacpp's
 // BackendSelection and engines/tts/src/backend_selection.cpp: ggml-opencl
 // is only used when an Adreno 700+ device is present (where its kernels
@@ -374,6 +441,73 @@ const char * dev_reg_name(ggml_backend_dev_t dev) {
 // with, those entry points live in separate shared libraries that
 // are dlopen()'d at runtime and are not linkable from libqvac-parakeet.
 // The registry walk reaches the same backends in both modes.
+// Ask the backend whether ggml_flash_attn_ext accepts a mask with one slice per head.
+// Whether the backend runs the sigmoid-gated GLU on a [2C, T] tensor (the conformer conv module's
+// a * sigmoid(b) over the two channel halves) without materialising the halves.
+bool backend_runs_siglu(ggml_backend_t backend, int C) {
+    if (!backend) return false;
+    ggml_init_params ip = { ggml_tensor_overhead() * 4, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    const int T = 8;
+    ggml_tensor * out = ggml_siglu(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * C, T));
+    const bool ok = ggml_backend_supports_op(backend, out);
+    ggml_free(ctx);
+    return ok;
+}
+
+bool backend_runs_flash_attn_per_head_mask(ggml_backend_t backend, int HD, int H) {
+    if (!backend) return false;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    const int T = 64;
+    ggml_tensor * q    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, T, H);
+    ggml_tensor * k    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, T, H);
+    ggml_tensor * v    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, T, H);
+    ggml_tensor * mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, T, T, H);
+    ggml_tensor * out  = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f, 0.0f, 0.0f);
+    const bool ok = ggml_backend_supports_op(backend, out);
+    ggml_free(ctx);
+    return ok;
+}
+
+// The fused attention node exactly as rel_pos_mha_flash_graph emits it: head-major
+// views for k and v, the f16 mask per head or, with heads folded into the batch, as
+// [T, T, 1, H].
+bool backend_runs_flash_attn(ggml_backend_t backend, int HD, int H, bool per_head_mask) {
+    if (!backend) return false;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    const int T = 64;
+    ggml_tensor * q    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, T, H);
+    ggml_tensor * kp   = ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, H, T), 0, 2, 1, 3);
+    ggml_tensor * vp   = ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, H, T), 0, 2, 1, 3);
+    ggml_tensor * mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, T, T, H);
+    ggml_tensor * out;
+    if (per_head_mask) {
+        out = ggml_flash_attn_ext(ctx, q, kp, vp, mask, 1.0f, 0.0f, 0.0f);
+    } else {
+        ggml_tensor * q4 = ggml_view_4d(ctx, q,  HD, T, 1, H, q->nb[1],  q->nb[2],  q->nb[2],  0);
+        ggml_tensor * k4 = ggml_view_4d(ctx, kp, HD, T, 1, H, kp->nb[1], kp->nb[2], kp->nb[2], 0);
+        ggml_tensor * v4 = ggml_view_4d(ctx, vp, HD, T, 1, H, vp->nb[1], vp->nb[2], vp->nb[2], 0);
+        ggml_tensor * m4 = ggml_reshape_4d(ctx, mask, T, T, 1, H);
+        out = ggml_flash_attn_ext(ctx, q4, k4, v4, m4, 1.0f, 0.0f, 0.0f);
+    }
+    const bool ok = ggml_backend_supports_op(backend, out);
+    ggml_free(ctx);
+    return ok;
+}
+
+AttnPath select_attn_path(ggml_backend_t backend, int HD, int H) {
+    AttnPath attn;
+    if (!flash_attn_allowed(k_flash_attn_compiled, backend)) return attn;
+    attn.per_head_mask = backend_runs_flash_attn_per_head_mask(backend, HD, H);
+    attn.flash_attn    = backend_runs_flash_attn(backend, HD, H, attn.per_head_mask);
+    return attn;
+}
+
 ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose,
                                 bool & out_skipped_unsupported_gpu,
                                 bool & out_is_mali_vulkan) {
@@ -559,6 +693,169 @@ bool get_bool(const gguf_context * g, const std::string & k, bool fallback) {
     return gguf_get_val_bool(g, id);
 }
 
+int require_key(const gguf_context * g, const std::string & key) {
+    const int id = find_key(g, key);
+    if (id < 0) {
+        throw std::runtime_error(
+            "gguf: missing required metadata '" + key + "'");
+    }
+    return id;
+}
+
+uint32_t require_u32(
+    const gguf_context * g,
+    const std::string & key) {
+    const int id = require_key(g, key);
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_UINT32) {
+        throw std::runtime_error(
+            "gguf: metadata '" + key + "' must be uint32");
+    }
+    return gguf_get_val_u32(g, id);
+}
+
+int32_t require_i32(
+    const gguf_context * g,
+    const std::string & key) {
+    const int id = require_key(g, key);
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_INT32) {
+        throw std::runtime_error(
+            "gguf: metadata '" + key + "' must be int32");
+    }
+    return gguf_get_val_i32(g, id);
+}
+
+bool require_bool(
+    const gguf_context * g,
+    const std::string & key) {
+    const int id = require_key(g, key);
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_BOOL) {
+        throw std::runtime_error(
+            "gguf: metadata '" + key + "' must be bool");
+    }
+    return gguf_get_val_bool(g, id);
+}
+
+std::string require_string(
+    const gguf_context * g,
+    const std::string & key) {
+    const int id = require_key(g, key);
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_STRING) {
+        throw std::runtime_error(
+            "gguf: metadata '" + key + "' must be string");
+    }
+    return gguf_get_val_str(g, id);
+}
+
+std::vector<int32_t> require_i32_array(
+    const gguf_context * g,
+    const std::string & key) {
+    const int id = require_key(g, key);
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY ||
+        gguf_get_arr_type(g, id) != GGUF_TYPE_INT32) {
+        throw std::runtime_error(
+            "gguf: metadata '" + key + "' must be int32[]");
+    }
+
+    const size_t count = gguf_get_arr_n(g, id);
+    const auto * values = static_cast<const int32_t *>(
+        gguf_get_arr_data(g, id));
+    return std::vector<int32_t>(values, values + count);
+}
+
+std::vector<std::string> require_string_array(
+    const gguf_context * g,
+    const std::string & key) {
+    const int id = require_key(g, key);
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY ||
+        gguf_get_arr_type(g, id) != GGUF_TYPE_STRING) {
+        throw std::runtime_error(
+            "gguf: metadata '" + key + "' must be string[]");
+    }
+
+    std::vector<std::string> values;
+    const size_t count = gguf_get_arr_n(g, id);
+    values.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+        const char * value = gguf_get_arr_str(g, id, index);
+        values.emplace_back(value ? value : "");
+    }
+    return values;
+}
+
+void load_nemotron_metadata(
+    const gguf_context * g,
+    ParakeetCtcModel & model) {
+    (void) require_u32(g, "parakeet.encoder.d_model");
+    (void) require_u32(g, "parakeet.encoder.n_layers");
+    (void) require_u32(g, "parakeet.encoder.n_heads");
+    (void) require_u32(g, "parakeet.encoder.conv_kernel");
+    (void) require_u32(g, "parakeet.encoder.subsampling_factor");
+    (void) require_bool(g, "parakeet.encoder.use_bias");
+    (void) require_string(g, "parakeet.encoder.conv_norm_type");
+    (void) require_bool(g, "parakeet.encoder.causal_downsampling");
+    (void) require_string(g, "parakeet.encoder.conv_context_size");
+    (void) require_string(g, "parakeet.encoder.att_context_style");
+    (void) require_i32(g, "parakeet.encoder.att_context_size_left");
+    (void) require_i32(g, "parakeet.encoder.att_context_size_right");
+    (void) require_u32(g, "parakeet.preproc.sample_rate");
+    (void) require_u32(g, "parakeet.preproc.n_mels");
+
+    NemotronConfig & cfg = model.nemotron_cfg;
+
+    cfg.pred_hidden =
+        require_u32(g, "parakeet.nemotron.pred_hidden");
+    cfg.pred_rnn_layers =
+        require_u32(g, "parakeet.nemotron.pred_rnn_layers");
+    cfg.joint_hidden =
+        require_u32(g, "parakeet.nemotron.joint_hidden");
+    cfg.max_symbols_per_step =
+        require_u32(g, "parakeet.nemotron.max_symbols_per_step");
+
+    model.vocab_size =
+        require_u32(g, "parakeet.nemotron.vocab_size");
+    model.blank_id =
+        require_u32(g, "parakeet.nemotron.blank_id");
+
+    cfg.num_prompts =
+        require_u32(g, "parakeet.nemotron.num_prompts");
+    cfg.prompt_width =
+        require_u32(g, "parakeet.nemotron.prompt_width");
+    cfg.prompt_input_width =
+        require_u32(g, "parakeet.nemotron.prompt_input_width");
+    cfg.left_context_frames =
+        require_u32(g, "parakeet.nemotron.left_context_frames");
+    cfg.cache_time_steps =
+        require_u32(g, "parakeet.nemotron.cache_time_steps");
+
+    cfg.allowed_right_context_frames = require_i32_array(
+        g, "parakeet.nemotron.allowed_right_context_frames");
+    cfg.allowed_chunk_ms = require_i32_array(
+        g, "parakeet.nemotron.allowed_chunk_ms");
+    cfg.default_locale = require_string(
+        g, "parakeet.nemotron.default_locale");
+
+    const std::vector<std::string> aliases = require_string_array(
+        g, "parakeet.nemotron.locale_aliases");
+    const std::vector<int32_t> prompt_ids = require_i32_array(
+        g, "parakeet.nemotron.locale_prompt_ids");
+
+    if (aliases.size() != prompt_ids.size()) {
+        throw std::runtime_error(
+            "gguf: Nemotron locale aliases and prompt IDs differ in length");
+    }
+
+    cfg.locale_prompts.reserve(aliases.size());
+    for (size_t index = 0; index < aliases.size(); ++index) {
+        cfg.locale_prompts.push_back(
+            {aliases[index], prompt_ids[index]});
+    }
+
+    if (!require_bool(g, "parakeet.encoder.streaming.enabled")) {
+        throw std::runtime_error(
+            "gguf: Nemotron requires cache-aware streaming metadata");
+    }
+}
+
 ggml_tensor * require_tensor(ggml_context * ctx, const std::string & name) {
     ggml_tensor * t = ggml_get_tensor(ctx, name.c_str());
     if (!t) throw std::runtime_error("gguf: missing required tensor '" + name + "'");
@@ -612,6 +909,208 @@ std::vector<float> read_filterbank_to_vector(ggml_tensor * t) {
     return out;
 }
 
+void require_nemotron_shape(
+    const ggml_tensor * tensor,
+    const std::string & name,
+    std::initializer_list<int64_t> expected) {
+    if (!tensor) {
+        throw std::runtime_error(
+            "gguf: missing required Nemotron tensor '" + name + "'");
+    }
+    if (ggml_n_dims(tensor) != static_cast<int>(expected.size())) {
+        throw std::runtime_error(
+            "gguf: unexpected rank for Nemotron tensor '" + name + "'");
+    }
+
+    size_t dimension = 0;
+    for (const int64_t expected_size : expected) {
+        if (tensor->ne[dimension] != expected_size) {
+            throw std::runtime_error(
+                "gguf: unexpected shape for Nemotron tensor '" + name + "'");
+        }
+        ++dimension;
+    }
+}
+
+}
+
+void validate_nemotron_model(const ParakeetCtcModel & model) {
+    static const std::vector<int32_t> expected_right_contexts = {
+        0, 1, 3, 6, 13,
+    };
+    static const std::vector<int32_t> expected_chunk_ms = {
+        80, 160, 320, 560, 1120,
+    };
+    constexpr const char * expected_variant =
+        "nemotron-3.5-asr-streaming-0.6b-v1";
+
+    if (model.model_type != ParakeetModelType::NEMOTRON) {
+        throw std::runtime_error(
+            "validate_nemotron_model called for non-Nemotron model");
+    }
+    if (model.model_variant != expected_variant) {
+        throw std::runtime_error(
+            "gguf: unsupported Nemotron variant '" +
+            model.model_variant + "'");
+    }
+
+    const EncoderConfig & encoder = model.encoder_cfg;
+    if (encoder.n_layers != 24 ||
+        encoder.d_model != 1024 ||
+        encoder.n_heads != 8 ||
+        encoder.conv_kernel != 9 ||
+        encoder.subsampling_factor != 8 ||
+        encoder.conv_norm_type != ConvNormType::LayerNorm ||
+        encoder.use_bias ||
+        !encoder.causal_downsampling ||
+        !encoder.conv_causal ||
+        !encoder.att_chunked_limited ||
+        encoder.att_context_left != 56 ||
+        encoder.att_context_right != 3) {
+        throw std::runtime_error(
+            "gguf: incompatible Nemotron FastConformer geometry");
+    }
+    if (!model.supports_streaming ||
+        model.mel_cfg.sample_rate != 16000 ||
+        model.mel_cfg.n_mels != 128) {
+        throw std::runtime_error(
+            "gguf: incompatible Nemotron streaming/preprocessor metadata");
+    }
+
+    const NemotronConfig & config = model.nemotron_cfg;
+    if (model.vocab_size != 13087 ||
+        model.blank_id != 13087 ||
+        config.pred_hidden != 640 ||
+        config.pred_rnn_layers != 2 ||
+        config.joint_hidden != 640 ||
+        config.max_symbols_per_step != 10 ||
+        config.num_prompts != 128 ||
+        config.prompt_width != 128 ||
+        config.prompt_input_width !=
+            encoder.d_model + config.prompt_width ||
+        config.left_context_frames != 56 ||
+        config.cache_time_steps != 8 ||
+        config.default_locale != "auto") {
+        throw std::runtime_error(
+            "gguf: incompatible Nemotron prompt/RNNT metadata");
+    }
+    if (config.allowed_right_context_frames != expected_right_contexts ||
+        config.allowed_chunk_ms != expected_chunk_ms) {
+        throw std::runtime_error(
+            "gguf: unsupported Nemotron streaming operating points");
+    }
+    if (config.locale_prompts.empty()) {
+        throw std::runtime_error(
+            "gguf: Nemotron locale table is empty");
+    }
+
+    bool has_default_locale = false;
+    for (const NemotronLocalePrompt & locale : config.locale_prompts) {
+        if (locale.alias.empty() ||
+            locale.prompt_id < 0 ||
+            locale.prompt_id >= config.num_prompts) {
+            throw std::runtime_error(
+                "gguf: invalid Nemotron locale prompt entry");
+        }
+        if (locale.alias == config.default_locale) {
+            has_default_locale = true;
+        }
+    }
+    if (!has_default_locale) {
+        throw std::runtime_error(
+            "gguf: Nemotron default locale is absent from the locale table");
+    }
+
+    const NemotronWeights & weights = model.nemotron;
+    require_nemotron_shape(
+        weights.prompt.proj_0_w,
+        "nemotron.prompt.proj.0.weight",
+        {1152, 2048});
+    require_nemotron_shape(
+        weights.prompt.proj_0_b,
+        "nemotron.prompt.proj.0.bias",
+        {2048});
+    require_nemotron_shape(
+        weights.prompt.proj_2_w,
+        "nemotron.prompt.proj.2.weight",
+        {2048, 1024});
+    require_nemotron_shape(
+        weights.prompt.proj_2_b,
+        "nemotron.prompt.proj.2.bias",
+        {1024});
+
+    const RnntWeights & rnnt = weights.rnnt;
+    require_nemotron_shape(
+        rnnt.predict_embed,
+        "nemotron.predict.embed.weight",
+        {640, 13088});
+    if (rnnt.lstm.size() != 2) {
+        throw std::runtime_error(
+            "gguf: Nemotron predictor must contain two LSTM layers");
+    }
+    for (size_t layer = 0; layer < rnnt.lstm.size(); ++layer) {
+        const TdtLstmLayer & lstm = rnnt.lstm[layer];
+        const std::string prefix =
+            "nemotron.predict.lstm." + std::to_string(layer);
+        require_nemotron_shape(lstm.w_ih, prefix + ".w_ih", {640, 2560});
+        require_nemotron_shape(lstm.w_hh, prefix + ".w_hh", {640, 2560});
+        require_nemotron_shape(lstm.b_ih, prefix + ".b_ih", {2560});
+        require_nemotron_shape(lstm.b_hh, prefix + ".b_hh", {2560});
+    }
+
+    require_nemotron_shape(
+        rnnt.joint_enc_w,
+        "nemotron.joint.enc.weight",
+        {1024, 640});
+    require_nemotron_shape(
+        rnnt.joint_enc_b,
+        "nemotron.joint.enc.bias",
+        {640});
+    require_nemotron_shape(
+        rnnt.joint_pred_w,
+        "nemotron.joint.pred.weight",
+        {640, 640});
+    require_nemotron_shape(
+        rnnt.joint_pred_b,
+        "nemotron.joint.pred.bias",
+        {640});
+    require_nemotron_shape(
+        rnnt.joint_out_w,
+        "nemotron.joint.out.weight",
+        {640, 13088});
+    require_nemotron_shape(
+        rnnt.joint_out_b,
+        "nemotron.joint.out.bias",
+        {13088});
+}
+
+int32_t resolve_nemotron_prompt_id(
+    const ParakeetCtcModel & model,
+    const std::string & language) {
+    if (model.model_type != ParakeetModelType::NEMOTRON) {
+        throw std::runtime_error(
+            "resolve_nemotron_prompt_id called for non-Nemotron model");
+    }
+
+    const NemotronConfig & config = model.nemotron_cfg;
+    const std::string requested =
+        language.empty() ? config.default_locale : language;
+    for (const NemotronLocalePrompt & locale : config.locale_prompts) {
+        if (locale.alias == requested) {
+            return locale.prompt_id;
+        }
+    }
+
+    std::string supported;
+    for (const NemotronLocalePrompt & locale : config.locale_prompts) {
+        if (!supported.empty()) {
+            supported += ", ";
+        }
+        supported += locale.alias;
+    }
+    throw std::runtime_error(
+        "unsupported Nemotron locale '" + requested +
+        "'; supported locales: " + supported);
 }
 
 void set_backends_directory(const std::string & dir) {
@@ -925,8 +1424,8 @@ static bool path_is_directory(const std::string & path) {
 }
 
 // Presence-driven, additive loader: loads the Core ML encoder sidecar
-// when one sits next to the GGUF. Any miss (env override, CTC model, absent
-// directory, load failure) silently leaves ctx_coreml null so the ggml encoder runs.
+// when one sits next to the GGUF. Any miss (env override, unsupported family,
+// absent directory, load failure) leaves ctx_coreml null so ggml runs.
 static void maybe_init_coreml_encoder(const std::string & gguf_path,
                                       ParakeetCtcModel  & model,
                                       bool                verbose) {
@@ -934,8 +1433,9 @@ static void maybe_init_coreml_encoder(const std::string & gguf_path,
         if (verbose) PARAKEET_LOG_INFO("parakeet: Core ML encoder disabled via PARAKEET_COREML_DISABLE; using ggml\n");
         return;
     }
-    if (model.model_type == ParakeetModelType::CTC) {
-        return;  // CTC greedy decode reads ggml CTC-head logits, which the sidecar does not emit
+    if (model.model_type == ParakeetModelType::CTC ||
+        model.model_type == ParakeetModelType::NEMOTRON) {
+        return;
     }
     const std::string path = coreml_encoder_sidecar_path(gguf_path);
     if (!path_is_directory(path)) {
@@ -985,6 +1485,18 @@ int load_from_gguf(const std::string & gguf_path,
     // route only that head to CPU while the encoder + CTC/TDT/EOU heads stay on GPU.
     impl->sortformer_force_cpu =
         gpu_is_mali_vulkan && impl->backend_active == impl->backend_gpu;
+    impl->attn = select_attn_path(impl->backend_active, out_model.encoder_cfg.head_dim,
+                                  out_model.encoder_cfg.n_heads);
+    impl->glu_fused = !gpu_is_mali_vulkan && backend_runs_siglu(impl->backend_active, out_model.encoder_cfg.d_model);
+    if (impl->backend_gpu && impl->backend_active == impl->backend_gpu && !gpu_is_mali_vulkan) {
+        impl->dw_direct_planar   = backend_runs_conv_2d_dw(impl->backend_gpu, false);
+        impl->dw_direct_channels = backend_runs_conv_2d_dw(impl->backend_gpu, true);
+        if (verbose) {
+            PARAKEET_LOG_INFO("parakeet: depthwise conv lowering: subsampler %s, conformer %s\n",
+                              impl->dw_direct_planar   ? "direct" : "im2col",
+                              impl->dw_direct_channels ? "direct" : "im2col");
+        }
+    }
     if (impl->sortformer_force_cpu && verbose) {
         PARAKEET_LOG_INFO(
             "parakeet: Sortformer diarization head -> CPU on Mali-Vulkan "
@@ -1124,14 +1636,28 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.supports_streaming = get_bool(g, "parakeet.encoder.streaming.enabled", false);
 
     const std::string mtype_str = get_str(g, "parakeet.model.type", "ctc");
-    if      (mtype_str == "rnnt")       out_model.model_type = ParakeetModelType::RNNT;
-    else if (mtype_str == "tdt")        out_model.model_type = ParakeetModelType::TDT;
-    else if (mtype_str == "eou")        out_model.model_type = ParakeetModelType::EOU;
-    else if (mtype_str == "sortformer") out_model.model_type = ParakeetModelType::SORTFORMER;
-    else                                out_model.model_type = ParakeetModelType::CTC;
+    if (mtype_str == "ctc") {
+        out_model.model_type = ParakeetModelType::CTC;
+    } else if (mtype_str == "rnnt") {
+        out_model.model_type = ParakeetModelType::RNNT;
+    } else if (mtype_str == "tdt") {
+        out_model.model_type = ParakeetModelType::TDT;
+    } else if (mtype_str == "eou") {
+        out_model.model_type = ParakeetModelType::EOU;
+    } else if (mtype_str == "nemotron") {
+        out_model.model_type = ParakeetModelType::NEMOTRON;
+    } else if (mtype_str == "sortformer") {
+        out_model.model_type = ParakeetModelType::SORTFORMER;
+    } else {
+        throw std::runtime_error(
+            "gguf: unsupported parakeet.model.type '" + mtype_str + "'");
+    }
 
     // Optional variant tag (empty for legacy GGUFs that predate the key).
     out_model.model_variant = get_str(g, "parakeet.model_variant", "");
+    if (out_model.model_type == ParakeetModelType::NEMOTRON) {
+        load_nemotron_metadata(g, out_model);
+    }
 
     if (out_model.model_type == ParakeetModelType::RNNT) {
         out_model.encoder_cfg.rnnt_pred_hidden =
@@ -1390,6 +1916,19 @@ int load_from_gguf(const std::string & gguf_path,
         out_model.sortformer.head_h2h_b = require_tensor(impl->ctx, "sortformer.head.first_hidden_to_hidden.bias");
         out_model.sortformer.head_h2s_w = require_tensor(impl->ctx, "sortformer.head.single_hidden_to_spks.weight");
         out_model.sortformer.head_h2s_b = require_tensor(impl->ctx, "sortformer.head.single_hidden_to_spks.bias");
+    } else if (out_model.model_type == ParakeetModelType::NEMOTRON) {
+        load_transducer_weights(
+            impl->ctx, "nemotron",
+            out_model.nemotron_cfg.pred_rnn_layers,
+            out_model.nemotron.rnnt);
+        out_model.nemotron.prompt.proj_0_w =
+            require_tensor(impl->ctx, "nemotron.prompt.proj.0.weight");
+        out_model.nemotron.prompt.proj_0_b =
+            require_tensor(impl->ctx, "nemotron.prompt.proj.0.bias");
+        out_model.nemotron.prompt.proj_2_w =
+            require_tensor(impl->ctx, "nemotron.prompt.proj.2.weight");
+        out_model.nemotron.prompt.proj_2_b =
+            require_tensor(impl->ctx, "nemotron.prompt.proj.2.bias");
     } else if (out_model.model_type == ParakeetModelType::RNNT) {
         load_transducer_weights(
             impl->ctx, "rnnt",
@@ -1398,6 +1937,10 @@ int load_from_gguf(const std::string & gguf_path,
         load_transducer_weights(
             impl->ctx, "tdt",
             out_model.encoder_cfg.tdt_pred_rnn_layers, out_model.tdt);
+    }
+
+    if (out_model.model_type == ParakeetModelType::NEMOTRON) {
+        validate_nemotron_model(out_model);
     }
 
     if (impl->backend_blas) {
@@ -1492,6 +2035,7 @@ const char * model_type_name(ParakeetModelType model_type) {
         case ParakeetModelType::RNNT:       return "rnnt";
         case ParakeetModelType::TDT:        return "tdt";
         case ParakeetModelType::EOU:        return "eou";
+        case ParakeetModelType::NEMOTRON:   return "nemotron";
         case ParakeetModelType::SORTFORMER: return "sortformer";
         case ParakeetModelType::CTC:
         default:                            return "ctc";
@@ -1550,6 +2094,18 @@ void print_model_summary(const ParakeetCtcModel & m) {
                           m.encoder_cfg.eou_cache_lookback_frames,
                           m.encoder_cfg.eou_cache_time_steps,
                           m.encoder_cfg.eou_max_symbols_per_step);
+    } else if (m.model_type == ParakeetModelType::NEMOTRON) {
+        PARAKEET_LOG_INFO(
+            "  nemotron: vocab=%d blank=%d prompts=%d pred_hidden=%d "
+            "pred_layers=%d joint_hidden=%d locales=%zu default_locale=%s\n",
+            m.vocab_size,
+            m.blank_id,
+            m.nemotron_cfg.num_prompts,
+            m.nemotron_cfg.pred_hidden,
+            m.nemotron_cfg.pred_rnn_layers,
+            m.nemotron_cfg.joint_hidden,
+            m.nemotron_cfg.locale_prompts.size(),
+            m.nemotron_cfg.default_locale.c_str());
     } else if (m.model_type == ParakeetModelType::SORTFORMER) {
         PARAKEET_LOG_INFO("  sortformer: num_spks=%d  fc_d_model=%d  tf=%dlx%dh d_model=%d inner=%d pre_ln=%d\n",
                           m.encoder_cfg.sortformer_num_spks,
@@ -1587,6 +2143,17 @@ ggml_tensor * apply_time_mask(ggml_context * ctx, ggml_tensor * x, ggml_tensor *
     return ggml_mul(ctx, x, mask);
 }
 
+// ggml_conv_2d's trailing permute+cont only reorders the batch dim, so for N == 1 the matmul
+// result already has the [OW, OH, OC, 1] layout and the copy is skipped.
+ggml_tensor * conv_2d_im2col(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b, int s, int p) {
+    if (b->ne[3] != 1) return ggml_conv_2d(ctx, a, b, s, s, p, p, 1, 1);
+    ggml_tensor * im2col = ggml_im2col(ctx, a, b, s, s, p, p, 1, 1, true, a->type);
+    ggml_tensor * cols   = ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[1] * im2col->ne[2]);
+    ggml_tensor * kernel = ggml_reshape_2d(ctx, a, a->ne[0] * a->ne[1] * a->ne[2], a->ne[3]);
+    ggml_tensor * y = ggml_mul_mat(ctx, cols, kernel);
+    return ggml_reshape_4d(ctx, y, im2col->ne[1], im2col->ne[2], a->ne[3], 1);
+}
+
 ggml_tensor * subsampling_graph(ggml_context    * gctx,
                                 ggml_tensor     * mel_in,
                                 const SubsamplingWeights & S,
@@ -1597,7 +2164,8 @@ ggml_tensor * subsampling_graph(ggml_context    * gctx,
                                 ggml_tensor     * mask_t2,
                                 ggml_tensor     * mask_t3,
                                 bool              all_valid,
-                                bool              causal_downsampling) {
+                                bool              causal_downsampling,
+                                bool              dw_direct) {
     ggml_tensor * x = mel_in;
 
     auto maybe_mask = [&](ggml_tensor * xin, ggml_tensor * m) {
@@ -1633,6 +2201,10 @@ ggml_tensor * subsampling_graph(ggml_context    * gctx,
     auto conv_2d_dw_f32 = [&](ggml_tensor * a, ggml_tensor * b,
                               int s0, int s1, int p0, int p1, int d0, int d1) -> ggml_tensor * {
         ggml_tensor * kf32 = a->type == GGML_TYPE_F32 ? a : ggml_cast(gctx, a, GGML_TYPE_F32);
+        if (dw_direct) {
+            ggml_tensor * k4 = ggml_reshape_4d(gctx, kf32, kf32->ne[0], kf32->ne[1], 1, kf32->ne[2] * kf32->ne[3]);
+            return ggml_conv_2d_dw_direct(gctx, k4, b, s0, s1, p0, p1, d0, d1);
+        }
         ggml_tensor * new_a = ggml_reshape_4d(gctx, kf32, kf32->ne[0], kf32->ne[1], 1, kf32->ne[2] * kf32->ne[3]);
         ggml_tensor * im2col = ggml_im2col(gctx, new_a,
                                   ggml_reshape_4d(gctx, b, b->ne[0], b->ne[1], 1, b->ne[2] * b->ne[3]),
@@ -1646,7 +2218,7 @@ ggml_tensor * subsampling_graph(ggml_context    * gctx,
 
     x = maybe_mask(x, mask_t0);
     x = causal_pad(x);
-    x = ggml_conv_2d(gctx, S.conv0_w, x, 2, 2, conv_pad, conv_pad, 1, 1);
+    x = conv_2d_im2col(gctx, S.conv0_w, x, 2, conv_pad);
     x = ggml_add(gctx, x, conv_bias_bcast(gctx, S.conv0_b, subsampling_channels));
     x = maybe_mask(x, mask_t1);
     x = ggml_relu(gctx, x);
@@ -1656,7 +2228,7 @@ ggml_tensor * subsampling_graph(ggml_context    * gctx,
     x = conv_2d_dw_f32(S.conv1_dw_w, x, 2, 2, conv_pad, conv_pad, 1, 1);
     x = ggml_add(gctx, x, conv_bias_bcast(gctx, S.conv1_dw_b, subsampling_channels));
     x = maybe_mask(x, mask_t2);
-    x = ggml_conv_2d(gctx, S.conv1_pw_w, x, 1, 1, 0, 0, 1, 1);
+    x = conv_2d_im2col(gctx, S.conv1_pw_w, x, 1, 0);
     x = ggml_add(gctx, x, conv_bias_bcast(gctx, S.conv1_pw_b, subsampling_channels));
     x = maybe_mask(x, mask_t2);
     x = ggml_relu(gctx, x);
@@ -1666,7 +2238,7 @@ ggml_tensor * subsampling_graph(ggml_context    * gctx,
     x = conv_2d_dw_f32(S.conv2_dw_w, x, 2, 2, conv_pad, conv_pad, 1, 1);
     x = ggml_add(gctx, x, conv_bias_bcast(gctx, S.conv2_dw_b, subsampling_channels));
     x = maybe_mask(x, mask_t3);
-    x = ggml_conv_2d(gctx, S.conv2_pw_w, x, 1, 1, 0, 0, 1, 1);
+    x = conv_2d_im2col(gctx, S.conv2_pw_w, x, 1, 0);
     x = ggml_add(gctx, x, conv_bias_bcast(gctx, S.conv2_pw_b, subsampling_channels));
     x = maybe_mask(x, mask_t3);
     x = ggml_relu(gctx, x);
@@ -1719,17 +2291,23 @@ std::vector<float> compute_rel_pos_encoding(int T, int D) {
 ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_front, int p_back) {
     if (p_front <= 0 && p_back <= 0) return x;
     ggml_tensor * y = x;
-    if (p_front > 0) {
-        ggml_tensor * head = ggml_view_4d(ctx, x, p_front, x->ne[1], x->ne[2], x->ne[3],
-                                          x->nb[1], x->nb[2], x->nb[3], 0);
+    int front_remaining = p_front;
+    while (front_remaining > 0) {
+        const int chunk = std::min<int64_t>(front_remaining, y->ne[0]);
+        ggml_tensor * head = ggml_view_4d(ctx, y, chunk, y->ne[1], y->ne[2], y->ne[3],
+                                          y->nb[1], y->nb[2], y->nb[3], 0);
         ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, head), 0.0f);
         y = ggml_concat(ctx, z, y, 0);
+        front_remaining -= chunk;
     }
-    if (p_back > 0) {
-        ggml_tensor * tail = ggml_view_4d(ctx, y, p_back, y->ne[1], y->ne[2], y->ne[3],
+    int back_remaining = p_back;
+    while (back_remaining > 0) {
+        const int chunk = std::min<int64_t>(back_remaining, y->ne[0]);
+        ggml_tensor * tail = ggml_view_4d(ctx, y, chunk, y->ne[1], y->ne[2], y->ne[3],
                                           y->nb[1], y->nb[2], y->nb[3], 0);
         ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, tail), 0.0f);
         y = ggml_concat(ctx, y, z, 0);
+        back_remaining -= chunk;
     }
     return y;
 }
@@ -1741,17 +2319,23 @@ ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_front, in
 ggml_tensor * zero_pad_dim1(ggml_context * ctx, ggml_tensor * x, int p_front, int p_back) {
     if (p_front <= 0 && p_back <= 0) return x;
     ggml_tensor * y = x;
-    if (p_front > 0) {
-        ggml_tensor * head = ggml_view_4d(ctx, x, x->ne[0], p_front, x->ne[2], x->ne[3],
-                                          x->nb[1], x->nb[2], x->nb[3], 0);
+    int front_remaining = p_front;
+    while (front_remaining > 0) {
+        const int chunk = std::min<int64_t>(front_remaining, y->ne[1]);
+        ggml_tensor * head = ggml_view_4d(ctx, y, y->ne[0], chunk, y->ne[2], y->ne[3],
+                                          y->nb[1], y->nb[2], y->nb[3], 0);
         ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, head), 0.0f);
         y = ggml_concat(ctx, z, y, 1);
+        front_remaining -= chunk;
     }
-    if (p_back > 0) {
-        ggml_tensor * tail = ggml_view_4d(ctx, y, y->ne[0], p_back, y->ne[2], y->ne[3],
+    int back_remaining = p_back;
+    while (back_remaining > 0) {
+        const int chunk = std::min<int64_t>(back_remaining, y->ne[1]);
+        ggml_tensor * tail = ggml_view_4d(ctx, y, y->ne[0], chunk, y->ne[2], y->ne[3],
                                           y->nb[1], y->nb[2], y->nb[3], 0);
         ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, tail), 0.0f);
         y = ggml_concat(ctx, y, z, 1);
+        back_remaining -= chunk;
     }
     return y;
 }
@@ -1795,11 +2379,37 @@ ggml_tensor * conformer_ff_graph(ggml_context * ctx, ggml_tensor * x,
     return x;
 }
 
+// Transformer-XL relative shift as a view: bd is [2T-1 (position), T (query), H] and the
+// score bias for (key j, query i) is bd[T-1-i+j, i]. Reading each query row with a stride of
+// 2T-2 elements from offset T-1 lands exactly on that element, so no padding or copies.
+ggml_tensor * rel_shift_view(ggml_context * ctx, ggml_tensor * bd, int T) {
+    const size_t f = sizeof(float);
+    return ggml_view_3d(ctx, bd, T, T, bd->ne[2], (size_t) (2 * T - 2) * f, bd->nb[2], (size_t) (T - 1) * f);
+}
+
+struct RelPosAttnInputs {
+    ggml_tensor * q;
+    ggml_tensor * k;
+    ggml_tensor * v;
+    ggml_tensor * p;
+    ggml_tensor * u_bias;
+    ggml_tensor * v_bias;
+    float         scale;
+};
+
+ggml_tensor * rel_pos_mha_flash_graph(ggml_context * ctx, const RelPosAttnInputs & in,
+                                      ggml_tensor * att_mask, const BlockWeights & W,
+                                      int H, int HD, int T, bool per_head_mask);
+ggml_tensor * rel_pos_mha_unfused_graph(ggml_context * ctx, const RelPosAttnInputs & in,
+                                        ggml_tensor * att_mask, const BlockWeights & W,
+                                        int H, int HD, int T);
+
 ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
                                 ggml_tensor * pos_emb,
                                 ggml_tensor * att_mask,
                                 const BlockWeights & W,
-                                int H, int HD, int T) {
+                                int H, int HD, int T,
+                                const AttnPath & attn) {
     ggml_tensor * q;
     ggml_tensor * k;
     ggml_tensor * v;
@@ -1842,13 +2452,78 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
     ggml_tensor * p = ggml_mul_mat(ctx, W.attn_pos_w, pos_emb);
     p = ggml_reshape_3d(ctx, p, HD, H, pos_emb->ne[1]);
 
+    ggml_tensor * u_bias = ggml_reshape_3d(ctx, W.pos_bias_u, HD, 1, H);
+    ggml_tensor * v_bias = ggml_reshape_3d(ctx, W.pos_bias_v, HD, 1, H);
+
+    const float scale = 1.0f / std::sqrt((float) HD);
+
+    const RelPosAttnInputs in = { q, k, v, p, u_bias, v_bias, scale };
+    if (attn.flash_attn) {
+        return rel_pos_mha_flash_graph(ctx, in, att_mask, W, H, HD, T, attn.per_head_mask);
+    }
+    return rel_pos_mha_unfused_graph(ctx, in, att_mask, W, H, HD, T);
+}
+
+ggml_tensor * rel_pos_mha_flash_graph(ggml_context * ctx, const RelPosAttnInputs & in,
+                                      ggml_tensor * att_mask, const BlockWeights & W,
+                                      int H, int HD, int T, bool per_head_mask) {
+    ggml_tensor * q = in.q;
+    ggml_tensor * k = in.k;
+    ggml_tensor * v = in.v;
+    ggml_tensor * p = in.p;
+    ggml_tensor * u_bias = in.u_bias;
+    ggml_tensor * v_bias = in.v_bias;
+    const float   scale  = in.scale;
+    // Head-major views feed the bias adds, the position mat-mul and the fused
+    // attention directly; nothing is materialised. The relative-position term is
+    // built pre-scaled so the attention mask is softmax(scale * qk + mask) with
+    //   mask = rel_shift(scale * (q + v_bias) . p) [+ att_mask]
+    // and the Transformer-XL shift is a strided view (see rel_shift_view).
+    ggml_tensor * qp = ggml_permute(ctx, q, 0, 2, 1, 3);
+    ggml_tensor * kp = ggml_permute(ctx, k, 0, 2, 1, 3);
+    ggml_tensor * vp = ggml_permute(ctx, v, 0, 2, 1, 3);
+    ggml_tensor * pp = ggml_permute(ctx, p, 0, 2, 1, 3);
+    ggml_tensor * q_u = ggml_add(ctx, qp, u_bias);
+    ggml_tensor * q_v = ggml_scale(ctx, ggml_add(ctx, qp, v_bias), scale);
+
+    ggml_tensor * bd       = ggml_mul_mat(ctx, pp, q_v);
+    ggml_tensor * bd_shift = rel_shift_view(ctx, bd, T);
+    // Mode 2 / 3 streaming windows pass a (T_k, T_q, 1, 1) f32 additive mask that
+    // must be folded in, otherwise attention leaks outside the window.
+    ggml_tensor * fa_mask  = att_mask ? ggml_add(ctx, bd_shift, att_mask) : bd_shift;
+    ggml_tensor * bd_mask  = ggml_cast(ctx, fa_mask, GGML_TYPE_F16);
+    ggml_tensor * flat;
+    if (per_head_mask) {
+        ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, q_u, kp, vp, bd_mask, scale, 0.0f, 0.0f);
+        flat = ggml_reshape_2d(ctx, attn_out, HD * H, T);
+    } else {
+        // Backends whose fused attention only broadcasts the mask over heads (CUDA)
+        // see H independent single-head sequences instead: heads move to dim 3.
+        ggml_tensor * q4 = ggml_view_4d(ctx, q_u, HD, T, 1, H, q_u->nb[1], q_u->nb[2], q_u->nb[2], 0);
+        ggml_tensor * k4 = ggml_view_4d(ctx, kp,  HD, T, 1, H, kp->nb[1],  kp->nb[2],  kp->nb[2],  0);
+        ggml_tensor * v4 = ggml_view_4d(ctx, vp,  HD, T, 1, H, vp->nb[1],  vp->nb[2],  vp->nb[2],  0);
+        ggml_tensor * m4 = ggml_reshape_4d(ctx, bd_mask, T, T, 1, H);
+        ggml_tensor * attn_out = ggml_flash_attn_ext(ctx, q4, k4, v4, m4, scale, 0.0f, 0.0f);
+        ggml_tensor * heads = ggml_reshape_3d(ctx, attn_out, HD, T, H);
+        flat = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, heads, 0, 2, 1, 3)), HD * H, T);
+    }
+    return maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_out_w, flat), W.attn_out_b);
+}
+
+ggml_tensor * rel_pos_mha_unfused_graph(ggml_context * ctx, const RelPosAttnInputs & in,
+                                        ggml_tensor * att_mask, const BlockWeights & W,
+                                        int H, int HD, int T) {
+    ggml_tensor * q = in.q;
+    ggml_tensor * k = in.k;
+    ggml_tensor * v = in.v;
+    ggml_tensor * p = in.p;
+    ggml_tensor * u_bias = in.u_bias;
+    ggml_tensor * v_bias = in.v_bias;
+    const float   scale  = in.scale;
     ggml_tensor * q_perm = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
     ggml_tensor * k_perm = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
     ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
     ggml_tensor * p_perm = ggml_cont(ctx, ggml_permute(ctx, p, 0, 2, 1, 3));
-
-    ggml_tensor * u_bias = ggml_reshape_3d(ctx, W.pos_bias_u, HD, 1, H);
-    ggml_tensor * v_bias = ggml_reshape_3d(ctx, W.pos_bias_v, HD, 1, H);
     ggml_tensor * q_u = ggml_add(ctx, q_perm, u_bias);
     ggml_tensor * q_v = ggml_add(ctx, q_perm, v_bias);
 
@@ -1863,33 +2538,6 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
                                              bd_reshaped->nb[1], bd_reshaped->nb[2], 0);
     bd_final = ggml_cont(ctx, bd_final);
 
-    const float scale = 1.0f / std::sqrt((float) HD);
-
-#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN
-    // Non-flash path computes:
-    //   attn = softmax(scale * (q*k^T + bd_final) + att_mask)
-    //        = softmax(scale * q*k^T + scale * bd_final + att_mask)
-    // ggml_flash_attn_ext computes:
-    //   attn = softmax(scale * q*k^T + mask)
-    // so the equivalent mask is `scale * bd_final + att_mask`. Mode 1
-    // (full-window) sets att_mask = nullptr so the fall-through to
-    // bd_scaled alone is byte-exact vs the non-flash path. Mode 2 / 3
-    // streaming windows pass a non-null (T_k, T_q, 1, 1) f32 chunked
-    // mask that must be folded in here, otherwise FA attends to
-    // positions outside the streaming window and produces token
-    // duplication / EOU-detection failures (test-streaming Mode 3
-    // chunk=1000 right=500 -> WER 10.5 % regression; test-eou-streaming
-    // Mode 2 -> no is_eou_boundary). Broadcast: bd_scaled is
-    // (T, T, H, 1); att_mask is (T, T, 1, 1); ggml_can_repeat(att_mask,
-    // bd_scaled) holds so the sum is (T, T, H, 1).
-    ggml_tensor * bd_scaled = ggml_scale(ctx, bd_final, scale);
-    ggml_tensor * fa_mask   = att_mask ? ggml_add(ctx, bd_scaled, att_mask) : bd_scaled;
-    ggml_tensor * bd_mask   = ggml_cast(ctx, fa_mask, GGML_TYPE_F16);
-    ggml_tensor * attn_out  = ggml_flash_attn_ext(ctx, q_u, k_perm, v_perm, bd_mask,
-                                                  scale, 0.0f, 0.0f);
-    ggml_tensor * flat      = ggml_reshape_2d(ctx, attn_out, HD * H, T);
-    return maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_out_w, flat), W.attn_out_b);
-#else
     ggml_tensor * ac     = ggml_mul_mat(ctx, k_perm, q_u);
     ggml_tensor * scores = ggml_add(ctx, ac, bd_final);
 
@@ -1910,13 +2558,60 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
     ggml_tensor * flat     = ggml_reshape_2d(ctx, merged, HD * H, T);
 
     return maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_out_w, flat), W.attn_out_b);
-#endif
+}
+
+// How the conformer depthwise conv is lowered on the backend that runs the graph.
+enum class DwConvLowering {
+    Im2col,         // ggml_conv_1d_dw: im2col + batched mat-mul, portable
+    DirectPlanar,   // GGML_OP_CONV_2D_DW on a (T, d_model) transposed copy
+    DirectChannels, // GGML_OP_CONV_2D_DW straight on the (d_model, T) activations, no transposes
+};
+
+// Channel-contiguous view of a (d_model, T) activation: logical (W=T, H=1, C=d_model, N=1)
+// with the channel stride equal to the element size, which ggml_conv_2d_dw_direct treats
+// as CWHN and answers in the same layout.
+ggml_tensor * channels_first_view(ggml_context * ctx, ggml_tensor * y, int d_model) {
+    ggml_tensor * y4 = ggml_reshape_4d(ctx, y, d_model, y->ne[1], 1, 1);
+    return ggml_permute(ctx, y4, 2, 0, 1, 3);
+}
+
+// Depthwise kernel [K, C] re-laid as CWHN: a [K, 1, 1, C] logical view over a [C, K] copy.
+ggml_tensor * channels_first_kernel(ggml_context * ctx, ggml_tensor * w_f32, int conv_kernel, int d_model) {
+    ggml_tensor * w2 = ggml_reshape_2d(ctx, w_f32, conv_kernel, d_model);
+    ggml_tensor * wt = ggml_cont(ctx, ggml_transpose(ctx, w2));
+    return ggml_permute(ctx, ggml_reshape_4d(ctx, wt, d_model, conv_kernel, 1, 1), 3, 0, 1, 2);
+}
+
+ggml_tensor * depthwise_conv_channels_first(ggml_context * ctx, ggml_tensor * y,
+                                            const BlockWeights & W,
+                                            int d_model, int conv_kernel, int pad) {
+    const int T = (int) y->ne[1];
+    ggml_tensor * w_f32 = W.conv_dw_w->type == GGML_TYPE_F32
+                        ? W.conv_dw_w
+                        : ggml_cast(ctx, W.conv_dw_w, GGML_TYPE_F32);
+    ggml_tensor * kernel = channels_first_kernel(ctx, w_f32, conv_kernel, d_model);
+    ggml_tensor * out    = ggml_conv_2d_dw_direct(ctx, kernel, channels_first_view(ctx, y, d_model),
+                                                  1, 1, pad, 0, 1, 1);
+    return ggml_view_2d(ctx, out, d_model, T, (size_t) d_model * sizeof(float), 0);
+}
+
+// The channel-contiguous view of a [d_model, T] activation is only distinguishable
+// from a plain contiguous tensor with two or more frames (nb[1] > nb[0]).
+constexpr int64_t k_channels_first_min_frames = 2;
+
+// CPU keeps its transposed direct kernel; a GPU backend that answered the CONV_2D_DW
+// probe runs the depthwise conv in place, anything else uses the portable im2col lowering.
+DwConvLowering select_dw_lowering(const ParakeetCtcModel & model, ggml_backend_t backend) {
+    if (backend_is_cpu(backend))        return DwConvLowering::DirectPlanar;
+    if (model.impl->dw_direct_channels) return DwConvLowering::DirectChannels;
+    return DwConvLowering::Im2col;
 }
 
 ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
                                    const BlockWeights & W,
                                    int d_model, int /*T*/, int conv_kernel,
-                                   bool use_conv2d_dw,
+                                   DwConvLowering dw_lowering,
+                                   bool glu_fused,
                                    ConvNormType conv_norm_type,
                                    bool conv_causal,
                                    float layer_norm_eps) {
@@ -1934,27 +2629,45 @@ ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
     y = maybe_add_bias(ctx, y, W.conv_pw1_b);
 
     // Conformer GLU: split (2*d_model, T, B) along the channel axis into two
-    // halves, then y = half1 * sigmoid(half2). The two halves are strided
-    // views over the same source tensor and ggml-vulkan miscomputes the
-    // sigmoid / mul kernels when fed strided inputs (validated on RTX 5060;
-    // see test-vk-vs-cpu bisect: block0_conv_post_glu rel jumps from 1e-3
-    // to ~0.8 without the contig). Materialising each half with ggml_cont
-    // before the elementwise ops fixes the divergence on Vulkan and is a
-    // no-op-cheap memcpy on CPU.
-    ggml_tensor * half1 = ggml_cont(ctx,
-        ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
-                     y->nb[1], y->nb[2], 0));
-    ggml_tensor * half2 = ggml_cont(ctx,
-        ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
-                     y->nb[1], y->nb[2],
-                     (size_t) d_model * y->nb[0]));
-    y = ggml_mul(ctx, half1, ggml_sigmoid(ctx, half2));
-
-    ggml_tensor * yt = ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));
+    // halves, then y = half1 * sigmoid(half2). The gated op reads both halves
+    // in place; where the backend lacks it, the halves are materialised first
+    // because ggml-vulkan miscomputes the sigmoid / mul kernels on strided
+    // inputs (validated on RTX 5060; see test-vk-vs-cpu bisect:
+    // block0_conv_post_glu rel jumps from 1e-3 to ~0.8 without the contig).
+    if (glu_fused) {
+        y = ggml_siglu(ctx, y);
+    } else {
+        ggml_tensor * half1 = ggml_cont(ctx,
+            ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
+                         y->nb[1], y->nb[2], 0));
+        ggml_tensor * half2 = ggml_cont(ctx,
+            ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
+                         y->nb[1], y->nb[2],
+                         (size_t) d_model * y->nb[0]));
+        y = ggml_mul(ctx, half1, ggml_sigmoid(ctx, half2));
+    }
 
     const int pad_left  = conv_causal ? (conv_kernel - 1) : ((conv_kernel - 1) / 2);
     const int pad_right = conv_causal ? 0                 : ((conv_kernel - 1) / 2);
-    if (use_conv2d_dw) {
+
+    const bool channels_first = dw_lowering == DwConvLowering::DirectChannels && !conv_causal &&
+                                y->ne[1] >= k_channels_first_min_frames;
+    if (channels_first) {
+        y = depthwise_conv_channels_first(ctx, y, W, d_model, conv_kernel, pad_left);
+        y = maybe_add_bias(ctx, y, W.conv_dw_b);
+        if (conv_norm_type == ConvNormType::LayerNorm) {
+            y = layer_norm_affine(ctx, y, W.conv_norm_w, W.conv_norm_b, layer_norm_eps);
+        } else {
+            y = ggml_mul(ctx, y, W.conv_bn_scale);
+            y = ggml_add(ctx, y, W.conv_bn_shift);
+        }
+        y = ggml_silu(ctx, y);
+        return maybe_add_bias(ctx, ggml_mul_mat(ctx, W.conv_pw2_w, y), W.conv_pw2_b);
+    }
+
+    ggml_tensor * yt = ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));
+
+    if (dw_lowering == DwConvLowering::DirectPlanar) {
         const int T_local = (int) yt->ne[0];
         ggml_tensor * yt_4d = ggml_reshape_4d(ctx, yt, T_local, 1, d_model, 1);
         if (conv_causal && pad_left > 0) {
@@ -2012,7 +2725,9 @@ ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,
                                     const BlockWeights & W,
                                     int d_model, int H, int HD, int T,
                                     int conv_kernel, float eps,
-                                    bool use_conv2d_dw,
+                                    DwConvLowering dw_lowering,
+                                    const AttnPath & attn,
+                                    bool glu_fused,
                                     ConvNormType conv_norm_type,
                                     bool conv_causal) {
     ggml_tensor * residual = x;
@@ -2025,12 +2740,12 @@ ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,
 
     residual = x;
     ggml_tensor * xn = layer_norm_affine(ctx, x, W.norm_attn_w, W.norm_attn_b, eps);
-    y = rel_pos_mha_graph(ctx, xn, pos_emb, att_mask, W, H, HD, T);
+    y = rel_pos_mha_graph(ctx, xn, pos_emb, att_mask, W, H, HD, T, attn);
     x = ggml_add(ctx, residual, y);
 
     residual = x;
     xn = layer_norm_affine(ctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-    y = conformer_conv_graph(ctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw,
+    y = conformer_conv_graph(ctx, xn, W, d_model, T, conv_kernel, dw_lowering, glu_fused,
                              conv_norm_type, conv_causal, eps);
     x = ggml_add(ctx, residual, y);
 
@@ -2118,7 +2833,7 @@ int run_subsampling(ParakeetCtcModel   & model,
 
     ggml_tensor * out = subsampling_graph(gctx, mel_in, model.subsampling, C_sub, d_model,
                                           mask_t0, mask_t1, mask_t2, mask_t3, false,
-                                          causal_ds);
+                                          causal_ds, model.impl->dw_direct_planar);
     ggml_set_name(out, "sub_out");
     ggml_set_output(out);
 
@@ -2202,9 +2917,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     const int conv_kernel = enc.conv_kernel;
     const float eps = enc.layer_norm_eps;
 
-    // Metal / CUDA / Vulkan don't implement CONV_2D_DW yet; use the
-    // im2col+matmul lowering on any non-CPU backend.
-    const bool use_conv2d_dw = backend_is_cpu(backend);
+    const DwConvLowering dw_lowering = select_dw_lowering(model, backend);
 
     auto sub_out_len = [&](int Lin) {
         return enc.causal_downsampling ? (Lin / 2 + 1) : _conv_out_len(Lin, 3, 2, 1);
@@ -2314,7 +3027,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     } else {
         x = subsampling_graph(gctx, g.mel_in, model.subsampling, C_sub, d_model,
                               g.mask_t0, g.mask_t1, g.mask_t2, g.mask_t3, all_valid,
-                              enc.causal_downsampling);
+                              enc.causal_downsampling, model.impl->dw_direct_planar);
         g.sub_out_node = x;
         ggml_set_name(g.sub_out_node, "subsampling_out");
         ggml_set_output(g.sub_out_node);
@@ -2350,7 +3063,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
 
             residual = x;
             ggml_tensor * xn = layer_norm_affine(gctx, x, W.norm_attn_w, W.norm_attn_b, eps);
-            y = rel_pos_mha_graph(gctx, xn, g.pe_in, g.att_mask, W, H, HD, T);
+            y = rel_pos_mha_graph(gctx, xn, g.pe_in, g.att_mask, W, H, HD, T, model.impl->attn);
             x = ggml_add(gctx, residual, y);
             g.post_attn_0_node = x;
             ggml_set_name(g.post_attn_0_node, "block_0_post_attn");
@@ -2358,8 +3071,8 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
 
             residual = x;
             xn = layer_norm_affine(gctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-            y = conformer_conv_graph(gctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw,
-                                     enc.conv_norm_type, enc.conv_causal, eps);
+            y = conformer_conv_graph(gctx, xn, W, d_model, T, conv_kernel, dw_lowering,
+                                     model.impl->glu_fused, enc.conv_norm_type, enc.conv_causal, eps);
             x = ggml_add(gctx, residual, y);
             g.post_conv_0_node = x;
             ggml_set_name(g.post_conv_0_node, "block_0_post_conv");
@@ -2384,7 +3097,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
         } else {
             x = conformer_block_graph(gctx, x, g.pe_in, g.att_mask, model.blocks[i],
                                       d_model, H, HD, T, conv_kernel, eps,
-                                      use_conv2d_dw,
+                                      dw_lowering, model.impl->attn, model.impl->glu_fused,
                                       enc.conv_norm_type, enc.conv_causal);
         }
         if (i == n_run_layers - 1) {
@@ -2501,6 +3214,113 @@ static int run_encoder_coreml(ParakeetCtcModel & model,
     return 0;
 }
 #endif  // PARAKEET_USE_COREML
+
+int run_nemotron_prompt_projection(
+    ParakeetCtcModel & model,
+    const float * encoder_out,
+    int n_frames,
+    int d_model,
+    int32_t prompt_id,
+    std::vector<float> & projected) {
+    projected.clear();
+    if (model.model_type != ParakeetModelType::NEMOTRON ||
+        !model.impl ||
+        !model.impl->backend_active ||
+        !encoder_out ||
+        n_frames <= 0 ||
+        d_model != model.encoder_cfg.d_model ||
+        prompt_id < 0 ||
+        prompt_id >= model.nemotron_cfg.num_prompts) {
+        return -1;
+    }
+
+    const int prompt_width = model.nemotron_cfg.prompt_width;
+    const int input_width = model.nemotron_cfg.prompt_input_width;
+    if (prompt_width != model.nemotron_cfg.num_prompts ||
+        input_width != d_model + prompt_width) {
+        return -2;
+    }
+
+    std::vector<float> conditioned_input(
+        static_cast<size_t>(input_width) * n_frames, 0.0f);
+    for (int frame = 0; frame < n_frames; ++frame) {
+        float * destination =
+            conditioned_input.data() + static_cast<size_t>(frame) * input_width;
+        const float * source =
+            encoder_out + static_cast<size_t>(frame) * d_model;
+        std::copy(source, source + d_model, destination);
+        destination[d_model + prompt_id] = 1.0f;
+    }
+
+    constexpr size_t graph_size = 64;
+    auto & cached = model.impl->nemotron_prompt_graph;
+    if (!cached || cached->n_frames != n_frames) {
+        cached = std::make_unique<NemotronPromptGraph>();
+        const size_t graph_memory =
+            ggml_tensor_overhead() * graph_size +
+            ggml_graph_overhead_custom(graph_size, false) +
+            16 * 1024;
+        ggml_init_params params = {};
+        params.mem_size = graph_memory;
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
+        cached->context = ggml_init(params);
+        if (!cached->context) {
+            cached.reset();
+            return -3;
+        }
+
+        cached->input = ggml_new_tensor_2d(
+            cached->context, GGML_TYPE_F32, input_width, n_frames);
+        ggml_set_input(cached->input);
+        ggml_tensor * hidden = ggml_mul_mat(
+            cached->context, model.nemotron.prompt.proj_0_w, cached->input);
+        hidden = ggml_add(
+            cached->context, hidden, model.nemotron.prompt.proj_0_b);
+        hidden = ggml_relu(cached->context, hidden);
+        cached->output = ggml_mul_mat(
+            cached->context, model.nemotron.prompt.proj_2_w, hidden);
+        cached->output = ggml_add(
+            cached->context, cached->output, model.nemotron.prompt.proj_2_b);
+        ggml_set_output(cached->output);
+
+        cached->graph =
+            ggml_new_graph_custom(cached->context, graph_size, false);
+        ggml_build_forward_expand(cached->graph, cached->output);
+
+        ggml_backend_t backend = model.impl->backend_active;
+        cached->allocator = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+        if (!cached->allocator ||
+            !ggml_gallocr_alloc_graph(cached->allocator, cached->graph)) {
+            cached.reset();
+            return -4;
+        }
+        cached->n_frames = n_frames;
+    }
+
+    NemotronPromptGraph & graph = *cached;
+    if (!ggml_gallocr_alloc_graph(graph.allocator, graph.graph)) {
+        return -4;
+    }
+    ggml_backend_tensor_set(
+        graph.input,
+        conditioned_input.data(),
+        0,
+        conditioned_input.size() * sizeof(float));
+    if (ggml_backend_graph_compute(
+            model.impl->backend_active, graph.graph) != GGML_STATUS_SUCCESS) {
+        return -5;
+    }
+
+    projected.resize(static_cast<size_t>(d_model) * n_frames);
+    ggml_backend_tensor_get(
+        graph.output,
+        projected.data(),
+        0,
+        projected.size() * sizeof(float));
+    return 0;
+}
 
 int run_encoder(ParakeetCtcModel   & model,
                 const float        * mel,
@@ -2643,7 +3463,8 @@ int run_encoder(ParakeetCtcModel   & model,
         return -4;
     }
 
-    out.n_enc_frames = T;
+    out.n_enc_frames =
+        model.model_type == ParakeetModelType::NEMOTRON ? V3 : T;
     out.d_model      = d_model;
     out.vocab_size   = vocab_size;
 
@@ -2840,14 +3661,14 @@ static int build_substage_graph(const ParakeetCtcModel & model,
         ggml_tensor * r = x;
         ggml_tensor * xn = layer_norm_affine(g.ctx, x, W.norm_attn_w, W.norm_attn_b, eps);
         ggml_tensor * y = rel_pos_mha_graph(g.ctx, xn, g.pe_in, /*att_mask=*/nullptr,
-                                            W, H, HD, T);
+                                            W, H, HD, T, model.impl->attn);
         x = ggml_add(g.ctx, r, y);
     }
     if (stage == Substage::CONV || stage == Substage::FULL_BLOCK) {
         ggml_tensor * r = x;
         ggml_tensor * xn = layer_norm_affine(g.ctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-        const bool use_conv2d_dw = backend_is_cpu(backend);
-        ggml_tensor * y = conformer_conv_graph(g.ctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw,
+        ggml_tensor * y = conformer_conv_graph(g.ctx, xn, W, d_model, T, conv_kernel,
+                                               select_dw_lowering(model, backend), model.impl->glu_fused,
                                                enc.conv_norm_type, enc.conv_causal, eps);
         x = ggml_add(g.ctx, r, y);
     }
@@ -3060,6 +3881,25 @@ void ctc_greedy_decode_window(const float * logits,
         prev = best;
     }
     inout_prev_token = prev;
+}
+
+
+bool flash_attn_compiled() { return k_flash_attn_compiled; }
+
+// Builds one encoder block on the model's active backend and reports whether the
+// graph contains `op`: lets a test see which attention path the loader chose.
+bool encoder_graph_uses_op(const ParakeetCtcModel & model, enum ggml_op op) {
+    constexpr int probe_mel_frames = 128;
+    EncoderGraph g;
+    if (build_encoder_graph_cached(model, g, probe_mel_frames, model.mel_cfg.n_mels,
+                                   /*n_run_layers_override=*/1, /*all_valid=*/true,
+                                   model.impl->backend_active) != 0) {
+        return false;
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(g.cgraph); ++i) {
+        if (ggml_graph_node(g.cgraph, i)->op == op) return true;
+    }
+    return false;
 }
 
 }

@@ -161,6 +161,20 @@ path instead: it VAE-encodes `source_audio`, skips the LM and FSQ
 detokenizer, executes each `RepaintParams` or `FlowEditParams` operation in
 order, and VAE-decodes the final latent.
 
+### ACE-Step LRC generation
+
+With `GenerateParams::generate_lrc` set, the engine aligns the request lyrics
+with the generated audio and returns karaoke-style LRC timestamps in
+`GenerateResult::metadata.lrc`, plus an alignment confidence score in
+`metadata.lyrics_score` (`[0, 1]`). After sampling, one extra DiT forward at
+the final timestep runs with explicit softmax on the validated lyric
+cross-attention heads (the graph stops at the deepest captured layer), the
+captured matrices are converted from the ggml column-major layout, and DTW
+aligns each lyric line with the audio timeline. Requires lyrics — with Simple
+Mode the LM-written lyrics are aligned — and the official 24-layer/16-head
+DiT; the capture path is fully separate from the sampling graph, so normal
+inference is untouched when disabled.
+
 ### ACE-Step Simple Mode
 
 With `GenerateParams::simple_mode` set, `caption` is a short natural-language
@@ -174,6 +188,21 @@ instrumental hint to the LM. Simple Mode requires the plain `text2music` task
 with no pre-supplied `audio_codes`; the composed request is reported back in
 `GenerateResult::metadata`. The inspire pass emits `lm` progress ticks and
 honors cancellation like every other stage.
+
+### ACE-Step quality scoring
+
+With `GenerateParams::compute_quality_score` set, the generated audio codes
+are teacher-forced back through the LM "understand" prompt and the request is
+scored: caption and lyrics earn a normalized PMI (their mean log-prob given
+the codes against the same text under a no-input prompt) and each set
+metadata field earns a rank-weighted top-k recall of its YAML line. The
+weight-normalized global score (caption 0.5, lyrics 0.3, metadata 0.2) lands
+in `GenerateResult::metadata.quality_score` in `[0, 1]` with the per-condition
+breakdown in `quality_report` — made for ranking a batch of takes (stem tasks
+on the base DiT vary strongly by seed) and keeping the best. Scoring runs
+extra LM forwards after code generation, reports `score` progress ticks, and
+honors cancellation; it requires the LM code path, so cover / lego tasks and
+the audio edit path reject it.
 
 ## Model stages
 
@@ -552,9 +581,11 @@ combinations are rejected rather than silently ignored.
 | `--steps N`, `--shift F` | per variant | sampler overrides |
 | `--no-dcw` | DCW enabled | disable the official Haar low/high correction applied after each DiT step |
 | `--no-loudness` | normalization on | skip the percentile loudness normalization (99.999th percentile to 1.0, tail hard-clipped) applied to generation output; edits and lego stems are never normalized |
+| `--lrc out.lrc` | off | write synchronized lyric timestamps (LRC) next to the WAV; requires lyrics |
 | `--temp F`, `--topp F`, `--topk N`, `--cfg F` | `0.85`, `0.9`, off, `2.0` | LM sampling for the audio codes |
 | `--no-phase1` | off | skip the LM metadata auto-fill pass |
 | `--simple` | off | Simple Mode: expand `--caption` into a full request (lyrics regenerate unless `--lyrics "[Instrumental]"` is passed) |
+| `--score` | off | teacher-forced LM quality score of the generated codes, printed with its per-condition breakdown |
 | `--req FILE` | | request JSON; pre-supplied `audio_codes` skip the LM stage |
 | `--ref-audio FILE` | | 48 kHz PCM16 WAV used by ACE-Step's timbre-conditioning path |
 | `--src-audio FILE` | | 48 kHz PCM16 source WAV; required for editing |

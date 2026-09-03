@@ -9,6 +9,9 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <exception>
+#include <thread>
+#include <utility>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -206,6 +209,89 @@ void rfft_power_radix2(const float * __restrict x_real,
     }
 }
 
+// Frames are independent, so the FFT and filterbank loops fan out over a few
+// short-lived threads that join before the encoder starts. Capped so a many-core
+// host does not burn cores on ~5 us frames; small inputs stay single-threaded.
+constexpr int k_mel_max_threads      = 8;
+constexpr int k_mel_frames_per_thread = 256;
+
+int mel_thread_count(int n_frames, int requested) {
+    if (requested > 0) return requested;
+    const int by_work = n_frames / k_mel_frames_per_thread;
+    const int by_hw   = (int) std::thread::hardware_concurrency();
+    return std::max(1, std::min({k_mel_max_threads, by_work, by_hw}));
+}
+
+// Joins every started worker on scope exit, so a throw anywhere never destroys
+// a joinable thread.
+struct JoinedThreads {
+    explicit JoinedThreads(int n) { threads.reserve((size_t) n); }
+    ~JoinedThreads() { for (std::thread & t : threads) t.join(); }
+    template <typename F> void start(F && f) { threads.emplace_back(std::forward<F>(f)); }
+    std::vector<std::thread> threads;
+};
+
+// fn(t0, t1) handles frames [t0, t1); the calling thread takes the last range.
+// A worker's exception is carried back and rethrown on the calling thread.
+template <typename Fn>
+void parallel_over_frames(int n_frames, int requested_threads, Fn && fn) {
+    const int n_threads = mel_thread_count(n_frames, requested_threads);
+    if (n_threads == 1) { fn(0, n_frames); return; }
+    const int per = (n_frames + n_threads - 1) / n_threads;
+    std::vector<std::exception_ptr> errors((size_t) n_threads);
+    {
+        JoinedThreads workers(n_threads - 1);
+        for (int i = 0; i < n_threads - 1; ++i) {
+            workers.start([&fn, &errors, i, t0 = i * per, t1 = std::min(n_frames, (i + 1) * per)] {
+                try { fn(t0, t1); } catch (...) { errors[(size_t) i] = std::current_exception(); }
+            });
+        }
+        try {
+            fn(std::min(n_frames, (n_threads - 1) * per), n_frames);
+        } catch (...) {
+            errors[(size_t) n_threads - 1] = std::current_exception();
+        }
+    }
+    for (const std::exception_ptr & e : errors) {
+        if (e) std::rethrow_exception(e);
+    }
+}
+
+// Window + real FFT for frames [t0, t1) with this thread's own scratch.
+void power_spectrum_rows(int t0, int t1, int n_fft, int hop, int n_bins,
+                         const float * __restrict x_padded, const float * __restrict window_padded,
+                         float * __restrict power_data) {
+    std::vector<float>               windowed((size_t) n_fft);
+    std::vector<std::complex<float>> tbuf((size_t) n_fft / 2);
+    float               * __restrict windowed_data = windowed.data();
+    std::complex<float> * __restrict tbuf_data     = tbuf.data();
+    for (int t = t0; t < t1; ++t) {
+        const int start = t * hop;
+        for (int i = 0; i < n_fft; ++i) {
+            windowed_data[i] = x_padded[start + i] * window_padded[i];
+        }
+        rfft_power_radix2(windowed_data, power_data + (size_t) t * n_bins, n_fft, tbuf_data);
+    }
+}
+
+// Mel filterbank projection for frames [t0, t1): out[t,m] = sum_k fb[m,k] * power[t,k].
+// The inner loop is left exactly as the serial version so the reduction order is unchanged.
+void filterbank_rows(int t0, int t1, int n_bins, int n_mels,
+                     const float * __restrict fb, const float * __restrict power_data,
+                     float * __restrict mel_data) {
+    for (int t = t0; t < t1; ++t) {
+        const float * __restrict frame_power = power_data + t * n_bins;
+        float * __restrict mel_t = mel_data + t * n_mels;
+        for (int m = 0; m < n_mels; ++m) {
+            const float * __restrict row = fb + m * n_bins;
+            float acc = 0.0f;
+            #pragma GCC ivdep
+            for (int k = 0; k < n_bins; ++k) acc += row[k] * frame_power[k];
+            mel_t[m] = acc;
+        }
+    }
+}
+
 void apply_preemph(std::vector<float> & x, float preemph) {
     if (preemph == 0.0f || x.size() < 2) return;
     for (size_t t = x.size() - 1; t >= 1; --t) {
@@ -306,59 +392,23 @@ int compute_log_mel_impl(const float        * samples,
     float                  * __restrict power_data = state.power.data();
     const float            * __restrict x_padded   = state.x_padded.data();
 
-    // NOTE on threading: this loop was experimentally parallelised with
-    // `#pragma omp parallel { local tbuf; #pragma omp for ... }` during
-    // the optimization audit. On a 16-thread Ryzen the
-    // result was a +120 % regression with stdev of 18 ms because the
-    // ggml-cpu encoder also uses an OpenMP thread pool and the two
-    // pools oversubscribe the cores during the encoder warmup window.
-    // Kept serial; the real-FFT change below + the precomputed twiddle
-    // table from a prior patch already get mel under ~3 ms median.
-    //
     // Per-frame work: pre-multiply by the analysis window into a
     // n_fft-long real buffer, then run the real-input radix-2 FFT
     // which packs into n_fft/2 complex points, FFTs, and unpacks
-    // straight into power[0..n_fft/2]. Roughly 2x fewer butterflies
-    // than the previous complex-on-real path. `tbuf` only needs
-    // n_fft/2 complex slots now.
-    std::vector<float>               windowed((size_t) cfg.n_fft);
-    std::vector<std::complex<float>> tbuf((size_t) cfg.n_fft / 2);
-    float               * __restrict windowed_data = windowed.data();
-    std::complex<float> * __restrict tbuf_data     = tbuf.data();
-
-    for (int t = 0; t < n_frames; ++t) {
-        const int start = t * cfg.hop_length;
-        // Pre-multiply by the window in a single pass.
-        for (int i = 0; i < cfg.n_fft; ++i) {
-            windowed_data[i] = x_padded[start + i] * window_padded[i];
-        }
-        rfft_power_radix2(windowed_data,
-                          power_data + (size_t) t * n_bins,
-                          cfg.n_fft,
-                          tbuf_data);
-    }
+    // straight into power[0..n_fft/2]. Each worker thread owns its
+    // window/FFT scratch; the frames themselves are independent, and the
+    // workers join before ggml-cpu's pool wakes for the encoder.
+    parallel_over_frames(n_frames, cfg.n_threads, [&](int t0, int t1) {
+        power_spectrum_rows(t0, t1, cfg.n_fft, cfg.hop_length, n_bins, x_padded, window_padded, power_data);
+    });
 
     const int n_mels = cfg.n_mels;
     out_mel.resize((size_t) n_frames * n_mels);
     const float * __restrict fb = cfg.filterbank.data();
-    // Mel filterbank projection: out[t,m] = sum_k fb[m,k] * power[t,k].
-    // Per-frame outer loop is independent; SIMD inner is handled by
-    // `__restrict` + `#pragma GCC ivdep` so gcc-13 emits AVX2 FMA at
-    // 8 lanes wide. The same threading caveat as the FFT loop above
-    // applies (parallelising this regressed the bench during the
-    // optimization audit because of OpenMP oversubscription with
-    // ggml-cpu's encoder thread pool).
-    for (int t = 0; t < n_frames; ++t) {
-        const float * __restrict frame_power = power_data + t * n_bins;
-        float * __restrict mel_t = out_mel.data() + t * n_mels;
-        for (int m = 0; m < n_mels; ++m) {
-            const float * __restrict row = fb + m * n_bins;
-            float acc = 0.0f;
-            #pragma GCC ivdep
-            for (int k = 0; k < n_bins; ++k) acc += row[k] * frame_power[k];
-            mel_t[m] = acc;
-        }
-    }
+    float * __restrict mel_data = out_mel.data();
+    parallel_over_frames(n_frames, cfg.n_threads, [&](int t0, int t1) {
+        filterbank_rows(t0, t1, n_bins, n_mels, fb, power_data, mel_data);
+    });
 
     const float guard = cfg.log_zero_guard_value;
     #pragma GCC ivdep
@@ -366,27 +416,272 @@ int compute_log_mel_impl(const float        * samples,
         out_mel[i] = std::log(out_mel[i] + guard);
     }
 
-    const int seq_len = (n_samples + cfg.hop_length - 1) / cfg.hop_length;
+    const int seq_len = cfg.normalize == MelNormalize::None
+        ? std::max(1, n_samples / cfg.hop_length)
+        : std::max(1, (n_samples + cfg.hop_length - 1) / cfg.hop_length);
     const int valid_frames = std::min(seq_len, n_frames);
 
     if (cfg.normalize == MelNormalize::PerFeature) {
         apply_per_feature_cmvn(out_mel, valid_frames, n_mels);
+    }
 
-        // Per-feature CMVN sets the trailing padded frames to mean=0 implicitly,
-        // but we still want them to contribute zero energy to the encoder mask
-        // path. For NeMo `normalize=NA` we leave them as raw log-mel values
-        // (typically near -16, the log_zero_guard floor) -- the encoder's
-        // pad_mask zeros them out at the conv module anyway, and crucially the
-        // CMVN-free branch must not introduce a bin-wise mean shift the model
-        // wasn't trained against.
-        for (int t = valid_frames; t < n_frames; ++t) {
-            for (int m = 0; m < n_mels; ++m) out_mel[t * n_mels + m] = 0.0f;
+    // NeMo masks frames past seq_len after optional CMVN. PerFeature
+    // models keep the historical ceil(n_samples / hop) length. None
+    // (Nemotron `normalize=NA`) uses floor division to match NeMo.
+    for (int t = valid_frames; t < n_frames; ++t) {
+        for (int m = 0; m < n_mels; ++m) {
+            out_mel[t * n_mels + m] = 0.0f;
         }
     }
 
     return 0;
 }
 
+}
+
+struct IncrementalMelState::Impl {
+    std::vector<float> samples;
+    std::vector<float> prefix;
+    std::vector<float> window;
+    std::vector<float> windowed;
+    std::vector<float> power;
+    std::vector<std::complex<float>> fft;
+
+    int64_t sample_base = 0;
+    int64_t total_samples = 0;
+    int64_t next_frame = 0;
+    int window_n_fft = 0;
+    const std::vector<float> * window_source = nullptr;
+    float last_raw_sample = 0.0f;
+    bool has_last_raw_sample = false;
+    bool finalized = false;
+};
+
+IncrementalMelState::IncrementalMelState()
+    : impl(std::make_unique<Impl>()) {}
+
+IncrementalMelState::~IncrementalMelState() = default;
+IncrementalMelState::IncrementalMelState(
+    IncrementalMelState &&) noexcept = default;
+IncrementalMelState & IncrementalMelState::operator=(
+    IncrementalMelState &&) noexcept = default;
+
+void reset_incremental_mel(IncrementalMelState & state) {
+    state.impl = std::make_unique<IncrementalMelState::Impl>();
+}
+
+namespace {
+
+void append_preemphasized_samples(
+    IncrementalMelState::Impl & state,
+    const float * samples,
+    int n_samples,
+    float preemphasis,
+    int prefix_size) {
+    state.samples.reserve(
+        state.samples.size() + static_cast<size_t>(n_samples));
+    for (int index = 0; index < n_samples; ++index) {
+        const float raw = samples[index];
+        const float value = state.has_last_raw_sample
+            ? raw - preemphasis * state.last_raw_sample
+            : raw;
+        state.samples.push_back(value);
+        if (static_cast<int>(state.prefix.size()) < prefix_size) {
+            state.prefix.push_back(value);
+        }
+        state.last_raw_sample = raw;
+        state.has_last_raw_sample = true;
+        ++state.total_samples;
+    }
+}
+
+float incremental_sample_at(
+    const IncrementalMelState::Impl & state,
+    int64_t sample_index,
+    bool finalized) {
+    if (sample_index < 0) {
+        sample_index = std::min<int64_t>(
+            -sample_index,
+            state.total_samples - 1);
+    } else if (sample_index >= state.total_samples && finalized) {
+        sample_index = std::max<int64_t>(
+            0, 2 * state.total_samples - 2 - sample_index);
+    }
+    if (sample_index < static_cast<int64_t>(state.prefix.size())) {
+        return state.prefix[static_cast<size_t>(sample_index)];
+    }
+    return state.samples[
+        static_cast<size_t>(sample_index - state.sample_base)];
+}
+
+bool incremental_frame_ready(
+    const IncrementalMelState::Impl & state,
+    const MelConfig & config,
+    bool finalized) {
+    if (finalized) {
+        return state.next_frame <=
+            state.total_samples / config.hop_length;
+    }
+    const int64_t center =
+        state.next_frame * config.hop_length;
+    const int64_t padding = config.n_fft / 2;
+    int64_t maximum_sample = center + padding - 1;
+    if (center < padding) {
+        maximum_sample = std::max(
+            maximum_sample, padding - center);
+    }
+    return maximum_sample < state.total_samples;
+}
+
+void prepare_incremental_window(
+    IncrementalMelState::Impl & state,
+    const MelConfig & config) {
+    if (state.window_n_fft == config.n_fft &&
+        state.window_source == &config.window) {
+        return;
+    }
+    state.window = make_padded_window(
+        config.window, config.n_fft);
+    state.window_n_fft = config.n_fft;
+    state.window_source = &config.window;
+    state.windowed.resize(static_cast<size_t>(config.n_fft));
+    state.power.resize(
+        static_cast<size_t>(config.n_fft / 2 + 1));
+    state.fft.resize(static_cast<size_t>(config.n_fft / 2));
+}
+
+void compute_incremental_frame(
+    IncrementalMelState::Impl & state,
+    const MelConfig & config,
+    bool finalized,
+    float * destination) {
+    const int64_t center =
+        state.next_frame * config.hop_length;
+    const int64_t padding = config.n_fft / 2;
+    for (int index = 0; index < config.n_fft; ++index) {
+        const int64_t sample_index =
+            center + index - padding;
+        state.windowed[static_cast<size_t>(index)] =
+            incremental_sample_at(state, sample_index, finalized) *
+            state.window[static_cast<size_t>(index)];
+    }
+    rfft_power_radix2(
+        state.windowed.data(),
+        state.power.data(),
+        config.n_fft,
+        state.fft.data());
+
+    const int bins = config.n_fft / 2 + 1;
+    for (int mel = 0; mel < config.n_mels; ++mel) {
+        const float * filter =
+            config.filterbank.data() +
+            static_cast<size_t>(mel) * bins;
+        float value = 0.0f;
+        #pragma GCC ivdep
+        for (int bin = 0; bin < bins; ++bin) {
+            value += filter[bin] *
+                state.power[static_cast<size_t>(bin)];
+        }
+        destination[mel] =
+            std::log(value + config.log_zero_guard_value);
+    }
+}
+
+void compact_incremental_samples(
+    IncrementalMelState::Impl & state,
+    const MelConfig & config) {
+    const int64_t next_left =
+        state.next_frame * config.hop_length -
+        config.n_fft / 2;
+    const int64_t keep_from = std::max<int64_t>(
+        state.sample_base, std::max<int64_t>(0, next_left));
+    const int64_t remove_count =
+        std::min<int64_t>(
+            keep_from - state.sample_base,
+            static_cast<int64_t>(state.samples.size()));
+    if (remove_count <= 0) {
+        return;
+    }
+    state.samples.erase(
+        state.samples.begin(),
+        state.samples.begin() +
+            static_cast<std::ptrdiff_t>(remove_count));
+    state.sample_base += remove_count;
+}
+
+}
+
+int append_log_mel(
+    const float * samples,
+    int n_samples,
+    bool finalize,
+    const MelConfig & config,
+    IncrementalMelState & state,
+    std::vector<float> & out_mel,
+    int & out_n_frames) {
+    out_mel.clear();
+    out_n_frames = 0;
+    if (!state.impl || state.impl->finalized) {
+        return finalize ? 0 : 1;
+    }
+    if (config.normalize != MelNormalize::None) {
+        return 2;
+    }
+    if (n_samples < 0 || (n_samples > 0 && !samples)) {
+        return 3;
+    }
+    if (config.filterbank.size() !=
+            static_cast<size_t>(
+                config.n_mels * (config.n_fft / 2 + 1)) ||
+        static_cast<int>(config.window.size()) !=
+            config.win_length) {
+        return 4;
+    }
+    if (n_samples > 0) {
+        append_preemphasized_samples(
+            *state.impl,
+            samples,
+            n_samples,
+            config.preemph,
+            config.n_fft / 2 + 1);
+    }
+    if (finalize && state.impl->total_samples == 0) {
+        state.impl->finalized = true;
+        return 0;
+    }
+
+    prepare_incremental_window(*state.impl, config);
+    const int64_t first_frame = state.impl->next_frame;
+    while (incremental_frame_ready(
+        *state.impl, config, finalize)) {
+        out_mel.resize(
+            out_mel.size() +
+            static_cast<size_t>(config.n_mels));
+        float * destination =
+            out_mel.data() + out_mel.size() - config.n_mels;
+        const int64_t valid_frames =
+            std::max<int64_t>(
+                1,
+                state.impl->total_samples / config.hop_length);
+        if (finalize &&
+            state.impl->next_frame >= valid_frames) {
+            std::fill(
+                destination,
+                destination + config.n_mels,
+                0.0f);
+        } else {
+            compute_incremental_frame(
+                *state.impl, config, finalize, destination);
+        }
+        ++state.impl->next_frame;
+    }
+    out_n_frames = static_cast<int>(
+        state.impl->next_frame - first_frame);
+    compact_incremental_samples(*state.impl, config);
+    if (finalize) {
+        state.impl->finalized = true;
+    }
+    return 0;
 }
 
 int compute_log_mel(const float        * samples,

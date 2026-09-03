@@ -52,8 +52,8 @@ void print_usage(const char * argv0) {
         "usage: %s --model <parakeet.gguf | sortformer.gguf> [options]\n"
         "\n"
         "Captures the default input device at 16 kHz mono. If --model is a\n"
-        "transcription (CTC/RNN-T/TDT/EOU) GGUF, runs live transcription. If --model is\n"
-        "a Sortformer GGUF, runs live speaker diarization (segments labeled\n"
+        "transcription (CTC/RNN-T/TDT/EOU/Nemotron) GGUF, runs live transcription. If\n"
+        "--model is a Sortformer GGUF, runs live speaker diarization (segments labeled\n"
         "speaker_0..speaker_3).\n"
         "Press Ctrl-C to stop; the final partial chunk is flushed before exit.\n"
         "\n"
@@ -61,7 +61,8 @@ void print_usage(const char * argv0) {
         "  --model PATH                   path to the GGUF (required)\n"
         "  --n-gpu-layers N               GPU offload (build with -DGGML_METAL=ON etc.)\n"
         "  --threads N                    CPU threads (0 = hardware_concurrency)\n"
-        "  --chunk-ms N                   transcription: segment stride in ms (default 1000)\n"
+        "  --chunk-ms N                   transcription: segment stride in ms (default 1000;\n"
+        "                                 Nemotron default 320, values 80/160/320/560/1120)\n"
         "                                 diarization:   chunk stride in ms (default 2000)\n"
         "  --left-context-ms N            transcription: left context per chunk (default 5000)\n"
         "  --right-lookahead-ms N         transcription: right lookahead per chunk (default 1000)\n"
@@ -168,7 +169,11 @@ int main(int argc, char ** argv) {
     parakeet::Engine engine(eopts);
 
     const bool diarization_mode = engine.is_diarization_model();
-    if (args.chunk_ms < 0) args.chunk_ms = diarization_mode ? 2000 : 1000;
+    if (args.chunk_ms < 0) {
+        args.chunk_ms = diarization_mode
+            ? 2000
+            : (engine.model_type() == "nemotron" ? 320 : 1000);
+    }
 
     std::unique_ptr<parakeet::StreamSession>           tx_sess;
     std::unique_ptr<parakeet::SortformerStreamSession> diar_sess;

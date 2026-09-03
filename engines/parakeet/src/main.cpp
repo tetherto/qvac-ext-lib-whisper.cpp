@@ -39,17 +39,19 @@ void print_usage(const char * argv0) {
     PARAKEET_LOG_INFO(
         "usage: %s --model <gguf> (--wav <input.wav> | --pcm-in <input.raw>) [options]\n"
         "\n"
-        "Single CLI for all four engine families. The GGUF is auto-detected:\n"
+        "Single CLI for all supported engine families. The GGUF is auto-detected:\n"
         "  CTC        (parakeet-ctc-0.6b/1.1b)        -> transcription\n"
         "  TDT 0.6B-v3                               -> multilingual transcription + PnC\n"
         "  TDT 1.1B                                  -> English-only transcription, no PnC\n"
         "  EOU        (parakeet_realtime_eou_120m-v1) -> low-latency streaming ASR with\n"
         "                                                native end-of-utterance token\n"
+        "  Nemotron   (3.5 ASR Streaming 0.6B)       -> locale-conditioned ASR with\n"
+        "                                                cache-aware streaming\n"
         "  Sortformer (diar_sortformer_4spk-v1, v2)   -> 4-speaker diarization\n"
         "Combined ASR + diarization (\"who said what\") via --diarization-model.\n"
         "\n"
         "options:\n"
-        "  --model PATH         path to a CTC, RNN-T, TDT, EOU, or Sortformer GGUF (required)\n"
+        "  --model PATH         path to a CTC, RNN-T, TDT, EOU, Nemotron, or Sortformer GGUF (required)\n"
         "  --wav PATH           path to a 16 kHz mono wav file\n"
         "  --pcm-in PATH        path to a raw PCM file (mono, format selected by --pcm-format)\n"
         "  --pcm-format FMT     raw PCM sample format: s16le (default) or f32le\n"
@@ -57,10 +59,9 @@ void print_usage(const char * argv0) {
         "                       model's sample rate exactly (resampling is not yet wired).\n"
         "                       If omitted, falls back to the model's rate with a warning.\n"
         "  --threads N          number of CPU threads (0 = hardware_concurrency)\n"
-        "  --language ID        CTC language id for multilingual aggregate vocabs\n"
-        "                       (e.g. hi, ta, gu). Required for IndicConformer-style\n"
-        "                       GGUFs that advertise parakeet.ctc.lang_* ranges;\n"
-        "                       ignored (full-vocab decode) for monolingual CTC.\n"
+        "  --language ID        Nemotron locale alias (e.g. en-US, hi-IN, auto), or\n"
+        "                       CTC language id for multilingual aggregate vocabs\n"
+        "                       (e.g. hi, ta, gu). Empty selects auto for Nemotron.\n"
         "  --n-gpu-layers N     when > 0, run the encoder on one GPU selected from the\n"
         "                       ggml backend registry. Multiple Metal/CUDA/Vulkan/OpenCL\n"
         "                       backends may be built or loaded; runtime tiering prefers\n"
@@ -104,18 +105,20 @@ void print_usage(const char * argv0) {
         "\n"
         "  --stream             enable streaming. Without --stream-duplex this is Mode 2:\n"
         "                       runs the offline encoder once, then emits one segment per\n"
-        "                       --stream-chunk-ms window via callback. Transcript is\n"
-        "                       byte-equal to the non-streaming path.\n"
-        "  --stream-duplex      enable Mode 3 duplex rolling-context streaming: feeds the\n"
-        "                       audio into a StreamSession in blocks and re-encodes each\n"
-        "                       sliding window with left-context + right-lookahead; there\n"
-        "                       is no encoder KV or convolution cache. Emits segments\n"
+        "                       --stream-chunk-ms window via callback. Nemotron instead\n"
+        "                       uses its native cache-aware encoder in both modes.\n"
+        "  --stream-duplex      enable Mode 3 duplex streaming: feeds the audio into a\n"
+        "                       StreamSession in blocks. CTC/RNN-T/TDT/EOU re-encode each\n"
+        "                       sliding window with left-context + right-lookahead (no\n"
+        "                       encoder KV or convolution cache). Nemotron uses bounded\n"
+        "                       attention and convolution caches instead. Emits segments\n"
         "                       as soon as each chunk is processed. Incurs per-chunk\n"
         "                       encoder cost but first segment lands at ~chunk_ms +\n"
         "                       right_lookahead_ms. Typical WER: ~0 %% on short clean\n"
         "                       speech, ~4 %% on long sci-fi narration at the default\n"
         "                       context budget. Requires --stream.\n"
-        "  --stream-chunk-ms N  segment window stride in ms (default 1000 Mode 2 /\n"
+        "  --stream-chunk-ms N  segment window stride in ms (default 1000; Nemotron\n"
+        "                       defaults to 320 and supports 80, 160, 320, 560, 1120)\n"
         "                       2000 Mode 3 recommended; snaps to the encoder frame\n"
         "                       stride, which is 80 ms on every shipped GGUF -- a\n"
         "                       different mel hop or subsampling factor would change\n"
@@ -778,7 +781,48 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
         }
 
         const auto t3 = clock::now();
+        std::vector<float> conditioned_encoder;
+        const float * decoder_input = enc_out.encoder_out.data();
+        if (model.model_type == ParakeetModelType::NEMOTRON) {
+            int32_t prompt_id = -1;
+            try {
+                prompt_id = resolve_nemotron_prompt_id(
+                    model, opts.language);
+            } catch (const std::exception & error) {
+                PARAKEET_LOG_ERROR("error: %s\n", error.what());
+                return 2;
+            }
+            if (int rc = run_nemotron_prompt_projection(
+                    model,
+                    enc_out.encoder_out.data(),
+                    enc_out.n_enc_frames,
+                    enc_out.d_model,
+                    prompt_id,
+                    conditioned_encoder); rc != 0) {
+                return rc;
+            }
+            decoder_input = conditioned_encoder.data();
+            if (const char * dump_path =
+                    std::getenv("PARAKEET_DUMP_PROMPT_OUTPUT")) {
+                FILE * file = std::fopen(dump_path, "wb");
+                if (file) {
+                    std::fwrite(
+                        conditioned_encoder.data(),
+                        sizeof(float),
+                        conditioned_encoder.size(),
+                        file);
+                    std::fclose(file);
+                    PARAKEET_LOG_INFO(
+                        "[dump] wrote prompt output (%d frames x %d) to %s\n",
+                        enc_out.n_enc_frames,
+                        enc_out.d_model,
+                        dump_path);
+                }
+            }
+        }
+
         if (model.model_type == ParakeetModelType::RNNT ||
+            model.model_type == ParakeetModelType::NEMOTRON ||
             model.model_type == ParakeetModelType::TDT) {
             static TdtRuntimeWeights rt;
             static bool rt_ready = false;
@@ -787,17 +831,20 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
                 rt_ready = true;
             }
             TdtDecodeOptions dopts;
-            if (model.model_type == ParakeetModelType::RNNT) {
+            if (model.model_type == ParakeetModelType::NEMOTRON) {
+                dopts.max_symbols_per_step =
+                    model.nemotron_cfg.max_symbols_per_step;
+            } else if (model.model_type == ParakeetModelType::RNNT) {
                 dopts.max_symbols_per_step =
                     model.encoder_cfg.rnnt_max_symbols_per_step;
             }
             TdtDecodeResult  dres;
-            const int rc = model.model_type == ParakeetModelType::RNNT
+            const int rc = model.model_type != ParakeetModelType::TDT
                 ? rnnt_greedy_decode(
-                    model, rt, enc_out.encoder_out.data(),
+                    model, rt, decoder_input,
                     enc_out.n_enc_frames, enc_out.d_model, dopts, dres)
                 : tdt_greedy_decode(
-                    model, rt, enc_out.encoder_out.data(),
+                    model, rt, decoder_input,
                     enc_out.n_enc_frames, enc_out.d_model, dopts, dres);
             if (rc != 0) return rc;
             ids_out  = std::move(dres.token_ids);
@@ -829,6 +876,21 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
             } catch (const std::exception & e) {
                 PARAKEET_LOG_ERROR("error: %s\n", e.what());
                 return 2;
+            }
+        }
+        if (const char * dump_path = std::getenv("PARAKEET_DUMP_TOKENS")) {
+            FILE * file = std::fopen(dump_path, "wb");
+            if (file) {
+                std::fwrite(
+                    ids_out.data(),
+                    sizeof(int32_t),
+                    ids_out.size(),
+                    file);
+                std::fclose(file);
+                PARAKEET_LOG_INFO(
+                    "[dump] wrote %zu token IDs to %s\n",
+                    ids_out.size(),
+                    dump_path);
             }
         }
         times.dec_ms = ms_since(t3);
@@ -984,7 +1046,10 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
 
         StreamingOptions sopts;
         sopts.sample_rate       = sr;
-        sopts.chunk_ms          = extra.stream_chunk_ms;
+        sopts.chunk_ms          = engine.model_type() == "nemotron" &&
+                                  extra.stream_chunk_ms == 1000
+                                ? 320
+                                : extra.stream_chunk_ms;
         if (extra.stream_left_ms  >= 0) sopts.left_context_ms    = extra.stream_left_ms;
         if (extra.stream_right_ms >= 0) sopts.right_lookahead_ms = extra.stream_right_ms;
 

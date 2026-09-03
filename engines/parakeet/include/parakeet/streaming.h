@@ -59,8 +59,13 @@ using StreamEventCallback = std::function<void(const StreamEvent &)>;
 
 struct StreamingOptions {
     int sample_rate  = 16000;
+    // Nemotron accepts its five trained cache-aware operating points only:
+    // 80, 160, 320, 560, or 1120 ms. Other model families accept any
+    // positive value.
     int chunk_ms     = 1000;
 
+    // Used by the sliding-window implementation. Nemotron maintains its
+    // trained 56-frame attention cache and ignores these two window knobs.
     int left_context_ms    = 10000;
     int right_lookahead_ms = 2000;
 
@@ -73,8 +78,8 @@ struct StreamingOptions {
     // simple RMS-thresholded VAD over the input PCM and fire
     // `StreamEventType::VadStateChanged` events on transitions. Sortformer
     // provides its own speaker-probability VAD events. EOU emits EndOfTurn,
-    // not VadStateChanged. Default off; opt in for CTC/RNN-T/TDT consumers that
-    // want VadState events.
+    // not VadStateChanged. Default off; opt in for CTC/RNN-T/TDT/Nemotron
+    // consumers that want VadState events.
     bool  enable_energy_vad = false;
 
     // Energy-VAD knobs (dB-scale; applies only when enable_energy_vad).
