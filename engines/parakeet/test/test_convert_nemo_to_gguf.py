@@ -364,10 +364,27 @@ class ConverterNemotronTests(unittest.TestCase):
         self.assertIn("nemotron.prompt.proj.0.weight", names)
         self.assertIn("nemotron.prompt.proj.2.bias", names)
 
-    def test_resolves_first_multicontext_pair_as_default(self):
+    def test_resolves_default_320ms_context_pair(self):
         self.assertEqual(
             CONVERTER.resolve_attention_context(
                 nemotron_config()["encoder"],
+                default_right=CONVERTER.NEMOTRON_DEFAULT_ATT_CONTEXT_RIGHT,
+            ),
+            (56, 3),
+        )
+
+    def test_pins_default_right_context_when_another_pair_is_listed_first(self):
+        encoder = nemotron_config()["encoder"]
+        encoder["att_context_size"] = [
+            [56, 0],
+            [56, 3],
+            [56, 6],
+            [56, 13],
+        ]
+        self.assertEqual(
+            CONVERTER.resolve_attention_context(
+                encoder,
+                default_right=CONVERTER.NEMOTRON_DEFAULT_ATT_CONTEXT_RIGHT,
             ),
             (56, 3),
         )

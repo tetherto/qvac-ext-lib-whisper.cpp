@@ -349,6 +349,49 @@ int check_lifecycle(
     return 0;
 }
 
+int check_finalize_drops_short_remainder(
+    parakeet::ParakeetCtcModel & model,
+    int right_context) {
+    parakeet::NemotronStreamState state;
+    if (parakeet::init_nemotron_stream_state(
+            model, "en-US", right_context, state) != 0) {
+        return 27;
+    }
+
+    const int n_mels = model.mel_cfg.n_mels;
+    const int factor = model.encoder_cfg.subsampling_factor;
+    const int first_frames = 1 + factor * right_context;
+    std::vector<float> first(
+        static_cast<size_t>(first_frames) * n_mels, 0.0f);
+    if (parakeet::append_nemotron_mel_frames(
+            state, first.data(), first_frames, n_mels) != 0) {
+        return 28;
+    }
+
+    std::vector<float> processed;
+    int frames = 0;
+    if (parakeet::next_nemotron_processed_signal(
+            state, n_mels, false, processed, frames) != 1) {
+        return 29;
+    }
+
+    const int leftover = factor - 1;
+    std::vector<float> remainder(
+        static_cast<size_t>(leftover) * n_mels, 0.0f);
+    if (parakeet::append_nemotron_mel_frames(
+            state, remainder.data(), leftover, n_mels) != 0) {
+        return 30;
+    }
+    if (parakeet::next_nemotron_processed_signal(
+            state, n_mels, true, processed, frames) != 0) {
+        std::fprintf(
+            stderr,
+            "finalize consumed a remainder shorter than one encoder frame\n");
+        return 31;
+    }
+    return 0;
+}
+
 int check_bounded_work(
     parakeet::ParakeetCtcModel & model,
     parakeet::TdtRuntimeWeights & runtime,
@@ -789,6 +832,10 @@ int main(int argc, char ** argv) {
             runtime,
             reference_dir + "/step-000",
             right_context); rc != 0) {
+        return rc;
+    }
+    if (int rc = check_finalize_drops_short_remainder(
+            model, right_context); rc != 0) {
         return rc;
     }
     if (int rc = check_bounded_work(

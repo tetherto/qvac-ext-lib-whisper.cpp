@@ -53,6 +53,24 @@ bool is_transducer(ParakeetModelType model_type) {
            model_type == ParakeetModelType::TDT;
 }
 
+std::string format_int_list(const std::vector<int32_t> & values) {
+    if (values.empty()) {
+        return "";
+    }
+    if (values.size() == 1) {
+        return std::to_string(values.front());
+    }
+    std::string text;
+    for (size_t index = 0; index + 1 < values.size(); ++index) {
+        if (index > 0) {
+            text += ", ";
+        }
+        text += std::to_string(values[index]);
+    }
+    text += ", and " + std::to_string(values.back());
+    return text;
+}
+
 TdtDecodeOptions transducer_decode_options(const ParakeetCtcModel & model) {
     TdtDecodeOptions options;
     if (model.model_type == ParakeetModelType::RNNT) {
@@ -1762,7 +1780,7 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
             chunk_sizes.size() != right_contexts.size()) {
             throw std::runtime_error(
                 "Engine::stream_start: unsupported Nemotron chunk_ms; "
-                "supported values are 80, 160, 320, 560, and 1120");
+                "supported values are " + format_int_list(chunk_sizes));
         }
 
         const size_t operating_point = static_cast<size_t>(

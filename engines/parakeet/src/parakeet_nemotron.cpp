@@ -8,15 +8,38 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <string>
 #include <utility>
 
 namespace parakeet {
 namespace {
 
-constexpr int kChannelCacheFrames = 56;
-constexpr int kConvolutionCacheFrames = 8;
+// GGUF-validated Nemotron cache geometry. validate_nemotron_model rejects
+// checkpoints that disagree; these defaults match that contract when a
+// caller has not yet populated the config.
+constexpr int kDefaultChannelCacheFrames = 56;
+constexpr int kDefaultConvolutionCacheFrames = 8;
+constexpr int kDefaultSubsamplingFactor = 8;
 constexpr int kPreEncodeCacheFrames = 9;
 constexpr int kSubsamplingOverlapFrames = 2;
+
+int channel_cache_frames(const ParakeetCtcModel & model) {
+    return model.nemotron_cfg.left_context_frames > 0
+        ? model.nemotron_cfg.left_context_frames
+        : kDefaultChannelCacheFrames;
+}
+
+int convolution_cache_frames(const ParakeetCtcModel & model) {
+    return model.nemotron_cfg.cache_time_steps > 0
+        ? model.nemotron_cfg.cache_time_steps
+        : kDefaultConvolutionCacheFrames;
+}
+
+int encoder_subsampling_factor(const ParakeetCtcModel & model) {
+    return model.encoder_cfg.subsampling_factor > 0
+        ? model.encoder_cfg.subsampling_factor
+        : kDefaultSubsamplingFactor;
+}
 
 struct NemotronStepGraph {
     ggml_context * context = nullptr;
@@ -32,7 +55,10 @@ struct NemotronStepGraph {
     std::vector<ggml_tensor *> time_cache_inputs;
     std::vector<ggml_tensor *> time_cache_outputs;
 
+    std::vector<float> positions;
     int encoder_frames = 0;
+    int channel_frames = 0;
+    int convolution_frames = 0;
 
     void clear() {
         if (allocator) {
@@ -52,7 +78,10 @@ struct NemotronStepGraph {
         channel_cache_outputs.clear();
         time_cache_inputs.clear();
         time_cache_outputs.clear();
+        positions.clear();
         encoder_frames = 0;
+        channel_frames = 0;
+        convolution_frames = 0;
     }
 
     ~NemotronStepGraph() {
@@ -264,23 +293,24 @@ ggml_tensor * update_channel_cache(
     ggml_tensor * cache,
     ggml_tensor * current,
     int width,
-    int current_frames) {
-    if (current_frames >= kChannelCacheFrames) {
+    int current_frames,
+    int channel_frames) {
+    if (current_frames >= channel_frames) {
         return ggml_view_2d(
             context,
             current,
             width,
-            kChannelCacheFrames,
+            channel_frames,
             current->nb[1],
             static_cast<size_t>(
-                current_frames - kChannelCacheFrames) *
+                current_frames - channel_frames) *
                 current->nb[1]);
     }
     ggml_tensor * retained = ggml_view_2d(
         context,
         cache,
         width,
-        kChannelCacheFrames - current_frames,
+        channel_frames - current_frames,
         cache->nb[1],
         static_cast<size_t>(current_frames) * cache->nb[1]);
     return ggml_concat(context, retained, current, 1);
@@ -293,6 +323,7 @@ ggml_tensor * cached_convolution(
     const BlockWeights & weights,
     int width,
     int current_frames,
+    int convolution_frames,
     float epsilon,
     ggml_tensor ** next_time_cache) {
     ggml_tensor * pointwise_weight = weights.conv_pw1_w;
@@ -334,7 +365,7 @@ ggml_tensor * cached_convolution(
         ggml_view_2d(
             context,
             convolution_input,
-            kConvolutionCacheFrames,
+            convolution_frames,
             width,
             convolution_input->nb[1],
             static_cast<size_t>(current_frames) *
@@ -388,6 +419,8 @@ ggml_tensor * build_cached_block(
     const BlockWeights & weights,
     const EncoderConfig & config,
     int current_frames,
+    int channel_frames,
+    int convolution_frames,
     ggml_tensor ** next_channel_cache,
     ggml_tensor ** next_time_cache) {
     ggml_tensor * residual = value;
@@ -420,7 +453,8 @@ ggml_tensor * build_cached_block(
         channel_cache,
         normalized_attention,
         config.d_model,
-        current_frames);
+        current_frames,
+        channel_frames);
     transformed = cached_attention(
         context,
         normalized_attention,
@@ -431,7 +465,7 @@ ggml_tensor * build_cached_block(
         config.n_heads,
         config.head_dim,
         current_frames,
-        kChannelCacheFrames + current_frames);
+        channel_frames + current_frames);
     value = ggml_add(context, residual, transformed);
 
     residual = value;
@@ -448,6 +482,7 @@ ggml_tensor * build_cached_block(
         weights,
         config.d_model,
         current_frames,
+        convolution_frames,
         config.layer_norm_eps,
         next_time_cache);
     value = ggml_add(context, residual, transformed);
@@ -481,8 +516,9 @@ int build_step_graph(
     NemotronStepGraph & output) {
     output.clear();
     const EncoderConfig & config = model.encoder_cfg;
-    const int key_frames =
-        kChannelCacheFrames + encoder_frames;
+    const int channel_frames = channel_cache_frames(model);
+    const int convolution_frames = convolution_cache_frames(model);
+    const int key_frames = channel_frames + encoder_frames;
     const size_t graph_size = GGML_DEFAULT_GRAPH_SIZE * 16;
     const size_t memory =
         ggml_tensor_overhead() * graph_size +
@@ -527,11 +563,11 @@ int build_step_graph(
             context,
             GGML_TYPE_F32,
             config.d_model,
-            kChannelCacheFrames);
+            channel_frames);
         ggml_tensor * time_cache = ggml_new_tensor_2d(
             context,
             GGML_TYPE_F32,
-            kConvolutionCacheFrames,
+            convolution_frames,
             config.d_model);
         ggml_set_input(channel_cache);
         ggml_set_input(time_cache);
@@ -550,6 +586,8 @@ int build_step_graph(
             model.blocks[layer],
             config,
             encoder_frames,
+            channel_frames,
+            convolution_frames,
             &next_channel_cache,
             &next_time_cache);
         ggml_set_output(next_channel_cache);
@@ -578,17 +616,21 @@ int build_step_graph(
         return -2;
     }
     output.encoder_frames = encoder_frames;
+    output.channel_frames = channel_frames;
+    output.convolution_frames = convolution_frames;
+    output.positions = relative_positions(key_frames, config.d_model);
     return 0;
 }
 
 void fill_attention_mask(
     int cache_length,
     int current_frames,
+    int channel_frames,
     std::vector<float> & mask) {
     const int key_frames =
-        kChannelCacheFrames + current_frames;
+        channel_frames + current_frames;
     const int first_valid_cache =
-        kChannelCacheFrames - cache_length;
+        channel_frames - cache_length;
     mask.assign(
         static_cast<size_t>(key_frames) * current_frames,
         -1.0e30f);
@@ -611,8 +653,10 @@ struct NemotronStreamState::Impl {
     IncrementalMelState incremental_mel;
     std::vector<float> mel_history;
     std::vector<float> pending_mel;
+    std::string piece_text;
     int mel_width = 0;
     int mel_chunks_emitted = 0;
+    int subsampling_factor = 8;
 };
 
 NemotronStreamState::NemotronStreamState()
@@ -632,7 +676,6 @@ void reset_nemotron_stream(NemotronStreamState & state) {
     state.prompt_id = -1;
     state.right_context_frames = -1;
     state.step_index = 0;
-    state.processed_mel_frames = 0;
     state.emitted_encoder_frames = 0;
     state.max_graph_encoder_frames = 0;
     state.cancelled = false;
@@ -672,15 +715,18 @@ int init_nemotron_stream_state(
     reset_nemotron_stream(state);
     state.prompt_id = resolve_nemotron_prompt_id(model, language);
     state.right_context_frames = right_context_frames;
+    state.impl->subsampling_factor = encoder_subsampling_factor(model);
+    const int channel_frames = channel_cache_frames(model);
+    const int convolution_frames = convolution_cache_frames(model);
     state.cache_channel.assign(
         static_cast<size_t>(model.encoder_cfg.n_layers) *
-            kChannelCacheFrames *
+            channel_frames *
             model.encoder_cfg.d_model,
         0.0f);
     state.cache_time.assign(
         static_cast<size_t>(model.encoder_cfg.n_layers) *
             model.encoder_cfg.d_model *
-            kConvolutionCacheFrames,
+            convolution_frames,
         0.0f);
     return 0;
 }
@@ -769,11 +815,16 @@ int next_nemotron_processed_signal(
     }
 
     const bool first = state.impl->mel_chunks_emitted == 0;
+    const int factor = state.impl->subsampling_factor;
     const int steady_frames =
-        8 * (state.right_context_frames + 1);
+        factor * (state.right_context_frames + 1);
     const int required_frames =
-        first ? 1 + 8 * state.right_context_frames : steady_frames;
-    const int minimum_final_frames = first ? 1 : 8;
+        first ? 1 + factor * state.right_context_frames : steady_frames;
+    // Non-first chunks need `factor` mel frames for one encoder frame
+    // after the two-frame subsampling overlap. A 1..(factor-1) remainder
+    // cannot produce an encoder frame, so finalize drops it (NeMo does
+    // the same last-chunk stride).
+    const int minimum_final_frames = first ? 1 : factor;
     const int pending_frames = static_cast<int>(
         state.impl->pending_mel.size() /
         static_cast<size_t>(n_mels));
@@ -827,6 +878,131 @@ int next_nemotron_processed_signal(
             static_cast<std::ptrdiff_t>(consumed_values));
     ++state.impl->mel_chunks_emitted;
     return 1;
+}
+
+namespace {
+
+void append_token_pieces(
+    const BpeVocab & vocab,
+    const std::vector<int32_t> & token_ids,
+    std::string & pieces) {
+    for (int32_t id : token_ids) {
+        if (id < 0 || id >= static_cast<int32_t>(vocab.pieces.size())) {
+            continue;
+        }
+        if (id == vocab.blank_id ||
+            id == vocab.bos_id ||
+            id == vocab.eos_id ||
+            id == vocab.pad_id) {
+            continue;
+        }
+        const std::string & piece = vocab.pieces[id];
+        for (size_t index = 0; index < piece.size(); ) {
+            const unsigned char c0 =
+                static_cast<unsigned char>(piece[index]);
+            if (c0 == 0xE2 &&
+                index + 2 < piece.size() &&
+                static_cast<unsigned char>(piece[index + 1]) == 0x96 &&
+                static_cast<unsigned char>(piece[index + 2]) == 0x81) {
+                pieces.push_back(' ');
+                index += 3;
+            } else {
+                pieces.push_back(piece[index]);
+                ++index;
+            }
+        }
+    }
+}
+
+std::string strip_leading_spaces(const std::string & text) {
+    size_t start = 0;
+    while (start < text.size() && text[start] == ' ') {
+        ++start;
+    }
+    return text.substr(start);
+}
+
+void upload_layer_caches(
+    const ParakeetCtcModel & model,
+    const NemotronStepGraph & graph,
+    const NemotronStreamState & state) {
+    const size_t channel_layer_size =
+        static_cast<size_t>(graph.channel_frames) *
+        model.encoder_cfg.d_model;
+    const size_t time_layer_size =
+        static_cast<size_t>(graph.convolution_frames) *
+        model.encoder_cfg.d_model;
+    for (int layer = 0; layer < model.encoder_cfg.n_layers; ++layer) {
+        ggml_backend_tensor_set(
+            graph.channel_cache_inputs[layer],
+            state.cache_channel.data() +
+                static_cast<size_t>(layer) * channel_layer_size,
+            0,
+            channel_layer_size * sizeof(float));
+        ggml_backend_tensor_set(
+            graph.time_cache_inputs[layer],
+            state.cache_time.data() +
+                static_cast<size_t>(layer) * time_layer_size,
+            0,
+            time_layer_size * sizeof(float));
+    }
+}
+
+void download_layer_caches(
+    const ParakeetCtcModel & model,
+    const NemotronStepGraph & graph,
+    NemotronStreamState & state) {
+    const size_t channel_layer_size =
+        static_cast<size_t>(graph.channel_frames) *
+        model.encoder_cfg.d_model;
+    const size_t time_layer_size =
+        static_cast<size_t>(graph.convolution_frames) *
+        model.encoder_cfg.d_model;
+    for (int layer = 0; layer < model.encoder_cfg.n_layers; ++layer) {
+        ggml_backend_tensor_get(
+            graph.channel_cache_outputs[layer],
+            state.cache_channel.data() +
+                static_cast<size_t>(layer) * channel_layer_size,
+            0,
+            channel_layer_size * sizeof(float));
+        ggml_backend_tensor_get(
+            graph.time_cache_outputs[layer],
+            state.cache_time.data() +
+                static_cast<size_t>(layer) * time_layer_size,
+            0,
+            time_layer_size * sizeof(float));
+    }
+}
+
+int prepare_step_inputs(
+    NemotronStepGraph & graph,
+    const std::vector<float> & encoder_input,
+    int cache_length,
+    int encoder_frames) {
+    ggml_backend_tensor_set(
+        graph.encoder_input,
+        encoder_input.data(),
+        0,
+        encoder_input.size() * sizeof(float));
+    std::vector<float> mask;
+    fill_attention_mask(
+        cache_length,
+        encoder_frames,
+        graph.channel_frames,
+        mask);
+    ggml_backend_tensor_set(
+        graph.attention_mask,
+        mask.data(),
+        0,
+        mask.size() * sizeof(float));
+    ggml_backend_tensor_set(
+        graph.position_input,
+        graph.positions.data(),
+        0,
+        graph.positions.size() * sizeof(float));
+    return 0;
+}
+
 }
 
 int run_nemotron_stream_step(
@@ -907,49 +1083,14 @@ int run_nemotron_stream_step(
         return -8;
     }
 
-    ggml_backend_tensor_set(
-        graph.encoder_input,
-        encoder_input.data(),
-        0,
-        encoder_input.size() * sizeof(float));
-    std::vector<float> mask;
-    fill_attention_mask(
-        state.cache_length, encoder_frames, mask);
-    ggml_backend_tensor_set(
-        graph.attention_mask,
-        mask.data(),
-        0,
-        mask.size() * sizeof(float));
-    const int key_frames =
-        kChannelCacheFrames + encoder_frames;
-    const std::vector<float> positions =
-        relative_positions(key_frames, width);
-    ggml_backend_tensor_set(
-        graph.position_input,
-        positions.data(),
-        0,
-        positions.size() * sizeof(float));
-
-    const size_t channel_layer_size =
-        static_cast<size_t>(kChannelCacheFrames) * width;
-    const size_t time_layer_size =
-        static_cast<size_t>(kConvolutionCacheFrames) * width;
-    for (int layer = 0;
-         layer < model.encoder_cfg.n_layers;
-         ++layer) {
-        ggml_backend_tensor_set(
-            graph.channel_cache_inputs[layer],
-            state.cache_channel.data() +
-                static_cast<size_t>(layer) * channel_layer_size,
-            0,
-            channel_layer_size * sizeof(float));
-        ggml_backend_tensor_set(
-            graph.time_cache_inputs[layer],
-            state.cache_time.data() +
-                static_cast<size_t>(layer) * time_layer_size,
-            0,
-            time_layer_size * sizeof(float));
+    if (int rc = prepare_step_inputs(
+            graph,
+            encoder_input,
+            state.cache_length,
+            encoder_frames); rc != 0) {
+        return rc;
     }
+    upload_layer_caches(model, graph, state);
 
     if (ggml_backend_graph_compute(
             model.backend_active(),
@@ -965,22 +1106,7 @@ int run_nemotron_stream_step(
         result.encoder_raw.data(),
         0,
         result.encoder_raw.size() * sizeof(float));
-    for (int layer = 0;
-         layer < model.encoder_cfg.n_layers;
-         ++layer) {
-        ggml_backend_tensor_get(
-            graph.channel_cache_outputs[layer],
-            state.cache_channel.data() +
-                static_cast<size_t>(layer) * channel_layer_size,
-            0,
-            channel_layer_size * sizeof(float));
-        ggml_backend_tensor_get(
-            graph.time_cache_outputs[layer],
-            state.cache_time.data() +
-                static_cast<size_t>(layer) * time_layer_size,
-            0,
-            time_layer_size * sizeof(float));
-    }
+    download_layer_caches(model, graph, state);
 
     if (int rc = run_nemotron_prompt_projection(
             model,
@@ -1011,13 +1137,14 @@ int run_nemotron_stream_step(
         state.token_ids.end(),
         result.new_token_ids.begin(),
         result.new_token_ids.end());
-    result.text = detokenize(model.vocab, state.token_ids);
+    append_token_pieces(
+        model.vocab, result.new_token_ids, state.impl->piece_text);
+    result.text = strip_leading_spaces(state.impl->piece_text);
 
     state.cache_length = std::min(
-        kChannelCacheFrames,
+        graph.channel_frames,
         state.cache_length + encoder_frames);
     ++state.step_index;
-    state.processed_mel_frames += n_mel_frames;
     state.emitted_encoder_frames += encoder_frames;
     state.max_graph_encoder_frames = std::max(
         state.max_graph_encoder_frames, encoder_frames);

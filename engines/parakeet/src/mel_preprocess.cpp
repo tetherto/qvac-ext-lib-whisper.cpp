@@ -366,16 +366,18 @@ int compute_log_mel_impl(const float        * samples,
         out_mel[i] = std::log(out_mel[i] + guard);
     }
 
-    const int seq_len = std::max(1, n_samples / cfg.hop_length);
+    const int seq_len = cfg.normalize == MelNormalize::None
+        ? std::max(1, n_samples / cfg.hop_length)
+        : std::max(1, (n_samples + cfg.hop_length - 1) / cfg.hop_length);
     const int valid_frames = std::min(seq_len, n_frames);
 
     if (cfg.normalize == MelNormalize::PerFeature) {
         apply_per_feature_cmvn(out_mel, valid_frames, n_mels);
     }
 
-    // NeMo masks every frame beyond the sequence length after optional
-    // normalization. This is also how run_encoder discovers mel_valid, so the
-    // zeroing is required for normalize=NA models such as Nemotron.
+    // NeMo masks frames past seq_len after optional CMVN. PerFeature
+    // models keep the historical ceil(n_samples / hop) length. None
+    // (Nemotron `normalize=NA`) uses floor division to match NeMo.
     for (int t = valid_frames; t < n_frames; ++t) {
         for (int m = 0; m < n_mels; ++m) {
             out_mel[t * n_mels + m] = 0.0f;

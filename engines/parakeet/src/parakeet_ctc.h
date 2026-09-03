@@ -221,6 +221,8 @@ struct NemotronConfig {
     int num_prompts = 0;
     int prompt_width = 0;
     int prompt_input_width = 0;
+    // Streaming cache geometry from GGUF metadata. The cache-aware
+    // encoder reads these rather than hard-coded 56 / 8 frame counts.
     int left_context_frames = 0;
     int cache_time_steps = 0;
 
@@ -265,7 +267,6 @@ struct NemotronStreamState {
     int prompt_id = -1;
     int right_context_frames = -1;
     int step_index = 0;
-    int64_t processed_mel_frames = 0;
     int64_t emitted_encoder_frames = 0;
     int max_graph_encoder_frames = 0;
     bool cancelled = false;

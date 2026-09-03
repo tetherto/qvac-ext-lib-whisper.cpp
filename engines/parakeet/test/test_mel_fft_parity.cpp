@@ -477,6 +477,87 @@ int section_per_feature_cmvn(void) {
     return 0;
 }
 
+int section_per_feature_valid_frame_zeroing() {
+    using namespace parakeet;
+
+    MelConfig cfg = make_test_cfg();
+    cfg.normalize = MelNormalize::PerFeature;
+    const int n_samples = cfg.hop_length + 1;
+    const std::vector<float> signal = make_signal(n_samples);
+    std::vector<float> mel;
+    int n_frames = 0;
+    if (compute_log_mel(
+            signal.data(), n_samples, cfg, mel, n_frames) != 0) {
+        std::fprintf(stderr, "[valid-frames] compute_log_mel failed\n");
+        return 1;
+    }
+
+    const int expected_frames = 1 + n_samples / cfg.hop_length;
+    if (n_frames != expected_frames) {
+        std::fprintf(
+            stderr,
+            "[valid-frames] FAIL: n_frames=%d expected=%d\n",
+            n_frames,
+            expected_frames);
+        return 1;
+    }
+
+    const int last = n_frames - 1;
+    bool last_all_zero = true;
+    for (int m = 0; m < cfg.n_mels; ++m) {
+        if (mel[last * cfg.n_mels + m] != 0.0f) {
+            last_all_zero = false;
+            break;
+        }
+    }
+    if (last_all_zero) {
+        std::fprintf(
+            stderr,
+            "[valid-frames] FAIL: PerFeature hop+1 input used floor "
+            "seq_len and zeroed a valid frame\n");
+        return 1;
+    }
+
+    const int floor_n_samples = cfg.hop_length;
+    const std::vector<float> floor_signal = make_signal(floor_n_samples);
+    std::vector<float> floor_mel;
+    int floor_frames = 0;
+    if (compute_log_mel(
+            floor_signal.data(),
+            floor_n_samples,
+            cfg,
+            floor_mel,
+            floor_frames) != 0) {
+        std::fprintf(stderr, "[valid-frames] floor compute_log_mel failed\n");
+        return 1;
+    }
+    const int floor_seq_len = floor_n_samples / cfg.hop_length;
+    if (floor_frames <= floor_seq_len) {
+        std::fprintf(
+            stderr,
+            "[valid-frames] FAIL: expected a pad frame to zero\n");
+        return 1;
+    }
+    for (int t = floor_seq_len; t < floor_frames; ++t) {
+        for (int m = 0; m < cfg.n_mels; ++m) {
+            if (floor_mel[t * cfg.n_mels + m] != 0.0f) {
+                std::fprintf(
+                    stderr,
+                    "[valid-frames] FAIL: pad frame %d feature %d "
+                    "was not zeroed\n",
+                    t,
+                    m);
+                return 1;
+            }
+        }
+    }
+
+    std::fprintf(
+        stderr,
+        "[valid-frames] PASS  PerFeature ceil seq_len and pad zeroing\n");
+    return 0;
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     using namespace parakeet;
 
@@ -489,6 +570,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     rc |= section_repeated_call_invariance(cfg, signal);
     rc |= section_incremental_short_input_parity(cfg);
     rc |= section_per_feature_cmvn();
+    rc |= section_per_feature_valid_frame_zeroing();
 
     if (rc != 0) {
         std::fprintf(stderr, "[test-mel-fft-parity] FAIL\n");

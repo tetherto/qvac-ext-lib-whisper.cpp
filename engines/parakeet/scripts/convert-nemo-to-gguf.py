@@ -125,6 +125,7 @@ NEMOTRON_VARIANT = "nemotron-3.5-asr-streaming-0.6b-v1"
 NEMOTRON_ALLOWED_RIGHT_CONTEXTS = [0, 1, 3, 6, 13]
 NEMOTRON_ALLOWED_CHUNK_MS = [80, 160, 320, 560, 1120]
 NEMOTRON_LEFT_CONTEXT = 56
+NEMOTRON_DEFAULT_ATT_CONTEXT_RIGHT = 3
 NEMOTRON_NUM_PROMPTS = 128
 NEMOTRON_PROMPT_INPUT = 1152
 NEMOTRON_PROMPT_HIDDEN = 2048
@@ -509,13 +510,21 @@ def validate_nemotron_contract(cfg: dict, sd: dict):
         )
 
 
-def resolve_attention_context(enc: dict):
+def resolve_attention_context(enc: dict, default_right=None):
     raw_context = enc.get("att_context_size", [-1, -1])
     if (
         isinstance(raw_context, (list, tuple))
         and raw_context
         and isinstance(raw_context[0], (list, tuple))
     ):
+        if default_right is not None:
+            for pair in raw_context:
+                if (
+                    isinstance(pair, (list, tuple))
+                    and len(pair) >= 2
+                    and int(pair[1]) == default_right
+                ):
+                    return int(pair[0]), int(pair[1])
         raw_context = raw_context[0]
     if isinstance(raw_context, (list, tuple)) and len(raw_context) >= 2:
         return int(raw_context[0]), int(raw_context[1])
@@ -800,7 +809,14 @@ def write_gguf(out: Path, ckpt: Path, cfg: dict, sd: dict, tok_bytes: bytes,
     conv_context_style = str(enc.get("conv_context_style", "regular"))
     causal_downsample = bool(enc.get("causal_downsampling", False))
     att_style        = str(enc.get("att_context_style", "regular"))
-    att_ctx_left, att_ctx_right = resolve_attention_context(enc)
+    att_ctx_left, att_ctx_right = resolve_attention_context(
+        enc,
+        default_right=(
+            NEMOTRON_DEFAULT_ATT_CONTEXT_RIGHT
+            if model_type == "nemotron"
+            else None
+        ),
+    )
 
     writer.add_uint32("parakeet.encoder.d_model",                     d_model)
     writer.add_uint32("parakeet.encoder.n_layers",                    n_layers)

@@ -27,6 +27,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <regex>
 #include <stdexcept>
@@ -136,6 +137,32 @@ struct EncoderGraph {
     ~EncoderGraph() { free_(); }
 };
 
+struct NemotronPromptGraph {
+    ggml_context * context = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_gallocr_t allocator = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * output = nullptr;
+    int n_frames = 0;
+
+    void clear() {
+        if (allocator) {
+            ggml_gallocr_free(allocator);
+            allocator = nullptr;
+        }
+        if (context) {
+            ggml_free(context);
+            context = nullptr;
+        }
+        graph = nullptr;
+        input = nullptr;
+        output = nullptr;
+        n_frames = 0;
+    }
+
+    ~NemotronPromptGraph() { clear(); }
+};
+
 struct ParakeetCtcModel::Impl {
     gguf_context         * gguf           = nullptr;
     ggml_context         * ctx            = nullptr;
@@ -165,6 +192,7 @@ struct ParakeetCtcModel::Impl {
     ggml_backend_sched_t   sched          = nullptr;
     std::vector<std::unique_ptr<EncoderGraph>> encoder_graphs;
     static constexpr size_t k_encoder_graph_cache_max = 3;
+    std::unique_ptr<NemotronPromptGraph> nemotron_prompt_graph;
 
 #ifdef PARAKEET_USE_COREML
     // Optional Apple Neural Engine encoder sidecar. Non-null only on
@@ -182,6 +210,7 @@ struct ParakeetCtcModel::Impl {
             if (g) g->free_();
         }
         encoder_graphs.clear();
+        nemotron_prompt_graph.reset();
         if (sched)          ggml_backend_sched_free(sched);
         if (weights_buffer) ggml_backend_buffer_free(weights_buffer);
         for (ggml_backend_buffer_t b : weights_extra_buffers) {
@@ -664,7 +693,6 @@ void load_nemotron_metadata(
     (void) require_string(g, "parakeet.encoder.att_context_style");
     (void) require_i32(g, "parakeet.encoder.att_context_size_left");
     (void) require_i32(g, "parakeet.encoder.att_context_size_right");
-    (void) require_bool(g, "parakeet.encoder.streaming.enabled");
     (void) require_u32(g, "parakeet.preproc.sample_rate");
     (void) require_u32(g, "parakeet.preproc.n_mels");
 
@@ -2964,68 +2992,72 @@ int run_nemotron_prompt_projection(
     }
 
     constexpr size_t graph_size = 64;
-    const size_t graph_memory =
-        ggml_tensor_overhead() * graph_size +
-        ggml_graph_overhead_custom(graph_size, false) +
-        16 * 1024;
-    ggml_init_params params = {};
-    params.mem_size = graph_memory;
-    params.mem_buffer = nullptr;
-    params.no_alloc = true;
-    ggml_context * context = ggml_init(params);
-    if (!context) {
-        return -3;
+    auto & cached = model.impl->nemotron_prompt_graph;
+    if (!cached || cached->n_frames != n_frames) {
+        cached = std::make_unique<NemotronPromptGraph>();
+        const size_t graph_memory =
+            ggml_tensor_overhead() * graph_size +
+            ggml_graph_overhead_custom(graph_size, false) +
+            16 * 1024;
+        ggml_init_params params = {};
+        params.mem_size = graph_memory;
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
+        cached->context = ggml_init(params);
+        if (!cached->context) {
+            cached.reset();
+            return -3;
+        }
+
+        cached->input = ggml_new_tensor_2d(
+            cached->context, GGML_TYPE_F32, input_width, n_frames);
+        ggml_set_input(cached->input);
+        ggml_tensor * hidden = ggml_mul_mat(
+            cached->context, model.nemotron.prompt.proj_0_w, cached->input);
+        hidden = ggml_add(
+            cached->context, hidden, model.nemotron.prompt.proj_0_b);
+        hidden = ggml_relu(cached->context, hidden);
+        cached->output = ggml_mul_mat(
+            cached->context, model.nemotron.prompt.proj_2_w, hidden);
+        cached->output = ggml_add(
+            cached->context, cached->output, model.nemotron.prompt.proj_2_b);
+        ggml_set_output(cached->output);
+
+        cached->graph =
+            ggml_new_graph_custom(cached->context, graph_size, false);
+        ggml_build_forward_expand(cached->graph, cached->output);
+
+        ggml_backend_t backend = model.impl->backend_active;
+        cached->allocator = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+        if (!cached->allocator ||
+            !ggml_gallocr_alloc_graph(cached->allocator, cached->graph)) {
+            cached.reset();
+            return -4;
+        }
+        cached->n_frames = n_frames;
     }
 
-    ggml_tensor * input = ggml_new_tensor_2d(
-        context, GGML_TYPE_F32, input_width, n_frames);
-    ggml_set_input(input);
-    ggml_tensor * hidden = ggml_mul_mat(
-        context, model.nemotron.prompt.proj_0_w, input);
-    hidden = ggml_add(
-        context, hidden, model.nemotron.prompt.proj_0_b);
-    hidden = ggml_relu(context, hidden);
-    ggml_tensor * output = ggml_mul_mat(
-        context, model.nemotron.prompt.proj_2_w, hidden);
-    output = ggml_add(
-        context, output, model.nemotron.prompt.proj_2_b);
-    ggml_set_output(output);
-
-    ggml_cgraph * graph =
-        ggml_new_graph_custom(context, graph_size, false);
-    ggml_build_forward_expand(graph, output);
-
-    ggml_backend_t backend = model.impl->backend_active;
-    ggml_gallocr_t allocator = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(backend));
-    if (!allocator || !ggml_gallocr_alloc_graph(allocator, graph)) {
-        if (allocator) {
-            ggml_gallocr_free(allocator);
-        }
-        ggml_free(context);
+    NemotronPromptGraph & graph = *cached;
+    if (!ggml_gallocr_alloc_graph(graph.allocator, graph.graph)) {
         return -4;
     }
-
     ggml_backend_tensor_set(
-        input,
+        graph.input,
         conditioned_input.data(),
         0,
         conditioned_input.size() * sizeof(float));
-    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
-        ggml_gallocr_free(allocator);
-        ggml_free(context);
+    if (ggml_backend_graph_compute(
+            model.impl->backend_active, graph.graph) != GGML_STATUS_SUCCESS) {
         return -5;
     }
 
     projected.resize(static_cast<size_t>(d_model) * n_frames);
     ggml_backend_tensor_get(
-        output,
+        graph.output,
         projected.data(),
         0,
         projected.size() * sizeof(float));
-
-    ggml_gallocr_free(allocator);
-    ggml_free(context);
     return 0;
 }
 

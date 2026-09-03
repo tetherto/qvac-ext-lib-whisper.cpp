@@ -94,6 +94,7 @@ engine-specific guides qualify model-level validation.
 | `ai4bharat/indic-conformer-600m-multilingual` | parakeet | 22 Indic (CTC-only export) | 600 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan | OpenCL/CUDA share the CTC path but remain unvalidated; requires `--language` / `EngineOptions::language` |
 | `nvidia/parakeet-tdt-0.6b-v3` | parakeet | ~25 + punctuation and capitalization | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA; Core ML offline encoder | graph decoder on Metal/Vulkan/CUDA; scalar on CPU/OpenCL |
 | `nvidia/parakeet-tdt-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA; Core ML offline encoder | no punctuation; graph decoder on Metal/Vulkan/CUDA |
+| `nvidia/nemotron-3.5-asr-streaming-0.6b` | parakeet | locale-conditioned multilingual | 600 M | `f16` | CPU, Metal, Vulkan, OpenCL, CUDA | cache-aware streaming at 80/160/320/560/1120 ms; empty language selects `auto` |
 
 ### End-of-utterance and diarization
 

@@ -418,7 +418,10 @@ def offline_reference(model, wav_path, prompt_index, output_dir):
     save_tensor(offline_dir / "encoder_raw.npy", encoder_raw[0])
     save_tensor(offline_dir / "prompt_one_hot.npy", prompt_one_hot[0])
     save_tensor(offline_dir / "prompt_output.npy", prompt_output[0])
-    save_tensor(offline_dir / "token_ids.npy", hypothesis_token_ids(hypotheses))
+    save_optional_tensor(
+        offline_dir / "token_ids.npy",
+        hypothesis_token_ids(hypotheses),
+    )
 
     transcriptions = extract_transcriptions(hypotheses)
     (offline_dir / "transcript.txt").write_text(

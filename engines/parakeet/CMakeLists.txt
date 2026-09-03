@@ -832,7 +832,7 @@ if (PARAKEET_BUILD_TESTS)
     target_link_libraries(test-nemotron PRIVATE ggml parakeet-backend-defs)
     target_include_directories(test-nemotron PRIVATE src include ggml/include)
     parakeet_apply_backend_defs(test-nemotron)
-    parakeet_register_test(test-nemotron)
+    parakeet_register_test(test-nemotron
         LABEL "fixture"
         ARGS
             "${_qvp_nemotron_f16_gguf}"
