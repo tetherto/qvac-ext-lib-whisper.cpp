@@ -13,6 +13,7 @@
 #include "acestep/lyrics_alignment.h"
 #include "acestep/philox.h"
 #include "acestep/quality_score.h"
+#include "acestep/tok_ggml.h"
 #include "acestep/textenc_ggml.h"
 
 #include "acestep/cancellation_scope.h"
@@ -128,6 +129,7 @@ struct Engine::Impl {
     LMModel *      lm      = nullptr;
     CondModel *    cond    = nullptr;
     DetokModel *   detok   = nullptr;
+    TokModel *     tok     = nullptr;
     DitModel *     dit     = nullptr;
 
     std::unique_ptr<Vae> vae;
@@ -152,6 +154,7 @@ struct Engine::Impl {
     ~Impl() {
         free_dit();
         free_detok();
+        free_tok();
         free_cond();
         free_lm();
         free_textenc();
@@ -188,6 +191,12 @@ struct Engine::Impl {
         detok = detok_model_load(opts.dit_model_path, backend_detok, opts.verbose);
         if (!detok) throw std::runtime_error("acestep engine: FSQ detokenizer load failed");
     }
+    void ensure_tok() {
+        if (tok) return;
+        if (opts.verbose) fprintf(stderr, "[acestep-engine] loading FSQ tokenizer\n");
+        tok = tok_model_load(opts.dit_model_path, backend_detok, opts.verbose);
+        if (!tok) throw std::runtime_error("acestep engine: FSQ tokenizer load failed");
+    }
     void ensure_dit() {
         if (dit) return;
         if (opts.verbose) fprintf(stderr, "[acestep-engine] loading DiT\n");
@@ -208,6 +217,7 @@ struct Engine::Impl {
     void free_lm()      { if (lm)      { lm_model_free(lm);           lm      = nullptr; } }
     void free_cond()    { if (cond)    { cond_model_free(cond);       cond    = nullptr; } }
     void free_detok()   { if (detok)   { detok_model_free(detok);     detok   = nullptr; } }
+    void free_tok()     { if (tok)     { tok_model_free(tok);         tok     = nullptr; } }
     void free_dit()     { if (dit)     { dit_model_free(dit);         dit     = nullptr; } }
     void free_vae()     { vae.reset(); }
 };
@@ -794,13 +804,15 @@ static LmSampleParams make_lm_sample_params(const GenerateParams & params, long 
 }
 
 static bool needs_lm_phase_one(const GenerateParams & params, const AcePrompt & prompt) {
-    if (params.simple_mode) return true;
+    if (params.simple_mode || params.rewrite_query) return true;
     return params.lm_phase1 && !has_complete_metadata(prompt);
 }
 
-// Fields simple mode left empty for the LM must never stay empty past Phase 1:
-// downstream prompt building and metadata reporting rely on them.
-static void finalize_simple_mode_prompt(GenerationState & state) {
+// Fields the LM expansion (Inspire or Format) left empty must never stay
+// empty past Phase 1: downstream prompt building and metadata reporting rely
+// on them, and state.language must carry the LM-chosen language into
+// tokenize_prompt.
+static void finalize_lm_expanded_prompt(GenerationState & state) {
     if (state.prompt.lyrics.empty()) state.prompt.lyrics = INSTRUMENTAL_LYRICS;
     if (state.prompt.vocal_language.empty()) state.prompt.vocal_language = DEFAULT_VOCAL_LANGUAGE;
     state.language = state.prompt.vocal_language;
@@ -814,14 +826,19 @@ static bool run_lm_phase_one(EngineImpl & engine, const GenerateParams & params,
                              GenerationState & state, const LmSampleParams & sample) {
     LmSampleParams phase_one = sample;
     phase_one.max_new_tokens = 0;
-    if (lm_generate_phase1(engine.lm, engine.bpe_lm, state.prompt, phase_one,
-                           true, true, params.simple_mode)) {
-        if (params.simple_mode) finalize_simple_mode_prompt(state);
+    const LmPhase1Mode mode = params.simple_mode  ? LmPhase1Mode::Inspire
+                              : params.rewrite_query ? LmPhase1Mode::Format
+                                                     : LmPhase1Mode::Auto;
+    if (lm_generate_phase1(engine.lm, engine.bpe_lm, state.prompt, phase_one, true, true, mode)) {
+        if (params.simple_mode || params.rewrite_query) finalize_lm_expanded_prompt(state);
         return true;
     }
     if (engine.cancel_flag.load()) return false;
     if (params.simple_mode) {
         throw std::runtime_error("acestep engine: simple_mode LM expansion failed");
+    }
+    if (params.rewrite_query) {
+        throw std::runtime_error("acestep engine: rewrite_query LM formatting failed");
     }
     fprintf(stderr, "[acestep-engine] Phase 1 failed; falling back to provided/default metas\n");
     return true;
@@ -2120,6 +2137,83 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
         normalize_loudness(result.pcm);
     }
     populate_metadata(state, result);
+    return result;
+}
+
+static void validate_understand_request(const UnderstandParams & params) {
+    if (params.audio.empty()) {
+        throw std::invalid_argument("acestep engine: understand requires audio");
+    }
+    if ((params.audio.size() & 1u) != 0) {
+        throw std::invalid_argument("acestep engine: understand audio must be interleaved stereo");
+    }
+}
+
+UnderstandResult Engine::understand(const UnderstandParams & params, const ProgressFn & progress) const {
+    Impl & engine = *impl_;
+    CancellationScope cancellation_scope(engine.cancel_flag);
+
+    UnderstandResult result;
+    if (engine.cancel_flag.load()) {
+        return result;
+    }
+    validate_understand_request(params);
+    result.seed = resolve_seed(params.seed);
+
+    const StageReporter report = [&](const char * stage, int step, int total) {
+        if (progress && !progress(stage, step, total)) {
+            engine.cancel_flag.store(true);
+            return false;
+        }
+        return !engine.cancel_flag.load();
+    };
+    const bool low_memory = !engine.keep_stages;
+    StageTimes timing;
+    StageDump  dump(engine.opts.dump_stages_dir, engine.opts.verbose);
+
+    engine.ensure_vae(true);
+    EncodedAudio source;
+    if (!encode_audio(*engine.vae, params.audio, "source", "00_source_latent", report,
+                      engine.opts.verbose, dump, timing, source)) {
+        return result;
+    }
+    if (low_memory) engine.free_vae();
+
+    if (!report("tok", 0, 1)) return result;
+    engine.ensure_tok();
+    std::vector<int> codes;
+    if (tok_model_encode(engine.tok, source.latent.data(), source.frames, codes) <= 0) {
+        throw std::runtime_error("acestep engine: FSQ tokenize failed");
+    }
+    if (low_memory) engine.free_tok();
+    timing.mark("tok");
+    dump.write_ints("01_tok_codes", codes);
+    if (!report("tok", 1, 1)) return result;
+
+    engine.ensure_lm();
+    LmSampleParams sample;
+    sample.temperature = params.lm_temperature;
+    sample.top_p       = params.lm_top_p;
+    sample.top_k       = params.lm_top_k;
+    sample.seed        = (uint32_t) result.seed;
+    sample.verbose     = engine.opts.verbose;
+    sample.on_step     = [&](int current, int total) { return report("understand", current, total); };
+
+    AcePrompt parsed;
+    if (!lm_understand(engine.lm, engine.bpe_lm, codes, sample, params.vocal_language, parsed)) {
+        if (engine.cancel_flag.load()) return result;
+        throw std::runtime_error("acestep engine: LM understand failed");
+    }
+    if (low_memory) engine.free_lm();
+    timing.mark("understand");
+
+    result.caption        = parsed.caption;
+    result.bpm            = parsed.bpm;
+    result.duration       = parsed.duration;
+    result.keyscale       = parsed.keyscale;
+    result.timesignature  = parsed.timesignature;
+    result.vocal_language = parsed.vocal_language;
+    result.audio_codes    = std::move(codes);
     return result;
 }
 
