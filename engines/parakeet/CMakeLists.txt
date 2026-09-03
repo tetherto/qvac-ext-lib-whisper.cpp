@@ -335,6 +335,12 @@ if (PARAKEET_BUILD_LIBRARY)
     #             supported set so the encoder path there is untouched
     #             (Sortformer uses `parakeet_sortformer.cpp` not
     #             `parakeet_ctc.cpp::rel_pos_mha_graph`).
+    #   - CUDA:   ON. The rel-pos attention feeds the flash-attn kernel
+    #             head-major views with the bias folded into the mask;
+    #             per-head masks are rejected there, so heads fold into
+    #             the batch dim (probed at load). RTX 3080, TDT q8_0:
+    #             encoder 30.0 -> 25.8 ms on 30 s audio, transcripts
+    #             unchanged, WER subset 2.1741 -> 2.1839 %.
     #   - CPU:    OFF. Cast-to-f16 of the BD mask before softmax
     #             measurably changed accumulator order and showed
     #             +3.1 % encoder regression on the CPU parity sweep;
@@ -345,12 +351,12 @@ if (PARAKEET_BUILD_LIBRARY)
     #             should flip and bench. Vulkan validation harness
     #             (test/test_vk_vs_cpu.cpp) is the natural home for
     #             that A/B once a non-Tegra Vulkan device is available.
-    if (GGML_METAL)
+    if (GGML_METAL OR GGML_CUDA)
         set(PARAKEET_FLASH_ATTN_DEFAULT ON)
     else()
         set(PARAKEET_FLASH_ATTN_DEFAULT OFF)
     endif()
-    option(PARAKEET_FLASH_ATTN "parakeet: enable fused flash-attn in MHA (default ON for Metal; OFF elsewhere pending per-backend A/B)" ${PARAKEET_FLASH_ATTN_DEFAULT})
+    option(PARAKEET_FLASH_ATTN "parakeet: enable fused flash-attn in MHA (default ON for Metal and CUDA; OFF elsewhere pending per-backend A/B)" ${PARAKEET_FLASH_ATTN_DEFAULT})
     if (PARAKEET_FLASH_ATTN)
         target_compile_definitions(qvac-parakeet PRIVATE PARAKEET_EXPERIMENTAL_FLASH_ATTN)
     endif()
@@ -495,6 +501,8 @@ if (PARAKEET_BUILD_TESTS)
         add_test(NAME ${target}
                  COMMAND $<TARGET_FILE:${QPRT_EXE}> ${QPRT_ARGS})
         set_property(TEST ${target} PROPERTY LABELS ${QPRT_LABEL})
+        # A test that finds its backend without the feature under test exits 3.
+        set_property(TEST ${target} PROPERTY SKIP_RETURN_CODE 3)
         if (WIN32)
             # When ggml builds as shared (the clang-cl / MSVC default with
             # GGML_BACKEND_DL on), test exes link against import libs and
@@ -775,6 +783,16 @@ if (PARAKEET_BUILD_TESTS)
     target_include_directories(test-mel-fft-parity PRIVATE ggml/include src include)
     parakeet_apply_backend_defs(test-mel-fft-parity)
     parakeet_register_test(test-mel-fft-parity LABEL "unit")
+
+    # Threaded mel front-end must be byte-equal to the single-thread result.
+    add_executable(test-mel-threads
+        test/test_mel_threads.cpp
+        src/mel_preprocess.cpp
+        src/parakeet_log.cpp)
+    target_link_libraries(test-mel-threads PRIVATE ggml)
+    target_include_directories(test-mel-threads PRIVATE ggml/include src include)
+    parakeet_apply_backend_defs(test-mel-threads)
+    parakeet_register_test(test-mel-threads LABEL "unit")
 
     # test_rnnt.cpp exercises internal decoder entry points
     # (rnnt_decode_window, build_transducer_argmax_outputs) that are not
@@ -1123,6 +1141,100 @@ if (PARAKEET_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}" "${_qvp_tdt_ref}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+    # Load-time [w_ih | w_hh] row stacking, independent of any GGUF fixture.
+    add_executable(test-lstm-input-concat test/test_lstm_input_concat.cpp)
+    target_link_libraries(test-lstm-input-concat PRIVATE ggml)
+    target_include_directories(test-lstm-input-concat PRIVATE src ggml/include)
+    parakeet_apply_ccache(test-lstm-input-concat)
+    parakeet_register_test(test-lstm-input-concat LABEL "unit")
+
+    # Fused attention is a build option; only CUDA and Metal take it, and the
+    # encoder graph built on CPU must never contain the fused node.
+    add_executable(test-attn-path
+        test/test_attn_path.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-attn-path PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-attn-path PRIVATE include src ggml/include)
+    parakeet_apply_backend_defs(test-attn-path)
+    parakeet_register_test(test-attn-path LABEL "unit")
+    parakeet_register_test(test-attn-path-graph
+        LABEL    "fixture"
+        EXE      test-attn-path
+        ARGS     "${_qvp_tdt_q8_gguf}"
+        REQUIRES "${_qvp_tdt_q8_gguf}")
+    parakeet_register_test(test-attn-path-graph-gpu
+        LABEL    "gpu"
+        EXE      test-attn-path
+        ARGS     "${_qvp_tdt_q8_gguf}" "--n-gpu-layers" "1"
+        REQUIRES "${_qvp_tdt_q8_gguf}")
+
+    # The channel-contiguous depthwise-conv view needs two or more frames.
+    add_executable(test-conv-channels-view test/test_conv_channels_view.cpp)
+    target_link_libraries(test-conv-channels-view PRIVATE ggml)
+    target_include_directories(test-conv-channels-view PRIVATE src ggml/include)
+    parakeet_apply_ccache(test-conv-channels-view)
+    parakeet_register_test(test-conv-channels-view LABEL "unit")
+
+    # The fused LSTM cell op and the concatenated-input GEMV must both reproduce
+    # the per-gate decoder graph token for token.
+    add_executable(test-tdt-lstm-parity
+        test/test_tdt_lstm_parity.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-tdt-lstm-parity PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-tdt-lstm-parity PRIVATE include src ggml/include)
+    parakeet_apply_backend_defs(test-tdt-lstm-parity)
+    parakeet_register_test(test-tdt-lstm-parity-gpu
+        LABEL    "gpu"
+        EXE      test-tdt-lstm-parity
+        ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}" "--n-gpu-layers" "1"
+        REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+    # The unrolled decode graph (K greedy steps per commit) must reproduce the
+    # sequential per-step loop token for token, at K=1 and K=8.
+    add_executable(test-tdt-unroll-parity
+        test/test_tdt_unroll_parity.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-tdt-unroll-parity PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-tdt-unroll-parity PRIVATE include src ggml/include)
+    parakeet_apply_backend_defs(test-tdt-unroll-parity)
+    parakeet_register_test(test-tdt-unroll-parity-gpu
+        LABEL    "gpu"
+        EXE      test-tdt-unroll-parity
+        ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}" "--n-gpu-layers" "1" "--require-unrolled"
+        REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
+    # CPU decode has no graph path, so this one guards that the unroll setter
+    # leaves the sequential loop alone.
+    parakeet_register_test(test-tdt-unroll-parity
+        LABEL    "fixture"
+        EXE      test-tdt-unroll-parity
+        ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
     # Multi-piece French guard for the on-device predictor (QVAC-21005): the gpu0
     # scalar path and the gpu1 graph path must produce identical token IDs on a
     # word with multiple word-final sub-words (e.g. "analyses"). English jfk does
@@ -1264,7 +1376,7 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
 
-    if (GGML_VULKAN OR GGML_METAL)
+    if (GGML_VULKAN OR GGML_METAL OR GGML_CUDA)
         add_executable(test-gpu-vs-cpu
             test/test_gpu_vs_cpu.cpp
             src/parakeet_ctc.cpp
