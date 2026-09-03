@@ -366,27 +366,272 @@ int compute_log_mel_impl(const float        * samples,
         out_mel[i] = std::log(out_mel[i] + guard);
     }
 
-    const int seq_len = (n_samples + cfg.hop_length - 1) / cfg.hop_length;
+    const int seq_len = cfg.normalize == MelNormalize::None
+        ? std::max(1, n_samples / cfg.hop_length)
+        : std::max(1, (n_samples + cfg.hop_length - 1) / cfg.hop_length);
     const int valid_frames = std::min(seq_len, n_frames);
 
     if (cfg.normalize == MelNormalize::PerFeature) {
         apply_per_feature_cmvn(out_mel, valid_frames, n_mels);
+    }
 
-        // Per-feature CMVN sets the trailing padded frames to mean=0 implicitly,
-        // but we still want them to contribute zero energy to the encoder mask
-        // path. For NeMo `normalize=NA` we leave them as raw log-mel values
-        // (typically near -16, the log_zero_guard floor) -- the encoder's
-        // pad_mask zeros them out at the conv module anyway, and crucially the
-        // CMVN-free branch must not introduce a bin-wise mean shift the model
-        // wasn't trained against.
-        for (int t = valid_frames; t < n_frames; ++t) {
-            for (int m = 0; m < n_mels; ++m) out_mel[t * n_mels + m] = 0.0f;
+    // NeMo masks frames past seq_len after optional CMVN. PerFeature
+    // models keep the historical ceil(n_samples / hop) length. None
+    // (Nemotron `normalize=NA`) uses floor division to match NeMo.
+    for (int t = valid_frames; t < n_frames; ++t) {
+        for (int m = 0; m < n_mels; ++m) {
+            out_mel[t * n_mels + m] = 0.0f;
         }
     }
 
     return 0;
 }
 
+}
+
+struct IncrementalMelState::Impl {
+    std::vector<float> samples;
+    std::vector<float> prefix;
+    std::vector<float> window;
+    std::vector<float> windowed;
+    std::vector<float> power;
+    std::vector<std::complex<float>> fft;
+
+    int64_t sample_base = 0;
+    int64_t total_samples = 0;
+    int64_t next_frame = 0;
+    int window_n_fft = 0;
+    const std::vector<float> * window_source = nullptr;
+    float last_raw_sample = 0.0f;
+    bool has_last_raw_sample = false;
+    bool finalized = false;
+};
+
+IncrementalMelState::IncrementalMelState()
+    : impl(std::make_unique<Impl>()) {}
+
+IncrementalMelState::~IncrementalMelState() = default;
+IncrementalMelState::IncrementalMelState(
+    IncrementalMelState &&) noexcept = default;
+IncrementalMelState & IncrementalMelState::operator=(
+    IncrementalMelState &&) noexcept = default;
+
+void reset_incremental_mel(IncrementalMelState & state) {
+    state.impl = std::make_unique<IncrementalMelState::Impl>();
+}
+
+namespace {
+
+void append_preemphasized_samples(
+    IncrementalMelState::Impl & state,
+    const float * samples,
+    int n_samples,
+    float preemphasis,
+    int prefix_size) {
+    state.samples.reserve(
+        state.samples.size() + static_cast<size_t>(n_samples));
+    for (int index = 0; index < n_samples; ++index) {
+        const float raw = samples[index];
+        const float value = state.has_last_raw_sample
+            ? raw - preemphasis * state.last_raw_sample
+            : raw;
+        state.samples.push_back(value);
+        if (static_cast<int>(state.prefix.size()) < prefix_size) {
+            state.prefix.push_back(value);
+        }
+        state.last_raw_sample = raw;
+        state.has_last_raw_sample = true;
+        ++state.total_samples;
+    }
+}
+
+float incremental_sample_at(
+    const IncrementalMelState::Impl & state,
+    int64_t sample_index,
+    bool finalized) {
+    if (sample_index < 0) {
+        sample_index = std::min<int64_t>(
+            -sample_index,
+            state.total_samples - 1);
+    } else if (sample_index >= state.total_samples && finalized) {
+        sample_index = std::max<int64_t>(
+            0, 2 * state.total_samples - 2 - sample_index);
+    }
+    if (sample_index < static_cast<int64_t>(state.prefix.size())) {
+        return state.prefix[static_cast<size_t>(sample_index)];
+    }
+    return state.samples[
+        static_cast<size_t>(sample_index - state.sample_base)];
+}
+
+bool incremental_frame_ready(
+    const IncrementalMelState::Impl & state,
+    const MelConfig & config,
+    bool finalized) {
+    if (finalized) {
+        return state.next_frame <=
+            state.total_samples / config.hop_length;
+    }
+    const int64_t center =
+        state.next_frame * config.hop_length;
+    const int64_t padding = config.n_fft / 2;
+    int64_t maximum_sample = center + padding - 1;
+    if (center < padding) {
+        maximum_sample = std::max(
+            maximum_sample, padding - center);
+    }
+    return maximum_sample < state.total_samples;
+}
+
+void prepare_incremental_window(
+    IncrementalMelState::Impl & state,
+    const MelConfig & config) {
+    if (state.window_n_fft == config.n_fft &&
+        state.window_source == &config.window) {
+        return;
+    }
+    state.window = make_padded_window(
+        config.window, config.n_fft);
+    state.window_n_fft = config.n_fft;
+    state.window_source = &config.window;
+    state.windowed.resize(static_cast<size_t>(config.n_fft));
+    state.power.resize(
+        static_cast<size_t>(config.n_fft / 2 + 1));
+    state.fft.resize(static_cast<size_t>(config.n_fft / 2));
+}
+
+void compute_incremental_frame(
+    IncrementalMelState::Impl & state,
+    const MelConfig & config,
+    bool finalized,
+    float * destination) {
+    const int64_t center =
+        state.next_frame * config.hop_length;
+    const int64_t padding = config.n_fft / 2;
+    for (int index = 0; index < config.n_fft; ++index) {
+        const int64_t sample_index =
+            center + index - padding;
+        state.windowed[static_cast<size_t>(index)] =
+            incremental_sample_at(state, sample_index, finalized) *
+            state.window[static_cast<size_t>(index)];
+    }
+    rfft_power_radix2(
+        state.windowed.data(),
+        state.power.data(),
+        config.n_fft,
+        state.fft.data());
+
+    const int bins = config.n_fft / 2 + 1;
+    for (int mel = 0; mel < config.n_mels; ++mel) {
+        const float * filter =
+            config.filterbank.data() +
+            static_cast<size_t>(mel) * bins;
+        float value = 0.0f;
+        #pragma GCC ivdep
+        for (int bin = 0; bin < bins; ++bin) {
+            value += filter[bin] *
+                state.power[static_cast<size_t>(bin)];
+        }
+        destination[mel] =
+            std::log(value + config.log_zero_guard_value);
+    }
+}
+
+void compact_incremental_samples(
+    IncrementalMelState::Impl & state,
+    const MelConfig & config) {
+    const int64_t next_left =
+        state.next_frame * config.hop_length -
+        config.n_fft / 2;
+    const int64_t keep_from = std::max<int64_t>(
+        state.sample_base, std::max<int64_t>(0, next_left));
+    const int64_t remove_count =
+        std::min<int64_t>(
+            keep_from - state.sample_base,
+            static_cast<int64_t>(state.samples.size()));
+    if (remove_count <= 0) {
+        return;
+    }
+    state.samples.erase(
+        state.samples.begin(),
+        state.samples.begin() +
+            static_cast<std::ptrdiff_t>(remove_count));
+    state.sample_base += remove_count;
+}
+
+}
+
+int append_log_mel(
+    const float * samples,
+    int n_samples,
+    bool finalize,
+    const MelConfig & config,
+    IncrementalMelState & state,
+    std::vector<float> & out_mel,
+    int & out_n_frames) {
+    out_mel.clear();
+    out_n_frames = 0;
+    if (!state.impl || state.impl->finalized) {
+        return finalize ? 0 : 1;
+    }
+    if (config.normalize != MelNormalize::None) {
+        return 2;
+    }
+    if (n_samples < 0 || (n_samples > 0 && !samples)) {
+        return 3;
+    }
+    if (config.filterbank.size() !=
+            static_cast<size_t>(
+                config.n_mels * (config.n_fft / 2 + 1)) ||
+        static_cast<int>(config.window.size()) !=
+            config.win_length) {
+        return 4;
+    }
+    if (n_samples > 0) {
+        append_preemphasized_samples(
+            *state.impl,
+            samples,
+            n_samples,
+            config.preemph,
+            config.n_fft / 2 + 1);
+    }
+    if (finalize && state.impl->total_samples == 0) {
+        state.impl->finalized = true;
+        return 0;
+    }
+
+    prepare_incremental_window(*state.impl, config);
+    const int64_t first_frame = state.impl->next_frame;
+    while (incremental_frame_ready(
+        *state.impl, config, finalize)) {
+        out_mel.resize(
+            out_mel.size() +
+            static_cast<size_t>(config.n_mels));
+        float * destination =
+            out_mel.data() + out_mel.size() - config.n_mels;
+        const int64_t valid_frames =
+            std::max<int64_t>(
+                1,
+                state.impl->total_samples / config.hop_length);
+        if (finalize &&
+            state.impl->next_frame >= valid_frames) {
+            std::fill(
+                destination,
+                destination + config.n_mels,
+                0.0f);
+        } else {
+            compute_incremental_frame(
+                *state.impl, config, finalize, destination);
+        }
+        ++state.impl->next_frame;
+    }
+    out_n_frames = static_cast<int>(
+        state.impl->next_frame - first_frame);
+    compact_incremental_samples(*state.impl, config);
+    if (finalize) {
+        state.impl->finalized = true;
+    }
+    return 0;
 }
 
 int compute_log_mel(const float        * samples,

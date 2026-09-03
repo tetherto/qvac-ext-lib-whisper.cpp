@@ -3,12 +3,14 @@
 // Loaded GGUF inference: transcribe, stream, diarize, and backend metadata behind one Engine class.
 //
 // Loads weights once; subsequent calls pay mel + encoder + decode only. Model kind (CTC, RNN-T, TDT,
-// EOU, Sortformer) comes from GGUF metadata.
+// EOU, Nemotron, Sortformer) comes from GGUF metadata.
 //
 // Transcription:
 //   - transcribe / transcribe_samples — one-shot wav or PCM to text.
-//   - transcribe_stream — full audio up front; segments via callback (offline encoder, chunked output).
-//   - stream_start — push PCM over time with left/right context windows (live streaming).
+//   - transcribe_stream — full audio up front; segments via callback. CTC/RNN-T/TDT/EOU
+//     encode once then slice output; Nemotron uses its cache-aware encoder.
+//   - stream_start — push PCM over time. CTC/RNN-T/TDT/EOU re-encode sliding windows;
+//     Nemotron keeps bounded attention and convolution caches.
 //
 // Diarization (Sortformer GGUFs):
 //   - diarize / diarize_samples — offline segments + speaker_probs.
@@ -59,8 +61,8 @@
 //     destruct without an explicit `finalize()` call, any audio that
 //     hadn't yet rolled into a chunk is dropped, the synthetic
 //     `is_final=true` terminator is not emitted (Sortformer), and the
-//     final partial-chunk tail segment is not emitted (CTC/RNN-T/TDT/EOU
-//     Mode 3). Always call `finalize()` if you care about those.
+//     final partial-chunk tail segment is not emitted (CTC/RNN-T/TDT/EOU/
+//     Nemotron Mode 3). Always call `finalize()` if you care about those.
 
 #include "export.h"
 #include "streaming.h"
@@ -183,13 +185,12 @@ struct EngineOptions {
     int long_form_window_frames  = 0;
     int long_form_context_frames = 0;
 
-    // Multilingual CTC language id (e.g. "hi", "ta").
-    // - Empty: full-vocab greedy. Required (throws / CLI error) when the GGUF
-    //   advertises parakeet.ctc.lang_* ranges (IndicConformer aggregate vocab).
-    // - Non-empty on monolingual CTC (no lang_* ranges): ignored; decode stays
-    //   full-vocab greedy.
-    // - Non-empty on a multilingual GGUF: must match a advertised lang id or
-    //   load/transcribe throws.
+    // Model-family-specific language selection.
+    // - Nemotron: locale alias or "auto"; empty resolves to "auto".
+    // - Multilingual CTC: required language id (e.g. "hi", "ta") when the
+    //   GGUF advertises parakeet.ctc.lang_* ranges.
+    // - Monolingual CTC and existing transducer families: ignored.
+    // Unsupported Nemotron locales and multilingual CTC language IDs throw.
     std::string language;
 };
 
@@ -275,8 +276,8 @@ public:
 
     const EngineOptions & options() const;
 
-    // "ctc", "tdt", "eou", or "sortformer", reflecting the
-    // parakeet.model.type metadata of the loaded GGUF.
+    // "ctc", "rnnt", "tdt", "eou", "nemotron", or "sortformer", reflecting
+    // the parakeet.model.type metadata of the loaded GGUF.
     std::string model_type() const;
 
     // Resolved compute device for this Engine's loaded model. CPU when

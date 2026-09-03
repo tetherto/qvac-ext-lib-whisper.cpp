@@ -250,6 +250,7 @@ set(PARAKEET_LIB_SOURCES
     src/parakeet_coreml_path.cpp
     src/coreml/parakeet_coreml_shape.cpp
     src/parakeet_engine.cpp
+    src/parakeet_nemotron.cpp
     src/parakeet_tdt.cpp
     src/parakeet_eou.cpp
     src/parakeet_sortformer.cpp
@@ -553,6 +554,7 @@ if (PARAKEET_BUILD_TESTS)
     set(_qvp_tdt_q8_gguf   "${PARAKEET_TEST_MODEL_DIR}/parakeet-tdt-0.6b-v3.q8_0.gguf")
     set(_qvp_tdt_f16_gguf  "${PARAKEET_TEST_MODEL_DIR}/parakeet-tdt-0.6b-v3.f16.gguf")
     set(_qvp_eou_q8_gguf   "${PARAKEET_TEST_MODEL_DIR}/parakeet_realtime_eou_120m-v1.q8_0.gguf")
+    set(_qvp_nemotron_f16_gguf "${PARAKEET_TEST_MODEL_DIR}/nemotron-3.5-asr-streaming-0.6b.f16.gguf")
     set(_qvp_sf_q8_gguf    "${PARAKEET_TEST_MODEL_DIR}/diar_sortformer_4spk-v1.q8_0.gguf")
     set(_qvp_sf_f16_gguf   "${PARAKEET_TEST_MODEL_DIR}/diar_sortformer_4spk-v1.f16.gguf")
     set(_qvp_sfs_q8_gguf   "${PARAKEET_TEST_MODEL_DIR}/diar_streaming_sortformer_4spk-v2.q8_0.gguf")
@@ -572,6 +574,22 @@ if (PARAKEET_BUILD_TESTS)
     set(_qvp_ctc_ref       "${PARAKEET_TEST_REF_DIR}/ctc-ref")
     set(_qvp_tdt_ref       "${PARAKEET_TEST_REF_DIR}/tdt-ref")
     set(_qvp_sf_ref        "${PARAKEET_TEST_REF_DIR}/sortformer-ref")
+    set(_qvp_nemotron_en_ref
+        "${PARAKEET_TEST_REF_DIR}/nemotron-ref-en-us-320/offline")
+    set(_qvp_nemotron_auto_ref
+        "${PARAKEET_TEST_REF_DIR}/nemotron-ref-auto-320/offline")
+    set(_qvp_nemotron_hi_ref
+        "${PARAKEET_TEST_REF_DIR}/nemotron-ref-hi-in-320/offline")
+    set(_qvp_nemotron_stream_ref
+        "${PARAKEET_TEST_REF_DIR}/nemotron-ref-en-us-320")
+    set(_qvp_nemotron_stream_80_ref
+        "${PARAKEET_TEST_REF_DIR}/nemotron-ref-en-us-80")
+    set(_qvp_nemotron_stream_160_ref
+        "${PARAKEET_TEST_REF_DIR}/nemotron-ref-en-us-160")
+    set(_qvp_nemotron_stream_560_ref
+        "${PARAKEET_TEST_REF_DIR}/nemotron-ref-en-us-560")
+    set(_qvp_nemotron_stream_1120_ref
+        "${PARAKEET_TEST_REF_DIR}/nemotron-ref-en-us-1120")
 
     add_executable(test-mel
         test/test_mel.cpp
@@ -766,6 +784,7 @@ if (PARAKEET_BUILD_TESTS)
         test/test_rnnt.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
         src/parakeet_log.cpp
         src/parakeet_tdt.cpp
         src/parakeet_eou.cpp
@@ -777,6 +796,109 @@ if (PARAKEET_BUILD_TESTS)
     target_include_directories(test-rnnt PRIVATE src include ggml/include)
     parakeet_apply_backend_defs(test-rnnt)
     parakeet_register_test(test-rnnt LABEL "unit")
+
+    add_executable(test-nemotron-loader
+        test/test_nemotron_loader.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-nemotron-loader PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-nemotron-loader PRIVATE src include ggml/include)
+    parakeet_apply_backend_defs(test-nemotron-loader)
+    parakeet_register_test(test-nemotron-loader
+        LABEL    "fixture"
+        ARGS     "${_qvp_nemotron_f16_gguf}"
+        REQUIRES "${_qvp_nemotron_f16_gguf}")
+
+    add_executable(test-nemotron
+        test/test_nemotron.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-nemotron PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-nemotron PRIVATE src include ggml/include)
+    parakeet_apply_backend_defs(test-nemotron)
+    parakeet_register_test(test-nemotron
+        LABEL "fixture"
+        ARGS
+            "${_qvp_nemotron_f16_gguf}"
+            "${_qvp_jfk_wav}"
+            "${_qvp_nemotron_en_ref}"
+            "${_qvp_nemotron_auto_ref}"
+            "${_qvp_hi_wav}"
+            "${_qvp_nemotron_hi_ref}"
+        REQUIRES
+            "${_qvp_nemotron_f16_gguf}"
+            "${_qvp_jfk_wav}"
+            "${_qvp_nemotron_en_ref}/mel.npy"
+            "${_qvp_nemotron_en_ref}/encoder_raw.npy"
+            "${_qvp_nemotron_en_ref}/prompt_output.npy"
+            "${_qvp_nemotron_en_ref}/token_ids.npy"
+            "${_qvp_nemotron_en_ref}/transcript.txt"
+            "${_qvp_nemotron_auto_ref}/token_ids.npy"
+            "${_qvp_nemotron_auto_ref}/transcript.txt"
+            "${_qvp_hi_wav}"
+            "${_qvp_nemotron_hi_ref}/token_ids.npy"
+            "${_qvp_nemotron_hi_ref}/transcript.txt")
+
+    add_executable(test-nemotron-stream-step
+        test/test_nemotron_stream_step.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_nemotron.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp)
+    target_link_libraries(test-nemotron-stream-step PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-nemotron-stream-step PRIVATE src include ggml/include)
+    parakeet_apply_backend_defs(test-nemotron-stream-step)
+    function(parakeet_register_nemotron_stream_case test_name reference_dir right_context)
+        parakeet_register_test(${test_name}
+            EXE test-nemotron-stream-step
+            LABEL "fixture"
+            ARGS
+                "${_qvp_nemotron_f16_gguf}"
+                "${reference_dir}"
+                "${right_context}"
+                "${_qvp_jfk_wav}"
+            REQUIRES
+                "${_qvp_nemotron_f16_gguf}"
+                "${reference_dir}/step-000/processed_signal.npy"
+                "${reference_dir}/step-000/encoder_raw.npy"
+                "${reference_dir}/step-000/cache_channel_after.npy"
+                "${reference_dir}/step-000/cache_time_after.npy"
+                "${reference_dir}/step-001/processed_signal.npy"
+                "${reference_dir}/step-001/encoder_raw.npy"
+                "${reference_dir}/step-001/cache_channel_after.npy"
+                "${reference_dir}/step-001/cache_time_after.npy"
+                "${reference_dir}/offline/mel.npy"
+                "${reference_dir}/transcript.txt"
+                "${_qvp_jfk_wav}")
+    endfunction()
+    parakeet_register_nemotron_stream_case(
+        test-nemotron-stream-step-80 "${_qvp_nemotron_stream_80_ref}" 0)
+    parakeet_register_nemotron_stream_case(
+        test-nemotron-stream-step-160 "${_qvp_nemotron_stream_160_ref}" 1)
+    parakeet_register_nemotron_stream_case(
+        test-nemotron-stream-step "${_qvp_nemotron_stream_ref}" 3)
+    parakeet_register_nemotron_stream_case(
+        test-nemotron-stream-step-560 "${_qvp_nemotron_stream_560_ref}" 6)
+    parakeet_register_nemotron_stream_case(
+        test-nemotron-stream-step-1120 "${_qvp_nemotron_stream_1120_ref}" 13)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if (Python3_Interpreter_FOUND)
@@ -941,6 +1063,7 @@ if (PARAKEET_BUILD_TESTS)
         test/test_sched_diarize_lifecycle.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
         src/parakeet_log.cpp
         src/parakeet_tdt.cpp
         src/parakeet_eou.cpp
@@ -965,6 +1088,7 @@ if (PARAKEET_BUILD_TESTS)
         test/test_tdt_encoder_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
         src/parakeet_log.cpp
         src/parakeet_tdt.cpp
         src/parakeet_eou.cpp
@@ -984,6 +1108,7 @@ if (PARAKEET_BUILD_TESTS)
         test/test_tdt_decoder_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
         src/parakeet_log.cpp
         src/parakeet_tdt.cpp
         src/parakeet_eou.cpp
@@ -1013,6 +1138,7 @@ if (PARAKEET_BUILD_TESTS)
         test/test_eou_decoder_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
         src/parakeet_log.cpp
         src/parakeet_tdt.cpp
         src/parakeet_eou.cpp
@@ -1042,6 +1168,7 @@ if (PARAKEET_BUILD_TESTS)
         test/test_sortformer_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
         src/parakeet_log.cpp
         src/parakeet_tdt.cpp
         src/parakeet_eou.cpp

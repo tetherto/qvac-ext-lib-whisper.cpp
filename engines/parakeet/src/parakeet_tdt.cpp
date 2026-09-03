@@ -633,26 +633,39 @@ TdtRuntimeWeights::~TdtRuntimeWeights() {
 int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
     W = TdtRuntimeWeights{};
 
-    const bool is_rnnt = model.model_type == ParakeetModelType::RNNT;
+    const bool is_nemotron =
+        model.model_type == ParakeetModelType::NEMOTRON;
+    const bool is_rnnt =
+        model.model_type == ParakeetModelType::RNNT || is_nemotron;
     if (!is_rnnt && model.model_type != ParakeetModelType::TDT) {
-        std::fprintf(stderr, "tdt_prepare_runtime: expected RNNT or TDT model\n");
+        std::fprintf(
+            stderr,
+            "tdt_prepare_runtime: expected RNNT, Nemotron, or TDT model\n");
         return 1;
     }
-    W.H_pred        = is_rnnt
-                        ? model.encoder_cfg.rnnt_pred_hidden
-                        : model.encoder_cfg.tdt_pred_hidden;
-    W.H_joint       = is_rnnt
-                        ? model.encoder_cfg.rnnt_joint_hidden
-                        : model.encoder_cfg.tdt_joint_hidden;
+    W.H_pred = is_nemotron
+        ? model.nemotron_cfg.pred_hidden
+        : (is_rnnt
+            ? model.encoder_cfg.rnnt_pred_hidden
+            : model.encoder_cfg.tdt_pred_hidden);
+    W.H_joint = is_nemotron
+        ? model.nemotron_cfg.joint_hidden
+        : (is_rnnt
+            ? model.encoder_cfg.rnnt_joint_hidden
+            : model.encoder_cfg.tdt_joint_hidden);
     W.D_enc         = model.encoder_cfg.d_model;
-    W.L             = is_rnnt
-                        ? model.encoder_cfg.rnnt_pred_rnn_layers
-                        : model.encoder_cfg.tdt_pred_rnn_layers;
+    W.L = is_nemotron
+        ? model.nemotron_cfg.pred_rnn_layers
+        : (is_rnnt
+            ? model.encoder_cfg.rnnt_pred_rnn_layers
+            : model.encoder_cfg.tdt_pred_rnn_layers);
     W.num_durations = is_rnnt ? 0 : model.encoder_cfg.tdt_num_durations;
     W.V_plus_1      = (int) model.vocab_size + 1;
     W.V_out         = W.V_plus_1 + W.num_durations;
 
-    W.weights = is_rnnt ? &model.rnnt : &model.tdt;
+    W.weights = is_nemotron
+        ? &model.nemotron.rnnt
+        : (is_rnnt ? &model.rnnt : &model.tdt);
     W.backend = model.backend_active();
     if (!W.backend) {
         std::fprintf(stderr, "tdt_prepare_runtime: model has no active backend (call load_from_gguf first)\n");
@@ -980,7 +993,9 @@ int tdt_decode_window(const ParakeetCtcModel & model,
     const int L       = W.L;
     const int blank   = (int) model.blank_id;
     const int V_out   = W.V_out;
-    const bool is_rnnt = model.model_type == ParakeetModelType::RNNT;
+    const bool is_rnnt =
+        model.model_type == ParakeetModelType::RNNT ||
+        model.model_type == ParakeetModelType::NEMOTRON;
 
     // GPU path: stash the full-window encoder-side projection into
     // enc_proj_persist on-device once at the top of the window so per-step
@@ -1112,7 +1127,8 @@ int rnnt_decode_window(const ParakeetCtcModel & model,
                        RnntDecodeState & state,
                        std::vector<int32_t> & out_tokens,
                        int & out_steps) {
-    if (model.model_type != ParakeetModelType::RNNT) {
+    if (model.model_type != ParakeetModelType::RNNT &&
+        model.model_type != ParakeetModelType::NEMOTRON) {
         return kWrongTransducerModel;
     }
     return tdt_decode_window(
@@ -1127,7 +1143,8 @@ int rnnt_greedy_decode(const ParakeetCtcModel & model,
                        int encoder_dim,
                        const RnntDecodeOptions & options,
                        RnntDecodeResult & result) {
-    if (model.model_type != ParakeetModelType::RNNT) {
+    if (model.model_type != ParakeetModelType::RNNT &&
+        model.model_type != ParakeetModelType::NEMOTRON) {
         return kWrongTransducerModel;
     }
     return tdt_greedy_decode(

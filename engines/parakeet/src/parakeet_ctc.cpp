@@ -25,7 +25,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <regex>
 #include <stdexcept>
@@ -135,6 +137,32 @@ struct EncoderGraph {
     ~EncoderGraph() { free_(); }
 };
 
+struct NemotronPromptGraph {
+    ggml_context * context = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_gallocr_t allocator = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * output = nullptr;
+    int n_frames = 0;
+
+    void clear() {
+        if (allocator) {
+            ggml_gallocr_free(allocator);
+            allocator = nullptr;
+        }
+        if (context) {
+            ggml_free(context);
+            context = nullptr;
+        }
+        graph = nullptr;
+        input = nullptr;
+        output = nullptr;
+        n_frames = 0;
+    }
+
+    ~NemotronPromptGraph() { clear(); }
+};
+
 struct ParakeetCtcModel::Impl {
     gguf_context         * gguf           = nullptr;
     ggml_context         * ctx            = nullptr;
@@ -164,6 +192,7 @@ struct ParakeetCtcModel::Impl {
     ggml_backend_sched_t   sched          = nullptr;
     std::vector<std::unique_ptr<EncoderGraph>> encoder_graphs;
     static constexpr size_t k_encoder_graph_cache_max = 3;
+    std::unique_ptr<NemotronPromptGraph> nemotron_prompt_graph;
 
 #ifdef PARAKEET_USE_COREML
     // Optional Apple Neural Engine encoder sidecar. Non-null only on
@@ -181,6 +210,7 @@ struct ParakeetCtcModel::Impl {
             if (g) g->free_();
         }
         encoder_graphs.clear();
+        nemotron_prompt_graph.reset();
         if (sched)          ggml_backend_sched_free(sched);
         if (weights_buffer) ggml_backend_buffer_free(weights_buffer);
         for (ggml_backend_buffer_t b : weights_extra_buffers) {
@@ -559,6 +589,169 @@ bool get_bool(const gguf_context * g, const std::string & k, bool fallback) {
     return gguf_get_val_bool(g, id);
 }
 
+int require_key(const gguf_context * g, const std::string & key) {
+    const int id = find_key(g, key);
+    if (id < 0) {
+        throw std::runtime_error(
+            "gguf: missing required metadata '" + key + "'");
+    }
+    return id;
+}
+
+uint32_t require_u32(
+    const gguf_context * g,
+    const std::string & key) {
+    const int id = require_key(g, key);
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_UINT32) {
+        throw std::runtime_error(
+            "gguf: metadata '" + key + "' must be uint32");
+    }
+    return gguf_get_val_u32(g, id);
+}
+
+int32_t require_i32(
+    const gguf_context * g,
+    const std::string & key) {
+    const int id = require_key(g, key);
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_INT32) {
+        throw std::runtime_error(
+            "gguf: metadata '" + key + "' must be int32");
+    }
+    return gguf_get_val_i32(g, id);
+}
+
+bool require_bool(
+    const gguf_context * g,
+    const std::string & key) {
+    const int id = require_key(g, key);
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_BOOL) {
+        throw std::runtime_error(
+            "gguf: metadata '" + key + "' must be bool");
+    }
+    return gguf_get_val_bool(g, id);
+}
+
+std::string require_string(
+    const gguf_context * g,
+    const std::string & key) {
+    const int id = require_key(g, key);
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_STRING) {
+        throw std::runtime_error(
+            "gguf: metadata '" + key + "' must be string");
+    }
+    return gguf_get_val_str(g, id);
+}
+
+std::vector<int32_t> require_i32_array(
+    const gguf_context * g,
+    const std::string & key) {
+    const int id = require_key(g, key);
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY ||
+        gguf_get_arr_type(g, id) != GGUF_TYPE_INT32) {
+        throw std::runtime_error(
+            "gguf: metadata '" + key + "' must be int32[]");
+    }
+
+    const size_t count = gguf_get_arr_n(g, id);
+    const auto * values = static_cast<const int32_t *>(
+        gguf_get_arr_data(g, id));
+    return std::vector<int32_t>(values, values + count);
+}
+
+std::vector<std::string> require_string_array(
+    const gguf_context * g,
+    const std::string & key) {
+    const int id = require_key(g, key);
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_ARRAY ||
+        gguf_get_arr_type(g, id) != GGUF_TYPE_STRING) {
+        throw std::runtime_error(
+            "gguf: metadata '" + key + "' must be string[]");
+    }
+
+    std::vector<std::string> values;
+    const size_t count = gguf_get_arr_n(g, id);
+    values.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+        const char * value = gguf_get_arr_str(g, id, index);
+        values.emplace_back(value ? value : "");
+    }
+    return values;
+}
+
+void load_nemotron_metadata(
+    const gguf_context * g,
+    ParakeetCtcModel & model) {
+    (void) require_u32(g, "parakeet.encoder.d_model");
+    (void) require_u32(g, "parakeet.encoder.n_layers");
+    (void) require_u32(g, "parakeet.encoder.n_heads");
+    (void) require_u32(g, "parakeet.encoder.conv_kernel");
+    (void) require_u32(g, "parakeet.encoder.subsampling_factor");
+    (void) require_bool(g, "parakeet.encoder.use_bias");
+    (void) require_string(g, "parakeet.encoder.conv_norm_type");
+    (void) require_bool(g, "parakeet.encoder.causal_downsampling");
+    (void) require_string(g, "parakeet.encoder.conv_context_size");
+    (void) require_string(g, "parakeet.encoder.att_context_style");
+    (void) require_i32(g, "parakeet.encoder.att_context_size_left");
+    (void) require_i32(g, "parakeet.encoder.att_context_size_right");
+    (void) require_u32(g, "parakeet.preproc.sample_rate");
+    (void) require_u32(g, "parakeet.preproc.n_mels");
+
+    NemotronConfig & cfg = model.nemotron_cfg;
+
+    cfg.pred_hidden =
+        require_u32(g, "parakeet.nemotron.pred_hidden");
+    cfg.pred_rnn_layers =
+        require_u32(g, "parakeet.nemotron.pred_rnn_layers");
+    cfg.joint_hidden =
+        require_u32(g, "parakeet.nemotron.joint_hidden");
+    cfg.max_symbols_per_step =
+        require_u32(g, "parakeet.nemotron.max_symbols_per_step");
+
+    model.vocab_size =
+        require_u32(g, "parakeet.nemotron.vocab_size");
+    model.blank_id =
+        require_u32(g, "parakeet.nemotron.blank_id");
+
+    cfg.num_prompts =
+        require_u32(g, "parakeet.nemotron.num_prompts");
+    cfg.prompt_width =
+        require_u32(g, "parakeet.nemotron.prompt_width");
+    cfg.prompt_input_width =
+        require_u32(g, "parakeet.nemotron.prompt_input_width");
+    cfg.left_context_frames =
+        require_u32(g, "parakeet.nemotron.left_context_frames");
+    cfg.cache_time_steps =
+        require_u32(g, "parakeet.nemotron.cache_time_steps");
+
+    cfg.allowed_right_context_frames = require_i32_array(
+        g, "parakeet.nemotron.allowed_right_context_frames");
+    cfg.allowed_chunk_ms = require_i32_array(
+        g, "parakeet.nemotron.allowed_chunk_ms");
+    cfg.default_locale = require_string(
+        g, "parakeet.nemotron.default_locale");
+
+    const std::vector<std::string> aliases = require_string_array(
+        g, "parakeet.nemotron.locale_aliases");
+    const std::vector<int32_t> prompt_ids = require_i32_array(
+        g, "parakeet.nemotron.locale_prompt_ids");
+
+    if (aliases.size() != prompt_ids.size()) {
+        throw std::runtime_error(
+            "gguf: Nemotron locale aliases and prompt IDs differ in length");
+    }
+
+    cfg.locale_prompts.reserve(aliases.size());
+    for (size_t index = 0; index < aliases.size(); ++index) {
+        cfg.locale_prompts.push_back(
+            {aliases[index], prompt_ids[index]});
+    }
+
+    if (!require_bool(g, "parakeet.encoder.streaming.enabled")) {
+        throw std::runtime_error(
+            "gguf: Nemotron requires cache-aware streaming metadata");
+    }
+}
+
 ggml_tensor * require_tensor(ggml_context * ctx, const std::string & name) {
     ggml_tensor * t = ggml_get_tensor(ctx, name.c_str());
     if (!t) throw std::runtime_error("gguf: missing required tensor '" + name + "'");
@@ -612,6 +805,208 @@ std::vector<float> read_filterbank_to_vector(ggml_tensor * t) {
     return out;
 }
 
+void require_nemotron_shape(
+    const ggml_tensor * tensor,
+    const std::string & name,
+    std::initializer_list<int64_t> expected) {
+    if (!tensor) {
+        throw std::runtime_error(
+            "gguf: missing required Nemotron tensor '" + name + "'");
+    }
+    if (ggml_n_dims(tensor) != static_cast<int>(expected.size())) {
+        throw std::runtime_error(
+            "gguf: unexpected rank for Nemotron tensor '" + name + "'");
+    }
+
+    size_t dimension = 0;
+    for (const int64_t expected_size : expected) {
+        if (tensor->ne[dimension] != expected_size) {
+            throw std::runtime_error(
+                "gguf: unexpected shape for Nemotron tensor '" + name + "'");
+        }
+        ++dimension;
+    }
+}
+
+}
+
+void validate_nemotron_model(const ParakeetCtcModel & model) {
+    static const std::vector<int32_t> expected_right_contexts = {
+        0, 1, 3, 6, 13,
+    };
+    static const std::vector<int32_t> expected_chunk_ms = {
+        80, 160, 320, 560, 1120,
+    };
+    constexpr const char * expected_variant =
+        "nemotron-3.5-asr-streaming-0.6b-v1";
+
+    if (model.model_type != ParakeetModelType::NEMOTRON) {
+        throw std::runtime_error(
+            "validate_nemotron_model called for non-Nemotron model");
+    }
+    if (model.model_variant != expected_variant) {
+        throw std::runtime_error(
+            "gguf: unsupported Nemotron variant '" +
+            model.model_variant + "'");
+    }
+
+    const EncoderConfig & encoder = model.encoder_cfg;
+    if (encoder.n_layers != 24 ||
+        encoder.d_model != 1024 ||
+        encoder.n_heads != 8 ||
+        encoder.conv_kernel != 9 ||
+        encoder.subsampling_factor != 8 ||
+        encoder.conv_norm_type != ConvNormType::LayerNorm ||
+        encoder.use_bias ||
+        !encoder.causal_downsampling ||
+        !encoder.conv_causal ||
+        !encoder.att_chunked_limited ||
+        encoder.att_context_left != 56 ||
+        encoder.att_context_right != 3) {
+        throw std::runtime_error(
+            "gguf: incompatible Nemotron FastConformer geometry");
+    }
+    if (!model.supports_streaming ||
+        model.mel_cfg.sample_rate != 16000 ||
+        model.mel_cfg.n_mels != 128) {
+        throw std::runtime_error(
+            "gguf: incompatible Nemotron streaming/preprocessor metadata");
+    }
+
+    const NemotronConfig & config = model.nemotron_cfg;
+    if (model.vocab_size != 13087 ||
+        model.blank_id != 13087 ||
+        config.pred_hidden != 640 ||
+        config.pred_rnn_layers != 2 ||
+        config.joint_hidden != 640 ||
+        config.max_symbols_per_step != 10 ||
+        config.num_prompts != 128 ||
+        config.prompt_width != 128 ||
+        config.prompt_input_width !=
+            encoder.d_model + config.prompt_width ||
+        config.left_context_frames != 56 ||
+        config.cache_time_steps != 8 ||
+        config.default_locale != "auto") {
+        throw std::runtime_error(
+            "gguf: incompatible Nemotron prompt/RNNT metadata");
+    }
+    if (config.allowed_right_context_frames != expected_right_contexts ||
+        config.allowed_chunk_ms != expected_chunk_ms) {
+        throw std::runtime_error(
+            "gguf: unsupported Nemotron streaming operating points");
+    }
+    if (config.locale_prompts.empty()) {
+        throw std::runtime_error(
+            "gguf: Nemotron locale table is empty");
+    }
+
+    bool has_default_locale = false;
+    for (const NemotronLocalePrompt & locale : config.locale_prompts) {
+        if (locale.alias.empty() ||
+            locale.prompt_id < 0 ||
+            locale.prompt_id >= config.num_prompts) {
+            throw std::runtime_error(
+                "gguf: invalid Nemotron locale prompt entry");
+        }
+        if (locale.alias == config.default_locale) {
+            has_default_locale = true;
+        }
+    }
+    if (!has_default_locale) {
+        throw std::runtime_error(
+            "gguf: Nemotron default locale is absent from the locale table");
+    }
+
+    const NemotronWeights & weights = model.nemotron;
+    require_nemotron_shape(
+        weights.prompt.proj_0_w,
+        "nemotron.prompt.proj.0.weight",
+        {1152, 2048});
+    require_nemotron_shape(
+        weights.prompt.proj_0_b,
+        "nemotron.prompt.proj.0.bias",
+        {2048});
+    require_nemotron_shape(
+        weights.prompt.proj_2_w,
+        "nemotron.prompt.proj.2.weight",
+        {2048, 1024});
+    require_nemotron_shape(
+        weights.prompt.proj_2_b,
+        "nemotron.prompt.proj.2.bias",
+        {1024});
+
+    const RnntWeights & rnnt = weights.rnnt;
+    require_nemotron_shape(
+        rnnt.predict_embed,
+        "nemotron.predict.embed.weight",
+        {640, 13088});
+    if (rnnt.lstm.size() != 2) {
+        throw std::runtime_error(
+            "gguf: Nemotron predictor must contain two LSTM layers");
+    }
+    for (size_t layer = 0; layer < rnnt.lstm.size(); ++layer) {
+        const TdtLstmLayer & lstm = rnnt.lstm[layer];
+        const std::string prefix =
+            "nemotron.predict.lstm." + std::to_string(layer);
+        require_nemotron_shape(lstm.w_ih, prefix + ".w_ih", {640, 2560});
+        require_nemotron_shape(lstm.w_hh, prefix + ".w_hh", {640, 2560});
+        require_nemotron_shape(lstm.b_ih, prefix + ".b_ih", {2560});
+        require_nemotron_shape(lstm.b_hh, prefix + ".b_hh", {2560});
+    }
+
+    require_nemotron_shape(
+        rnnt.joint_enc_w,
+        "nemotron.joint.enc.weight",
+        {1024, 640});
+    require_nemotron_shape(
+        rnnt.joint_enc_b,
+        "nemotron.joint.enc.bias",
+        {640});
+    require_nemotron_shape(
+        rnnt.joint_pred_w,
+        "nemotron.joint.pred.weight",
+        {640, 640});
+    require_nemotron_shape(
+        rnnt.joint_pred_b,
+        "nemotron.joint.pred.bias",
+        {640});
+    require_nemotron_shape(
+        rnnt.joint_out_w,
+        "nemotron.joint.out.weight",
+        {640, 13088});
+    require_nemotron_shape(
+        rnnt.joint_out_b,
+        "nemotron.joint.out.bias",
+        {13088});
+}
+
+int32_t resolve_nemotron_prompt_id(
+    const ParakeetCtcModel & model,
+    const std::string & language) {
+    if (model.model_type != ParakeetModelType::NEMOTRON) {
+        throw std::runtime_error(
+            "resolve_nemotron_prompt_id called for non-Nemotron model");
+    }
+
+    const NemotronConfig & config = model.nemotron_cfg;
+    const std::string requested =
+        language.empty() ? config.default_locale : language;
+    for (const NemotronLocalePrompt & locale : config.locale_prompts) {
+        if (locale.alias == requested) {
+            return locale.prompt_id;
+        }
+    }
+
+    std::string supported;
+    for (const NemotronLocalePrompt & locale : config.locale_prompts) {
+        if (!supported.empty()) {
+            supported += ", ";
+        }
+        supported += locale.alias;
+    }
+    throw std::runtime_error(
+        "unsupported Nemotron locale '" + requested +
+        "'; supported locales: " + supported);
 }
 
 void set_backends_directory(const std::string & dir) {
@@ -925,8 +1320,8 @@ static bool path_is_directory(const std::string & path) {
 }
 
 // Presence-driven, additive loader: loads the Core ML encoder sidecar
-// when one sits next to the GGUF. Any miss (env override, CTC model, absent
-// directory, load failure) silently leaves ctx_coreml null so the ggml encoder runs.
+// when one sits next to the GGUF. Any miss (env override, unsupported family,
+// absent directory, load failure) leaves ctx_coreml null so ggml runs.
 static void maybe_init_coreml_encoder(const std::string & gguf_path,
                                       ParakeetCtcModel  & model,
                                       bool                verbose) {
@@ -934,8 +1329,9 @@ static void maybe_init_coreml_encoder(const std::string & gguf_path,
         if (verbose) PARAKEET_LOG_INFO("parakeet: Core ML encoder disabled via PARAKEET_COREML_DISABLE; using ggml\n");
         return;
     }
-    if (model.model_type == ParakeetModelType::CTC) {
-        return;  // CTC greedy decode reads ggml CTC-head logits, which the sidecar does not emit
+    if (model.model_type == ParakeetModelType::CTC ||
+        model.model_type == ParakeetModelType::NEMOTRON) {
+        return;
     }
     const std::string path = coreml_encoder_sidecar_path(gguf_path);
     if (!path_is_directory(path)) {
@@ -1124,14 +1520,28 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.supports_streaming = get_bool(g, "parakeet.encoder.streaming.enabled", false);
 
     const std::string mtype_str = get_str(g, "parakeet.model.type", "ctc");
-    if      (mtype_str == "rnnt")       out_model.model_type = ParakeetModelType::RNNT;
-    else if (mtype_str == "tdt")        out_model.model_type = ParakeetModelType::TDT;
-    else if (mtype_str == "eou")        out_model.model_type = ParakeetModelType::EOU;
-    else if (mtype_str == "sortformer") out_model.model_type = ParakeetModelType::SORTFORMER;
-    else                                out_model.model_type = ParakeetModelType::CTC;
+    if (mtype_str == "ctc") {
+        out_model.model_type = ParakeetModelType::CTC;
+    } else if (mtype_str == "rnnt") {
+        out_model.model_type = ParakeetModelType::RNNT;
+    } else if (mtype_str == "tdt") {
+        out_model.model_type = ParakeetModelType::TDT;
+    } else if (mtype_str == "eou") {
+        out_model.model_type = ParakeetModelType::EOU;
+    } else if (mtype_str == "nemotron") {
+        out_model.model_type = ParakeetModelType::NEMOTRON;
+    } else if (mtype_str == "sortformer") {
+        out_model.model_type = ParakeetModelType::SORTFORMER;
+    } else {
+        throw std::runtime_error(
+            "gguf: unsupported parakeet.model.type '" + mtype_str + "'");
+    }
 
     // Optional variant tag (empty for legacy GGUFs that predate the key).
     out_model.model_variant = get_str(g, "parakeet.model_variant", "");
+    if (out_model.model_type == ParakeetModelType::NEMOTRON) {
+        load_nemotron_metadata(g, out_model);
+    }
 
     if (out_model.model_type == ParakeetModelType::RNNT) {
         out_model.encoder_cfg.rnnt_pred_hidden =
@@ -1390,6 +1800,19 @@ int load_from_gguf(const std::string & gguf_path,
         out_model.sortformer.head_h2h_b = require_tensor(impl->ctx, "sortformer.head.first_hidden_to_hidden.bias");
         out_model.sortformer.head_h2s_w = require_tensor(impl->ctx, "sortformer.head.single_hidden_to_spks.weight");
         out_model.sortformer.head_h2s_b = require_tensor(impl->ctx, "sortformer.head.single_hidden_to_spks.bias");
+    } else if (out_model.model_type == ParakeetModelType::NEMOTRON) {
+        load_transducer_weights(
+            impl->ctx, "nemotron",
+            out_model.nemotron_cfg.pred_rnn_layers,
+            out_model.nemotron.rnnt);
+        out_model.nemotron.prompt.proj_0_w =
+            require_tensor(impl->ctx, "nemotron.prompt.proj.0.weight");
+        out_model.nemotron.prompt.proj_0_b =
+            require_tensor(impl->ctx, "nemotron.prompt.proj.0.bias");
+        out_model.nemotron.prompt.proj_2_w =
+            require_tensor(impl->ctx, "nemotron.prompt.proj.2.weight");
+        out_model.nemotron.prompt.proj_2_b =
+            require_tensor(impl->ctx, "nemotron.prompt.proj.2.bias");
     } else if (out_model.model_type == ParakeetModelType::RNNT) {
         load_transducer_weights(
             impl->ctx, "rnnt",
@@ -1398,6 +1821,10 @@ int load_from_gguf(const std::string & gguf_path,
         load_transducer_weights(
             impl->ctx, "tdt",
             out_model.encoder_cfg.tdt_pred_rnn_layers, out_model.tdt);
+    }
+
+    if (out_model.model_type == ParakeetModelType::NEMOTRON) {
+        validate_nemotron_model(out_model);
     }
 
     if (impl->backend_blas) {
@@ -1492,6 +1919,7 @@ const char * model_type_name(ParakeetModelType model_type) {
         case ParakeetModelType::RNNT:       return "rnnt";
         case ParakeetModelType::TDT:        return "tdt";
         case ParakeetModelType::EOU:        return "eou";
+        case ParakeetModelType::NEMOTRON:   return "nemotron";
         case ParakeetModelType::SORTFORMER: return "sortformer";
         case ParakeetModelType::CTC:
         default:                            return "ctc";
@@ -1550,6 +1978,18 @@ void print_model_summary(const ParakeetCtcModel & m) {
                           m.encoder_cfg.eou_cache_lookback_frames,
                           m.encoder_cfg.eou_cache_time_steps,
                           m.encoder_cfg.eou_max_symbols_per_step);
+    } else if (m.model_type == ParakeetModelType::NEMOTRON) {
+        PARAKEET_LOG_INFO(
+            "  nemotron: vocab=%d blank=%d prompts=%d pred_hidden=%d "
+            "pred_layers=%d joint_hidden=%d locales=%zu default_locale=%s\n",
+            m.vocab_size,
+            m.blank_id,
+            m.nemotron_cfg.num_prompts,
+            m.nemotron_cfg.pred_hidden,
+            m.nemotron_cfg.pred_rnn_layers,
+            m.nemotron_cfg.joint_hidden,
+            m.nemotron_cfg.locale_prompts.size(),
+            m.nemotron_cfg.default_locale.c_str());
     } else if (m.model_type == ParakeetModelType::SORTFORMER) {
         PARAKEET_LOG_INFO("  sortformer: num_spks=%d  fc_d_model=%d  tf=%dlx%dh d_model=%d inner=%d pre_ln=%d\n",
                           m.encoder_cfg.sortformer_num_spks,
@@ -1719,17 +2159,23 @@ std::vector<float> compute_rel_pos_encoding(int T, int D) {
 ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_front, int p_back) {
     if (p_front <= 0 && p_back <= 0) return x;
     ggml_tensor * y = x;
-    if (p_front > 0) {
-        ggml_tensor * head = ggml_view_4d(ctx, x, p_front, x->ne[1], x->ne[2], x->ne[3],
-                                          x->nb[1], x->nb[2], x->nb[3], 0);
+    int front_remaining = p_front;
+    while (front_remaining > 0) {
+        const int chunk = std::min<int64_t>(front_remaining, y->ne[0]);
+        ggml_tensor * head = ggml_view_4d(ctx, y, chunk, y->ne[1], y->ne[2], y->ne[3],
+                                          y->nb[1], y->nb[2], y->nb[3], 0);
         ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, head), 0.0f);
         y = ggml_concat(ctx, z, y, 0);
+        front_remaining -= chunk;
     }
-    if (p_back > 0) {
-        ggml_tensor * tail = ggml_view_4d(ctx, y, p_back, y->ne[1], y->ne[2], y->ne[3],
+    int back_remaining = p_back;
+    while (back_remaining > 0) {
+        const int chunk = std::min<int64_t>(back_remaining, y->ne[0]);
+        ggml_tensor * tail = ggml_view_4d(ctx, y, chunk, y->ne[1], y->ne[2], y->ne[3],
                                           y->nb[1], y->nb[2], y->nb[3], 0);
         ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, tail), 0.0f);
         y = ggml_concat(ctx, y, z, 0);
+        back_remaining -= chunk;
     }
     return y;
 }
@@ -1741,17 +2187,23 @@ ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_front, in
 ggml_tensor * zero_pad_dim1(ggml_context * ctx, ggml_tensor * x, int p_front, int p_back) {
     if (p_front <= 0 && p_back <= 0) return x;
     ggml_tensor * y = x;
-    if (p_front > 0) {
-        ggml_tensor * head = ggml_view_4d(ctx, x, x->ne[0], p_front, x->ne[2], x->ne[3],
-                                          x->nb[1], x->nb[2], x->nb[3], 0);
+    int front_remaining = p_front;
+    while (front_remaining > 0) {
+        const int chunk = std::min<int64_t>(front_remaining, y->ne[1]);
+        ggml_tensor * head = ggml_view_4d(ctx, y, y->ne[0], chunk, y->ne[2], y->ne[3],
+                                          y->nb[1], y->nb[2], y->nb[3], 0);
         ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, head), 0.0f);
         y = ggml_concat(ctx, z, y, 1);
+        front_remaining -= chunk;
     }
-    if (p_back > 0) {
-        ggml_tensor * tail = ggml_view_4d(ctx, y, y->ne[0], p_back, y->ne[2], y->ne[3],
+    int back_remaining = p_back;
+    while (back_remaining > 0) {
+        const int chunk = std::min<int64_t>(back_remaining, y->ne[1]);
+        ggml_tensor * tail = ggml_view_4d(ctx, y, y->ne[0], chunk, y->ne[2], y->ne[3],
                                           y->nb[1], y->nb[2], y->nb[3], 0);
         ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, tail), 0.0f);
         y = ggml_concat(ctx, y, z, 1);
+        back_remaining -= chunk;
     }
     return y;
 }
@@ -2502,6 +2954,113 @@ static int run_encoder_coreml(ParakeetCtcModel & model,
 }
 #endif  // PARAKEET_USE_COREML
 
+int run_nemotron_prompt_projection(
+    ParakeetCtcModel & model,
+    const float * encoder_out,
+    int n_frames,
+    int d_model,
+    int32_t prompt_id,
+    std::vector<float> & projected) {
+    projected.clear();
+    if (model.model_type != ParakeetModelType::NEMOTRON ||
+        !model.impl ||
+        !model.impl->backend_active ||
+        !encoder_out ||
+        n_frames <= 0 ||
+        d_model != model.encoder_cfg.d_model ||
+        prompt_id < 0 ||
+        prompt_id >= model.nemotron_cfg.num_prompts) {
+        return -1;
+    }
+
+    const int prompt_width = model.nemotron_cfg.prompt_width;
+    const int input_width = model.nemotron_cfg.prompt_input_width;
+    if (prompt_width != model.nemotron_cfg.num_prompts ||
+        input_width != d_model + prompt_width) {
+        return -2;
+    }
+
+    std::vector<float> conditioned_input(
+        static_cast<size_t>(input_width) * n_frames, 0.0f);
+    for (int frame = 0; frame < n_frames; ++frame) {
+        float * destination =
+            conditioned_input.data() + static_cast<size_t>(frame) * input_width;
+        const float * source =
+            encoder_out + static_cast<size_t>(frame) * d_model;
+        std::copy(source, source + d_model, destination);
+        destination[d_model + prompt_id] = 1.0f;
+    }
+
+    constexpr size_t graph_size = 64;
+    auto & cached = model.impl->nemotron_prompt_graph;
+    if (!cached || cached->n_frames != n_frames) {
+        cached = std::make_unique<NemotronPromptGraph>();
+        const size_t graph_memory =
+            ggml_tensor_overhead() * graph_size +
+            ggml_graph_overhead_custom(graph_size, false) +
+            16 * 1024;
+        ggml_init_params params = {};
+        params.mem_size = graph_memory;
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
+        cached->context = ggml_init(params);
+        if (!cached->context) {
+            cached.reset();
+            return -3;
+        }
+
+        cached->input = ggml_new_tensor_2d(
+            cached->context, GGML_TYPE_F32, input_width, n_frames);
+        ggml_set_input(cached->input);
+        ggml_tensor * hidden = ggml_mul_mat(
+            cached->context, model.nemotron.prompt.proj_0_w, cached->input);
+        hidden = ggml_add(
+            cached->context, hidden, model.nemotron.prompt.proj_0_b);
+        hidden = ggml_relu(cached->context, hidden);
+        cached->output = ggml_mul_mat(
+            cached->context, model.nemotron.prompt.proj_2_w, hidden);
+        cached->output = ggml_add(
+            cached->context, cached->output, model.nemotron.prompt.proj_2_b);
+        ggml_set_output(cached->output);
+
+        cached->graph =
+            ggml_new_graph_custom(cached->context, graph_size, false);
+        ggml_build_forward_expand(cached->graph, cached->output);
+
+        ggml_backend_t backend = model.impl->backend_active;
+        cached->allocator = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+        if (!cached->allocator ||
+            !ggml_gallocr_alloc_graph(cached->allocator, cached->graph)) {
+            cached.reset();
+            return -4;
+        }
+        cached->n_frames = n_frames;
+    }
+
+    NemotronPromptGraph & graph = *cached;
+    if (!ggml_gallocr_alloc_graph(graph.allocator, graph.graph)) {
+        return -4;
+    }
+    ggml_backend_tensor_set(
+        graph.input,
+        conditioned_input.data(),
+        0,
+        conditioned_input.size() * sizeof(float));
+    if (ggml_backend_graph_compute(
+            model.impl->backend_active, graph.graph) != GGML_STATUS_SUCCESS) {
+        return -5;
+    }
+
+    projected.resize(static_cast<size_t>(d_model) * n_frames);
+    ggml_backend_tensor_get(
+        graph.output,
+        projected.data(),
+        0,
+        projected.size() * sizeof(float));
+    return 0;
+}
+
 int run_encoder(ParakeetCtcModel   & model,
                 const float        * mel,
                 int                  n_mel_frames,
@@ -2643,7 +3202,8 @@ int run_encoder(ParakeetCtcModel   & model,
         return -4;
     }
 
-    out.n_enc_frames = T;
+    out.n_enc_frames =
+        model.model_type == ParakeetModelType::NEMOTRON ? V3 : T;
     out.d_model      = d_model;
     out.vocab_size   = vocab_size;
 

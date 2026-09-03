@@ -3,7 +3,8 @@
 Parakeet is a pure C++/ggml implementation of NVIDIA FastConformer ASR,
 end-of-turn detection, and Sortformer speaker diarization. Inference requires no
 Python, PyTorch, NeMo, or ONNX Runtime. A single `parakeet::Engine` loads CTC,
-RNN-T, TDT, EOU, or Sortformer GGUFs and selects the implementation from GGUF metadata.
+RNN-T, TDT, EOU, Nemotron, or Sortformer GGUFs and selects the implementation
+from GGUF metadata.
 
 ## Supported checkpoints
 
@@ -16,6 +17,7 @@ RNN-T, TDT, EOU, or Sortformer GGUFs and selects the implementation from GGUF me
 | `nvidia/parakeet-tdt-0.6b-v3` | TDT | 128 | 1024 × 24 | 8192 | 600 M | 715 MiB q8_0 / 1.34 GiB f16 | 0.006 q8_0 Metal | About 25 languages, with punctuation and capitalization |
 | `nvidia/parakeet-tdt-1.1b` | TDT | 80 | 1024 × 42 | 1024 | 1.1 B | 1225 MiB q8_0 | 0.027–0.079 Metal | English only; no punctuation or capitalization |
 | `nvidia/parakeet_realtime_eou_120m-v1` | RNN-T + `<EOU>` | 128 | 512 × 17 | 1027 | 120 M | 246 MiB f16 / 132 MiB q8_0 | 0.0052 Vulkan | English ASR and native end-of-turn token |
+| `nvidia/nemotron-3.5-asr-streaming-0.6b` | Prompt-conditioned RNN-T | 128 | 1024 × 24 | 13087 | 600 M | ~1.3 GiB f16 | 0.108 CPU | Locale-conditioned ASR; empty language selects `auto`; cache-aware streaming at 80/160/320/560/1120 ms |
 | `nvidia/diar_sortformer_4spk-v1` | Sortformer | 80 | 512 × 18 | n/a | 123 M | 263 MiB f16 / 141 MiB q8_0 / 75 MiB q4_0 | 0.0020 Vulkan | Up to four speakers; offline and sliding-history streaming |
 | `nvidia/diar_streaming_sortformer_4spk-v2` | Sortformer | 128 | 512 × 17 | n/a | 117 M | 251 MiB f16 / 134 MiB q8_0 / 72 MiB q4_0 | similar to v1 offline | Streaming-trained; sliding-history streaming |
 | `nvidia/diar_streaming_sortformer_4spk-v2.1` | Sortformer + AOSC | 128 | 512 × 17 | n/a | 117 M | 251 MiB f16 / 134 MiB q8_0 / 72 MiB q4_0 | similar to v1 offline | Audio-Online Speaker Cache preserves slots across long gaps |
@@ -29,6 +31,19 @@ Unified RNN-T uses standard greedy transducer decoding. Its encoder was trained
 with dynamic chunked convolution and attention, but this implementation runs it
 offline in full-context mode. Mode 2 and `StreamSession` use buffered window
 re-encoding; native NeMo cache-aware encoder state is not implemented.
+
+Nemotron offline inference uses the GGUF's default 320 ms operating point
+(`att_context_size=[56,3]`). `EngineOptions::language` accepts the locale aliases
+stored in the GGUF, and an empty value resolves to `auto`. The selected locale is
+broadcast as a 128-wide one-hot prompt, concatenated to every encoder frame, and
+projected before RNN-T decoding. The cache-aware streaming path incrementally
+converts arbitrary PCM bursts to mel frames, maintains bounded 56-frame
+attention and 8-frame convolution caches, and matches NeMo at all five supported
+operating points. Set `StreamingOptions::chunk_ms` to `80`, `160`, `320`, `560`,
+or `1120` to select the corresponding trained right-context configuration.
+Both callback streaming and live `StreamSession` input use the native caches;
+the sliding-window `left_context_ms` and `right_lookahead_ms` knobs are ignored
+for Nemotron.
 
 ## Build modes
 
@@ -301,10 +316,10 @@ Include `<parakeet/parakeet.h>` for the complete surface or individual headers.
 
 | API | Purpose |
 |---|---|
-| `Engine::transcribe` | One-shot WAV transcription for CTC, RNN-T, TDT, or EOU |
+| `Engine::transcribe` | One-shot WAV transcription for CTC, RNN-T, TDT, EOU, or Nemotron |
 | `Engine::transcribe_samples` | One-shot float PCM transcription |
-| `Engine::transcribe_stream` / `transcribe_samples_stream` | Mode 2: encode all audio once, then emit chunked callbacks |
-| `Engine::stream_start` | Mode 3 live session with rolling context and sliding-window re-encoding |
+| `Engine::transcribe_stream` / `transcribe_samples_stream` | Chunked callbacks; one offline encode for legacy families, native cache-aware streaming for Nemotron |
+| `Engine::stream_start` | Live session; rolling-window re-encoding for legacy families, native cache-aware streaming for Nemotron |
 | `StreamSession::feed_pcm_f32` / `feed_pcm_i16` | Push arbitrary-sized PCM blocks |
 | `Engine::diarize` / `diarize_samples` | Offline Sortformer diarization |
 | `Engine::diarize_start` | Live Sortformer session |
@@ -330,9 +345,11 @@ int main() {
 }
 ```
 
-Mode 3 is duplex rolling-context/sliding-window re-encoding. It re-runs the
-encoder for each window using `left_context_ms` and `right_lookahead_ms`; it
-does not maintain an encoder KV cache or convolution cache.
+Mode 3 is duplex rolling-context/sliding-window re-encoding for CTC, RNN-T, TDT,
+and EOU. It re-runs the encoder for each window using `left_context_ms` and
+`right_lookahead_ms`; it does not maintain an encoder KV cache or convolution
+cache. Nemotron Mode 3 uses the cache-aware encoder instead and ignores those
+window knobs.
 
 Always call `finalize()` to drain the partial tail. Destroying a
 `StreamSession` or `SortformerStreamSession` cancels it and does not finalize
@@ -345,7 +362,7 @@ wait for in-flight calls.
 call processing the audio. `StreamingSegment::is_eou_boundary` and
 `StreamEventType::EndOfTurn` mean the EOU model emitted `<EOU>`. They are not
 VAD state changes. Sortformer emits `VadStateChanged` from speaker
-probabilities. CTC/RNN-T/TDT can opt into RMS energy VAD with
+probabilities. CTC/RNN-T/TDT/Nemotron can opt into RMS energy VAD with
 `enable_energy_vad`; configure it with `energy_vad_threshold_db`,
 `energy_vad_window_ms`, and `energy_vad_hangover_ms`.
 
@@ -411,9 +428,14 @@ build-parakeet/parakeet \
 build-parakeet/parakeet \
   --model engines/parakeet/models/indic-conformer-600m-multilingual.q8_0.gguf \
   --wav engines/parakeet/test/samples/hi-16k.wav --language hi
+
+# Nemotron: locale alias or auto; empty also selects auto
+build-parakeet/parakeet \
+  --model engines/parakeet/models/nemotron-3.5-asr-streaming-0.6b.f16.gguf \
+  --wav engines/parakeet/test/samples/jfk.wav --language en-US
 ```
 
-`live-mic` runs CTC/RNN-T/TDT/EOU transcription or Sortformer diarization.
+`live-mic` runs CTC/RNN-T/TDT/EOU/Nemotron transcription or Sortformer diarization.
 `live-mic-attributed` combines a CTC/RNN-T/TDT/EOU ASR model with Sortformer.
 Both capture 16 kHz mono through miniaudio, accept independent streaming and
 backend options, and finalize tail audio on Ctrl-C.
@@ -512,4 +534,5 @@ Source: [workflow run 31603189415](https://github.com/tetherto/qvac/actions/runs
 
 Code is Apache-2.0. CTC, RNN-T, TDT, and Sortformer weights are CC-BY-4.0 unless
 their model card says otherwise. `parakeet_realtime_eou_120m-v1` uses the
-NVIDIA Open Model License. No weights are shipped by this repository.
+NVIDIA Open Model License. Nemotron 3.5 ASR Streaming 0.6B uses OpenMDW-1.1.
+No weights are shipped by this repository.
