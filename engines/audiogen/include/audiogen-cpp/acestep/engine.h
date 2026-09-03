@@ -161,6 +161,19 @@ struct GenerateParams {
     // NOTE: `lyrics` DEFAULTS to "[Instrumental]" — assign an empty string
     // explicitly for LM-written vocals, or every request stays instrumental.
     bool        simple_mode    = false;
+    // Synchronized lyric timestamps: after synthesis, one extra DiT forward at
+    // the final timestep captures the lyric cross-attention heads and DTW
+    // aligns each lyric line with the audio. The LRC text and its alignment
+    // score land in GenerateResult::metadata. Requires lyrics (with Simple
+    // Mode the LM-written lyrics are used) and is unavailable on the audio
+    // edit path.
+    bool        generate_lrc = false;
+    // Teacher-forced LM quality scoring of the generated audio codes against
+    // the resolved request (Simple Mode scores what the LM composed). Fills
+    // GenerateMetadata::quality_score / quality_report at the cost of extra
+    // LM forwards after code generation. Requires the LM code path, so it is
+    // rejected for cover / lego tasks and on the audio edit path.
+    bool        compute_quality_score = false;
     // Official sampler-side Haar DCW "double" correction. Applied on turbo
     // DiTs only: the official preset disables DCW for base/sft models.
     bool        dcw_enabled     = true;
@@ -222,6 +235,15 @@ struct GenerateMetadata {
     int         timesignature = 0;
     long long   seed = 0;
     int         n_codes = 0;
+    // Filled when GenerateParams::generate_lrc is set: LRC-formatted lyric
+    // timestamps and the alignment confidence score in [0, 1].
+    std::string lrc;
+    double      lyrics_score = 0.0;
+    // Populated only when GenerateParams::compute_quality_score was set:
+    // weighted global quality in [0, 1] (caption/lyrics PMI + metadata
+    // recall) and its human-readable per-condition breakdown.
+    double      quality_score = 0.0;
+    std::string quality_report;
 };
 
 struct GenerateResult {
@@ -231,9 +253,37 @@ struct GenerateResult {
     GenerateMetadata   metadata;
 };
 
+// Reverse pipeline (audio understanding): audio in, musical description out.
+struct UnderstandParams {
+    // Required: normalized interleaved stereo PCM at 48 kHz, [t*2 + ch].
+    std::vector<float> audio;
+    // Optional language hint (e.g. "es"); forced through the metadata FSM and
+    // echoed to the result instead of the LM's guess.
+    std::string vocal_language;
+    // LM sampling. Defaults mirror the generation LM.
+    float     lm_temperature = 0.85f;
+    float     lm_top_p       = 0.9f;
+    int       lm_top_k       = 0;   // 0 = disabled (top_p only)
+    long long seed           = -1;  // <0 = random
+};
+
+// What the listener heard. Lyrics are intentionally NOT reported: the LM's
+// transcription hallucinates on real songs, so the field is unsupported.
+struct UnderstandResult {
+    std::string      caption;         // descriptive caption of the audio
+    int              bpm = 0;
+    float            duration = 0.0f; // LM estimate in seconds (codes fix the true length)
+    std::string      keyscale;
+    std::string      timesignature;
+    std::string      vocal_language;
+    std::vector<int> audio_codes;     // recovered FSQ codes; reusable as GenerateParams::audio_codes
+    long long        seed = 0;
+};
+
 // Optional progress callback: stage name
-// ("reference"|"source"|"lm"|"dit"|"vae"), current step, total steps
-// (total <= 0 when unknown). Return false to request cancellation.
+// ("reference"|"source"|"lm"|"score"|"tok"|"understand"|"dit"|"vae"),
+// current step, total steps (total <= 0 when unknown). Return false to
+// request cancellation.
 using ProgressFn = std::function<bool(const std::string & stage, int step, int total)>;
 
 class AUDIOGEN_API Engine {
@@ -251,7 +301,15 @@ public:
     // Generate music from a text prompt. Empty pcm on cancellation.
     GenerateResult generate(const GenerateParams & params, const ProgressFn & progress = {}) const;
 
-    // Cooperative cancel for an in-flight generate() on another thread.
+    // Describe audio: VAE-encode it, FSQ-tokenize the latents, and let the LM
+    // report metadata, caption, and the recovered codes. Stages report as
+    // "source" (VAE encode), "tok", and "understand" (LM decode, unknown
+    // total). Empty caption and codes on cancellation. Throws
+    // std::runtime_error on invalid input or a failed stage.
+    UnderstandResult understand(const UnderstandParams & params, const ProgressFn & progress = {}) const;
+
+    // Cooperative cancel for an in-flight generate() or understand() on
+    // another thread.
     void cancel() const;
 
     int         sample_rate() const;  // 48000

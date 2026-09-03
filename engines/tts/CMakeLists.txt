@@ -558,6 +558,14 @@ if (TTS_CPP_BUILD_EXECUTABLES)
     target_include_directories(lavasr-bench PRIVATE include ggml/include src)
     tts_cpp_apply_ccache(lavasr-bench)
 
+    # Supertonic single-pass bench (--text / --runs / --json-out). Sits with
+    # the other -bench CLIs rather than the TESTS block so the standalone
+    # benchmark workflow can build it with SPEECH_BUILD_TESTS=OFF.
+    add_executable(supertonic-bench src/supertonic_bench.cpp)
+    target_link_libraries(supertonic-bench PRIVATE tts-cpp)
+    target_include_directories(supertonic-bench PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(supertonic-bench)
+
     # CosyVoice3 end-to-end CLI: text -> 24 kHz WAV via the public Engine (the
     # same API the JS addon / @qvac/sdk drive).  See src/cosyvoice_cli.cpp.
     add_executable(cosyvoice-cli src/cosyvoice_cli.cpp)
@@ -2954,15 +2962,6 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-supertonic-f16-attn-parity)
     tts_cpp_register_test(test-supertonic-f16-attn-parity LABEL "unit")
 
-    # supertonic-bench is a benchmark CLI (takes --text / --out / --runs),
-    # not a parity test, so it doesn't go through add_supertonic_harness
-    # which auto-registers everything as a positional-args (MODEL, REF_DIR)
-    # ctest target.  Built unconditionally with the rest of the test set
-    # so `cmake --build --target supertonic-bench` works the same way.
-    add_executable(supertonic-bench src/supertonic_bench.cpp)
-    target_link_libraries(supertonic-bench PRIVATE tts-cpp)
-    target_include_directories(supertonic-bench PRIVATE ggml/include src include)
-    tts_cpp_apply_ccache(supertonic-bench)
 endif()
 
 set(TTS_CPP_POINTWISE_ACCEL_TARGETS

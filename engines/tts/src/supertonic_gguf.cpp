@@ -697,13 +697,21 @@ bool backend_supports_f16_src1_mul_mat_uncached(ggml_backend_t backend) {
 // visible in cold-start traces, and the cache eliminates 100 % of
 // the redundancy.
 //
-// Cache shape: `unordered_map<ggml_backend_t, probe_results>`.
-// Key is the backend handle (stable for the backend's lifetime;
-// recycled keys after a backend is freed are technically possible
-// but the per-handle entry cost is ~24 bytes, so we don't bother
-// invalidating on free).  Test seam: `supertonic_clear_capability_cache`
-// drops every entry — used by the unit test to verify the cache
-// is hit on the second call.
+// Cache shape: `unordered_map<ggml_backend_dev_t, probe_results>`.
+// Key is the backend's DEVICE, not the backend instance: every probe
+// resolves through the device (`ggml_backend_supports_op` forwards to
+// the device's supports_op), so capabilities are a per-device property,
+// and devices are backend-registry singletons that live for the
+// process. Keying by the transient `ggml_backend_t` handle was a real
+// bug, not a space tradeoff: entries were never invalidated, so when a
+// freed backend's heap address was recycled by a LATER backend of a
+// DIFFERENT type, the stale entry replayed the old backend's
+// capabilities — e.g. a CPU backend's fused_supertonic_ops=true onto a
+// CUDA backend, which then aborted in ggml-cuda on the unimplemented
+// GGML_OP_SUPERTONIC_DEPTHWISE_1D (intermittent by allocator luck; hit
+// on the qvac tts-ggml linux-x64 CUDA integration lane).  Test seam:
+// `supertonic_clear_capability_cache` drops every entry — used by the
+// unit test to verify the cache is hit on the second call.
 //
 // Thread-safety: guarded by a single std::mutex.  Hot path is
 // load-time only, never the per-synth path, so contention is
@@ -745,8 +753,8 @@ inline std::mutex & capability_cache_mu() {
     static std::mutex m;
     return m;
 }
-inline std::unordered_map<ggml_backend_t, backend_capabilities> & capability_cache() {
-    static std::unordered_map<ggml_backend_t, backend_capabilities> c;
+inline std::unordered_map<ggml_backend_dev_t, backend_capabilities> & capability_cache() {
+    static std::unordered_map<ggml_backend_dev_t, backend_capabilities> c;
     return c;
 }
 // Probe-call counter for the regression test in
@@ -802,9 +810,13 @@ std::atomic<uint64_t> & capability_probe_call_counter() {
 //      switch to `std::shared_ptr<const backend_capabilities>`
 //      ownership.
 const backend_capabilities & cached_backend_capabilities(ggml_backend_t backend) {
+    // Device, not instance, is the cache identity (see the cache-shape
+    // comment above). A null device never happens for a registry-created
+    // backend; mapping it to the nullptr key keeps the function total.
+    ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
     std::lock_guard<std::mutex> lk(capability_cache_mu());
     auto & c = capability_cache();
-    auto it = c.find(backend);
+    auto it = c.find(dev);
     if (it != c.end()) return it->second;
     capability_probe_call_counter().fetch_add(1, std::memory_order_relaxed);
     backend_capabilities caps;
@@ -816,7 +828,7 @@ const backend_capabilities & cached_backend_capabilities(ggml_backend_t backend)
     caps.bf16_kv_flash_attn  = backend_supports_bf16_kv_flash_attn_uncached(backend);
     caps.pinned_host_buffer  = backend_supports_pinned_host_buffer_uncached(backend);
     caps.fused_supertonic_ops = backend_supports_fused_supertonic_ops(backend);
-    return c.emplace(backend, caps).first->second;
+    return c.emplace(dev, caps).first->second;
 }
 
 // Backwards-compatible name kept for the in-tree callers that already
