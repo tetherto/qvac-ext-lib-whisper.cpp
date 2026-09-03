@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,18 @@ struct MelState {
     const std::vector<float> *       window_padded_src   = nullptr;
 };
 
+struct IncrementalMelState {
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+
+    IncrementalMelState();
+    ~IncrementalMelState();
+    IncrementalMelState(IncrementalMelState &&) noexcept;
+    IncrementalMelState & operator=(IncrementalMelState &&) noexcept;
+    IncrementalMelState(const IncrementalMelState &) = delete;
+    IncrementalMelState & operator=(const IncrementalMelState &) = delete;
+};
+
 int compute_log_mel(const float        * samples,
                     int                  n_samples,
                     const MelConfig    & cfg,
@@ -88,6 +101,17 @@ int compute_log_mel(const float        * samples,
                     MelState           & state,
                     std::vector<float> & out_mel,
                     int                & out_n_frames);
+
+int append_log_mel(
+    const float * samples,
+    int n_samples,
+    bool finalize,
+    const MelConfig & cfg,
+    IncrementalMelState & state,
+    std::vector<float> & out_mel,
+    int & out_n_frames);
+
+void reset_incremental_mel(IncrementalMelState & state);
 
 void apply_per_feature_cmvn(std::vector<float> & mel,
                             int                  n_frames,

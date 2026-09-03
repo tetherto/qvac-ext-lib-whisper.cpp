@@ -207,11 +207,85 @@ struct TdtWeights {
 
 using RnntWeights = TdtWeights;
 
+struct NemotronLocalePrompt {
+    std::string alias;
+    int32_t prompt_id = -1;
+};
+
+struct NemotronConfig {
+    int pred_hidden = 0;
+    int pred_rnn_layers = 0;
+    int joint_hidden = 0;
+    int max_symbols_per_step = 0;
+
+    int num_prompts = 0;
+    int prompt_width = 0;
+    int prompt_input_width = 0;
+    // Streaming cache geometry from GGUF metadata. The cache-aware
+    // encoder reads these rather than hard-coded 56 / 8 frame counts.
+    int left_context_frames = 0;
+    int cache_time_steps = 0;
+
+    std::vector<int32_t> allowed_right_context_frames;
+    std::vector<int32_t> allowed_chunk_ms;
+    std::vector<NemotronLocalePrompt> locale_prompts;
+    std::string default_locale;
+};
+
+struct NemotronPromptWeights {
+    ggml_tensor * proj_0_w = nullptr;
+    ggml_tensor * proj_0_b = nullptr;
+    ggml_tensor * proj_2_w = nullptr;
+    ggml_tensor * proj_2_b = nullptr;
+};
+
+struct NemotronWeights {
+    RnntWeights rnnt;
+    NemotronPromptWeights prompt;
+};
+
+struct TdtRuntimeWeights;
+
+struct NemotronStreamStepResult {
+    std::vector<float> encoder_raw;
+    std::vector<float> encoder_conditioned;
+    std::vector<int32_t> new_token_ids;
+    std::string text;
+    int encoder_frames = 0;
+    int decoder_steps = 0;
+};
+
+struct NemotronStreamState {
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+
+    std::vector<float> cache_channel;
+    std::vector<float> cache_time;
+    std::vector<int32_t> token_ids;
+
+    int cache_length = 0;
+    int prompt_id = -1;
+    int right_context_frames = -1;
+    int step_index = 0;
+    int64_t emitted_encoder_frames = 0;
+    int max_graph_encoder_frames = 0;
+    bool cancelled = false;
+    bool finalized = false;
+
+    NemotronStreamState();
+    ~NemotronStreamState();
+    NemotronStreamState(NemotronStreamState &&) noexcept;
+    NemotronStreamState & operator=(NemotronStreamState &&) noexcept;
+    NemotronStreamState(const NemotronStreamState &) = delete;
+    NemotronStreamState & operator=(const NemotronStreamState &) = delete;
+};
+
 enum class ParakeetModelType {
     CTC,
     RNNT,
     TDT,
     EOU,
+    NEMOTRON,
     SORTFORMER,
 };
 
@@ -318,6 +392,9 @@ struct ParakeetCtcModel {
     // on Mali-Vulkan, where the head runs on CPU while the encoder stays on GPU.
     SortformerWeights         sortformer_cpu;
 
+    NemotronConfig nemotron_cfg;
+    NemotronWeights nemotron;
+
     ggml_tensor * mel_filterbank = nullptr;
     ggml_tensor * window         = nullptr;
 
@@ -355,6 +432,11 @@ int load_from_gguf(const std::string & gguf_path,
 
 void print_model_summary(const ParakeetCtcModel & m);
 const char * model_type_name(ParakeetModelType model_type);
+
+void validate_nemotron_model(const ParakeetCtcModel & model);
+int32_t resolve_nemotron_prompt_id(
+    const ParakeetCtcModel & model,
+    const std::string & language);
 
 bool        model_has_gpu_backend(const ParakeetCtcModel & m);
 // True when a GPU was detected but routed to CPU as a known-bad backend (Mali).
@@ -424,6 +506,56 @@ int run_encoder(ParakeetCtcModel   & model,
                 EncoderOutputs     & out,
                 int                  max_layers = -1,
                 bool                 capture_intermediates = true);
+
+// Apply Nemotron's locale one-hot concatenation and two-layer projection to
+// row-major encoder output shaped (n_frames, d_model).
+int run_nemotron_prompt_projection(
+    ParakeetCtcModel & model,
+    const float * encoder_out,
+    int n_frames,
+    int d_model,
+    int32_t prompt_id,
+    std::vector<float> & projected);
+
+int init_nemotron_stream_state(
+    const ParakeetCtcModel & model,
+    const std::string & language,
+    int right_context_frames,
+    NemotronStreamState & state);
+
+int append_nemotron_mel_frames(
+    NemotronStreamState & state,
+    const float * mel,
+    int n_frames,
+    int n_mels);
+
+int append_nemotron_pcm(
+    const ParakeetCtcModel & model,
+    NemotronStreamState & state,
+    const float * samples,
+    int n_samples,
+    bool finalize);
+
+int next_nemotron_processed_signal(
+    NemotronStreamState & state,
+    int n_mels,
+    bool finalize,
+    std::vector<float> & processed_signal,
+    int & n_frames);
+
+int run_nemotron_stream_step(
+    ParakeetCtcModel & model,
+    TdtRuntimeWeights & runtime,
+    const float * processed_signal,
+    int n_mel_frames,
+    int n_mels,
+    bool finalize,
+    NemotronStreamState & state,
+    NemotronStreamStepResult & result);
+
+void cancel_nemotron_stream(NemotronStreamState & state);
+void reset_nemotron_stream(NemotronStreamState & state);
+int nemotron_pending_mel_frames(const NemotronStreamState & state);
 
 // Run the conformer block stack on pre-subsampled embeddings, skipping the
 // subsampling/pre_encode block. Used by the v2.1 streaming (AOSC) path where
