@@ -4,7 +4,6 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
-#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -422,10 +421,10 @@ std::vector<int> quality_encode_target(const BpeTokenizer & bpe, const std::stri
         if (next == text.size()) break;
         if (next == think) {
             ids.push_back(TOKEN_THINK);
-            pos = next + std::strlen("<think>");
+            pos = next + strlen("<think>");
         } else {
             ids.push_back(TOKEN_THINK_END);
-            pos = next + std::strlen("</think>");
+            pos = next + strlen("</think>");
         }
     }
     return ids;
