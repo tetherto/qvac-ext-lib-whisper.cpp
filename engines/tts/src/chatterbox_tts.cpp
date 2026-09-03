@@ -23,6 +23,9 @@
 
 #include "backend_selection.h"
 #include "backend_util.h"
+#include "chatterbox_fit_internal.h"
+#include "fit_price.h"
+#include "fit_util.h"
 #include "sched_dispatch.h"
 #include "gguf_stream.h"
 #include "ggml.h"
@@ -212,7 +215,12 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers, bool verbose) {
 // stays alive for the lifetime of the process (we never evict), which
 // matches the streaming CLI's single-voice use case.  A proper LRU would
 // belong in a server front-end.
-static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose);
+// When `measure_bytes` is non-null the load is metadata-only: the weight
+// buffer is SIZED instead of allocated, tensors come back marked externally
+// allocated (dummy non-null data) for size-only graph pricing, and no tensor
+// data is read.  See include/tts-cpp/chatterbox/fit.h.
+static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose,
+                                 size_t * measure_bytes = nullptr);
 
 // Tears down every per-synth host-side cache before ggml_backend_free
 // runs: the CFM estimator graph cache, the encoder / HiFT / F0 graph
@@ -328,7 +336,8 @@ static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_lay
 
 static double s3gen_model_cache_last_load_ms() { return g_s3gen_cache_last_load_ms; }
 
-static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose) {
+static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose,
+                                 size_t * measure_bytes) {
     model_ctx m;
     // no_alloc=true: tmp_ctx carries tensor METADATA only; payloads are
     // streamed straight from the file into the backend buffer below so the
@@ -354,6 +363,19 @@ static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, boo
         ggml_set_name(dst, name);
         m.tensors[name] = dst;
     }
+    if (measure_bytes) {
+        *measure_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            m.ctx_w, ggml_backend_get_default_buffer_type(m.backend));
+        // Same trick ggml's own measure paths use: mark every weight tensor
+        // externally allocated so size-only graph pricing excludes it.  The
+        // model must never have tensor data read or written after this.
+        for (ggml_tensor * cur = ggml_get_first_tensor(m.ctx_w); cur;
+             cur = ggml_get_next_tensor(m.ctx_w, cur)) {
+            if (!cur->data && !cur->view_src) {
+                cur->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+            }
+        }
+    } else {
     m.buffer_w = ggml_backend_alloc_ctx_tensors(m.ctx_w, m.backend);
     {
         auto fail = [&](const std::string & what) {
@@ -375,6 +397,7 @@ static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, boo
             }
         }
     }
+    }  // end !measure_bytes
     // NOTE: ALL scheduler setup (m.sched_fb's backends and the buffer_w
     // USAGE_WEIGHTS flag) is done lazily in s3gen_sched_prepare on the
     // synthesis thread — NOT here. load_s3gen_gguf runs in the s3gen_preload
@@ -938,25 +961,22 @@ static const std::vector<float> & cached_pos_emb(int T, int D) {
 // stable T) skip the rebuild + gallocr_reserve.  pos_emb
 // vectors are cached separately by cached_pos_emb (keyed on (T, D));
 // re-used across every same-T synth.
-static std::vector<float> run_encoder(const model_ctx & m, const std::vector<float> & input_embed, int T, int D = 512) {
+// Graph half of run_encoder, shared with the fit projector
+// (s3gen_measure_fit) so the priced graph is the executed graph by
+// construction.  Resets `cache` and rebuilds its ctx/graph for length T; the
+// caller creates the gallocr (or prices the graph without one).
+static void build_encoder_graph_nodes(graph_cache & cache, const model_ctx & m, int T, int D) {
     const int H = 8, HEAD_DIM = 64;
     const int T2 = 2 * T;
-
-    graph_cache & cache = g_encoder_graph_cache;
-    const bool build_graph = (cache.key != (int64_t) T) || (cache.ctx == nullptr);
-    if (build_graph) {
-        if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
-        if (cache.ctx)    { ggml_free(cache.ctx);            cache.ctx    = nullptr; }
-        cache.buf.resize(64 * 1024 * 1024);
-        ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
-        cache.ctx = ggml_init(gp);
-        cache.gf  = ggml_new_graph_custom(cache.ctx, 32768, false);
-        cache.key = (int64_t) T;
-    }
+    if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
+    if (cache.ctx)    { ggml_free(cache.ctx);            cache.ctx    = nullptr; }
+    cache.buf.resize(64 * 1024 * 1024);
+    ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
+    cache.ctx = ggml_init(gp);
+    cache.gf  = ggml_new_graph_custom(cache.ctx, 32768, false);
+    cache.key = (int64_t) T;
     ggml_context * ctx = cache.ctx;
     ggml_cgraph * gf = cache.gf;
-
-    if (build_graph) {
 
     ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
     ggml_set_name(x_in, "x_in"); ggml_set_input(x_in);
@@ -1038,10 +1058,18 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     ggml_tensor * mu = ggml_add(ctx, ggml_mul_mat(ctx, epw, x), epb);
     ggml_set_name(mu, "mu"); ggml_set_output(mu);
     ggml_build_forward_expand(gf, mu);
+}
 
-    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    ggml_gallocr_reserve(cache.allocr, gf);
-    }  // end build_graph
+static std::vector<float> run_encoder(const model_ctx & m, const std::vector<float> & input_embed, int T, int D = 512) {
+    const int T2 = 2 * T;
+
+    graph_cache & cache = g_encoder_graph_cache;
+    if (cache.key != (int64_t) T || cache.ctx == nullptr) {
+        build_encoder_graph_nodes(cache, m, T, D);
+        cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+        ggml_gallocr_reserve(cache.allocr, cache.gf);
+    }
+    ggml_cgraph * gf = cache.gf;
 
     ggml_gallocr_alloc_graph(cache.allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), input_embed.data(), 0, input_embed.size()*sizeof(float));
@@ -1510,40 +1538,30 @@ static std::vector<float> compute_time_emb_cached(const model_ctx & m, float t_v
 
 // Single estimator forward: (x, mu, t_emb, spks, cond) -> dxdt
 // All shapes are numpy (80, T) or (80,) as given, flattened row-major.
-static std::vector<float> cfm_estimator_forward(
-    const model_ctx & m,
-    cfm_estimator_cache & cache,
-    const std::vector<float> & x,
-    const std::vector<float> & mu,
-    const std::vector<float> & t_emb,
-    const std::vector<float> & spks,
-    const std::vector<float> & cond,
-    int T,
-    bool f16_kv_attn) {
+// Graph half of cfm_estimator_forward, shared with the fit projector
+// (s3gen_measure_fit).  Resets `cache` and rebuilds its ctx/graph for (T,
+// b2=false); the caller creates the gallocr (or prices without one).
+static void build_cfm_graph_nodes(cfm_estimator_cache & cache, const model_ctx & m,
+                                  int T, bool f16_kv_attn) {
     const int MEL = 80, CH = 256, TIME_DIM = 1024;
     const int N_MID = 12, N_BLOCKS = 4;
     const bool use_unfused = m.is_mali && !chbx_force_cfm_fa();
 
-    const bool build_graph = (cache.T != T) || cache.b2;
-    if (build_graph) {
-        if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
-        if (cache.ctx) { ggml_free(cache.ctx); cache.ctx = nullptr; }
-        // 64 MB is comfortable headroom for ~1500 tensor headers + 65536-node
-        // graph metadata at no_alloc=true (the buffer holds tensor structs
-        // and graph book-keeping only, not weight data).  Was 256 MB before;
-        // dropped after measuring real usage at <8 MB and noticing that the
-        // virtual reservation was inflating RSS on systems without overcommit.
-        cache.buf.resize(64 * 1024 * 1024);
-        ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
-        cache.ctx = ggml_init(gp);
-        cache.gf = ggml_new_graph_custom(cache.ctx, 65536, false);
-        cache.T  = T;
-        cache.b2 = false;
-    }
+    if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
+    if (cache.ctx) { ggml_free(cache.ctx); cache.ctx = nullptr; }
+    // 64 MB is comfortable headroom for ~1500 tensor headers + 65536-node
+    // graph metadata at no_alloc=true (the buffer holds tensor structs
+    // and graph book-keeping only, not weight data).  Was 256 MB before;
+    // dropped after measuring real usage at <8 MB and noticing that the
+    // virtual reservation was inflating RSS on systems without overcommit.
+    cache.buf.resize(64 * 1024 * 1024);
+    ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
+    cache.ctx = ggml_init(gp);
+    cache.gf = ggml_new_graph_custom(cache.ctx, 65536, false);
+    cache.T  = T;
+    cache.b2 = false;
     ggml_context * ctx = cache.ctx;
     ggml_cgraph * gf = cache.gf;
-
-    if (build_graph) {
 
     ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, MEL); ggml_set_name(x_in, "x_in"); ggml_set_input(x_in);
     ggml_tensor * mu_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, MEL); ggml_set_name(mu_in, "mu_in"); ggml_set_input(mu_in);
@@ -1594,10 +1612,24 @@ static std::vector<float> cfm_estimator_forward(
     out = ggml_add(ctx, out, ggml_reshape_2d(ctx, fp_b, 1, MEL));
     ggml_set_name(out, "out"); ggml_set_output(out);
     ggml_build_forward_expand(gf, out);
+}
 
-    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    ggml_gallocr_reserve(cache.allocr, gf);
-    }  // end graph-build block
+static std::vector<float> cfm_estimator_forward(
+    const model_ctx & m,
+    cfm_estimator_cache & cache,
+    const std::vector<float> & x,
+    const std::vector<float> & mu,
+    const std::vector<float> & t_emb,
+    const std::vector<float> & spks,
+    const std::vector<float> & cond,
+    int T,
+    bool f16_kv_attn) {
+    if (cache.T != T || cache.b2) {
+        build_cfm_graph_nodes(cache, m, T, f16_kv_attn);
+        cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+        ggml_gallocr_reserve(cache.allocr, cache.gf);
+    }
+    ggml_cgraph * gf = cache.gf;
 
     // Tried: run one dummy compute right after gallocr_reserve to pre-warm
     // Vulkan's first-dispatch state (shader residency / memory pool / command
@@ -1635,41 +1667,29 @@ static std::vector<float> cfm_estimator_forward(
 // estimator-call count — the expensive weight-tensor reads amortise across
 // both batch elements, so the pipeline gets close to a 2× speedup on CPU
 // where the decoder is memory-bandwidth bound.
-static void cfm_estimator_forward_b2(
-    const model_ctx & m,
-    cfm_estimator_cache & cache,
-    const std::vector<float> & x_c,     const std::vector<float> & x_u,
-    const std::vector<float> & mu_c,    const std::vector<float> & mu_u,
-    const std::vector<float> & t_emb_c, const std::vector<float> & t_emb_u,
-    const std::vector<float> & spks_c,  const std::vector<float> & spks_u,
-    const std::vector<float> & cond_c,  const std::vector<float> & cond_u,
-    std::vector<float> & out_c, std::vector<float> & out_u,
-    int T,
-    bool f16_kv_attn) {
+// Graph half of cfm_estimator_forward_b2 (batch=2 CFG), shared with the fit
+// projector.  Resets `cache` and rebuilds its ctx/graph for (T, b2=true).
+static void build_cfm_graph_nodes_b2(cfm_estimator_cache & cache, const model_ctx & m,
+                                     int T, bool f16_kv_attn) {
     const int MEL = 80, CH = 256, TIME_DIM = 1024;
     const int N_MID = 12, N_BLOCKS = 4;
     const int B = 2;
     const bool use_unfused = m.is_mali && !chbx_force_cfm_fa();
 
-    const bool build_graph = (cache.T != T) || !cache.b2;
-    if (build_graph) {
-        if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
-        if (cache.ctx) { ggml_free(cache.ctx); cache.ctx = nullptr; }
-        // 64 MB is plenty for 65536 graph nodes + ~3000 tensor headers (the
-        // batch=2 graph roughly doubles tensor count vs the batch=1 path).
-        // Was 512 MB before — see cfm_estimator_forward for the rationale on
-        // why the original number was overspec.
-        cache.buf.resize(64 * 1024 * 1024);
-        ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
-        cache.ctx = ggml_init(gp);
-        cache.gf = ggml_new_graph_custom(cache.ctx, 65536, false);
-        cache.T  = T;
-        cache.b2 = true;
-    }
+    if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
+    if (cache.ctx) { ggml_free(cache.ctx); cache.ctx = nullptr; }
+    // 64 MB is plenty for 65536 graph nodes + ~3000 tensor headers (the
+    // batch=2 graph roughly doubles tensor count vs the batch=1 path).
+    // Was 512 MB before — see cfm_estimator_forward for the rationale on
+    // why the original number was overspec.
+    cache.buf.resize(64 * 1024 * 1024);
+    ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
+    cache.ctx = ggml_init(gp);
+    cache.gf = ggml_new_graph_custom(cache.ctx, 65536, false);
+    cache.T  = T;
+    cache.b2 = true;
     ggml_context * ctx = cache.ctx;
     ggml_cgraph * gf = cache.gf;
-
-    if (build_graph) {
 
     ggml_tensor * x_in    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, B); ggml_set_name(x_in, "x_in");       ggml_set_input(x_in);
     ggml_tensor * mu_in   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, B); ggml_set_name(mu_in, "mu_in");     ggml_set_input(mu_in);
@@ -1722,10 +1742,27 @@ static void cfm_estimator_forward_b2(
     out = ggml_add(ctx, out, ggml_reshape_2d(ctx, fp_b, 1, MEL));
     ggml_set_name(out, "out"); ggml_set_output(out);
     ggml_build_forward_expand(gf, out);
+}
 
-    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    ggml_gallocr_reserve(cache.allocr, gf);
+static void cfm_estimator_forward_b2(
+    const model_ctx & m,
+    cfm_estimator_cache & cache,
+    const std::vector<float> & x_c,     const std::vector<float> & x_u,
+    const std::vector<float> & mu_c,    const std::vector<float> & mu_u,
+    const std::vector<float> & t_emb_c, const std::vector<float> & t_emb_u,
+    const std::vector<float> & spks_c,  const std::vector<float> & spks_u,
+    const std::vector<float> & cond_c,  const std::vector<float> & cond_u,
+    std::vector<float> & out_c, std::vector<float> & out_u,
+    int T,
+    bool f16_kv_attn) {
+    const int MEL = 80, TIME_DIM = 1024;
+
+    if (cache.T != T || !cache.b2) {
+        build_cfm_graph_nodes_b2(cache, m, T, f16_kv_attn);
+        cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+        ggml_gallocr_reserve(cache.allocr, cache.gf);
     }
+    ggml_cgraph * gf = cache.gf;
 
     ggml_gallocr_alloc_graph(cache.allocr, gf);
 
@@ -1933,22 +1970,17 @@ static const std::vector<float> & cached_inv_alpha(const model_ctx & m,
 // Graph + gallocator cached process-wide via g_f0_graph_cache (keyed
 // on T_mel).  Same-shape calls (e.g. streaming chunks at constant
 // T_mel) skip the rebuild + gallocr_reserve.
-static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vector<float> & mel, int T_mel) {
-    graph_cache & cache = g_f0_graph_cache;
-    const bool build_graph = (cache.key != (int64_t) T_mel) || (cache.ctx == nullptr);
-    if (build_graph) {
-        if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
-        if (cache.ctx)    { ggml_free(cache.ctx);            cache.ctx    = nullptr; }
-        cache.buf.resize(8 * 1024 * 1024);
-        ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
-        cache.ctx = ggml_init(gp);
-        cache.gf  = ggml_new_graph_custom(cache.ctx, 1024, false);
-        cache.key = (int64_t) T_mel;
-    }
+// Graph half of run_f0_predictor, shared with the fit projector.
+static void build_f0_graph_nodes(graph_cache & cache, const model_ctx & m, int T_mel) {
+    if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
+    if (cache.ctx)    { ggml_free(cache.ctx);            cache.ctx    = nullptr; }
+    cache.buf.resize(8 * 1024 * 1024);
+    ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
+    cache.ctx = ggml_init(gp);
+    cache.gf  = ggml_new_graph_custom(cache.ctx, 1024, false);
+    cache.key = (int64_t) T_mel;
     ggml_context * ctx = cache.ctx;
     ggml_cgraph * gf = cache.gf;
-
-    if (build_graph) {
 
     ggml_tensor * mel_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_mel, 80);
     ggml_set_name(mel_in, "mel_in"); ggml_set_input(mel_in);
@@ -1978,9 +2010,16 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
     y = ggml_reshape_1d(ctx, y, T_mel);
     ggml_set_name(y, "out"); ggml_set_output(y);
     ggml_build_forward_expand(gf, y);
-    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    ggml_gallocr_reserve(cache.allocr, gf);
-    }  // end build_graph
+}
+
+static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vector<float> & mel, int T_mel) {
+    graph_cache & cache = g_f0_graph_cache;
+    if (cache.key != (int64_t) T_mel || cache.ctx == nullptr) {
+        build_f0_graph_nodes(cache, m, T_mel);
+        cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+        ggml_gallocr_reserve(cache.allocr, cache.gf);
+    }
+    ggml_cgraph * gf = cache.gf;
 
     ggml_gallocr_alloc_graph(cache.allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mel_in"), mel.data(), 0, mel.size()*sizeof(float));
@@ -2040,36 +2079,43 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int 
 // s3gen_release_synth_caches() before ggml_backend_free, so the cached
 // gallocator releases against a still-valid backend on backend swap or
 // s3gen_unload().
+// Graph half of run_stft, shared with the fit projector.
+static void build_stft_graph_nodes(graph_cache & cache, const model_ctx & m, int T_src) {
+    const int n_fft = 16, hop = 4;
+    const int F = n_fft / 2 + 1;
+    (void) m;
+    if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
+    if (cache.ctx)    { ggml_free(cache.ctx);            cache.ctx    = nullptr; }
+    // Reuse `buf` across rebuilds — keeping it allocated avoids a
+    // 4 MB malloc when streaming chunks rotate through varying T_src
+    // values.  graph_cache::destroy() preserves the buf reservation.
+    cache.buf.resize(4 * 1024 * 1024);
+    ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
+    cache.ctx = ggml_init(gp);
+    cache.gf  = ggml_new_graph_custom(cache.ctx, 8192, false);
+    cache.key = (int64_t) T_src;
+
+    ggml_tensor * s = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, T_src, 1);
+    ggml_set_name(s, "s"); ggml_set_input(s);
+    ggml_tensor * s_pad = reflect_pad_1d(cache.ctx, s, n_fft/2, n_fft/2);
+    ggml_tensor * k = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, n_fft, 1, 2*F);
+    ggml_set_name(k, "k"); ggml_set_input(k);
+    ggml_tensor * spec = conv1d_f32(cache.ctx, k, s_pad, hop, 0, 1);
+    ggml_set_name(spec, "out"); ggml_set_output(spec);
+    ggml_build_forward_expand(cache.gf, spec);
+}
+
 static std::vector<float> run_stft(const model_ctx & m, const std::vector<float> & src) {
     const int n_fft = 16, hop = 4;
     const int F = n_fft / 2 + 1;
     int T_src = (int)src.size();
+    (void) hop;
 
     const std::vector<float> & kernel = cached_stft_kernel(n_fft);
 
     graph_cache & cache = g_stft_graph_cache;
-    const bool build_graph = (cache.key != (int64_t) T_src) || (cache.ctx == nullptr);
-    if (build_graph) {
-        if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
-        if (cache.ctx)    { ggml_free(cache.ctx);            cache.ctx    = nullptr; }
-        // Reuse `buf` across rebuilds — keeping it allocated avoids a
-        // 4 MB malloc when streaming chunks rotate through varying T_src
-        // values.  graph_cache::destroy() preserves the buf reservation.
-        cache.buf.resize(4 * 1024 * 1024);
-        ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
-        cache.ctx = ggml_init(gp);
-        cache.gf  = ggml_new_graph_custom(cache.ctx, 8192, false);
-        cache.key = (int64_t) T_src;
-
-        ggml_tensor * s = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, T_src, 1);
-        ggml_set_name(s, "s"); ggml_set_input(s);
-        ggml_tensor * s_pad = reflect_pad_1d(cache.ctx, s, n_fft/2, n_fft/2);
-        ggml_tensor * k = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, n_fft, 1, 2*F);
-        ggml_set_name(k, "k"); ggml_set_input(k);
-        ggml_tensor * spec = conv1d_f32(cache.ctx, k, s_pad, hop, 0, 1);
-        ggml_set_name(spec, "out"); ggml_set_output(spec);
-        ggml_build_forward_expand(cache.gf, spec);
-
+    if (cache.key != (int64_t) T_src || cache.ctx == nullptr) {
+        build_stft_graph_nodes(cache, m, T_src);
         cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
         ggml_gallocr_reserve(cache.allocr, cache.gf);
     }
@@ -2093,9 +2139,12 @@ static std::vector<float> run_stft(const model_ctx & m, const std::vector<float>
 // same-shape calls do zero CPU host work outside
 // the graph compute itself.  HiFT is the biggest multilingual beneficiary
 // because audio length scales with prompt length.
-static std::vector<float> run_hift_decode(const model_ctx & m,
-                                          const std::vector<float> & mel, int T_mel,
-                                          const std::vector<float> & s_stft, int T_stft) {
+// Graph half of run_hift_decode, shared with the fit projector.  In measure
+// mode (`measure` true, metadata-only model) the alpha-cache warm-up and the
+// global alpha-entry registration are skipped: the former reads weight data
+// and the latter would clobber the runtime cache's input metadata.
+static void build_hift_graph_nodes(graph_cache & cache, const model_ctx & m,
+                                   int T_mel, int T_stft, bool measure) {
     const int MEL = 80, NFFT2 = 18, BASE_CH = 512, n_fft = 16, hop = 4;
     const int F = n_fft / 2 + 1;
     std::vector<int> ups_rates  = {8, 5, 3};
@@ -2106,24 +2155,17 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     std::vector<int> src_rb_ksizes = {7, 7, 11};
     std::vector<std::vector<int>> src_rb_dils = {{1,3,5},{1,3,5},{1,3,5}};
 
-    graph_cache & cache = g_hift_graph_cache;
-    const int64_t cache_key = pack_hift_key(T_mel, T_stft);
-    // Reuse the same-shape HiFT graph only when the direct backend path owns a
-    // cached gallocator. The scheduler path leaves cache.allocr null because
-    // ggml_backend_sched_alloc_graph mutates node->src[] while inserting
-    // GPU<->CPU copies, so scheduler-routed calls must rebuild from a clean graph.
-    const bool build_graph = (cache.key != cache_key) || (cache.ctx == nullptr) || (cache.allocr == nullptr);
-    if (build_graph) {
-        if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
-        if (cache.ctx)    { ggml_free(cache.ctx);            cache.ctx    = nullptr; }
-        // 64 MB arena — same as the pre-cache version.  Reusing the
-        // vector across rebuilds avoids a 64 MB malloc churn when (T_mel,
-        // T_stft) change between streaming chunks.
-        cache.buf.resize(64 * 1024 * 1024);
-        ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
-        cache.ctx = ggml_init(gp);
-        cache.gf  = ggml_new_graph_custom(cache.ctx, 131072, false);
-        cache.key = cache_key;
+    if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
+    if (cache.ctx)    { ggml_free(cache.ctx);            cache.ctx    = nullptr; }
+    // 64 MB arena — same as the pre-cache version.  Reusing the
+    // vector across rebuilds avoids a 64 MB malloc churn when (T_mel,
+    // T_stft) change between streaming chunks.
+    cache.buf.resize(64 * 1024 * 1024);
+    ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
+    cache.ctx = ggml_init(gp);
+    cache.gf  = ggml_new_graph_custom(cache.ctx, 131072, false);
+    cache.key = pack_hift_key(T_mel, T_stft);
+    if (!measure) {
         // Wipe and re-populate the alpha-input metadata for the new build.
         // Mutex held briefly; the graph build below runs without the lock
         // because synthesize() is process-serial in practice.
@@ -2132,8 +2174,6 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     }
     ggml_context * ctx = cache.ctx;
     ggml_cgraph * gf = cache.gf;
-
-    if (build_graph) {
 
     ggml_tensor * mel_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_mel, MEL);
     ggml_set_name(mel_in, "mel_in"); ggml_set_input(mel_in);
@@ -2145,12 +2185,12 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
         // run_hift_decode can re-feed each alpha-input slot on cache
         // hits.  cached_inv_alpha actually owns the data — we just need
         // a stable handle to look it up later.
-        ggml_tensor * src = find_tensor(m, pref);
-        (void) cached_inv_alpha(m, pref);  // warm the data cache
         std::string gn = "inv_" + pref;
         ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
         ggml_set_name(t, gn.c_str()); ggml_set_input(t);
-        {
+        if (!measure) {
+            ggml_tensor * src = find_tensor(m, pref);
+            (void) cached_inv_alpha(m, pref);  // warm the data cache
             std::lock_guard<std::mutex> lk(g_synth_caches_mu);
             g_hift_inv_alpha_entries.emplace_back(std::move(gn), src);
         }
@@ -2266,9 +2306,27 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     y_trim = ggml_clamp(ctx, y_trim, -0.99f, 0.99f);
     ggml_set_name(y_trim, "wav"); ggml_set_output(y_trim);
     ggml_build_forward_expand(gf, y_trim);
-    // Direct backends allocate cache.allocr below; scheduler-routed backends
-    // allocate via s3gen_sched_alloc so conv_transpose_1d can run on CPU.
-    }  // end build_graph
+    // Direct backends allocate cache.allocr in run_hift_decode; scheduler-
+    // routed backends allocate via s3gen_sched_prepare so conv_transpose_1d
+    // can run on CPU.
+    (void) BASE_CH;
+}
+
+static std::vector<float> run_hift_decode(const model_ctx & m,
+                                          const std::vector<float> & mel, int T_mel,
+                                          const std::vector<float> & s_stft, int T_stft) {
+    const int n_fft = 16, hop = 4;
+
+    graph_cache & cache = g_hift_graph_cache;
+    const int64_t cache_key = pack_hift_key(T_mel, T_stft);
+    // Reuse the same-shape HiFT graph only when the direct backend path owns a
+    // cached gallocator. The scheduler path leaves cache.allocr null because
+    // ggml_backend_sched_alloc_graph mutates node->src[] while inserting
+    // GPU<->CPU copies, so scheduler-routed calls must rebuild from a clean graph.
+    if (cache.key != cache_key || cache.ctx == nullptr || cache.allocr == nullptr) {
+        build_hift_graph_nodes(cache, m, T_mel, T_stft, /*measure=*/false);
+    }
+    ggml_cgraph * gf = cache.gf;
 
     // Cached scaffolding (pulled outside build_graph too — when the graph
     // is reused, ik / ws data still need to be staged into the input
@@ -3212,6 +3270,165 @@ void s3gen_unload() {
 }
 
 // ============================================================================
+// Memory-fit measurement (include/tts-cpp/chatterbox/fit.h)
+// ============================================================================
+
+namespace tts_cpp::chatterbox::detail {
+
+bool s3gen_measure_fit(const std::string & gguf_path, int n_gpu_layers,
+                       int n_speech_tokens, s3gen_fit_measure & out,
+                       std::string * error) {
+    using ::tts_cpp::fitutil::sat_add;
+    out = s3gen_fit_measure{};
+    if (n_speech_tokens <= 0) {
+        if (error) *error = "s3gen_measure_fit: n_speech_tokens must be positive";
+        return false;
+    }
+    try {
+        // Metadata-only load: same backend policy, same tensor wiring, weight
+        // buffer sized instead of allocated, tensors marked externally
+        // allocated.  Local (never inserted into the process-wide cache).
+        size_t weights = 0;
+        model_ctx m = load_s3gen_gguf(gguf_path, n_gpu_layers, /*verbose=*/false, &weights);
+        struct release {
+            model_ctx & m;
+            ~release() {
+                if (m.sched_fb) ::tts_cpp::detail::sched_fallback_free(*m.sched_fb);
+                if (m.ctx_w)   { ggml_free(m.ctx_w); m.ctx_w = nullptr; }
+                if (m.backend) { ggml_backend_free(m.backend); m.backend = nullptr; }
+            }
+        } guard{m};
+        out.weights_bytes = weights;
+        out.meanflow      = m.meanflow;
+
+        // Workload shapes, exactly as s3gen_synthesize_to_wav derives them on
+        // the batch path (finalize=true appends 3 lookahead-silence tokens).
+        // Conditioning lengths come from the built-in voice tensors;
+        // reference-audio conditioning is capped to the same lengths
+        // (10 s -> 250 prompt tokens / 500 prompt_feat frames).
+        ggml_tensor * t_pt = find_tensor(m, "s3gen/builtin/prompt_token");
+        ggml_tensor * t_pf = find_tensor(m, "s3gen/builtin/prompt_feat");
+        const int pre_lookahead_len = 3;  // Chatterbox default (s3gen_synthesize_to_wav)
+        out.n_prompt_token = (int) ggml_nelements(t_pt);
+        out.mel_len1       = (int) t_pf->ne[1];
+        out.n_total        = out.n_prompt_token + n_speech_tokens + pre_lookahead_len;
+        out.T_mu           = 2 * out.n_total;
+        if (out.T_mu <= out.mel_len1) {
+            if (error) *error = "s3gen_measure_fit: workload shorter than the conditioning prompt";
+            return false;
+        }
+        out.T_mel = out.T_mu - out.mel_len1;
+        const int T_src  = out.T_mel * 480;   // 8*5*3 upsample * 4 token->sample
+        const int T_stft = T_src / 4 + 1;     // hop 4, reflect-padded by n_fft/2
+
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(m.backend);
+        auto price_gallocr = [&](ggml_cgraph * gf) -> uint64_t {
+            ggml_gallocr_t pricer = ggml_gallocr_new(buft);
+            if (!pricer) throw std::runtime_error("s3gen_measure_fit: gallocr_new failed");
+            size_t size = 0;
+            ggml_gallocr_reserve_n_size(pricer, gf, nullptr, nullptr, &size);
+            ggml_gallocr_free(pricer);
+            return size;
+        };
+
+        // Every stage cache below stays resident once its stage has run, so
+        // the five arenas sum.  Encoder / CFM / F0 / STFT run on the direct
+        // gallocr path (compute()); HiFT dual-paths through the scheduler
+        // when the backend cannot run some op, so it is priced accordingly.
+        uint64_t dev = 0;
+        {
+            graph_cache c;
+            build_encoder_graph_nodes(c, m, out.n_total, /*D=*/512);
+            out.encoder_bytes = price_gallocr(c.gf);
+            dev = sat_add(dev, out.encoder_bytes);
+            out.host_arena_bytes = sat_add(out.host_arena_bytes, c.buf.size());
+            c.destroy();
+        }
+        {
+            // use_b2 mirrors s3gen_synthesize_to_wav: batched CFG on GPU
+            // backends of the non-meanflow (MTL) variant.
+            out.used_b2 = (!m.meanflow) && (m.cfg_rate != 0.0f) &&
+                          !::tts_cpp::detail::backend_is_cpu(m.backend);
+            cfm_estimator_cache c;
+            if (out.used_b2) {
+                build_cfm_graph_nodes_b2(c, m, out.T_mu, /*f16_kv_attn=*/false);
+            } else {
+                build_cfm_graph_nodes(c, m, out.T_mu, /*f16_kv_attn=*/false);
+            }
+            out.cfm_bytes = price_gallocr(c.gf);
+            dev = sat_add(dev, out.cfm_bytes);
+            out.host_arena_bytes = sat_add(out.host_arena_bytes, c.buf.size());
+            c.destroy();
+        }
+        {
+            graph_cache c;
+            build_f0_graph_nodes(c, m, out.T_mel);
+            out.f0_bytes = price_gallocr(c.gf);
+            dev = sat_add(dev, out.f0_bytes);
+            out.host_arena_bytes = sat_add(out.host_arena_bytes, c.buf.size());
+            c.destroy();
+        }
+        {
+            graph_cache c;
+            build_stft_graph_nodes(c, m, T_src);
+            out.stft_bytes = price_gallocr(c.gf);
+            dev = sat_add(dev, out.stft_bytes);
+            out.host_arena_bytes = sat_add(out.host_arena_bytes, c.buf.size());
+            c.destroy();
+        }
+        {
+            graph_cache c;
+            build_hift_graph_nodes(c, m, out.T_mel, T_stft, /*measure=*/true);
+            ::tts_cpp::detail::fit_graph_price price;
+            if (!::tts_cpp::detail::fit_price_graph(m.backend, c.gf,
+                                                    /*sched_graph_size=*/131072, price)) {
+                c.destroy();
+                if (error) *error = "s3gen_measure_fit: HiFT graph pricing failed";
+                return false;
+            }
+            out.hift_device_bytes = price.device_bytes;
+            dev = sat_add(dev, price.device_bytes);
+            out.host_compute_bytes = sat_add(out.host_compute_bytes, price.host_bytes);
+            out.host_arena_bytes   = sat_add(out.host_arena_bytes, c.buf.size());
+            c.destroy();
+        }
+        out.device_compute_bytes = dev;
+
+        // Host working slabs at these shapes (s3gen_synthesize_to_wav locals
+        // that coexist mid-pipeline, plus the persistent host caches).
+        {
+            using ::tts_cpp::fitutil::sat_mul;
+            const uint64_t f32 = sizeof(float);
+            uint64_t host = 0;
+            host = sat_add(host, sat_mul((uint64_t) out.n_total * 512, f32));  // input_embed
+            // mu_T, mu, cond, z, zero_mu, zero_cond, dxdt_cond, dxdt_uncond
+            host = sat_add(host, sat_mul(8ull * (uint64_t) out.T_mu * 80, f32));
+            host = sat_add(host, sat_mul((uint64_t) out.T_mel * 80, f32));     // mel slice
+            // f0_up, src (SineGen), wav, and the pcm_out copy — all at the
+            // 24 kHz sample rate.
+            host = sat_add(host, sat_mul(4ull * (uint64_t) T_src, f32));
+            host = sat_add(host, sat_mul(18ull * (uint64_t) T_stft, f32));     // s_stft
+            // Persistent F32 CPU mirrors (cached_cpu_weights_f32).
+            host = sat_add(host, (uint64_t) ggml_nbytes(find_tensor(m, "flow/input_embedding")));
+            host = sat_add(host, (uint64_t) ggml_nbytes(find_tensor(m, "flow/spk_embed_affine/w")));
+            host = sat_add(host, (uint64_t) ggml_nbytes(find_tensor(m, "flow/spk_embed_affine/b")));
+            // Cached positional embeddings (encoder T and 2T windows) and the
+            // ISTFT window-sum vector.
+            host = sat_add(host, sat_mul((uint64_t) (2 * out.n_total - 1) * 512, f32));
+            host = sat_add(host, sat_mul((uint64_t) (4 * out.n_total - 1) * 512, f32));
+            host = sat_add(host, sat_mul((uint64_t) T_stft * 4 + 16, f32));
+            out.host_slab_bytes = host;
+        }
+        return true;
+    } catch (const std::exception & e) {
+        if (error) *error = e.what();
+        return false;
+    }
+}
+
+}  // namespace tts_cpp::chatterbox::detail
+
+// ============================================================================
 // Internal test hooks
 // ============================================================================
 //
@@ -3321,6 +3538,43 @@ size_t stft_kernel_cache_size() {
 size_t window_sum_cache_size() {
     std::lock_guard<std::mutex> lk(g_synth_caches_mu);
     return g_window_sum_cache.size();
+}
+
+// ---------- Memory-fit parity hooks ----------
+
+size_t s3gen_cached_weights_bytes() {
+    std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
+    if (!g_s3gen_cache_entry || !g_s3gen_cache_entry->m ||
+        !g_s3gen_cache_entry->m->buffer_w) {
+        return 0;
+    }
+    return ggml_backend_buffer_get_size(g_s3gen_cache_entry->m->buffer_w);
+}
+
+static size_t graph_cache_buffer_bytes_locked(const graph_cache & cache) {
+    return cache.allocr ? ggml_gallocr_get_buffer_size(cache.allocr, 0) : 0;
+}
+
+size_t encoder_graph_cache_buffer_bytes() {
+    std::lock_guard<std::mutex> lk(g_synth_caches_mu);
+    return graph_cache_buffer_bytes_locked(g_encoder_graph_cache);
+}
+size_t cfm_estimator_cache_buffer_bytes() {
+    std::lock_guard<std::mutex> lk(g_synth_caches_mu);
+    return g_cfm_estimator_cache.allocr
+               ? ggml_gallocr_get_buffer_size(g_cfm_estimator_cache.allocr, 0) : 0;
+}
+size_t f0_graph_cache_buffer_bytes() {
+    std::lock_guard<std::mutex> lk(g_synth_caches_mu);
+    return graph_cache_buffer_bytes_locked(g_f0_graph_cache);
+}
+size_t stft_graph_cache_buffer_bytes() {
+    std::lock_guard<std::mutex> lk(g_synth_caches_mu);
+    return graph_cache_buffer_bytes_locked(g_stft_graph_cache);
+}
+size_t hift_graph_cache_buffer_bytes() {
+    std::lock_guard<std::mutex> lk(g_synth_caches_mu);
+    return graph_cache_buffer_bytes_locked(g_hift_graph_cache);
 }
 
 }  // namespace tts_cpp::chatterbox::test_hooks

@@ -18,11 +18,11 @@ option(TTS_CPP_BUILD_SHARED      "tts-cpp: build tts-cpp as a SHARED library (ot
 option(TTS_CPP_BUILD_EXECUTABLES "tts-cpp: build tts-cli, mel2wav, CosyVoice, Supertonic, Parler, LavaSR, and Audio8 command-line tools" ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_BUILD_TESTS       "tts-cpp: build per-stage numerical validation harnesses"   ${TTS_CPP_STANDALONE_DEFAULT})
 option(TTS_CPP_INSTALL           "tts-cpp: generate install rules"                           ON)
-option(TTS_CPP_USE_SYSTEM_GGML   "tts-cpp: use find_package(ggml) instead of add_subdirectory(ggml). Defaults to ON for qvac-fabric-speech.cpp and vcpkg builds. OFF requires a manually staged engines/tts/ggml checkout of qvac-ext-ggml@speech; this tree has no setup-ggml.sh or patches overlay." ON)
+option(TTS_CPP_USE_SYSTEM_GGML   "tts-cpp: use find_package(ggml) instead of add_subdirectory(ggml). Defaults to ON for qvac-fabric-speech.cpp and vcpkg builds. OFF requires an engines/tts/ggml checkout of qvac-ext-ggml@speech, staged via scripts/setup-ggml.sh (or by hand); no patches overlay — the speech branch is patched at the commit level." ON)
 # Note: the standalone chatterbox.cpp repo carries a TTS_CPP_GGML_LIB_PREFIX
 # option here that controls renaming of bundled libggml-*.so to
 # libspeech-ggml-*.so when add_subdirectory(ggml) builds it locally. This
-# in-tree package can consume a manually staged speech-branch checkout but
+# in-tree package can consume a locally staged speech-branch checkout but
 # does not expose the standalone filename-prefix option; the speech branch or
 # `ggml-speech` vcpkg port already emits the integrated filenames.
 option(TTS_CPP_CCACHE            "tts-cpp: use ccache as compiler launcher if available"     ON)
@@ -166,14 +166,15 @@ if (NOT TARGET ggml)
         # fork carrying every infrastructure patch + the Supertonic 2
         # fused custom op family as commits (not as a patches/ overlay).
         #
-        # Stage the checkout manually at `engines/tts/ggml/`. No patches/
-        # directory is consulted: the speech branch is already patched at
-        # the commit level.
+        # Stage the checkout with `scripts/setup-ggml.sh`, which clones the
+        # pinned speech ref into `engines/tts/ggml/` and is idempotent on
+        # re-run. No patches/ directory is consulted: the speech branch is
+        # already patched at the commit level.
         if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ggml/CMakeLists.txt")
             message(FATAL_ERROR
                 "tts-cpp: bundled-ggml build requires engines/tts/ggml/ to be "
-                "a manually staged checkout of tetherto/qvac-ext-ggml@speech. "
-                "Populate that directory, or pass "
+                "a checkout of tetherto/qvac-ext-ggml@speech. Run "
+                "scripts/setup-ggml.sh to stage it, or pass "
                 "-DTTS_CPP_USE_SYSTEM_GGML=ON to consume the QVAC "
                 "speech-stack `ggml-speech` vcpkg port.")
         endif()
@@ -232,7 +233,7 @@ endif()
 # GGML_BACKEND_DL_PROJECT_PREFIX define). This in-tree package does not expose
 # that rename surface. System builds consume filenames and macros installed by
 # the ggml-speech port; bundled builds use the filenames produced by the
-# manually staged speech-branch checkout.
+# locally staged speech-branch checkout (scripts/setup-ggml.sh).
 
 option(TTS_CPP_OPENMP "tts-cpp: enable OpenMP for the tts-cpp target" ON)
 if (WIN32 AND NOT MINGW AND TTS_CPP_OPENMP AND NOT DEFINED CACHE{TTS_CPP_OPENMP_USER_OVERRIDE})
@@ -341,6 +342,12 @@ set(TTS_CPP_LIB_SOURCES
     src/audio8/codec_encode.cpp
     src/audio8/sampling.cpp
     src/audio8/engine.cpp
+    # Memory-fit preflight (include/tts-cpp/fit.h + the *-fit-params tools).
+    src/fit_common.cpp
+    src/audio8/fit.cpp
+    src/audio8/fit_main.cpp
+    src/chatterbox_fit.cpp
+    src/chatterbox_fit_main.cpp
 )
 
 if (TTS_CPP_BUILD_LIBRARY)
@@ -584,6 +591,17 @@ if (TTS_CPP_BUILD_EXECUTABLES)
     target_link_libraries(audio8-cli PRIVATE tts-cpp)
     target_include_directories(audio8-cli PRIVATE src)
     tts_cpp_apply_ccache(audio8-cli)
+
+    # Memory-fit preflight CLIs: project a model set against the free device
+    # memory without loading weights.  See src/audio8/fit_main.cpp and
+    # src/chatterbox_fit_main.cpp.
+    add_executable(audio8-fit-params src/audio8_fit_params.cpp)
+    target_link_libraries(audio8-fit-params PRIVATE tts-cpp)
+    tts_cpp_apply_ccache(audio8-fit-params)
+
+    add_executable(chatterbox-fit-params src/chatterbox_fit_params.cpp)
+    target_link_libraries(chatterbox-fit-params PRIVATE tts-cpp)
+    tts_cpp_apply_ccache(chatterbox-fit-params)
 endif()
 
 if (TTS_CPP_BUILD_TESTS)
@@ -2463,6 +2481,47 @@ if (TTS_CPP_BUILD_TESTS)
     target_include_directories(test-kv-cache-type PRIVATE ggml/include src include)
     tts_cpp_apply_ccache(test-kv-cache-type)
     tts_cpp_register_test(test-kv-cache-type LABEL "unit")
+
+    # ---- Memory-fit preflight (include/tts-cpp/fit.h + *-fit-params) ----
+    # Model-free: strict CLI parsers, saturating math, JSON escaping, and the
+    # exit-code contract of both fit CLIs.
+    add_executable(test-fit-cli test/test_fit_cli.cpp)
+    target_link_libraries(test-fit-cli PRIVATE tts-cpp ggml)
+    target_include_directories(test-fit-cli PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-fit-cli)
+    tts_cpp_register_test(test-fit-cli LABEL "unit")
+
+    # Audio8 fit parity.  The no-argument form synthesizes a tiny audio8-lm
+    # GGUF on the fly, so the LM-side byte-parity gates (weights, KV slabs,
+    # slow/fast graph arenas vs a real load + run) need no fixture at all;
+    # the fixture form adds the full-pipeline + codec-arena gates.
+    add_executable(test-audio8-fit-params test/audio8/test_fit_params.cpp)
+    target_link_libraries(test-audio8-fit-params PRIVATE tts-cpp ggml)
+    target_include_directories(test-audio8-fit-params PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-audio8-fit-params)
+    tts_cpp_register_test(test-audio8-fit-params LABEL "unit")
+    tts_cpp_register_test(test-audio8-fit-params-fixture
+        EXE      test-audio8-fit-params
+        LABEL    "fixture"
+        ARGS     "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}"
+        REQUIRES "${_tcb_audio8_lm}" "${_tcb_audio8_decoder}" "${_tcb_audio8_encoder}")
+
+    # Chatterbox fit parity: metadata-only projection vs a real T3 load +
+    # eval and a real S3Gen synthesis, byte for byte per buffer/arena.
+    add_executable(test-chatterbox-fit-params test/test_chatterbox_fit_params.cpp)
+    target_link_libraries(test-chatterbox-fit-params PRIVATE tts-cpp ggml tts-cpp-backend-defs)
+    target_include_directories(test-chatterbox-fit-params PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(test-chatterbox-fit-params)
+    tts_cpp_register_test(test-chatterbox-fit-params-turbo
+        EXE      test-chatterbox-fit-params
+        LABEL    "fixture"
+        ARGS     "${_tcb_t3_turbo_gguf}" "${_tcb_s3gen_gguf}"
+        REQUIRES "${_tcb_t3_turbo_gguf}" "${_tcb_s3gen_gguf}")
+    tts_cpp_register_test(test-chatterbox-fit-params-mtl
+        EXE      test-chatterbox-fit-params
+        LABEL    "fixture"
+        ARGS     "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}"
+        REQUIRES "${_tcb_t3_mtl_gguf}" "${_tcb_s3gen_mtl_gguf}")
 
     add_executable(test-s3gen-cfg-rate test/test_s3gen_cfg_rate.cpp)
     target_link_libraries(test-s3gen-cfg-rate PRIVATE tts-cpp ggml)

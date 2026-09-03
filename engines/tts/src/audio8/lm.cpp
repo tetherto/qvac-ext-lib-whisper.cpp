@@ -219,35 +219,41 @@ struct fast_source {
     bool is_code = false;
 };
 
-ggml_tensor * fast_input_tensor(ggml_context * ctx, const lm_model & model,
-                                const fast_source & source) {
-    if (!source.is_code) {
+ggml_tensor * fast_input_tensor(ggml_context * ctx, const lm_model & model, bool is_code) {
+    if (!is_code) {
         return input_f32(ctx, "input", model.hp.fast_hidden, 1);
     }
     return ggml_get_rows(ctx, model.fast_emb, input_i32(ctx, "input", 1));
 }
 
+// The graph half of fast_pass, shared with the fit projector so the priced
+// graph is the executed graph by construction.
+ggml_tensor * build_fast_pass_graph(lm_model & model, scratch & build, int position,
+                                    bool is_code) {
+    const lm_hparams & hp = model.hp;
+    ggml_context * ctx = build.ctx;
+    const int keys = position + 1;
+    ggml_tensor * mask = input_f32(ctx, "mask", keys, 1);
+    ggml_tensor * hidden = fast_input_tensor(ctx, model, is_code);
+    const rope_planes rope = rope_window(ctx, model.fast_rope_cos, model.fast_rope_sin,
+                                         position, 1);
+    hidden = run_blocks(ctx, build.graph, model.fast_blocks, hidden, rope, model.fast_kv,
+                        fast_shape(model, position), mask, hp.rms_eps);
+    return mark_output(build.graph,
+                       multiply_mat(ctx, model.fast_out,
+                                    rms_norm(ctx, hidden, model.fast_norm, hp.rms_eps),
+                                    model.precise_outputs));
+}
+
 bool fast_pass(lm_model & model, const fast_source & source, int position, int n_threads,
                std::vector<float> * logits_out, std::string * error) {
-    const lm_hparams & hp = model.hp;
     scratch build(AUDIO8_MAX_NODES);
     if (!build.ok()) {
         if (error) *error = "audio8: failed to create the fast graph context";
         return false;
     }
-    ggml_context * ctx = build.ctx;
+    ggml_tensor * logits = build_fast_pass_graph(model, build, position, source.is_code);
     const int keys = position + 1;
-    ggml_tensor * mask = input_f32(ctx, "mask", keys, 1);
-    ggml_tensor * hidden = fast_input_tensor(ctx, model, source);
-    const rope_planes rope = rope_window(ctx, model.fast_rope_cos, model.fast_rope_sin,
-                                         position, 1);
-    hidden = run_blocks(ctx, build.graph, model.fast_blocks, hidden, rope, model.fast_kv,
-                        fast_shape(model, position), mask, hp.rms_eps);
-    ggml_tensor * logits =
-        mark_output(build.graph,
-                    multiply_mat(ctx, model.fast_out,
-                                 rms_norm(ctx, hidden, model.fast_norm, hp.rms_eps),
-                                 model.precise_outputs));
 
     bool use_sched = false;
     if (!prepare_graph(model.backend, model.sched, model.buffer_w, model.fast_allocr,
@@ -312,7 +318,23 @@ void read_chosen(const std::vector<ggml_tensor *> & chosen, std::vector<int32_t>
     }
 }
 
+// The graph half of fast_frame, shared with the fit projector.
+std::vector<ggml_tensor *> build_fast_frame_graph(lm_model & model, scratch & build) {
+    ggml_context * ctx = build.ctx;
+    ggml_tensor * primed = fast_logits(
+        ctx, build.graph, model, input_f32(ctx, "input", model.hp.fast_hidden, 1), 0);
+    return chain_codes(ctx, build.graph, model, primed, input_i32(ctx, "first_code", 1));
+}
+
 }  // namespace
+
+void build_fast_fit_graph(lm_model & model, scratch & build, int position, bool prime) {
+    build_fast_pass_graph(model, build, position, /*is_code=*/!prime);
+}
+
+void build_fast_frame_fit_graph(lm_model & model, scratch & build) {
+    build_fast_frame_graph(model, build);
+}
 
 // Greedy expansion of one frame in a single graph. The sampled path cannot do
 // this: argmax is the only picker the backend can evaluate, so any other one has
@@ -325,13 +347,8 @@ bool fast_frame(lm_model & model, const std::vector<float> & fast_input, int sem
         if (error) *error = "audio8: failed to create the fast frame context";
         return false;
     }
-    ggml_context * ctx = build.ctx;
     const int32_t first_code = clamp_to_codebook(hp, semantic);
-
-    ggml_tensor * primed =
-        fast_logits(ctx, build.graph, model, input_f32(ctx, "input", hp.fast_hidden, 1), 0);
-    const std::vector<ggml_tensor *> chosen =
-        chain_codes(ctx, build.graph, model, primed, input_i32(ctx, "first_code", 1));
+    const std::vector<ggml_tensor *> chosen = build_fast_frame_graph(model, build);
 
     bool use_sched = false;
     if (!prepare_graph(model.backend, model.sched, model.buffer_w, model.frame_allocr,

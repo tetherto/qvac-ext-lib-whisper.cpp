@@ -21,7 +21,7 @@ using namespace ::tts_cpp::audio8::detail;
 
 namespace {
 
-constexpr int DEFAULT_MAX_FRAMES = 512;
+constexpr int DEFAULT_MAX_FRAMES = AUDIO8_DEFAULT_MAX_FRAMES;
 constexpr int DEFAULT_THREADS = 4;
 
 int resolve_threads(int requested) {

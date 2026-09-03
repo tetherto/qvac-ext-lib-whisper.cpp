@@ -172,4 +172,22 @@ size_t t3_step_graph_cache_misses();
 // backend.
 void t3_release_caches();
 
+// ---------- Memory-fit parity (include/tts-cpp/chatterbox/fit.h) -------
+//
+// Byte-exact backend-buffer sizes of the resident S3Gen allocations, so
+// test_chatterbox_fit_params.cpp can assert that the metadata-only
+// projection equals what a real synthesis actually allocated.  0 when
+// the corresponding cache / model is not built.
+
+// Weight buffer of the process-cached S3Gen model (s3gen_preload /
+// s3gen_synthesize_to_wav), in bytes.
+size_t s3gen_cached_weights_bytes();
+
+// Gallocr buffer held by each resident stage graph cache, in bytes.
+size_t encoder_graph_cache_buffer_bytes();
+size_t cfm_estimator_cache_buffer_bytes();
+size_t f0_graph_cache_buffer_bytes();
+size_t stft_graph_cache_buffer_bytes();
+size_t hift_graph_cache_buffer_bytes();
+
 }  // namespace tts_cpp::chatterbox::test_hooks

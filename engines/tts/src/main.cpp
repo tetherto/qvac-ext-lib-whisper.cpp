@@ -1,5 +1,6 @@
 #include "backend_selection.h"
 #include "backend_util.h"
+#include "fit_price.h"
 #include "gguf_stream.h"
 #include "gpt2_bpe.h"
 #include "mtl_tokenizer.h"
@@ -468,7 +469,21 @@ ggml_type chatterbox_mtl_resolve_kv_type(ggml_backend_t backend, ggml_type reque
     return eff;
 }
 
-bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers, ggml_type kv_type) {
+// Mark every unallocated tensor in `ctx` externally allocated (dummy non-null
+// data, the same trick ggml's own measure paths use) so metadata-only fit
+// loads can build graphs whose weight/state leafs the size-only allocators
+// skip.  The context must never have tensor data read or written after this.
+void t3_mark_externally_allocated(ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t;
+         t = ggml_get_next_tensor(ctx, t)) {
+        if (!t->data && !t->view_src) {
+            t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+        }
+    }
+}
+
+bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers, ggml_type kv_type, t3_load_measure * measure) {
+    if (measure) *measure = t3_load_measure{};
     {
         gguf_init_params peek_params = { /*.no_alloc=*/ true, /*.ctx=*/ nullptr };
         gguf_context * peek_ctx = gguf_init_from_file(path.c_str(), peek_params);
@@ -486,7 +501,8 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
             }
             gguf_free(peek_ctx);
             if (variant == "t3_mtl") {
-                return load_model_gguf_mtl(path, model, requested_ctx, n_gpu_layers, kv_type);
+                return load_model_gguf_mtl(path, model, requested_ctx, n_gpu_layers, kv_type,
+                                           measure);
             }
         }
     }
@@ -528,8 +544,12 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
             ggml_set_name(dst, name);
             model.tensors[name] = dst;
         }
-        model.buffer_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
-        {
+        if (measure) {
+            measure->weights_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+                model.ctx_w, ggml_backend_get_default_buffer_type(model.backend));
+            t3_mark_externally_allocated(model.ctx_w);
+        } else {
+            model.buffer_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
             ::tts_cpp::detail::gguf_stream_reader reader(gguf_ctx, path);
             if (!reader.ok()) throw std::runtime_error("failed to reopen GGUF for tensor data: " + path);
             for (ggml_tensor * cur = ggml_get_first_tensor(model.ctx_w); cur; cur = ggml_get_next_tensor(model.ctx_w, cur)) {
@@ -585,12 +605,18 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
         int64_t n_elements = (int64_t) hp.n_embd * hp.n_layer * hp.n_ctx;
         model.memory_k = ggml_new_tensor_1d(model.ctx_kv, hp.kv_type, n_elements);
         model.memory_v = ggml_new_tensor_1d(model.ctx_kv, hp.kv_type, n_elements);
-        model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
+        if (measure) {
+            measure->kv_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+                model.ctx_kv, ggml_backend_get_default_buffer_type(model.backend));
+            t3_mark_externally_allocated(model.ctx_kv);
+        } else {
+            model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
+        }
 
         if (g_log_verbose) fprintf(stderr, "%s: ctx=%d embd=%d layers=%d heads=%d text_vocab=%d speech_vocab=%d cond_prompt=%d\n",
                 __func__, hp.n_ctx, hp.n_embd, hp.n_layer, hp.n_head,
                 hp.n_text_vocab, hp.n_speech_vocab, hp.cond_prompt_len);
-        if (g_log_verbose) fprintf(stderr, "%s: weights=%.2f MB  KV=%.2f MB\n", __func__,
+        if (g_log_verbose && !measure) fprintf(stderr, "%s: weights=%.2f MB  KV=%.2f MB\n", __func__,
                 ggml_backend_buffer_get_size(model.buffer_w) / (1024.0*1024.0),
                 ggml_backend_buffer_get_size(model.buffer_kv) / (1024.0*1024.0));
 
@@ -937,6 +963,36 @@ bool eval_step(
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(model.hparams.n_speech_vocab);
     ggml_backend_tensor_get(logits, logits_out.data(), 0, (size_t)model.hparams.n_speech_vocab*sizeof(float));
+    return true;
+}
+
+// --------------------------------------------------------------------------
+// Memory-fit measurement (include/tts-cpp/chatterbox/fit.h)
+// --------------------------------------------------------------------------
+
+bool t3_measure_compute(const chatterbox_model & model, int n_text_tokens, int n_past,
+                        uint64_t & device_bytes, uint64_t & host_bytes) {
+    if (model.hparams.variant == CHBX_VARIANT_MTL) {
+        return t3_measure_compute_mtl(model, n_text_tokens, n_past,
+                                      device_bytes, host_bytes);
+    }
+    device_bytes = 0;
+    host_bytes   = 0;
+    ::tts_cpp::detail::fit_graph_price prompt, step;
+    // The builders are the real ones eval_prompt / eval_step run; the sched
+    // graph size mirrors t3_sched_prepare's.
+    if (!::tts_cpp::detail::fit_price_graph(model.backend,
+                                            build_prompt_graph(model, n_text_tokens),
+                                            2 * CHBX_MAX_NODES, prompt) ||
+        !::tts_cpp::detail::fit_price_graph(model.backend,
+                                            build_step_graph(model, n_past),
+                                            2 * CHBX_MAX_NODES, step)) {
+        return false;
+    }
+    // Both graphs allocate through the one Engine::Impl::allocr (or the one
+    // shared scheduler), which grows to the larger reservation.
+    device_bytes = std::max(prompt.device_bytes, step.device_bytes);
+    host_bytes   = std::max(prompt.host_bytes, step.host_bytes);
     return true;
 }
 

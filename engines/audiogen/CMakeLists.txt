@@ -109,6 +109,7 @@ set(AUDIOGEN_LIB_SOURCES
     src/acestep/lyrics_alignment.cpp
     src/acestep/quality_score.cpp
     src/acestep/detok_ggml.cpp
+    src/acestep/tok_ggml.cpp
     src/acestep/engine.cpp
     # Memory-fit preflight (include/audiogen-cpp/acestep/fit.h + the
     # acestep-fit-params CLI entry point, linkable by hosts).
