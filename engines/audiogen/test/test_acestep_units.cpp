@@ -1296,7 +1296,7 @@ void test_normalize_loudness() {
     CHECK(empty.empty());
 }
 
-bool near(double actual, double expected, double tolerance) {
+bool near_value(double actual, double expected, double tolerance) {
     return std::fabs(actual - expected) <= tolerance;
 }
 
@@ -1356,10 +1356,10 @@ void test_lyrics_preprocessing() {
     const Matrix head_a(2, 3, { 1, 2, 3, 4, 5, 6 });
     const Matrix head_b(2, 3, { 3, 4, 5, 6, 7, 8 });
     const auto scoring = preprocess_scoring({ head_a, head_b }, 1);
-    CHECK(near(scoring.average_matrix(0, 0), 2.0, 1e-6));
-    CHECK(near(scoring.energy_matrix(0, 0), 0.0, 1e-6));
-    CHECK(near(scoring.energy_matrix(1, 2), 1.0, 1e-6));
-    CHECK(near(scoring.calc_matrix(0, 1), 0.04, 1e-6));
+    CHECK(near_value(scoring.average_matrix(0, 0), 2.0, 1e-6));
+    CHECK(near_value(scoring.energy_matrix(0, 0), 0.0, 1e-6));
+    CHECK(near_value(scoring.energy_matrix(1, 2), 1.0, 1e-6));
+    CHECK(near_value(scoring.calc_matrix(0, 1), 0.04, 1e-6));
 
     const auto alignment = preprocess_alignment({ head_a, head_b }, 2.0f, 1);
     CHECK(alignment.calc_matrix.rows == 2 && alignment.calc_matrix.cols == 3);
@@ -1382,10 +1382,10 @@ void test_lyrics_metrics_and_score() {
     path.frame_indices = { 0, 1, 3 };
     const AlignmentMetrics metrics =
         compute_alignment_metrics(energy, path, { 1, 0, 1 }, 0.01, 0.0, 0.5);
-    CHECK(near(metrics.coverage, 1.0, 1e-12));
-    CHECK(near(metrics.monotonicity, 1.0, 1e-12));
-    CHECK(near(metrics.path_confidence, 0.74, 1e-7));
-    CHECK(near(calculate_lyrics_score(metrics), 0.74, 1e-12));
+    CHECK(near_value(metrics.coverage, 1.0, 1e-12));
+    CHECK(near_value(metrics.monotonicity, 1.0, 1e-12));
+    CHECK(near_value(metrics.path_confidence, 0.74, 1e-7));
+    CHECK(near_value(calculate_lyrics_score(metrics), 0.74, 1e-12));
 }
 
 void test_lyrics_timestamps_and_lrc() {
@@ -1397,10 +1397,10 @@ void test_lyrics_timestamps_and_lrc() {
     });
     const std::vector<TokenTimestamp> aligned =
         token_timestamps(attention, { 1, 2 }, { "Hello", "\n" }, 4.0);
-    CHECK(near(aligned[0].start, 0.0, 1e-12));
-    CHECK(near(aligned[0].end, 1.0, 1e-12));
-    CHECK(near(aligned[1].start, 1.0, 1e-12));
-    CHECK(near(aligned[1].end, 3.0, 1e-12));
+    CHECK(near_value(aligned[0].start, 0.0, 1e-12));
+    CHECK(near_value(aligned[0].end, 1.0, 1e-12));
+    CHECK(near_value(aligned[1].start, 1.0, 1e-12));
+    CHECK(near_value(aligned[1].end, 3.0, 1e-12));
 
     const std::vector<TokenTimestamp> tokens = {
         { 1, "Hello", 1.23456, 2.0, 0.2 },
@@ -1419,9 +1419,9 @@ void test_lyrics_timestamps_and_lrc() {
     const std::vector<SentenceTimestamp> sentences = sentence_timestamps(tokens, decoder);
     CHECK(sentences.size() == 2);
     CHECK(sentences[0].text == "Hello" && sentences[1].text == "World");
-    CHECK(near(sentences[0].start, 1.235, 1e-12));
-    CHECK(near(sentences[0].confidence, 0.0, 1e-12));
-    CHECK(near(sentences[1].confidence, 1.0, 1e-12));
+    CHECK(near_value(sentences[0].start, 1.235, 1e-12));
+    CHECK(near_value(sentences[0].confidence, 0.0, 1e-12));
+    CHECK(near_value(sentences[1].confidence, 1.0, 1e-12));
     CHECK(format_lrc(sentences) == "[00:01.24]Hello\n[01:01.00]World");
     CHECK(format_lrc(sentences, true) ==
           "[00:01.24][00:02.50]Hello\n[01:01.00][01:02.00]World");

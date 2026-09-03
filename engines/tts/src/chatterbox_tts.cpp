@@ -269,7 +269,7 @@ static void s3gen_model_cache_release() {
     // Vulkan (or Metal/CUDA) buffers allocated against the soon-to-be-
     // freed backend; gallocr_free against
     // a dangling vk_device asserts inside ggml-vulkan.  Same constraint as
-    // the existing thread_local time_mlp_cache documents.
+    // the backend-keyed time_mlp graph cache documents.
     s3gen_release_synth_caches();
     if (!g_s3gen_cache_entry) return;
     model_ctx * m = g_s3gen_cache_entry->m.get();
@@ -733,12 +733,18 @@ static const float * cached_cpu_weights_f32(const ggml_tensor * t) {
     return it->second.data();
 }
 
+// Defined alongside the time_mlp graph cache below: releases the
+// process-wide, backend-keyed time_mlp graph scaffolding (its own
+// mutex, so it is called before g_synth_caches_mu is taken).
+static void time_mlp_graph_cache_release();
+
 // Tear down every per-synth cache.  Safe to call multiple times; safe
 // before/after s3gen_model_cache_release.  Mutex held just long
 // enough to flip the data structures — if a synth is mid-flight on
 // another thread it must finish before this returns (gallocr_free on
 // a graph that's about to be reused is undefined).
 static void s3gen_release_synth_caches() {
+    time_mlp_graph_cache_release();
     std::lock_guard<std::mutex> lk(g_synth_caches_mu);
     g_cfm_estimator_cache.destroy();
     g_encoder_graph_cache.destroy();
@@ -1326,8 +1332,18 @@ static ggml_tensor * cfm_causal_k3_b(ggml_context * ctx, ggml_tensor * x,
 // reserved a fresh gallocr, computed, and freed — burning ~1 ms of
 // dispatch + allocator overhead per step on Metal. Per call (multilingual,
 // 10 CFM steps) that's ~10 ms; for meanflow with `compute_time_mixed`
-// it's slightly more. The cache is keyed on the backend pointer so a
-// fresh model_ctx in another thread doesn't share scaffolding.
+// it's slightly more.
+//
+// The cache is a process-wide, mutex-guarded map keyed on the backend
+// pointer, torn down by s3gen_release_synth_caches() like every other
+// graph cache. It must NOT be thread_local: a thread_local destructor
+// that frees backend memory runs during DLL_THREAD_DETACH under the
+// Windows loader lock when a worker thread exits, where the CUDA
+// runtime refuses to (re)bind thread state and cudaFree fails with
+// cudaErrorInitializationError, aborting the process from ggml-cuda's
+// CUDA_CHECK. Backend-keying also lets the unload path free this
+// scaffolding deterministically instead of leaving it to whichever
+// thread happened to build it.
 struct time_mlp_cache {
     ggml_backend_t  backend = nullptr;
     std::vector<uint8_t> buf;
@@ -1336,11 +1352,29 @@ struct time_mlp_cache {
     ggml_gallocr_t  allocr = nullptr;
     ggml_tensor *   x_in   = nullptr;
     ggml_tensor *   y_out  = nullptr;
+    time_mlp_cache() = default;
+    time_mlp_cache(const time_mlp_cache &)             = delete;
+    time_mlp_cache & operator=(const time_mlp_cache &) = delete;
     ~time_mlp_cache() {
         if (allocr) ggml_gallocr_free(allocr);
         if (ctx)    ggml_free(ctx);
     }
 };
+
+namespace {
+std::mutex g_time_mlp_graph_mu;
+std::unordered_map<ggml_backend_t, time_mlp_cache> g_time_mlp_graph_caches;
+}  // anonymous namespace
+
+static void time_mlp_graph_cache_release() {
+    std::lock_guard<std::mutex> lk(g_time_mlp_graph_mu);
+    g_time_mlp_graph_caches.clear();
+}
+
+static size_t time_mlp_graph_cache_size_for_hooks() {
+    std::lock_guard<std::mutex> lk(g_time_mlp_graph_mu);
+    return g_time_mlp_graph_caches.size();
+}
 
 static std::vector<float> compute_time_mlp(const model_ctx & m, float t_val) {
     const int TDIM = 320;
@@ -1353,7 +1387,8 @@ static std::vector<float> compute_time_mlp(const model_ctx & m, float t_val) {
         t_sin[i + TDIM/2] = std::cos(arg);
     }
 
-    thread_local time_mlp_cache cache;
+    std::lock_guard<std::mutex> lk(g_time_mlp_graph_mu);
+    time_mlp_cache & cache = g_time_mlp_graph_caches[m.backend];
     if (cache.ctx == nullptr || cache.backend != m.backend) {
         if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
         if (cache.ctx)    { ggml_free(cache.ctx); cache.ctx = nullptr; }
@@ -3187,6 +3222,9 @@ void s3gen_unload() {
 
 namespace tts_cpp::chatterbox::test_hooks {
 
+size_t time_mlp_graph_cache_size() {
+    return time_mlp_graph_cache_size_for_hooks();
+}
 size_t time_mlp_result_cache_size() {
     std::lock_guard<std::mutex> lk(g_synth_caches_mu);
     return g_time_mlp_results.size();
