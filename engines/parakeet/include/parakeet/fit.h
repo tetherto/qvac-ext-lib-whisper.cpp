@@ -91,7 +91,9 @@ struct FitResult {
     FitStatus   status = FitStatus::Error;
     bool        fits   = false;  // status == Success
     // "fits" | "does-not-fit" | "model-unreadable" | "no-backend-device" |
-    // "measurement-failed" | "invalid-arguments" | "workload-too-large"
+    // "measurement-failed" | "invalid-arguments" | "workload-too-large" |
+    // "model-type-not-supported" (Nemotron: its prompt-conditioned encoder
+    // is not modelled yet; refusing beats a wrong projection)
     std::string reason;
 
     std::string model_type;     // "ctc" | "rnnt" | "tdt" | "eou" | "sortformer"

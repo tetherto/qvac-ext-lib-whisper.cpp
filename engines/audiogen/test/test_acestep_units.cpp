@@ -20,10 +20,13 @@
 //   9b. fused load         — LM q|k|v / gate|up row blocks fail closed.
 //   10. quantize policy    — acestep-quantize per-tensor type selection.
 //   11. quantize roundtrip — synthetic GGUF through plan/stream/padding, read back.
+//   12. bpe tokenizer      — byte-level BPE encode/decode on a hand-built vocab.
 
 #include "backend_registry.h"
 #include "parallel_load.h"
 #include "audio_edit.h"
+#include "cancellation_scope.h"
+#include "bpe_tokenizer.h"
 #include "cover_noise.h"
 #include "dit_ggml.h"
 #include "dit_gguf.h"
@@ -32,9 +35,12 @@
 #include "generation_conditioning.h"
 #include "generation_plan.h"
 #include "lm_ggml.h"
+#include "loudness.h"
+#include "lyrics_alignment.h"
 #include "lm_pipeline.h"
 #include "metadata_fsm.h"
 #include "philox.h"
+#include "quality_score.h"
 #include "quantize_gguf.h"
 #include "quantize_policy.h"
 #include "qwen3_block.h"
@@ -648,6 +654,67 @@ void test_gpu_fallback_reason() {
     }
 }
 
+// 6c. GPU tier policy --------------------------------------------------------
+// Speech-engine GPU selection prefers CUDA over Vulkan on the same NVIDIA
+// card, and prefers discrete over integrated adapters. gpu_tier_for is the
+// pure ranking that captures that policy so a synthesised device topology can
+// be scored without a live ggml-backend registry.
+//
+// SCOPE: this test covers the classifier (what tier a device lands in) and
+// the enum-constant ordering (which tier outranks which). It does NOT
+// exercise backend_gpu_init's actual walk in backend_registry.h: that
+// function has its own parallel Adreno-OpenCL / CUDA-first / {require_validated,
+// {GPU, IGPU}} sequence and does not call gpu_tier_for today, so a reordering
+// of that walk would silently pass this test. Keeping the two in sync is a
+// code-review contract; the deeper fix (drive backend_gpu_init off
+// gpu_tier_for as the single source of truth) is tracked separately.
+void test_gpu_tier_policy() {
+    using tts_cpp::acestep::GpuTier;
+    using tts_cpp::acestep::gpu_tier_for;
+
+    // Adreno 700+ OpenCL wins outright — the OpenCL kernels are the validated
+    // path on Snapdragon 8 Gen 2+.
+    CHECK(gpu_tier_for("OpenCL", GGML_BACKEND_DEVICE_TYPE_GPU,  740) == GpuTier::AdrenoOpenCL700Plus);
+    CHECK(gpu_tier_for("OpenCL", GGML_BACKEND_DEVICE_TYPE_IGPU, 740) == GpuTier::AdrenoOpenCL700Plus);
+    // Adreno 6xx OpenCL is not routed to the OpenCL tier here (broken kernels)
+    // — the calling code separately skips it; the ranking treats it as generic OpenCL.
+    CHECK(gpu_tier_for("OpenCL", GGML_BACKEND_DEVICE_TYPE_GPU,  640) != GpuTier::AdrenoOpenCL700Plus);
+
+    // CUDA outranks Vulkan on the same NVIDIA card.
+    CHECK(gpu_tier_for("CUDA",   GGML_BACKEND_DEVICE_TYPE_GPU,  -1)  == GpuTier::CudaDiscrete);
+    CHECK(gpu_tier_for("Vulkan", GGML_BACKEND_DEVICE_TYPE_GPU,  -1)  == GpuTier::ValidatedDiscrete);
+    CHECK(static_cast<int>(GpuTier::CudaDiscrete) <
+          static_cast<int>(GpuTier::ValidatedDiscrete));
+
+    // Tegra / Jetson CUDA reports IGPU on some drivers — still preferred over
+    // a validated Vulkan discrete via the CUDA-first rule.
+    CHECK(gpu_tier_for("CUDA", GGML_BACKEND_DEVICE_TYPE_IGPU, -1) == GpuTier::CudaIntegrated);
+    CHECK(static_cast<int>(GpuTier::CudaIntegrated) <
+          static_cast<int>(GpuTier::ValidatedDiscrete));
+
+    // Discrete outranks integrated at every tier that has both — the
+    // other-addons behavior we are matching (llm/diffusion prefer dGPU).
+    CHECK(static_cast<int>(GpuTier::CudaDiscrete)      < static_cast<int>(GpuTier::CudaIntegrated));
+    CHECK(static_cast<int>(GpuTier::ValidatedDiscrete) < static_cast<int>(GpuTier::ValidatedIntegrated));
+    CHECK(static_cast<int>(GpuTier::OtherDiscrete)     < static_cast<int>(GpuTier::OtherIntegrated));
+
+    // Metal is validated; MTL is the new registry name for the same backend.
+    CHECK(gpu_tier_for("Metal", GGML_BACKEND_DEVICE_TYPE_GPU,  -1) == GpuTier::ValidatedDiscrete);
+    CHECK(gpu_tier_for("MTL",   GGML_BACKEND_DEVICE_TYPE_IGPU, -1) == GpuTier::ValidatedIntegrated);
+
+    // Non-GPU device types are not selectable — the ranking rejects them so
+    // the CPU/Accel devices never leak into the GPU pass.
+    CHECK(gpu_tier_for("Vulkan", GGML_BACKEND_DEVICE_TYPE_CPU,   -1) == GpuTier::NotSelectable);
+    CHECK(gpu_tier_for("BLAS",   GGML_BACKEND_DEVICE_TYPE_ACCEL, -1) == GpuTier::NotSelectable);
+    CHECK(gpu_tier_for(nullptr,  GGML_BACKEND_DEVICE_TYPE_CPU,   -1) == GpuTier::NotSelectable);
+
+    // A fake "ROCm" / "MUSA" registry lands in the Other tier — unvalidated
+    // but still a candidate below every validated GPU, matching the current
+    // {require_validated, ...} nest in backend_gpu_init.
+    CHECK(gpu_tier_for("ROCm", GGML_BACKEND_DEVICE_TYPE_GPU,  -1) == GpuTier::OtherDiscrete);
+    CHECK(gpu_tier_for("MUSA", GGML_BACKEND_DEVICE_TYPE_IGPU, -1) == GpuTier::OtherIntegrated);
+}
+
 // 7. stage placement ---------------------------------------------------------
 // Which backend each stage runs on decides which numerical path the generated
 // audio takes, so the policy is locked here rather than only observed on a
@@ -1125,6 +1192,278 @@ void test_generate_task_errors() {
     CHECK(approx(task.audio_cover_strength, 0.5f));
 }
 
+void test_simple_mode_policy() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::TASK_COVER_NOFSQ;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+    params.simple_mode = true;
+    params.caption = "a romantic modern salsa with male lead vocals for a wedding";
+    params.lyrics.clear();
+    CHECK(resolve_generate_task(params, task).empty());
+
+    params.lyrics = "[Instrumental]";
+    CHECK(resolve_generate_task(params, task).empty());
+
+    params.lyrics = "[verse]\nuser lyrics";
+    CHECK(resolve_generate_task(params, task).find("lyrics must be empty") != std::string::npos);
+
+    params.lyrics.clear();
+    params.caption.clear();
+    CHECK(resolve_generate_task(params, task).find("requires a caption") != std::string::npos);
+
+    params.caption = "a short query";
+    params.task_type = TASK_COVER_NOFSQ;
+    params.source_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("only task 'text2music'") != std::string::npos);
+
+    params.task_type.clear();
+    params.source_audio.clear();
+    params.audio_codes.assign(4, 1);
+    CHECK(resolve_generate_task(params, task).find("pre-supplied audio_codes") != std::string::npos);
+
+    params.audio_codes.clear();
+    params.edit_plan.push_back(tts_cpp::acestep::RepaintParams{});
+    CHECK(resolve_generate_task(params, task).find("combined with edit_plan") != std::string::npos);
+
+    params.edit_plan.clear();
+    params.lm_phase1 = false;
+    CHECK(resolve_generate_task(params, task).find("requires lm_phase1") != std::string::npos);
+
+    params.lm_phase1 = true;
+    params.simple_mode = false;
+    params.lyrics = "[verse]\nuser lyrics";
+    CHECK(resolve_generate_task(params, task).empty());
+}
+
+void test_simple_mode_prompt_resolvers() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::RepaintParams;
+    using tts_cpp::acestep::resolve_prompt_language;
+    using tts_cpp::acestep::resolve_prompt_lyrics;
+
+    GenerateParams params;
+    params.lyrics.clear();
+    CHECK(resolve_prompt_lyrics(params) == "[Instrumental]");
+    CHECK(resolve_prompt_language(params) == "en");
+
+    params.simple_mode = true;
+    CHECK(resolve_prompt_lyrics(params).empty());
+    CHECK(resolve_prompt_language(params).empty());
+
+    params.lyrics = "[Instrumental]";
+    params.vocal_language = "es";
+    CHECK(resolve_prompt_lyrics(params) == "[Instrumental]");
+    CHECK(resolve_prompt_language(params) == "es");
+
+    params.simple_mode = false;
+    params.lyrics.clear();
+    params.vocal_language.clear();
+    params.edit_plan.push_back(RepaintParams{});
+    CHECK(resolve_prompt_language(params) == "unknown");
+
+    params.edit_plan.clear();
+    params.task_type = tts_cpp::acestep::TASK_LEGO;
+    CHECK(resolve_prompt_language(params) == "unknown");
+}
+
+void test_normalize_loudness() {
+    using tts_cpp::acestep::normalize_loudness;
+
+    std::vector<float> pcm = { 0.1f, -0.2f, 0.4f, 0.05f };
+    normalize_loudness(pcm, 0);
+    CHECK(approx(pcm[0], 0.25f));
+    CHECK(approx(pcm[1], -0.5f));
+    CHECK(approx(pcm[2], 1.0f));
+    CHECK(approx(pcm[3], 0.125f));
+
+    std::vector<float> clipped = { 0.1f, -0.2f, 0.4f, 0.05f };
+    normalize_loudness(clipped, 10);
+    CHECK(approx(clipped[0], 0.5f));
+    CHECK(approx(clipped[1], -1.0f));
+    CHECK(approx(clipped[2], 1.0f));
+    CHECK(approx(clipped[3], 0.25f));
+
+    std::vector<float> silence(16, 0.0f);
+    normalize_loudness(silence);
+    CHECK(silence == std::vector<float>(16, 0.0f));
+
+    std::vector<float> empty;
+    normalize_loudness(empty);
+    CHECK(empty.empty());
+}
+
+bool near_value(double actual, double expected, double tolerance) {
+    return std::fabs(actual - expected) <= tolerance;
+}
+
+void test_lyrics_matrix_conversion() {
+    using tts_cpp::acestep::lyrics::Matrix;
+    using tts_cpp::acestep::lyrics::matrix_from_column_major;
+
+    const std::vector<float> ggml_values = {
+        1, 5, 9,
+        2, 6, 10,
+        3, 7, 11,
+        4, 8, 12,
+    };
+    const Matrix matrix = matrix_from_column_major(ggml_values.data(), 3, 4);
+    CHECK(matrix.values == std::vector<float>({ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }));
+}
+
+void test_lyrics_dtw() {
+    using tts_cpp::acestep::lyrics::Matrix;
+    using tts_cpp::acestep::lyrics::dtw;
+    using tts_cpp::acestep::lyrics::DtwPath;
+
+    const Matrix costs(3, 3, {
+        0.0f, 2.0f, 2.0f,
+        2.0f, 0.0f, 2.0f,
+        2.0f, 2.0f, 0.0f,
+    });
+    DtwPath path = dtw(costs);
+    CHECK(path.token_indices == std::vector<int32_t>({ 0, 1, 2 }));
+    CHECK(path.frame_indices == std::vector<int32_t>({ 0, 1, 2 }));
+
+    const Matrix rectangular(2, 5);
+    path = dtw(rectangular);
+    CHECK(path.token_indices.front() == 0 && path.token_indices.back() == 1);
+    CHECK(path.frame_indices.front() == 0 && path.frame_indices.back() == 4);
+
+    // Reference-parity tie-break (_dtw.py): with diagonal == vertical <
+    // horizontal at the last cell, the strict comparison chain falls through
+    // to horizontal, so the path detours through (1, 0) instead of stepping
+    // diagonally.
+    const Matrix tie(2, 2, {
+        0.0f, 0.0f,
+        1.0f, 0.0f,
+    });
+    path = dtw(tie);
+    CHECK(path.token_indices == std::vector<int32_t>({ 0, 1, 1 }));
+    CHECK(path.frame_indices == std::vector<int32_t>({ 0, 0, 1 }));
+}
+
+void test_lyrics_preprocessing() {
+    using namespace tts_cpp::acestep::lyrics;
+
+    const Matrix spike(1, 5, { 0.0f, 0.0f, 10.0f, 0.0f, 0.0f });
+    const Matrix filtered = median_filter(spike, 3);
+    CHECK(filtered.values == std::vector<float>({ 0, 0, 0, 0, 0 }));
+
+    const Matrix head_a(2, 3, { 1, 2, 3, 4, 5, 6 });
+    const Matrix head_b(2, 3, { 3, 4, 5, 6, 7, 8 });
+    const auto scoring = preprocess_scoring({ head_a, head_b }, 1);
+    CHECK(near_value(scoring.average_matrix(0, 0), 2.0, 1e-6));
+    CHECK(near_value(scoring.energy_matrix(0, 0), 0.0, 1e-6));
+    CHECK(near_value(scoring.energy_matrix(1, 2), 1.0, 1e-6));
+    CHECK(near_value(scoring.calc_matrix(0, 1), 0.04, 1e-6));
+
+    const auto alignment = preprocess_alignment({ head_a, head_b }, 2.0f, 1);
+    CHECK(alignment.calc_matrix.rows == 2 && alignment.calc_matrix.cols == 3);
+    CHECK(alignment.energy_matrix.rows == 2 && alignment.energy_matrix.cols == 3);
+}
+
+void test_lyrics_metrics_and_score() {
+    using namespace tts_cpp::acestep::lyrics;
+
+    CHECK(token_type_mask({ "hello", "[verse", "]", "world" }) ==
+          std::vector<int32_t>({ 1, 0, 0, 1 }));
+
+    const Matrix energy(3, 4, {
+        0.8f, 0.2f, 0.0f, 0.0f,
+        0.0f, 0.5f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.2f, 0.8f,
+    });
+    DtwPath path;
+    path.token_indices = { 0, 1, 2 };
+    path.frame_indices = { 0, 1, 3 };
+    const AlignmentMetrics metrics =
+        compute_alignment_metrics(energy, path, { 1, 0, 1 }, 0.01, 0.0, 0.5);
+    CHECK(near_value(metrics.coverage, 1.0, 1e-12));
+    CHECK(near_value(metrics.monotonicity, 1.0, 1e-12));
+    CHECK(near_value(metrics.path_confidence, 0.74, 1e-7));
+    CHECK(near_value(calculate_lyrics_score(metrics), 0.74, 1e-12));
+}
+
+void test_lyrics_timestamps_and_lrc() {
+    using namespace tts_cpp::acestep::lyrics;
+
+    const Matrix attention(2, 4, {
+        5.0f, 5.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 5.0f, 5.0f,
+    });
+    const std::vector<TokenTimestamp> aligned =
+        token_timestamps(attention, { 1, 2 }, { "Hello", "\n" }, 4.0);
+    CHECK(near_value(aligned[0].start, 0.0, 1e-12));
+    CHECK(near_value(aligned[0].end, 1.0, 1e-12));
+    CHECK(near_value(aligned[1].start, 1.0, 1e-12));
+    CHECK(near_value(aligned[1].end, 3.0, 1e-12));
+
+    const std::vector<TokenTimestamp> tokens = {
+        { 1, "Hello", 1.23456, 2.0, 0.2 },
+        { 2, "\n", 2.0, 2.5, 0.4 },
+        { 3, "World", 61.0, 62.0, 0.8 },
+    };
+    const auto decoder = [](const std::vector<int> & ids) {
+        std::string text;
+        for (int id : ids) {
+            if (id == 1) text += "Hello";
+            if (id == 2) text += "\n";
+            if (id == 3) text += "World";
+        }
+        return text;
+    };
+    const std::vector<SentenceTimestamp> sentences = sentence_timestamps(tokens, decoder);
+    CHECK(sentences.size() == 2);
+    CHECK(sentences[0].text == "Hello" && sentences[1].text == "World");
+    CHECK(near_value(sentences[0].start, 1.235, 1e-12));
+    CHECK(near_value(sentences[0].confidence, 0.0, 1e-12));
+    CHECK(near_value(sentences[1].confidence, 1.0, 1e-12));
+    CHECK(format_lrc(sentences) == "[00:01.24]Hello\n[01:01.00]World");
+    CHECK(format_lrc(sentences, true) ==
+          "[00:01.24][00:02.50]Hello\n[01:01.00][01:02.00]World");
+}
+
+void test_lrc_request_policy() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::RepaintParams;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+    params.generate_lrc = true;
+    params.lyrics = "[verse]\na line to align";
+    CHECK(resolve_generate_task(params, task).empty());
+
+    params.lyrics = "[Instrumental]";
+    CHECK(resolve_generate_task(params, task).find("requires lyrics") != std::string::npos);
+
+    params.lyrics.clear();
+    CHECK(resolve_generate_task(params, task).find("requires lyrics") != std::string::npos);
+
+    params.simple_mode = true;
+    params.caption = "a short query";
+    CHECK(resolve_generate_task(params, task).empty());
+
+    params.simple_mode = false;
+    params.lyrics = "[verse]\na line to align";
+    params.edit_plan.push_back(RepaintParams{});
+    CHECK(resolve_generate_task(params, task).find("audio edit path") != std::string::npos);
+}
+
+void test_inspire_user_message() {
+    using tts_cpp::acestep::lm_inspire_user_message;
+
+    CHECK(lm_inspire_user_message("a short query", "") == "a short query");
+    CHECK(lm_inspire_user_message("a short query", "[Instrumental]") ==
+          "a short query\n\ninstrumental: true");
+    CHECK(lm_inspire_user_message("a short query", "[verse]\nwords") == "a short query");
+}
+
 void test_cover_conditioning_switch() {
     using tts_cpp::acestep::GenerateTask;
     using tts_cpp::acestep::TASK_COVER_NOFSQ;
@@ -1225,6 +1564,154 @@ void test_generation_plans() {
     CHECK(plan.encode_reference);
     CHECK(!plan.reuse_source_reference);
     CHECK(plan.blend_cover_noise);
+}
+
+void test_lego_task_kinds() {
+    using tts_cpp::acestep::TASK_COVER_NOFSQ;
+    using tts_cpp::acestep::TASK_LEGO;
+    using tts_cpp::acestep::TASK_TEXT2MUSIC;
+    using tts_cpp::acestep::LEGO_TRACK_NAMES;
+    using tts_cpp::acestep::is_lego_task;
+    using tts_cpp::acestep::is_source_task;
+    using tts_cpp::acestep::is_valid_lego_track;
+
+    CHECK(is_lego_task(TASK_LEGO));
+    CHECK(!is_lego_task(TASK_TEXT2MUSIC));
+    CHECK(!is_lego_task(TASK_COVER_NOFSQ));
+    CHECK(is_source_task(TASK_LEGO));
+    CHECK(is_source_task(TASK_COVER_NOFSQ));
+    CHECK(!is_source_task(TASK_TEXT2MUSIC));
+
+    for (const char * name : LEGO_TRACK_NAMES) {
+        CHECK(is_valid_lego_track(name));
+    }
+    CHECK(!is_valid_lego_track(""));
+    CHECK(!is_valid_lego_track("piano"));
+    CHECK(!is_valid_lego_track("GUITAR"));
+}
+
+void test_lego_task_validation() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::TASK_LEGO;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+
+    params.task_type = TASK_LEGO;
+    CHECK(resolve_generate_task(params, task).find("requires source_audio") != std::string::npos);
+
+    params.source_audio.assign(3, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("source_audio must be interleaved stereo") != std::string::npos);
+
+    params.source_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("requires a track name") != std::string::npos);
+
+    params.track = "accordion";
+    CHECK(resolve_generate_task(params, task).find("unknown lego track") != std::string::npos);
+
+    params.track = "guitar";
+    CHECK(resolve_generate_task(params, task).empty());
+    CHECK(task.type == TASK_LEGO);
+    CHECK(task.track == "guitar");
+}
+
+void test_lego_generation_plan() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::GenerationPlan;
+    using tts_cpp::acestep::TASK_LEGO;
+    using tts_cpp::acestep::make_generation_plan;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask task;
+    params.task_type = TASK_LEGO;
+    params.track = "drums";
+    params.source_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).empty());
+
+    GenerationPlan plan = make_generation_plan(params, task);
+    CHECK(plan.encode_source);
+    CHECK(!plan.encode_reference);
+    CHECK(!plan.reuse_source_reference);
+    CHECK(!plan.run_lm);
+    CHECK(!plan.run_detokenizer);
+    CHECK(!plan.blend_cover_noise);
+
+    params.reference_audio.assign(4, 0.0f);
+    CHECK(resolve_generate_task(params, task).empty());
+    plan = make_generation_plan(params, task);
+    CHECK(plan.encode_reference);
+    CHECK(!plan.reuse_source_reference);
+}
+
+void test_lego_model_policy() {
+    using tts_cpp::acestep::is_sft_model_name;
+    using tts_cpp::acestep::lego_model_error;
+
+    CHECK(is_sft_model_name("acestep-v15-sft"));
+    CHECK(is_sft_model_name("acestep-v15-xl-sft"));
+    CHECK(!is_sft_model_name("acestep-v15-base"));
+    CHECK(!is_sft_model_name("acestep-v15-xl-base"));
+    CHECK(!is_sft_model_name("acestep-v15-turbo"));
+    CHECK(!is_sft_model_name(""));
+
+    CHECK(lego_model_error(false, false).empty());
+    CHECK(lego_model_error(true, false).find("requires a base DiT") != std::string::npos);
+    CHECK(lego_model_error(true, false).find("turbo") != std::string::npos);
+    CHECK(lego_model_error(false, true).find("requires a base DiT") != std::string::npos);
+    CHECK(lego_model_error(false, true).find("sft") != std::string::npos);
+}
+
+void test_guidance_and_dcw_policy() {
+    using tts_cpp::acestep::resolve_dcw_enabled;
+    using tts_cpp::acestep::resolve_guidance_scale;
+
+    CHECK(approx(resolve_guidance_scale(0.0f, true), 1.0f));
+    CHECK(approx(resolve_guidance_scale(7.0f, true), 1.0f));
+    CHECK(approx(resolve_guidance_scale(0.0f, false), 7.0f));
+    CHECK(approx(resolve_guidance_scale(3.5f, false), 3.5f));
+
+    CHECK(resolve_dcw_enabled(true, true));
+    CHECK(!resolve_dcw_enabled(true, false));
+    CHECK(!resolve_dcw_enabled(false, true));
+    CHECK(!resolve_dcw_enabled(false, false));
+}
+
+// APG guide: golden values hand-derived from the reference apg_forward
+// (momentum -0.75, norm_threshold 2.5, projection per channel over T).
+void test_apg_guide() {
+    using tts_cpp::acestep::dit_apg_guide;
+
+    std::vector<double> momentum(2, 0.0);
+    std::vector<float> cond = { 3.0f, 4.0f };
+    std::vector<float> uncond = { 2.0f, 2.0f };
+    std::vector<float> velocity = cond;
+    dit_apg_guide(velocity, uncond, momentum, 7.0f, 2, 1, 1);
+    CHECK(approx(velocity[0], 1.08f, 1e-4f));
+    CHECK(approx(velocity[1], 5.44f, 1e-4f));
+
+    velocity = cond;
+    dit_apg_guide(velocity, uncond, momentum, 7.0f, 2, 1, 1);
+    CHECK(approx(velocity[0], 2.52f, 1e-4f));
+    CHECK(approx(velocity[1], 4.36f, 1e-4f));
+
+    std::vector<double> fresh_momentum(2, 0.0);
+    std::vector<float> parallel_cond = { 10.0f, 0.0f };
+    std::vector<float> parallel_uncond = { 6.0f, 0.0f };
+    velocity = parallel_cond;
+    dit_apg_guide(velocity, parallel_uncond, fresh_momentum, 7.0f, 2, 1, 1);
+    CHECK(approx(velocity[0], 10.0f, 1e-4f));
+    CHECK(approx(velocity[1], 0.0f, 1e-4f));
+
+    std::vector<double> zero_momentum(2, 0.0);
+    std::vector<float> equal = { 1.5f, -0.5f };
+    velocity = equal;
+    dit_apg_guide(velocity, equal, zero_momentum, 7.0f, 2, 1, 1);
+    CHECK(approx(velocity[0], equal[0]));
+    CHECK(approx(velocity[1], equal[1]));
 }
 
 void test_generation_conditioning() {
@@ -1700,6 +2187,50 @@ void test_quantize_policy() {
     CHECK(!quant_should_promote_f32(2));
 }
 
+// MM3's LM (arch "qwen3") uses llama.cpp-style tensor names, and its synth file
+// (arch "mm3") bundles a DiT with a condition encoder, RVQ depth decoder, vocoder,
+// and timestep Fourier basis that must stay untouched. Neither reuses the HF-style
+// v_proj/down_proj/o_proj bump machinery: MM3's own attn_v.weight/ffn_down.weight/
+// attn_output.weight names are shared verbatim between the LM and the (denylisted)
+// depth decoder, and the DiT's fused attn_qkv/ffn_in/ffn_out layout has no bump
+// target to protect, so quantization is flat aside from the embed/output-head
+// overrides checked here.
+void test_quantize_policy_mm3() {
+    using namespace tts_cpp::acestep;
+
+    const QuantVariant * q4km = find_quant_variant("q4_k_m");
+    CHECK(q4km != nullptr);
+
+    // LM embedding table and untied output head both take the embed type.
+    CHECK(quant_pick_type("token_embd.weight", 2, "qwen3", *q4km, 36) == GGML_TYPE_Q6_K);
+    CHECK(quant_pick_type("output.weight", 2, "qwen3", *q4km, 36) == GGML_TYPE_Q6_K);
+
+    // Everything else in the LM is flat base-type: no bump for MM3's naming.
+    CHECK(quant_pick_type("blk.0.attn_v.weight", 2, "qwen3", *q4km, 36) == GGML_TYPE_Q4_K);
+    CHECK(quant_pick_type("blk.35.ffn_down.weight", 2, "qwen3", *q4km, 36) == GGML_TYPE_Q4_K);
+    CHECK(quant_pick_type("blk.0.attn_output.weight", 2, "qwen3", *q4km, 36) == GGML_TYPE_Q4_K);
+
+    // The untied-output rule is scoped to "qwen3" only; it must not leak into ACE-Step's LM.
+    CHECK(quant_pick_type("output.weight", 2, "acestep-lm", *q4km, 24) == GGML_TYPE_Q4_K);
+
+    // Synth policy: condition encoder and vocoder never quantize; the RVQ depth
+    // decoder is pinned at Q8_0 for every variant (fast integer matvec path).
+    CHECK(quant_pick_type("depth.proj.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q8_0);
+    CHECK(quant_pick_type("depth.blk.0.attn_v.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q8_0);
+    CHECK(quant_pick_type("depth.audio_embd.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q8_0);
+    CHECK(quant_pick_type("depth.blk.0.input_norm.weight", 1, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("depth.pos_embd.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("cond.proj.weight", 3, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("voc.conv_in.weight", 3, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
+    CHECK(quant_pick_type("dit.time_fourier.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_COUNT);
+
+    // The DiT is the one synth component that quantizes, flat, including the
+    // attn_output.weight name it shares with the LM and the denylisted depth decoder.
+    CHECK(quant_pick_type("dit.blk.0.attn_qkv.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q4_K);
+    CHECK(quant_pick_type("dit.proj_in.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q4_K);
+    CHECK(quant_pick_type("dit.blk.0.attn_output.weight", 2, "mm3", *q4km, 0) == GGML_TYPE_Q4_K);
+}
+
 // End-to-end guard on the offset/padding planning and the streaming writer: a
 // regression there emits a byte-shifted GGUF that only fails at engine load.
 // Quantizes a synthetic BF16-era file and reads the result back through the
@@ -1821,6 +2352,432 @@ void test_quantize_gguf_roundtrip() {
     std::remove(out_path.c_str());
 }
 
+// Same end-to-end guard for the MM3 synth layout: the protected condition
+// encoder must pass through byte-identical, the depth decoder must land at
+// Q8_0, and the DiT takes the variant base type. A regression here is silent
+// (the file still loads) and only shows up as degraded audio.
+// Each tensor gets its own source values so an expectation built from the
+// wrong tensor's bytes cannot pass.
+std::vector<float> quant_source_row(size_t count, float offset) {
+    std::vector<float> values(count);
+    for (size_t i = 0; i < count; ++i) {
+        values[i] = ((float) i - offset) / 64.0f;
+    }
+    return values;
+}
+
+void test_quantize_gguf_roundtrip_mm3() {
+    using namespace tts_cpp::acestep;
+
+    const std::string in_path  = test_temp_dir() + "/qvac-mm3-quantize-in.gguf";
+    const std::string out_path = test_temp_dir() + "/qvac-mm3-quantize-out.gguf";
+
+    // 256-wide rows satisfy the k-quant superblock alignment, so only the
+    // policy (not the alignment fallback) decides who quantizes.
+    const std::vector<float> cond_row  = quant_source_row(256 * 2, 256.0f);
+    const std::vector<float> depth_row = quant_source_row(256 * 2, 320.0f);
+    const std::vector<float> dit_row   = quant_source_row(256 * 2, 400.0f);
+
+    ggml_init_params ip{ 4 * 1024 * 1024, nullptr, /*no_alloc=*/false };
+    ggml_context *   ctx = ggml_init(ip);
+    gguf_context *   gc  = gguf_init_empty();
+    gguf_set_val_str(gc, "general.architecture", "mm3");
+
+    ggml_tensor * cond = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, 2);
+    ggml_set_name(cond, "cond.proj.weight");
+    ggml_fp32_to_fp16_row(cond_row.data(), (ggml_fp16_t *) cond->data, (int64_t) cond_row.size());
+    gguf_add_tensor(gc, cond);
+    std::vector<ggml_fp16_t> cond_bytes((size_t) cond_row.size());
+    std::memcpy(cond_bytes.data(), cond->data, cond_row.size() * sizeof(ggml_fp16_t));
+
+    ggml_tensor * depth = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, 2);
+    ggml_set_name(depth, "depth.blk.0.attn_v.weight");
+    ggml_fp32_to_fp16_row(depth_row.data(), (ggml_fp16_t *) depth->data, (int64_t) depth_row.size());
+    gguf_add_tensor(gc, depth);
+    std::vector<ggml_fp16_t> depth_bytes((size_t) depth_row.size());
+    std::memcpy(depth_bytes.data(), depth->data, depth_row.size() * sizeof(ggml_fp16_t));
+
+    ggml_tensor * dit = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, 2);
+    ggml_set_name(dit, "dit.blk.0.attn_qkv.weight");
+    ggml_fp32_to_fp16_row(dit_row.data(), (ggml_fp16_t *) dit->data, (int64_t) dit_row.size());
+    gguf_add_tensor(gc, dit);
+    std::vector<ggml_fp16_t> dit_bytes((size_t) dit_row.size());
+    std::memcpy(dit_bytes.data(), dit->data, dit_row.size() * sizeof(ggml_fp16_t));
+
+    CHECK(gguf_write_to_file(gc, in_path.c_str(), /*only_meta=*/false));
+    gguf_free(gc);
+    ggml_free(ctx);
+
+    const QuantVariant * q4km = find_quant_variant("Q4_K_M");
+    QuantizeStats        stats;
+    std::string          error;
+    CHECK(quantize_gguf_file(in_path, out_path, *q4km, stats, error));
+    CHECK(error.empty());
+    CHECK(stats.n_tensors == 3);
+    CHECK(stats.n_quantized == 2);
+
+    ggml_context *   out_meta   = nullptr;
+    gguf_init_params out_params = { /*no_alloc=*/false, /*ctx=*/&out_meta };
+    gguf_context *   out        = gguf_init_from_file(out_path.c_str(), out_params);
+    CHECK(out != nullptr);
+    if (out) {
+        ggml_tensor * q_cond = ggml_get_tensor(out_meta, "cond.proj.weight");
+        CHECK(q_cond && q_cond->type == GGML_TYPE_F16);
+        if (q_cond) {
+            CHECK(std::memcmp(q_cond->data, cond_bytes.data(),
+                              cond_bytes.size() * sizeof(ggml_fp16_t)) == 0);
+        }
+
+        ggml_tensor * q_depth = ggml_get_tensor(out_meta, "depth.blk.0.attn_v.weight");
+        CHECK(q_depth && q_depth->type == GGML_TYPE_Q8_0);
+        if (q_depth) {
+            std::vector<float> f32(depth_row.size());
+            ggml_fp16_to_fp32_row(depth_bytes.data(), f32.data(), (int64_t) f32.size());
+            std::vector<uint8_t> expected(ggml_row_size(GGML_TYPE_Q8_0, 256) * 2);
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, f32.data(), expected.data(), 0, 2, 256, nullptr);
+            CHECK(std::memcmp(q_depth->data, expected.data(), expected.size()) == 0);
+        }
+
+        ggml_tensor * q_dit = ggml_get_tensor(out_meta, "dit.blk.0.attn_qkv.weight");
+        CHECK(q_dit && q_dit->type == GGML_TYPE_Q4_K);
+        if (q_dit) {
+            // The writer must emit exactly ggml's reference quantization of the
+            // F32-converted source rows (ggml_quantize_chunk, no imatrix).
+            std::vector<float> f32(dit_row.size());
+            ggml_fp16_to_fp32_row(dit_bytes.data(), f32.data(), (int64_t) f32.size());
+            std::vector<uint8_t> expected(ggml_row_size(GGML_TYPE_Q4_K, 256) * 2);
+            ggml_quantize_chunk(GGML_TYPE_Q4_K, f32.data(), expected.data(), 0, 2, 256, nullptr);
+            CHECK(std::memcmp(q_dit->data, expected.data(), expected.size()) == 0);
+
+            std::vector<float> back(dit_row.size());
+            ggml_get_type_traits(GGML_TYPE_Q4_K)->to_float(q_dit->data, back.data(),
+                                                           (int64_t) back.size());
+            for (size_t i = 0; i < back.size(); ++i) {
+                CHECK(std::fabs(back[i] - dit_row[i]) < 0.25f);
+            }
+        }
+
+        gguf_free(out);
+        ggml_free(out_meta);
+    }
+
+    std::remove(in_path.c_str());
+    std::remove(out_path.c_str());
+}
+
+// 12. bpe tokenizer ------------------------------------------------------------
+// Weight-free: the tokenizer is hand-built instead of loaded from a GGUF, so
+// these lock bpe_encode/bpe_decode/bpe_utf8_codepoint against a tiny vocab
+// whose merges are fully traceable by hand.
+
+// Replica of the GPT-2 byte-level table build_byte_encoder() computes at load:
+// printable/latin bytes map to their own codepoint, the rest to 256+n in
+// ascending byte order (so ' ' -> U+0120).
+void build_test_byte2str(std::string byte2str[256]) {
+    bool direct[256] = {};
+    for (int b = '!'; b <= '~'; ++b) direct[b] = true;
+    for (int b = 0xA1; b <= 0xAC; ++b) direct[b] = true;
+    for (int b = 0xAE; b <= 0xFF; ++b) direct[b] = true;
+    int n = 0;
+    for (int b = 0; b < 256; ++b) {
+        const int cp = direct[b] ? b : 256 + n++;
+        std::string out;
+        if (cp < 0x80) {
+            out += (char) cp;
+        } else if (cp < 0x800) {
+            out += (char) (0xC0 | (cp >> 6));
+            out += (char) (0x80 | (cp & 0x3F));
+        } else {
+            out += (char) (0xE0 | (cp >> 12));
+            out += (char) (0x80 | ((cp >> 6) & 0x3F));
+            out += (char) (0x80 | (cp & 0x3F));
+        }
+        byte2str[b] = out;
+    }
+}
+
+// Vocab ids: h=0 e=1 l=2 o=3 a=4 b=5 1=6 2=7 he=8 ll=9 hello=10 Ġhello=11.
+// The merge chain h+e, l+l, he+ll, hell+o, Ġ+hello reaches "hello" and
+// " hello"; "a b" produces a piece deliberately absent from the vocab.
+tts_cpp::acestep::BpeTokenizer make_test_bpe_tokenizer() {
+    tts_cpp::acestep::BpeTokenizer tok;
+    build_test_byte2str(tok.byte2str);
+    const std::string g_space = tok.byte2str[(unsigned char) ' '];
+    const std::vector<std::string> tokens = {
+        "h", "e", "l", "o", "a", "b", "1", "2", "he", "ll", "hello", g_space + "hello",
+    };
+    for (size_t i = 0; i < tokens.size(); ++i) tok.vocab[tokens[i]] = (int) i;
+    tok.n_vocab   = (int) tokens.size();
+    tok.id_to_str = tokens;
+    const std::vector<std::string> merge_list = {
+        "h e", "l l", "he ll", "hell o", g_space + " hello", "a b",
+    };
+    for (size_t i = 0; i < merge_list.size(); ++i) tok.merges[merge_list[i]] = (int) i;
+    return tok;
+}
+
+// A cancel armed before generate() must survive into the run that observes it
+// and be consumed on exit, so the next run starts clean. Pinned on the scope
+// itself: the engine-level path needs model weights.
+void test_cancellation_scope_consumes_on_exit() {
+    using tts_cpp::acestep::CancellationScope;
+
+    std::atomic<bool> cancelled{ true };
+    {
+        CancellationScope scope(cancelled);
+        CHECK(cancelled.load());
+    }
+    CHECK(!cancelled.load());
+
+    cancelled.store(false);
+    {
+        CancellationScope scope(cancelled);
+        CHECK(!cancelled.load());
+        cancelled.store(true);
+    }
+    CHECK(!cancelled.load());
+}
+
+void test_bpe_utf8_codepoint() {
+    using tts_cpp::acestep::bpe_utf8_codepoint;
+
+    int adv = 0;
+    CHECK(bpe_utf8_codepoint("A", &adv) == 0x41 && adv == 1);
+    CHECK(bpe_utf8_codepoint("~", &adv) == 0x7E && adv == 1);
+    CHECK(bpe_utf8_codepoint("\xC3\xA9", &adv) == 0xE9 && adv == 2);      // é
+    CHECK(bpe_utf8_codepoint("\xE4\xB8\xAD", &adv) == 0x4E2D && adv == 3);  // 中
+    CHECK(bpe_utf8_codepoint("\xF0\x90\x90\x80", &adv) == 0x10400 && adv == 4);
+
+    // Malformed lead bytes fall back to advance-by-1 with the raw byte value.
+    const char lone_continuation[] = { (char) 0x80, 0, 0, 0, 0 };
+    CHECK(bpe_utf8_codepoint(lone_continuation, &adv) == 0x80 && adv == 1);
+    const char invalid_lead[] = { (char) 0xFF, 0, 0, 0, 0 };
+    CHECK(bpe_utf8_codepoint(invalid_lead, &adv) == 0xFF && adv == 1);
+
+    // A sequence that runs into the terminator decodes as its raw lead byte
+    // rather than consuming the declared width and reading past the end.
+    const char truncated_two[] = { (char) 0xC3, 0, 0, 0, 0 };
+    CHECK(bpe_utf8_codepoint(truncated_two, &adv) == 0xC3 && adv == 1);
+    const char truncated_three[] = { (char) 0xE4, 0, 0, 0, 0 };
+    CHECK(bpe_utf8_codepoint(truncated_three, &adv) == 0xE4 && adv == 1);
+    const char truncated_three_partial[] = { (char) 0xE4, (char) 0xB8, 0, 0, 0 };
+    CHECK(bpe_utf8_codepoint(truncated_three_partial, &adv) == 0xE4 && adv == 1);
+    const char truncated_four[] = { (char) 0xF0, (char) 0x90, (char) 0x90, 0, 0 };
+    CHECK(bpe_utf8_codepoint(truncated_four, &adv) == 0xF0 && adv == 1);
+
+    // A lead byte at the very end of a buffer must not be read past: this is
+    // the case that motivated the clamp.
+    const char lead_at_end[] = { (char) 0xF0, 0 };
+    CHECK(bpe_utf8_codepoint(lead_at_end, &adv) == 0xF0 && adv == 1);
+}
+
+void test_bpe_encode_merges() {
+    using tts_cpp::acestep::bpe_encode;
+
+    const auto tok = make_test_bpe_tokenizer();
+
+    // Full merge chain: h+e, l+l, he+ll, hell+o -> "hello".
+    CHECK(bpe_encode(tok, "hello") == std::vector<int>({ 10 }));
+    // Partial merge: only "h e" applies, the rest stays single symbols.
+    CHECK(bpe_encode(tok, "helo") == std::vector<int>({ 8, 2, 3 }));
+    // The GPT-2 pre-tokenizer folds the leading space into the word; the
+    // byte-level 'Ġ' symbol then merges into a single vocab entry.
+    CHECK(bpe_encode(tok, " hello") == std::vector<int>({ 11 }));
+    CHECK(bpe_encode(tok, "hello hello") == std::vector<int>({ 10, 11 }));
+    // Digits are pre-tokenized one at a time.
+    CHECK(bpe_encode(tok, "12") == std::vector<int>({ 6, 7 }));
+
+    CHECK(bpe_encode(tok, "").empty());
+    CHECK(bpe_encode(tok, "", /*add_eos=*/true) == std::vector<int>({ tok.eos_id }));
+    CHECK(bpe_encode(tok, "hello<|endoftext|>helo") == std::vector<int>({ 10, tok.eos_id, 8, 2, 3 }));
+    CHECK(bpe_encode(tok, "<|endoftext|>") == std::vector<int>({ tok.eos_id }));
+}
+
+void test_bpe_encode_byte_fallback() {
+    using tts_cpp::acestep::bpe_encode;
+
+    const auto tok = make_test_bpe_tokenizer();
+
+    // "a b" merges into "ab", which is not in the vocab: the encoder falls
+    // back to the per-byte tokens.
+    CHECK(bpe_encode(tok, "ab") == std::vector<int>({ 4, 5 }));
+    // Bytes with no single-byte vocab entry are dropped silently.
+    CHECK(bpe_encode(tok, "q").empty());
+    CHECK(bpe_encode(tok, "abq") == std::vector<int>({ 4, 5 }));
+    // A raw non-UTF-8 byte maps to a byte-level symbol outside the vocab whose
+    // fallback bytes are unknown too, so it encodes to nothing.
+    CHECK(bpe_encode(tok, "\x80").empty());
+}
+
+void test_bpe_decode_roundtrip() {
+    using tts_cpp::acestep::AUDIO_CODE_BASE;
+    using tts_cpp::acestep::TOKEN_IM_END;
+    using tts_cpp::acestep::TOKEN_IM_START;
+    using tts_cpp::acestep::TOKEN_THINK;
+    using tts_cpp::acestep::TOKEN_THINK_END;
+    using tts_cpp::acestep::bpe_decode;
+    using tts_cpp::acestep::bpe_encode;
+    using tts_cpp::acestep::bpe_utf8_codepoint;
+
+    auto tok = make_test_bpe_tokenizer();
+
+    // byte_dec is empty on the hand-built tokenizer, so this exercises the
+    // local-fallback byte decoder.
+    CHECK(bpe_decode(tok, bpe_encode(tok, "hello")) == "hello");
+    CHECK(bpe_decode(tok, bpe_encode(tok, "helo")) == "helo");
+    CHECK(bpe_decode(tok, bpe_encode(tok, " hello")) == " hello");
+    CHECK(bpe_decode(tok, {}).empty());
+
+    // eos decodes to nothing (outside id_to_str), as do negative and audio ids.
+    CHECK(bpe_decode(tok, bpe_encode(tok, "", /*add_eos=*/true)).empty());
+    CHECK(bpe_decode(tok, { -1, tok.n_vocab, AUDIO_CODE_BASE, AUDIO_CODE_BASE + 5, 10 }) == "hello");
+    CHECK(bpe_decode(tok, { TOKEN_IM_START, 10, TOKEN_IM_END }) == "hello");
+    CHECK(bpe_decode(tok, { TOKEN_THINK, 10, TOKEN_THINK_END }) == "<think>hello</think>");
+
+    // Same results through the cached byte_dec branch bpe_load_from_gguf fills.
+    for (int b = 0; b < 256; ++b) {
+        int adv;
+        tok.byte_dec[bpe_utf8_codepoint(tok.byte2str[b].c_str(), &adv)] = (uint8_t) b;
+    }
+    CHECK(bpe_decode(tok, bpe_encode(tok, " hello")) == " hello");
+    CHECK(bpe_decode(tok, { TOKEN_THINK, 10, TOKEN_THINK_END }) == "<think>hello</think>");
+}
+
+// 13. quality scoring ----------------------------------------------------------
+// Weight-free coverage of the teacher-forced scoring math and target builders
+// (quality_score.h); the LM-backed end-to-end path runs in the integration test.
+
+bool quality_near(double a, double b) {
+    return std::fabs(a - b) < 1e-9;
+}
+
+void test_quality_normalized_pmi() {
+    using tts_cpp::acestep::quality_normalized_pmi;
+
+    CHECK(quality_near(quality_normalized_pmi(-1.0, -1.0, 0.1), 0.5));
+    CHECK(quality_near(quality_normalized_pmi(-0.9, -1.0, 0.1), 1.0 / (1.0 + std::exp(-1.0))));
+    CHECK(quality_near(quality_normalized_pmi(-1.1, -1.0, 0.1), 1.0 - 1.0 / (1.0 + std::exp(-1.0))));
+    CHECK(quality_normalized_pmi(0.0, -100.0, 0.1) > 0.999999);
+    CHECK(quality_normalized_pmi(-100.0, 0.0, 0.1) < 0.000001);
+}
+
+void test_quality_yaml_formatting() {
+    using tts_cpp::acestep::quality_yaml_plain_safe;
+    using tts_cpp::acestep::quality_yaml_string;
+
+    CHECK(quality_yaml_plain_safe("C major"));
+    CHECK(quality_yaml_plain_safe("4/4"));
+    CHECK(quality_yaml_plain_safe("d'or"));
+    CHECK(!quality_yaml_plain_safe(""));
+    CHECK(!quality_yaml_plain_safe("null"));
+    CHECK(!quality_yaml_plain_safe("Yes"));
+    CHECK(!quality_yaml_plain_safe("120"));
+    CHECK(!quality_yaml_plain_safe("-3.5"));
+    CHECK(!quality_yaml_plain_safe("key: value"));
+    CHECK(!quality_yaml_plain_safe(" padded"));
+    CHECK(!quality_yaml_plain_safe("[verse]"));
+
+    CHECK(quality_yaml_string("C major") == "C major");
+    CHECK(quality_yaml_string("null") == "'null'");
+    CHECK(quality_yaml_string("") == "''");
+    CHECK(quality_yaml_string("d''") == "d''");
+    CHECK(quality_yaml_string("it's: quoted") == "'it''s: quoted'");
+    CHECK(quality_yaml_string("two\nlines") == "'two\n  lines'");
+}
+
+void test_quality_targets() {
+    using tts_cpp::acestep::quality_caption_target;
+    using tts_cpp::acestep::quality_lyrics_target;
+    using tts_cpp::acestep::quality_metadata_target;
+
+    CHECK(quality_metadata_target("bpm", 120LL) == "<think>\nbpm: 120\n</think>\n");
+    CHECK(quality_metadata_target("keyscale", std::string("C major")) ==
+          "<think>\nkeyscale: C major\n</think>\n");
+    CHECK(quality_metadata_target("language", std::string("null")) ==
+          "<think>\nlanguage: 'null'\n</think>\n");
+    CHECK(quality_caption_target("test caption") == "<think>\ncaption: test caption\n</think>\n");
+    CHECK(quality_caption_target("") == "<think>\ncaption: ''\n</think>\n");
+    CHECK(quality_lyrics_target("[verse]\nhello") == "<think>\n</think>\n# Lyric\n[verse]\nhello\n");
+
+    const std::string long_caption(100, 'x');
+    const std::string wrapped = quality_caption_target(long_caption);
+    CHECK(wrapped.rfind("<think>\ncaption: ", 0) == 0);
+    CHECK(wrapped.find('\n', strlen("<think>\n")) != std::string::npos);
+}
+
+void test_quality_encode_target() {
+    using tts_cpp::acestep::quality_encode_target;
+    using tts_cpp::acestep::TOKEN_THINK;
+    using tts_cpp::acestep::TOKEN_THINK_END;
+
+    const tts_cpp::acestep::BpeTokenizer tok = make_test_bpe_tokenizer();
+    const std::vector<int> ids = quality_encode_target(tok, "hello<think>hello</think>");
+    CHECK(ids == std::vector<int>({ 10, TOKEN_THINK, 10, TOKEN_THINK_END }));
+    CHECK(quality_encode_target(tok, "<think></think>") ==
+          std::vector<int>({ TOKEN_THINK, TOKEN_THINK_END }));
+    CHECK(quality_encode_target(tok, "hello") == std::vector<int>({ 10 }));
+}
+
+void test_quality_weighted_global() {
+    using tts_cpp::acestep::QualityCondition;
+    using tts_cpp::acestep::QualityMetric;
+    using tts_cpp::acestep::QualityScoreParams;
+    using tts_cpp::acestep::quality_weighted_global;
+
+    std::map<std::string, QualityCondition> conditions;
+    conditions["caption"].score  = 0.8;
+    conditions["caption"].metric = QualityMetric::PmiNormalized;
+    conditions["lyrics"].score   = 0.6;
+    conditions["lyrics"].metric  = QualityMetric::PmiNormalized;
+    conditions["bpm"].score      = 1.0;
+    conditions["keyscale"].score = 0.5;
+
+    QualityScoreParams params;
+    double             global = 0.0;
+    std::string        report;
+    std::string        error;
+    CHECK(quality_weighted_global(conditions, params, global, report, error));
+    CHECK(quality_near(global, 0.8 * 0.5 + 0.6 * 0.3 + 0.75 * 0.2));
+    CHECK(report.find("caption") != std::string::npos);
+    CHECK(report.find("Per-condition scores") != std::string::npos);
+
+    conditions.erase("lyrics");
+    CHECK(quality_weighted_global(conditions, params, global, report, error));
+    CHECK(quality_near(global, (0.8 * 0.5 + 0.75 * 0.2) / 0.7));
+
+    QualityScoreParams zero_weights;
+    zero_weights.caption_weight  = 0.0;
+    zero_weights.lyrics_weight   = 0.0;
+    zero_weights.metadata_weight = 0.0;
+    CHECK(!quality_weighted_global(conditions, zero_weights, global, report, error));
+    CHECK(!error.empty());
+}
+
+void test_quality_score_request_policy() {
+    using tts_cpp::acestep::GenerateParams;
+    using tts_cpp::acestep::GenerateTask;
+    using tts_cpp::acestep::RepaintParams;
+    using tts_cpp::acestep::resolve_generate_task;
+
+    GenerateParams params;
+    GenerateTask   task;
+    params.compute_quality_score = true;
+    params.caption               = "a caption";
+    CHECK(resolve_generate_task(params, task).empty());
+
+    params.task_type = tts_cpp::acestep::TASK_COVER_NOFSQ;
+    params.source_audio.assign(96, 0.0f);
+    CHECK(resolve_generate_task(params, task).find("LM code path") != std::string::npos);
+
+    params.task_type = tts_cpp::acestep::TASK_LEGO;
+    params.track     = "drums";
+    CHECK(resolve_generate_task(params, task).find("LM code path") != std::string::npos);
+
+    params.task_type = tts_cpp::acestep::TASK_TEXT2MUSIC;
+    params.edit_plan.push_back(RepaintParams{});
+    CHECK(resolve_generate_task(params, task).find("audio edit path") != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
@@ -1838,6 +2795,7 @@ int main() {
     test_vae_window_core();
     test_backend_device_types();
     test_gpu_fallback_reason();
+    test_gpu_tier_policy();
     test_stage_placement();
     test_placement_env();
     test_parallel_rows();
@@ -1848,8 +2806,24 @@ int main() {
     test_generate_task_audio_layout();
     test_generate_task_errors();
     test_generate_task_strengths();
+    test_simple_mode_policy();
+    test_simple_mode_prompt_resolvers();
+    test_normalize_loudness();
+    test_lyrics_matrix_conversion();
+    test_lyrics_dtw();
+    test_lyrics_preprocessing();
+    test_lyrics_metrics_and_score();
+    test_lyrics_timestamps_and_lrc();
+    test_lrc_request_policy();
+    test_inspire_user_message();
     test_cover_conditioning_switch();
     test_generation_plans();
+    test_lego_task_kinds();
+    test_lego_task_validation();
+    test_lego_generation_plan();
+    test_lego_model_policy();
+    test_guidance_and_dcw_policy();
+    test_apg_guide();
     test_generation_conditioning();
     test_cover_noise_blending();
     test_repaint_config();
@@ -1862,7 +2836,20 @@ int main() {
     test_wav_reader_mono_and_stereo();
     test_wav_reader_rejects_multichannel();
     test_quantize_policy();
+    test_quantize_policy_mm3();
     test_quantize_gguf_roundtrip();
+    test_quantize_gguf_roundtrip_mm3();
+    test_cancellation_scope_consumes_on_exit();
+    test_bpe_utf8_codepoint();
+    test_bpe_encode_merges();
+    test_bpe_encode_byte_fallback();
+    test_bpe_decode_roundtrip();
+    test_quality_normalized_pmi();
+    test_quality_yaml_formatting();
+    test_quality_targets();
+    test_quality_encode_target();
+    test_quality_weighted_global();
+    test_quality_score_request_policy();
 
     std::fprintf(stderr, "[test-acestep-units] %d/%d checks passed\n", g_checks - g_failures, g_checks);
     return g_failures == 0 ? 0 : 1;

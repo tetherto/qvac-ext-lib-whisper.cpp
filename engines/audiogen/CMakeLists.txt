@@ -106,6 +106,8 @@ set(AUDIOGEN_LIB_SOURCES
     src/acestep/lm_ggml.cpp
     src/acestep/bpe_tokenizer.cpp
     src/acestep/lm_pipeline.cpp
+    src/acestep/lyrics_alignment.cpp
+    src/acestep/quality_score.cpp
     src/acestep/detok_ggml.cpp
     src/acestep/engine.cpp
 )
@@ -293,6 +295,9 @@ if (AUDIOGEN_BUILD_TESTS)
         audiogen_link_in_tree_binary(test-minimax-quality)
         audiogen_register_test(test-minimax-quality LABEL "integration")
         set_property(TEST test-minimax-quality PROPERTY SKIP_RETURN_CODE 77)
+        add_test(NAME test-minimax-quality-q4 COMMAND $<TARGET_FILE:test-minimax-quality> --q4)
+        set_property(TEST test-minimax-quality-q4 PROPERTY LABELS "integration")
+        set_property(TEST test-minimax-quality-q4 PROPERTY SKIP_RETURN_CODE 77)
 
         add_executable(test-minimax-metal-ops test/test_minimax_metal_ops.cpp)
         audiogen_link_in_tree_binary(test-minimax-metal-ops)
@@ -306,7 +311,41 @@ if (AUDIOGEN_BUILD_TESTS)
             )
             set_property(TEST test-minimax-converter PROPERTY LABELS "unit")
             set_property(TEST test-minimax-converter PROPERTY ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+            add_test(NAME test-minimax-quant-audit
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_audit_quant_types.py
+            )
+            set_property(TEST test-minimax-quant-audit PROPERTY LABELS "unit")
+            set_property(TEST test-minimax-quant-audit PROPERTY ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+
+            add_test(NAME test-minimax-dump-compare
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_compare_ar_dumps.py
+            )
+            set_property(TEST test-minimax-dump-compare PROPERTY LABELS "unit")
+            set_property(TEST test-minimax-dump-compare PROPERTY ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
         endif()
+    endif()
+
+    # The engine-comparison harness ships its own node:test suites
+    # (benchmarks/comparison/tests/*.test.js). Registering them keeps the
+    # harness's adapters/aggregation/report logic from rotting unnoticed;
+    # they vanish (with a status message) on hosts without node.
+    find_program(AUDIOGEN_NODE_EXECUTABLE node)
+    if (AUDIOGEN_NODE_EXECUTABLE)
+        # node discovers the suites itself from the working directory, so one
+        # added later runs without reconfiguring (a configure-time file(GLOB)
+        # would pin the list until the next cmake run). A discovery that finds
+        # nothing still exits 0, so the zero-pass summary has to fail the test:
+        # FAIL_REGULAR_EXPRESSION is additive, leaving node's exit code as the
+        # primary signal.
+        add_test(NAME test-audiogen-comparison-lib
+            COMMAND ${AUDIOGEN_NODE_EXECUTABLE} --test
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/comparison/tests)
+        set_property(TEST test-audiogen-comparison-lib PROPERTY LABELS "unit")
+        set_property(TEST test-audiogen-comparison-lib
+            PROPERTY FAIL_REGULAR_EXPRESSION "# pass 0")
+    else()
+        message(STATUS "audiogen: node not found - test-audiogen-comparison-lib not registered")
     endif()
 endif()
 

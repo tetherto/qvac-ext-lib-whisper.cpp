@@ -44,6 +44,10 @@ std::string bpe_decode(const BpeTokenizer & tok, const std::vector<int> & ids);
 
 // UTF-8 codepoint decode (advances by the byte width). Exposed for the metadata
 // FSM's per-token text decoding.
+// Decodes one UTF-8 codepoint from the NUL-terminated `s` and reports how many
+// bytes it consumed. A multi-byte lead whose sequence runs into the terminator
+// yields the raw lead byte with *advance == 1, so the decoder never reads past
+// the end of the string.
 int bpe_utf8_codepoint(const char * s, int * advance);
 
 } // namespace tts_cpp::acestep

@@ -41,6 +41,7 @@
 #include <limits>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
 #include <vector>
 
 namespace th = tts_cpp::chatterbox::test_hooks;
@@ -153,6 +154,8 @@ void test_initial_state() {
     s3gen_unload();
     CHECK(th::time_mlp_result_cache_size() == 0,
           "time_mlp result cache must start empty");
+    CHECK(th::time_mlp_graph_cache_size() == 0,
+          "time_mlp graph cache must start empty");
     CHECK(th::time_emb_result_cache_size() == 0,
           "time_emb result cache must start empty");
     CHECK(th::weight_mirror_cache_size() == 0,
@@ -280,6 +283,9 @@ void test_warm_cache_bit_exact_and_lifecycle(const std::string & gguf,
     CHECK(n_weights_after_a > 0,
           "after first synth, weight_mirror_cache must have at least one "
           "entry (input_embedding + spk_embed_affine/{w,b})");
+    CHECK(th::time_mlp_graph_cache_size() == 1,
+          "after first synth, the time_mlp graph cache must hold exactly one "
+          "backend-keyed entry; saw %zu", th::time_mlp_graph_cache_size());
 
     // Round 2 — every per-pipeline graph must be built after the first
     // synth, with non-sentinel keys.
@@ -348,11 +354,26 @@ void test_warm_cache_bit_exact_and_lifecycle(const std::string & gguf,
 
     // Second call: every cache must already be warm.  Its size must
     // not grow because the t-schedule and the model weights are
-    // constant across synth calls.
-    if (!synthesize_once(gguf, ref_dir, wav_b, t_b)) {
+    // constant across synth calls.  Run it from a separate thread: the
+    // time_mlp graph cache is keyed by backend, not by thread, so a
+    // synth on another thread must reuse the same entry rather than
+    // build (and later thread_local-destroy, which crashed win32 CUDA
+    // under the loader lock) a per-thread duplicate.
+    bool synth_b_ok = false;
+    {
+        std::thread worker([&]() {
+            synth_b_ok = synthesize_once(gguf, ref_dir, wav_b, t_b);
+        });
+        worker.join();
+    }
+    if (!synth_b_ok) {
         fprintf(stderr, "skip: synth #2 failed\n");
         return;
     }
+    CHECK(th::time_mlp_graph_cache_size() == 1,
+          "a synth on a second thread must reuse the backend-keyed time_mlp "
+          "graph cache entry, not add one; saw %zu",
+          th::time_mlp_graph_cache_size());
     CHECK(th::time_mlp_result_cache_size() == n_time_mlp_after_a,
           "synth #2 must NOT add new time_mlp entries (saw %zu, expected %zu)",
           th::time_mlp_result_cache_size(), n_time_mlp_after_a);
@@ -426,6 +447,8 @@ void test_warm_cache_bit_exact_and_lifecycle(const std::string & gguf,
     s3gen_unload();
     CHECK(th::time_mlp_result_cache_size() == 0,
           "s3gen_unload must clear time_mlp result cache");
+    CHECK(th::time_mlp_graph_cache_size() == 0,
+          "s3gen_unload must clear the time_mlp graph cache");
     CHECK(th::time_emb_result_cache_size() == 0,
           "s3gen_unload must clear time_emb result cache");
     CHECK(th::weight_mirror_cache_size() == 0,

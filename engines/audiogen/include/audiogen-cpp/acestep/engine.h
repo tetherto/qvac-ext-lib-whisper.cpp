@@ -35,6 +35,8 @@
 //   [x] Informal parity vs acestep.cpp: synth correlation measured at 0.98-0.99
 //       on same codes; no reproducible result artifact is committed.
 //   [x] DiT sampler Haar DCW "double" correction (official ACE-Step defaults).
+//   [x] Simple Mode: LM inspire pass expands a short query into the full
+//       request (caption, lyrics, metadata) ahead of synthesis.
 // Deferred: DiT CFG/APG (guidance>1, base/sft only).
 
 #include "audiogen-cpp/export.h"
@@ -130,6 +132,7 @@ struct GenerateParams {
     float       duration = 20.0f;        // target seconds (drives LM code count)
     int         inference_steps = 0;     // 0 = auto (turbo: 8, base/sft: 50)
     float       shift = 0.0f;            // 0 = auto (turbo: 3.0, base/sft: 1.0)
+    float       guidance_scale = 0.0f;   // 0 = auto (turbo: 1.0, base/sft: 7.0); >1 runs CFG via APG
     std::string vocal_language;          // optional hint, e.g. "en"
     int         bpm = 0;                 // optional; 0 => N/A (LM/DiT infer)
     std::string keyscale;                // optional, e.g. "C major"
@@ -142,7 +145,37 @@ struct GenerateParams {
     int         lm_top_k       = 0;      // 0 = disabled (top_p only)
     float       lm_cfg_scale   = 2.0f;   // classifier-free guidance for codes
     bool        lm_phase1      = true;   // auto-fill missing metadata (FSM CoT)
-    // Official sampler-side Haar DCW "double" correction.
+    // Percentile loudness normalization on the generation output PCM (the
+    // acestep.cpp export behavior): the 99.999th-percentile sample scales to
+    // 1.0 and the tail above it hard-clips, maximizing perceived loudness.
+    // Disable to get the raw VAE output. Audio-edit outputs and lego stems are
+    // never normalized: repaint preserves untouched source regions bit-for-bit
+    // and a stem keeps its mix gain relative to its source.
+    bool        normalize_loudness = true;
+    // Simple Mode: treat `caption` as a short natural-language query and let
+    // the LM inspire pass compose the full request before synthesis — detailed
+    // caption, lyrics, and any metadata left unset (bpm, key/scale, time
+    // signature, duration <= 0, vocal language). Set fields are kept. Requires
+    // text2music with no pre-supplied audio_codes; `lyrics` must be empty (the
+    // LM writes them) or "[Instrumental]" (forwarded as the instrumental hint).
+    // NOTE: `lyrics` DEFAULTS to "[Instrumental]" — assign an empty string
+    // explicitly for LM-written vocals, or every request stays instrumental.
+    bool        simple_mode    = false;
+    // Synchronized lyric timestamps: after synthesis, one extra DiT forward at
+    // the final timestep captures the lyric cross-attention heads and DTW
+    // aligns each lyric line with the audio. The LRC text and its alignment
+    // score land in GenerateResult::metadata. Requires lyrics (with Simple
+    // Mode the LM-written lyrics are used) and is unavailable on the audio
+    // edit path.
+    bool        generate_lrc = false;
+    // Teacher-forced LM quality scoring of the generated audio codes against
+    // the resolved request (Simple Mode scores what the LM composed). Fills
+    // GenerateMetadata::quality_score / quality_report at the cost of extra
+    // LM forwards after code generation. Requires the LM code path, so it is
+    // rejected for cover / lego tasks and on the audio edit path.
+    bool        compute_quality_score = false;
+    // Official sampler-side Haar DCW "double" correction. Applied on turbo
+    // DiTs only: the official preset disables DCW for base/sft models.
     bool        dcw_enabled     = true;
     float       dcw_scaler      = 0.05f;  // low band coefficient: t * scaler
     float       dcw_high_scaler = 0.02f;  // high band coefficient: (1-t) * scaler
@@ -160,9 +193,17 @@ struct GenerateParams {
     std::vector<float> source_audio;
 
     // Task discriminator (mirrors acestep.cpp AceRequest::task_type).
-    // Supported today: "text2music" | "cover-nofsq".
+    // Supported today: "text2music" | "cover-nofsq" | "lego".
     // "cover" (FSQ roundtrip) is accepted at the API but not implemented yet.
+    // "lego" generates a new instrument layer that follows source_audio and
+    // returns only that layer; it requires a base DiT (turbo and sft are
+    // rejected).
     std::string task_type = "text2music";
+
+    // Lego target layer. Required when task_type is "lego"; one of:
+    // vocals|backing_vocals|drums|bass|guitar|keyboard|percussion|strings|
+    // synth|fx|brass|woodwinds.
+    std::string track;
 
     // Fraction of DiT steps that keep the source context (0..1). Default 1.0
     // keeps source context for every step. Values < 1.0 switch the DiT to a
@@ -194,6 +235,15 @@ struct GenerateMetadata {
     int         timesignature = 0;
     long long   seed = 0;
     int         n_codes = 0;
+    // Filled when GenerateParams::generate_lrc is set: LRC-formatted lyric
+    // timestamps and the alignment confidence score in [0, 1].
+    std::string lrc;
+    double      lyrics_score = 0.0;
+    // Populated only when GenerateParams::compute_quality_score was set:
+    // weighted global quality in [0, 1] (caption/lyrics PMI + metadata
+    // recall) and its human-readable per-condition breakdown.
+    double      quality_score = 0.0;
+    std::string quality_report;
 };
 
 struct GenerateResult {
@@ -204,7 +254,7 @@ struct GenerateResult {
 };
 
 // Optional progress callback: stage name
-// ("reference"|"source"|"lm"|"dit"|"vae"), current step, total steps
+// ("reference"|"source"|"lm"|"score"|"dit"|"vae"), current step, total steps
 // (total <= 0 when unknown). Return false to request cancellation.
 using ProgressFn = std::function<bool(const std::string & stage, int step, int total)>;
 

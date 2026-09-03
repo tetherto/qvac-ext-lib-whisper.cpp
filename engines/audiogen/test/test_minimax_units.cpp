@@ -1,15 +1,22 @@
 #include "minimax/logic.h"
 #include "minimax/backend.h"
 #include "minimax/bpe.h"
+#include "minimax/mm3-flash-attn.h"
 #include "minimax/mm3-flow-runtime.h"
 #include "minimax/mm3-replay-io.h"
 #include "minimax/mm3-window-orchestrator.h"
 #include "minimax/progress.h"
+#include "minimax/request-utils.h"
+
+#include "ggml-alloc.h"
+#include "ggml.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -129,6 +136,175 @@ void test_prompt() {
     CHECK(throws_invalid_argument([] { build_prompt(" \n\t", "words"); }));
 }
 
+void test_request_text_primitives() {
+    CHECK(mm3_is_space(' '));
+    CHECK(mm3_is_space('\t'));
+    CHECK(mm3_is_space('\r'));
+    CHECK(mm3_is_space('\v'));
+    CHECK(mm3_is_space('\f'));
+    CHECK(!mm3_is_space('\n'));
+    CHECK(!mm3_is_space('a'));
+
+    CHECK(mm3_rstrip("a b \t\n") == "a b");
+    CHECK(mm3_rstrip("  x") == "  x");
+    CHECK(mm3_rstrip("").empty());
+
+    CHECK(mm3_strip("\n\t hi \n") == "hi");
+    CHECK(mm3_strip("hi") == "hi");
+    CHECK(mm3_strip(" \t ").empty());
+    CHECK(mm3_strip("").empty());
+
+    CHECK(mm3_str_blank(""));
+    CHECK(mm3_str_blank(" \t\n"));
+    CHECK(!mm3_str_blank(" a "));
+}
+
+void test_request_line_splitting() {
+    CHECK(mm3_split_lines("") == std::vector<std::string>({""}));
+    CHECK(mm3_split_lines("a\nb") == std::vector<std::string>({"a", "b"}));
+    CHECK(mm3_split_lines("a\n") == std::vector<std::string>({"a", ""}));
+    CHECK(mm3_split_lines("a\r\nb") == std::vector<std::string>({"a\r", "b"}));
+
+    CHECK(mm3_splitlines("").empty());
+    CHECK(mm3_splitlines("a\r\nb") == std::vector<std::string>({"a", "b"}));
+    CHECK(mm3_splitlines("a\rb") == std::vector<std::string>({"a", "b"}));
+    CHECK(mm3_splitlines("a\n") == std::vector<std::string>({"a"}));
+    CHECK(mm3_splitlines("\n\n") == std::vector<std::string>({"", ""}));
+
+    CHECK(mm3_join_lines({}).empty());
+    CHECK(mm3_join_lines({"a"}) == "a");
+    CHECK(mm3_join_lines({"a", "", "b"}) == "a\n\nb");
+    CHECK(mm3_join_lines(mm3_split_lines("a\nb\nc")) == "a\nb\nc");
+}
+
+void test_request_replace_and_tags() {
+    std::string text = "aaa";
+    mm3_replace_all(text, "aa", "b");
+    CHECK(text == "ba");
+    text = "ab";
+    mm3_replace_all(text, "a", "aa");
+    CHECK(text == "aab");
+    text = "x";
+    mm3_replace_all(text, "", "y");
+    CHECK(text == "x");
+
+    CHECK(mm3_rewrite_special_tags("tag: <|genre pop|> end") == "tag: genre is pop end");
+    CHECK(mm3_rewrite_special_tags("<|instrumental|>") == "instrumental");
+    CHECK(mm3_rewrite_special_tags("<|bpm  120|>") == "bpm is 120");
+    CHECK(mm3_rewrite_special_tags("<|a b c|>") == "a is b c");
+    CHECK(mm3_rewrite_special_tags("<||>").empty());
+    CHECK(mm3_rewrite_special_tags("<|unclosed") == "<|unclosed");
+    CHECK(mm3_rewrite_special_tags("plain") == "plain");
+    CHECK(mm3_rewrite_special_tags("").empty());
+
+    std::string tags;
+    CHECK(mm3_leading_tags("[Verse] hello", &tags));
+    CHECK(tags == "[Verse]");
+    CHECK(mm3_leading_tags("  [A] [B]x", &tags));
+    CHECK(tags == "[A] [B]");
+    CHECK(!mm3_leading_tags("no tags", &tags));
+    CHECK(!mm3_leading_tags("[]", &tags));
+    CHECK(!mm3_leading_tags("[unclosed", &tags));
+    CHECK(!mm3_leading_tags("", &tags));
+
+    CHECK(mm3_lower_tags("[VERSE 1] La [CHORUS]") == "[verse 1] La [chorus]");
+    CHECK(mm3_lower_tags("[]") == "[]");
+    CHECK(mm3_lower_tags("[open") == "[open");
+    CHECK(mm3_lower_tags("none") == "none");
+}
+
+void test_request_markdown_helpers() {
+    std::string line = "## Title";
+    mm3_strip_heading(line);
+    CHECK(line == "Title");
+    line = "  # T";
+    mm3_strip_heading(line);
+    CHECK(line == "T");
+    line = "####### x";  // 7 hashes: beyond the h1-h6 window, kept verbatim
+    mm3_strip_heading(line);
+    CHECK(line == "####### x");
+    line = "#Title";
+    mm3_strip_heading(line);
+    CHECK(line == "#Title");
+    line = "    # x";  // 4-space indent is a code block, not a heading
+    mm3_strip_heading(line);
+    CHECK(line == "    # x");
+
+    line = "- item";
+    mm3_strip_bullet(line, "*+-");
+    CHECK(line == "item");
+    line = "  + item";
+    mm3_strip_bullet(line, "*+-");
+    CHECK(line == "item");
+    line = "-item";
+    mm3_strip_bullet(line, "*+-");
+    CHECK(line == "-item");
+    line = "*";
+    mm3_strip_bullet(line, "*");
+    CHECK(line == "*");
+
+    CHECK(mm3_unwrap_bold_once("**bold**") == "bold");
+    CHECK(mm3_unwrap_bold_once("a **b** c **d**") == "a b c d");
+    CHECK(mm3_unwrap_bold_once("****") == "****");
+    CHECK(mm3_unwrap_bold_once("**open") == "**open");
+    CHECK(mm3_unwrap_bold_once("plain") == "plain");
+
+    CHECK(mm3_unwrap_italic("*it*") == "it");
+    CHECK(mm3_unwrap_italic("a*b*c") == "abc");
+    CHECK(mm3_unwrap_italic("**x**") == "**x**");
+    CHECK(mm3_unwrap_italic("*a\nb*") == "*a\nb*");
+    CHECK(mm3_unwrap_italic("*") == "*");
+
+    CHECK(mm3_is_hrule("---"));
+    CHECK(mm3_is_hrule(" *** "));
+    CHECK(mm3_is_hrule("___"));
+    CHECK(mm3_is_hrule("-*_"));  // mixed marks count as one run
+    CHECK(!mm3_is_hrule("--"));
+    CHECK(!mm3_is_hrule("- - -"));
+    CHECK(!mm3_is_hrule("--- x"));
+    CHECK(!mm3_is_hrule(""));
+}
+
+void test_request_clean_caption() {
+    CHECK(mm3_clean_caption("## **Bright** pop") == "Bright pop");
+    CHECK(mm3_clean_caption("# Title\n\n- **bold** item\n---\n*soft* line   \n\n\nnext") ==
+          "Title\nbold item\nsoft line\nnext");
+    CHECK(mm3_clean_caption("\xE2\x80\xA2 point") == "point");
+    CHECK(mm3_clean_caption("a    b") == "ab");
+    CHECK(mm3_clean_caption("<|genre rock|>") == "genre is rock");
+    CHECK(mm3_clean_caption("plain caption") == "plain caption");
+    CHECK(mm3_clean_caption("").empty());
+}
+
+void test_request_normalize_lyrics() {
+    CHECK(mm3_normalize_lyrics("[Verse] ignored\nHello ^ world") ==
+          "[start]\n[verse]\nHello\nworld");
+    CHECK(mm3_normalize_lyrics("[Intro]  \nLa la [Chorus] la\n\nend") ==
+          "[start]\n[intro]\nLa la\n[chorus]\nla\n\nend");
+    CHECK(mm3_normalize_lyrics("[instrumental]") == "[start]\n[instrumental]");
+    CHECK(mm3_normalize_lyrics("a ^ b") == "[start]\na\nb");
+    CHECK(mm3_normalize_lyrics("") == "[start]\n");
+}
+
+void test_request_assemble_prompt() {
+    using tts_cpp::minimax::detail::build_prompt;
+
+    bool instrumental = false;
+    CHECK(mm3_assemble_prompt("Piano", " \n\t", &instrumental) ==
+          "<|im_start|><|caption_start|>Piano<|caption_end|><|lyrics_start|>"
+          "[start]\n[instrumental]<|lyrics_end|><|im_end|><|audio_start|>");
+    CHECK(instrumental);
+
+    CHECK(mm3_assemble_prompt("- **Jazz** trio", "[INTRO] hum", &instrumental) ==
+          "<|im_start|><|caption_start|>Jazz trio<|caption_end|><|lyrics_start|>"
+          "[start]\n[intro]<|lyrics_end|><|im_end|><|audio_start|>");
+    CHECK(!instrumental);
+
+    CHECK(build_prompt("Calm <|genre ambient|> pad", "la la") ==
+          "<|im_start|><|caption_start|>Calm genre is ambient pad<|caption_end|><|lyrics_start|>"
+          "[start]\nla la<|lyrics_end|><|im_end|><|audio_start|>");
+}
+
 void test_unconditional_mask() {
     using tts_cpp::minimax::detail::mask_unconditional;
     const std::vector<int32_t> conditional = {10, 11, 12, 13, 14, 15};
@@ -183,6 +359,65 @@ void test_production_dit_readback_preserves_velocity() {
     CHECK(error.empty());
     CHECK(requested_bytes == raw.size() * sizeof(float));
     CHECK(output == raw);
+}
+
+void test_depth_step_fused_readback_matches_source_tensors() {
+    // Mirrors mm3-depth-graph.h's per-step output fusion: reshape the hidden
+    // [H,1,2] and logits [V,1,2] CFG outputs to 1-D and concat along dim 0,
+    // then confirm one download splits back into the exact values each
+    // tensor was set to. H != V so a size mixup would size-mismatch, and
+    // distinct value ranges so a block swap or misaligned offset would show.
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    CHECK(cpu != nullptr);
+    if (!cpu) return;
+
+    const int64_t H = 5;
+    const int64_t V = 7;
+    constexpr size_t MAX_NODES = 8;
+
+    const size_t context_size =
+        ggml_tensor_overhead() * MAX_NODES + ggml_graph_overhead_custom(MAX_NODES, false);
+    ggml_init_params params = { context_size, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    CHECK(ctx != nullptr);
+
+    ggml_tensor * hidden = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, 1, 2);
+    ggml_tensor * logits = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, V, 1, 2);
+    ggml_set_input(hidden);
+    ggml_set_input(logits);
+
+    ggml_tensor * hidden_flat = ggml_reshape_1d(ctx, hidden, ggml_nelements(hidden));
+    ggml_tensor * logits_flat = ggml_reshape_1d(ctx, logits, ggml_nelements(logits));
+    ggml_tensor * fused       = ggml_concat(ctx, hidden_flat, logits_flat, 0);
+    ggml_set_output(fused);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, MAX_NODES, false);
+    ggml_build_forward_expand(graph, fused);
+
+    ggml_gallocr_t allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu));
+    CHECK(ggml_gallocr_alloc_graph(allocator, graph));
+
+    std::vector<float> hidden_values(static_cast<size_t>(H * 2));
+    std::vector<float> logits_values(static_cast<size_t>(V * 2));
+    for (size_t i = 0; i < hidden_values.size(); i++) hidden_values[i] = static_cast<float>(i + 1);
+    for (size_t i = 0; i < logits_values.size(); i++) logits_values[i] = static_cast<float>(100 + i);
+    ggml_backend_tensor_set(hidden, hidden_values.data(), 0, hidden_values.size() * sizeof(float));
+    ggml_backend_tensor_set(logits, logits_values.data(), 0, logits_values.size() * sizeof(float));
+
+    CHECK(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+
+    std::vector<float> fused_buf(hidden_values.size() + logits_values.size());
+    ggml_backend_tensor_get(fused, fused_buf.data(), 0, fused_buf.size() * sizeof(float));
+
+    const auto split = fused_buf.begin() + static_cast<std::ptrdiff_t>(hidden_values.size());
+    const std::vector<float> hidden_part(fused_buf.begin(), split);
+    const std::vector<float> logits_part(split, fused_buf.end());
+    CHECK(hidden_part == hidden_values);
+    CHECK(logits_part == logits_values);
+
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx);
+    ggml_backend_free(cpu);
 }
 
 void test_production_cfg_euler_step() {
@@ -659,6 +894,64 @@ void test_ar_candidate_helpers() {
     CHECK(std::isinf(candidates.guided[3]) && candidates.guided[3] < 0.0f);
 }
 
+void test_compact_head_layout() {
+    using namespace tts_cpp::minimax::detail;
+
+    CHECK(compact_head_row_count(16384) == 16385);
+    CHECK(compact_head_row_count(0) == 1);
+
+    // A synthetic 10-row, 4-byte-row "vocabulary": semantic block at rows
+    // [3,6), EOS at row 1.
+    std::array<CompactHeadCopy, 2> plan{};
+    CHECK(compact_head_copy_plan(10, 3, 3, 1, 4, plan));
+    CHECK(plan[0].src_offset == 12 && plan[0].dst_offset == 0 && plan[0].nbytes == 12);
+    CHECK(plan[1].src_offset == 4 && plan[1].dst_offset == 12 && plan[1].nbytes == 4);
+    CHECK(!compact_head_copy_plan(10, 8, 3, 1, 4, plan));
+    CHECK(!compact_head_copy_plan(10, 3, 3, 10, 4, plan));
+    CHECK(!compact_head_copy_plan(10, 3, 3, 1, 0, plan));
+
+    // Apply the plan to a byte buffer and confirm the compact output holds
+    // exactly the semantic block followed by the EOS row.
+    std::vector<uint8_t> source(10 * 4);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<uint8_t>(i);
+    }
+    std::vector<uint8_t> compact(static_cast<size_t>(compact_head_row_count(3)) * 4, 0xAA);
+    memcpy(compact.data() + plan[0].dst_offset, source.data() + plan[0].src_offset, plan[0].nbytes);
+    memcpy(compact.data() + plan[1].dst_offset, source.data() + plan[1].src_offset, plan[1].nbytes);
+    CHECK(compact == std::vector<uint8_t>({12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 4, 5, 6, 7}));
+
+    // Index mapping: candidates collected from the compact layout must match
+    // candidates collected directly from the full-vocab layout, bit-for-bit.
+    const int64_t vocab = 20;
+    const int64_t semantic_offset = 5;
+    const int64_t semantic_vocab = 4;
+    const int64_t eos = 2;
+    std::vector<float> full(static_cast<size_t>(vocab) * 2);
+    for (size_t i = 0; i < full.size(); ++i) {
+        full[i] = static_cast<float>(i);
+    }
+    ArCandidates from_full;
+    int64_t nonfinite_full = 0;
+    CHECK(collect_ar_candidates(full.data(), vocab, eos, semantic_offset, semantic_vocab, from_full,
+                                nonfinite_full));
+
+    const int64_t compact_vocab = compact_head_row_count(semantic_vocab);
+    std::vector<float> compact_logits(static_cast<size_t>(compact_vocab) * 2);
+    for (int64_t row = 0; row < 2; ++row) {
+        const float * src_row = full.data() + row * vocab;
+        float *       dst_row = compact_logits.data() + row * compact_vocab;
+        memcpy(dst_row, src_row + semantic_offset, static_cast<size_t>(semantic_vocab) * sizeof(float));
+        dst_row[semantic_vocab] = src_row[eos];
+    }
+    ArCandidates from_compact;
+    int64_t nonfinite_compact = 0;
+    CHECK(collect_ar_candidates(compact_logits.data(), compact_vocab, semantic_vocab, kCompactHeadSemanticOffset,
+                                semantic_vocab, from_compact, nonfinite_compact));
+    CHECK(from_full.conditional == from_compact.conditional);
+    CHECK(from_full.unconditional == from_compact.unconditional);
+}
+
 void test_ar_acoustic_rows_and_frame_cap() {
     using namespace tts_cpp::minimax::detail;
     const int32_t codes[] = {2, 3, 4};
@@ -786,6 +1079,56 @@ void test_model_pair_resolution() {
     fs::remove_all(root);
 }
 
+void test_model_pair_resolution_q4() {
+    namespace fs = std::filesystem;
+    using tts_cpp::minimax::detail::ModelPair;
+    using tts_cpp::minimax::detail::resolve_model_pair;
+    const fs::path root = fs::temp_directory_path() /
+                          ("minimax-model-pair-q4-" + std::to_string(std::random_device{}()));
+    fs::create_directories(root);
+    touch(root / "mm3-lm-q4_k_m.gguf");
+    touch(root / "mm3-synth-q4_k_m.gguf");
+    ModelPair q4_only = resolve_model_pair(root.string(), "", "");
+    CHECK(q4_only.quant == "q4_k_m");
+
+    touch(root / "mm3-lm-q8_0.gguf");
+    touch(root / "mm3-synth-q8_0.gguf");
+    ModelPair prefers_q8 = resolve_model_pair(root.string(), "", "");
+    CHECK(prefers_q8.quant == "q8_0");
+
+    fs::remove_all(root);
+}
+
+void test_model_pair_resolution_f32() {
+    namespace fs = std::filesystem;
+    using tts_cpp::minimax::detail::ModelPair;
+    using tts_cpp::minimax::detail::resolve_model_pair;
+    const fs::path root = fs::temp_directory_path() /
+                          ("minimax-model-pair-f32-" + std::to_string(std::random_device{}()));
+    fs::create_directories(root);
+    touch(root / "mm3-lm-f32.gguf");
+    touch(root / "mm3-synth-f32.gguf");
+    ModelPair f32_only = resolve_model_pair(root.string(), "", "");
+    CHECK(f32_only.quant == "f32");
+
+    touch(root / "mm3-lm-q4_k_m.gguf");
+    touch(root / "mm3-synth-q4_k_m.gguf");
+    ModelPair prefers_q4 = resolve_model_pair(root.string(), "", "");
+    CHECK(prefers_q4.quant == "q4_k_m");
+
+    touch(root / "mm3-lm-q6_k.gguf");
+    touch(root / "mm3-synth-q6_k.gguf");
+    ModelPair prefers_q6 = resolve_model_pair(root.string(), "", "");
+    CHECK(prefers_q6.quant == "q6_k");
+
+    touch(root / "mm3-lm-q8_0.gguf");
+    touch(root / "mm3-synth-q8_0.gguf");
+    ModelPair prefers_q8 = resolve_model_pair(root.string(), "", "");
+    CHECK(prefers_q8.quant == "q8_0");
+
+    fs::remove_all(root);
+}
+
 void test_backend_configuration() {
     using tts_cpp::minimax::detail::backend_configuration_matches;
     CHECK(backend_configuration_matches(0, 4, "first", 8, "second"));
@@ -851,6 +1194,34 @@ void test_device_backend_init() {
         CHECK(throws_runtime_error([] { backend_init("test"); }));
     }
     backend_configure_device("cpu");
+}
+
+void test_flash_attn_policy() {
+    CHECK(!mm3_use_flash_attn(false, false, "MM3_LM_NO_FLASH", "MM3_LM_FLASH"));
+    CHECK(!mm3_use_flash_attn(false, true, "MM3_DIT_NO_FLASH", nullptr));
+
+    set_env("MM3_LM_NO_FLASH", nullptr);
+    set_env("MM3_LM_FLASH", nullptr);
+    set_env("MM3_DIT_NO_FLASH", nullptr);
+
+    CHECK(!mm3_use_flash_attn(true, false, "MM3_LM_NO_FLASH", "MM3_LM_FLASH"));
+    CHECK(mm3_use_flash_attn(true, true, "MM3_DIT_NO_FLASH", nullptr));
+
+    set_env("MM3_LM_FLASH", "1");
+    CHECK(mm3_use_flash_attn(true, false, "MM3_LM_NO_FLASH", "MM3_LM_FLASH"));
+
+    set_env("MM3_LM_NO_FLASH", "1");
+    CHECK(!mm3_use_flash_attn(true, false, "MM3_LM_NO_FLASH", "MM3_LM_FLASH"));
+
+    set_env("MM3_DIT_NO_FLASH", "1");
+    CHECK(!mm3_use_flash_attn(true, true, "MM3_DIT_NO_FLASH", nullptr));
+
+    set_env("MM3_DIT_NO_FLASH", "0");
+    CHECK(mm3_use_flash_attn(true, true, "MM3_DIT_NO_FLASH", nullptr));
+
+    set_env("MM3_LM_NO_FLASH", nullptr);
+    set_env("MM3_LM_FLASH", nullptr);
+    set_env("MM3_DIT_NO_FLASH", nullptr);
 }
 
 void test_replay_io() {
@@ -932,10 +1303,18 @@ void test_progress_cancellation() {
 int main() {
     test_frame_validation();
     test_prompt();
+    test_request_text_primitives();
+    test_request_line_splitting();
+    test_request_replace_and_tags();
+    test_request_markdown_helpers();
+    test_request_clean_caption();
+    test_request_normalize_lyrics();
+    test_request_assemble_prompt();
     test_unconditional_mask();
     test_noise();
     test_flow_schedule();
     test_production_dit_readback_preserves_velocity();
+    test_depth_step_fused_readback_matches_source_tensors();
     test_production_cfg_euler_step();
     test_malformed_synthesis_metadata();
     test_vocoder_output_shape();
@@ -949,6 +1328,7 @@ int main() {
     test_nonfinite_vocoder_orchestration();
     test_finite_vocoder_orchestration_clipping();
     test_ar_candidate_helpers();
+    test_compact_head_layout();
     test_ar_acoustic_rows_and_frame_cap();
     test_sampling_edges();
     test_model_compatibility();
@@ -956,9 +1336,12 @@ int main() {
     test_pre_tokenization_branches();
     test_malformed_utf8();
     test_model_pair_resolution();
+    test_model_pair_resolution_q4();
+    test_model_pair_resolution_f32();
     test_backend_configuration();
     test_device_configuration();
     test_device_backend_init();
+    test_flash_attn_policy();
     test_replay_io();
     test_engine_instance_limit();
     test_cancellation();

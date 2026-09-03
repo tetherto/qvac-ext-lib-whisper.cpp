@@ -44,12 +44,29 @@ static void build_byte_encoder(std::string byte2str[256]) {
     }
 }
 
+// `s` is NUL-terminated (every caller passes c_str()-backed data). A lead byte
+// announcing a sequence that runs into the terminator is decoded as the single
+// raw byte instead of reading past the end, which is what the invalid-lead
+// fallback below already does. Well-formed UTF-8 carries no NUL continuation
+// byte, so valid input decodes exactly as before.
 static int utf8_codepoint(const char * s, int * advance) {
     unsigned char c = s[0];
     if (c < 0x80) { *advance = 1; return c; }
-    if ((c & 0xE0) == 0xC0) { *advance = 2; return ((c & 0x1F) << 6) | (s[1] & 0x3F); }
-    if ((c & 0xF0) == 0xE0) { *advance = 3; return ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); }
-    if ((c & 0xF8) == 0xF0) {
+    auto truncated = [&](int width) {
+        for (int i = 1; i < width; ++i) {
+            if (s[i] == '\0') return true;
+        }
+        return false;
+    };
+    if ((c & 0xE0) == 0xC0 && !truncated(2)) {
+        *advance = 2;
+        return ((c & 0x1F) << 6) | (s[1] & 0x3F);
+    }
+    if ((c & 0xF0) == 0xE0 && !truncated(3)) {
+        *advance = 3;
+        return ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+    }
+    if ((c & 0xF8) == 0xF0 && !truncated(4)) {
         *advance = 4;
         return ((c & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
     }

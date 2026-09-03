@@ -557,6 +557,14 @@ if (TTS_CPP_BUILD_EXECUTABLES)
     target_include_directories(lavasr-bench PRIVATE include ggml/include src)
     tts_cpp_apply_ccache(lavasr-bench)
 
+    # Supertonic single-pass bench (--text / --runs / --json-out). Sits with
+    # the other -bench CLIs rather than the TESTS block so the standalone
+    # benchmark workflow can build it with SPEECH_BUILD_TESTS=OFF.
+    add_executable(supertonic-bench src/supertonic_bench.cpp)
+    target_link_libraries(supertonic-bench PRIVATE tts-cpp)
+    target_include_directories(supertonic-bench PRIVATE ggml/include src include)
+    tts_cpp_apply_ccache(supertonic-bench)
+
     # CosyVoice3 end-to-end CLI: text -> 24 kHz WAV via the public Engine (the
     # same API the JS addon / @qvac/sdk drive).  See src/cosyvoice_cli.cpp.
     add_executable(cosyvoice-cli src/cosyvoice_cli.cpp)
@@ -1103,6 +1111,15 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-cosyvoice-load)
     tts_cpp_register_test(test-cosyvoice-load LABEL "unit")
 
+    # Sinusoidal timestep embedding for the flow DiT. Pure function on the CFM
+    # step path, so it needs no GGUF.
+    add_executable(test-cosyvoice-time-emb
+        test/test_cosyvoice_time_emb.cpp ${_tcb_cosy_core_srcs})
+    target_link_libraries(test-cosyvoice-time-emb PRIVATE ggml)
+    target_include_directories(test-cosyvoice-time-emb PRIVATE ggml/include src)
+    tts_cpp_apply_ccache(test-cosyvoice-time-emb)
+    tts_cpp_register_test(test-cosyvoice-time-emb LABEL "unit")
+
     # Qwen2 BPE tokenizer parity (header-only; no GGUF weights, just the Qwen2
     # vocab.json/merges.txt bundled with the model + HF-reference ids from
     # scripts/dump-cosyvoice3-tokenizer-reference.py).
@@ -1130,6 +1147,15 @@ if (TTS_CPP_BUILD_TESTS)
         src/backend_selection.cpp
         src/sched_dispatch.cpp
         src/log.cpp)
+
+    # Fail-closed GGUF header reading: synthesized metadata-only files with a
+    # wrong architecture and wrong-typed scalar/string keys. No fixtures.
+    add_executable(test-audio8-gguf-load test/audio8/test_gguf_load.cpp
+        ${_tcb_audio8_core_srcs})
+    target_link_libraries(test-audio8-gguf-load PRIVATE ggml)
+    target_include_directories(test-audio8-gguf-load PRIVATE include src)
+    tts_cpp_apply_ccache(test-audio8-gguf-load)
+    tts_cpp_register_test(test-audio8-gguf-load)
 
     add_executable(test-audio8-tokenizer test/audio8/test_tokenizer.cpp
         src/audio8/tokenizer.cpp src/audio8/unicode.cpp)
@@ -1185,6 +1211,16 @@ if (TTS_CPP_BUILD_TESTS)
     target_compile_definitions(test-audio8-ras PRIVATE _GLIBCXX_ASSERTIONS)
     tts_cpp_apply_ccache(test-audio8-ras)
     tts_cpp_register_test(test-audio8-ras)
+
+    # The top-k / top-p / temperature candidate filter on synthetic score
+    # vectors, which the fixture sampler test only reaches through reference
+    # dumps.  No fixtures, so it runs on a bare checkout.
+    add_executable(test-audio8-sampling-filter test/audio8/test_sampling_filter.cpp
+        src/audio8/sampling.cpp)
+    target_include_directories(test-audio8-sampling-filter PRIVATE src)
+    target_compile_definitions(test-audio8-sampling-filter PRIVATE _GLIBCXX_ASSERTIONS)
+    tts_cpp_apply_ccache(test-audio8-sampling-filter)
+    tts_cpp_register_test(test-audio8-sampling-filter)
 
     # End-to-end through the public engine, both the text path and the cloning
     # path, so it links the whole library rather than the stage sources.
@@ -1309,6 +1345,16 @@ if (TTS_CPP_BUILD_TESTS)
         src/backend_selection.cpp
         src/sched_dispatch.cpp
         src/log.cpp)
+
+    # Fail-closed GGUF loading: synthesizes tiny metadata-only GGUFs (truncated
+    # file, missing keys, missing tensors, wrong-typed key) and asserts the
+    # loader rejects each one.  No fixtures, so it runs on a bare checkout.
+    add_executable(test-parler-gguf-load test/parler/test_gguf_load.cpp
+        ${_tcb_parler_core_srcs})
+    target_link_libraries(test-parler-gguf-load PRIVATE ggml)
+    target_include_directories(test-parler-gguf-load PRIVATE ggml/include include src)
+    tts_cpp_apply_ccache(test-parler-gguf-load)
+    tts_cpp_register_test(test-parler-gguf-load)
 
     add_executable(test-parler-delay test/parler/test_delay.cpp src/parler/delay.cpp)
     target_include_directories(test-parler-delay PRIVATE src)
@@ -1817,9 +1863,11 @@ if (TTS_CPP_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "${_tcb_super2_gguf}"
         REQUIRES "${_tcb_super2_gguf}")
+    # gpu, not fixture: argv[2]=99 moves the graph onto the GPU, so this arm
+    # must stay out of the CPU-only lane even once the fixture is staged.
     tts_cpp_register_test(test-supertonic-sched-equivalence-gpu
         EXE      test-supertonic-sched-equivalence
-        LABEL    "fixture"
+        LABEL    "gpu"
         ARGS     "${_tcb_super2_gguf}" "99"
         REQUIRES "${_tcb_super2_gguf}")
     # Per-backend pins of the same bit-exactness check, so a host carrying
@@ -2081,9 +2129,39 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-text-split)
     tts_cpp_register_test(test-text-split LABEL "cpu")
 
+    # Chatterbox Turbo prompt tokenizer on a hand-built vocab: merge chains,
+    # byte-level encoding, paralinguistic added-token spans, punc_norm.
+    add_executable(test-gpt2-bpe test/test_gpt2_bpe.cpp src/gpt2_bpe.cpp)
+    target_include_directories(test-gpt2-bpe PRIVATE src)
+    tts_cpp_apply_ccache(test-gpt2-bpe)
+    tts_cpp_register_test(test-gpt2-bpe LABEL "cpu")
+
+    # Supertonic streaming chunker: pure text -> chunks policy (boundary
+    # priority, tolerance windows, min-chunk floor, tail merge).  No model,
+    # no ggml.
+    add_executable(test-supertonic-chunker test/test_supertonic_chunker.cpp
+        src/supertonic_chunker.cpp)
+    target_include_directories(test-supertonic-chunker PRIVATE src)
+    tts_cpp_apply_ccache(test-supertonic-chunker)
+    tts_cpp_register_test(test-supertonic-chunker LABEL "unit")
+
     # LavaSR DSP primitives: resampler, STFT/ISTFT, Slaney mel,
     # FastLR crossover merge.  Pure host math (no model / no ggml), compiled
     # straight from the lavasr/dsp sources so it always runs in CI.
+    # Fail-closed GGUF loading for both LavaSR stages: synthesizes tiny
+    # metadata-only GGUFs and asserts each loader rejects a missing, empty,
+    # truncated, unmarked, cross-architecture, or tensorless file.
+    add_executable(test-lavasr-gguf-load
+        test/test_lavasr_gguf_load.cpp
+        src/lavasr/denoiser_gguf.cpp
+        src/lavasr/enhancer_gguf.cpp
+        src/lavasr/denoiser_core.cpp
+        src/lavasr/enhancer_core.cpp)
+    target_link_libraries(test-lavasr-gguf-load PRIVATE ggml)
+    target_include_directories(test-lavasr-gguf-load PRIVATE ggml/include src test)
+    tts_cpp_apply_ccache(test-lavasr-gguf-load)
+    tts_cpp_register_test(test-lavasr-gguf-load LABEL "unit")
+
     add_executable(test-lavasr-dsp
         test/test_lavasr_dsp.cpp
         src/lavasr/dsp/resampler.cpp
@@ -2883,15 +2961,6 @@ if (TTS_CPP_BUILD_TESTS)
     tts_cpp_apply_ccache(test-supertonic-f16-attn-parity)
     tts_cpp_register_test(test-supertonic-f16-attn-parity LABEL "unit")
 
-    # supertonic-bench is a benchmark CLI (takes --text / --out / --runs),
-    # not a parity test, so it doesn't go through add_supertonic_harness
-    # which auto-registers everything as a positional-args (MODEL, REF_DIR)
-    # ctest target.  Built unconditionally with the rest of the test set
-    # so `cmake --build --target supertonic-bench` works the same way.
-    add_executable(supertonic-bench src/supertonic_bench.cpp)
-    target_link_libraries(supertonic-bench PRIVATE tts-cpp)
-    target_include_directories(supertonic-bench PRIVATE ggml/include src include)
-    tts_cpp_apply_ccache(supertonic-bench)
 endif()
 
 set(TTS_CPP_POINTWISE_ACCEL_TARGETS

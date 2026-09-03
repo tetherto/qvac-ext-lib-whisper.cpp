@@ -45,7 +45,15 @@ struct DitConfig {
     float rms_norm_eps      = 0.0f;
     int   enc_hidden_size   = 0;     // condition_embedder input dim (from weight shape)
     bool  is_turbo          = true;  // acestep.is_turbo: turbo=8 steps/shift 3; base/sft=50/shift 1
+    bool  is_sft            = false; // general.name contains "sft": CFG-capable, no stem tasks
+    std::string model_name;          // general.name from the GGUF (checkpoint dir name)
 };
+
+// convert.py stamps general.name with the checkpoint directory name
+// (acestep-v15-base / acestep-v15-sft / acestep-v15-xl-sft / ...).
+inline bool is_sft_model_name(const std::string & model_name) {
+    return model_name.find("sft") != std::string::npos;
+}
 
 struct DitModel;  // opaque: fused weight tensors + backend weight buffer
 
@@ -74,14 +82,46 @@ struct DitForwardInputs {
     const void * sa_mask_sw = nullptr;  // [S, S, 1, N] self-attn sliding window
     const void * ca_mask    = nullptr;  // [enc_S, S, 1, N] cross-attn encoder padding
 
-    // false = enc_hidden/positions/masks are unchanged since the previous call
-    // on this model, so their uploads are skipped (their graph slots persist).
+    // false = the inputs are unchanged since the previous call on this model,
+    // so their uploads are skipped (their graph slots persist). cond_dirty
+    // covers enc_hidden and ca_mask (they alternate between the cond and
+    // uncond pass under CFG); constants_dirty covers positions and sa_mask.
+    bool cond_dirty      = true;
     bool constants_dirty = true;
 };
 
 // Run one forward pass. Writes velocity [out_channels, T, N] (channel-major per
 // frame) to `velocity_out`. Returns false on failure.
 bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<float> & velocity_out);
+
+// One cross-attention head to capture during the lyric-alignment probe.
+struct DitAttentionHead {
+    int layer = 0;
+    int head  = 0;
+};
+
+// Inputs for the final-timestep probe used by lyric alignment: one forward at
+// t = 1/num_steps over the retained conditioning and the denoised latent.
+struct DitAttentionProbeInputs {
+    const float * context    = nullptr;  // [in_channels-out_channels, T] frame-major
+    const float * latent     = nullptr;  // [out_channels, T] denoised latent
+    const float * enc_hidden = nullptr;  // [H_enc, enc_S]
+    int           T          = 0;
+    int           enc_S      = 0;
+    int           H_enc      = 0;
+    int           real_enc_S = 0;
+    int           num_steps  = 0;
+    long long     seed       = 0;        // philox noise blended into the probe latent
+};
+
+// Runs the probe with explicit softmax on the captured cross-attention layers,
+// building the graph only up to the deepest captured layer. Appends one
+// [enc_S * S] buffer per head in ggml layout (enc_S contiguous per frame row).
+// Fully separate from the sampling graph cache: normal inference is untouched.
+bool dit_probe_cross_attention(DitModel *                            m,
+                               const DitAttentionProbeInputs &       in,
+                               const std::vector<DitAttentionHead> & heads,
+                               std::vector<std::vector<float>> &     captured_out);
 
 // Flow-matching timestep schedule (ACE-Step default):
 //   t_i = shift * t / (1 + (shift-1)*t),  t = 1 - i/num_steps.
@@ -98,7 +138,11 @@ void dit_apply_haar_dcw(std::vector<float> &       x_next,
                         float                      low_scale,
                         float                      high_scale);
 
-// One full flow-matching denoise (Euler, no CFG — turbo runs guidance=1.0).
+// One full flow-matching denoise (Euler). guidance_scale > 1 with a
+// null-condition embedding runs classifier-free guidance via APG (Adaptive
+// Projected Guidance, official ACE-Step base/sft path): a second unconditional
+// forward per step whose encoder states are the null embedding broadcast over
+// enc_S, combined as pred_cond + (scale-1) * orthogonal(momentum(diff)).
 struct DitSampleParams {
     const float * noise           = nullptr;  // [out_channels, T, N] initial x_T
     const float * context_latents = nullptr;  // [in_channels-out_channels, T, N] conditioning
@@ -109,6 +153,8 @@ struct DitSampleParams {
     int           N               = 1;
     const float * schedule        = nullptr;  // [num_steps] descending timesteps
     int           num_steps       = 0;
+    float         guidance_scale  = 1.0f;     // <= 1 disables CFG
+    const float * null_cond_emb   = nullptr;  // [H_enc] cond-model null embedding
     const int *   real_enc_S      = nullptr;  // [N] valid encoder lengths; null = all enc_S
     bool          dcw_enabled     = true;     // official ACE-Step Haar "double" mode
     float         dcw_scaler      = 0.05f;    // low band: t_curr * scaler
@@ -141,6 +187,17 @@ struct DitSampleParams {
 // Writes the denoised latent [out_channels, T, N] to `latent_out`. Rebuilds the
 // DiT graph per step (bring-up simplicity); correctness first, fusion later.
 bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & latent_out);
+
+// APG combine for one step: velocity holds the conditional prediction on entry
+// and the guided result on exit. momentum is the caller-held running average
+// ([out_channels * T * N] doubles, zero-initialized before the first step).
+void dit_apg_guide(std::vector<float> &       velocity,
+                   const std::vector<float> & velocity_uncond,
+                   std::vector<double> &      momentum,
+                   float                      guidance_scale,
+                   int                        T,
+                   int                        Oc,
+                   int                        N);
 
 struct DitFlowEditCondition {
     const float * context_latents = nullptr;

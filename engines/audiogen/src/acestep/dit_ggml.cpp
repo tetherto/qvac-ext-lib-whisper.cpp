@@ -8,6 +8,7 @@
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -432,8 +433,67 @@ static ggml_tensor * build_self_attn(ggml_context * ctx, DitModel * m, DitLayer 
     return linear(ctx, ly->sa_o_proj, attn);
 }
 
+struct DitAttentionCaptureConfig {
+    const DitAttentionHead * entries = nullptr;
+    int                      count   = 0;
+};
+
+static bool capture_has_layer(const DitAttentionCaptureConfig * capture, int layer) {
+    if (!capture) return false;
+    for (int i = 0; i < capture->count; i++) {
+        if (capture->entries[i].layer == layer) return true;
+    }
+    return false;
+}
+
+static bool capture_has_head(const DitAttentionCaptureConfig * capture, int layer, int head) {
+    if (!capture) return false;
+    for (int i = 0; i < capture->count; i++) {
+        if (capture->entries[i].layer == layer && capture->entries[i].head == head) return true;
+    }
+    return false;
+}
+
+static int capture_last_layer(const DitAttentionCaptureConfig * capture) {
+    int last = -1;
+    for (int i = 0; i < capture->count; i++) {
+        last = std::max(last, capture->entries[i].layer);
+    }
+    return last;
+}
+
+static void capture_name(char * buffer, size_t size, int layer, int head) {
+    snprintf(buffer, size, "cross_attn_l%d_h%d", layer, head);
+}
+
+// Explicit-softmax cross-attention for captured layers: the per-head
+// probabilities [enc_S, S] are exported as named contiguous graph outputs and
+// the attention output is recomposed from them, mirroring the flash-free path.
+static ggml_tensor * build_captured_cross_attn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k,
+                                               ggml_tensor * v, ggml_tensor * mask, float scale,
+                                               const DitAttentionCaptureConfig * capture,
+                                               int layer_idx, int enc_S, int S, int N, int Nh) {
+    ggml_tensor * probabilities = ggml_mul_mat(ctx, k, q);
+    probabilities               = ggml_soft_max_ext(ctx, probabilities, mask, scale, 0.0f);
+    for (int head = 0; head < Nh; head++) {
+        if (!capture_has_head(capture, layer_idx, head)) continue;
+        ggml_tensor * selected = ggml_view_3d(ctx, probabilities, enc_S, S, N, probabilities->nb[1],
+                                              probabilities->nb[3], (size_t) head * probabilities->nb[2]);
+        selected               = ggml_cont(ctx, selected);
+        char name[64];
+        capture_name(name, sizeof(name), layer_idx, head);
+        ggml_set_name(selected, name);
+        ggml_set_output(selected);
+    }
+    ggml_tensor * vt  = ggml_cont(ctx, ggml_transpose(ctx, v));
+    ggml_tensor * out = ggml_mul_mat(ctx, vt, probabilities);
+    return ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
+}
+
 static ggml_tensor * build_cross_attn(ggml_context * ctx, DitModel * m, DitLayer * ly, ggml_tensor * norm_ca,
-                                      ggml_tensor * enc, ggml_tensor * mask, int S, int enc_S, int N) {
+                                      ggml_tensor * enc, ggml_tensor * mask, int S, int enc_S, int N,
+                                      const DitAttentionCaptureConfig * capture = nullptr,
+                                      int layer_idx = -1) {
     const DitConfig & c   = m->cfg;
     int               D   = c.head_dim;
     int               Nh  = c.n_heads;
@@ -455,8 +515,11 @@ static ggml_tensor * build_cross_attn(ggml_context * ctx, DitModel * m, DitLayer
     v = ggml_reshape_4d(ctx, v, D, Nkv, enc_S, N);
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
-    const float scale = 1.0f / sqrtf((float) D);
-    ggml_tensor * attn = select_attention(ctx, q, k, v, mask, scale, m->use_flash_attn);
+    const float   scale = 1.0f / sqrtf((float) D);
+    ggml_tensor * attn  = capture_has_layer(capture, layer_idx)
+                              ? build_captured_cross_attn(ctx, q, k, v, mask, scale, capture,
+                                                          layer_idx, enc_S, S, N, Nh)
+                              : select_attention(ctx, q, k, v, mask, scale, m->use_flash_attn);
     attn                = ggml_reshape_3d(ctx, attn, (int64_t) Nh * D, S, N);
     return linear(ctx, ly->ca_o_proj, attn);
 }
@@ -470,7 +533,8 @@ static ggml_tensor * build_mlp(ggml_context * ctx, DitLayer * ly, ggml_tensor * 
 
 static ggml_tensor * build_layer(ggml_context * ctx, DitModel * m, int idx, ggml_tensor * hidden, ggml_tensor * tproj,
                                  ggml_tensor * enc, ggml_tensor * positions, ggml_tensor * sa_mask,
-                                 ggml_tensor * ca_mask, int S, int enc_S, int N) {
+                                 ggml_tensor * ca_mask, int S, int enc_S, int N,
+                                 const DitAttentionCaptureConfig * capture = nullptr) {
     const DitConfig & c  = m->cfg;
     DitLayer *        ly = &m->layers[idx];
     int               H  = c.hidden_size;
@@ -495,7 +559,8 @@ static ggml_tensor * build_layer(ggml_context * ctx, DitModel * m, int idx, ggml
 
     if (enc) {
         ggml_tensor * norm_ca = rms_norm_w(ctx, hidden, ly->cross_attn_norm, c.rms_norm_eps);
-        ggml_tensor * ca_out  = build_cross_attn(ctx, m, ly, norm_ca, enc, ca_mask, S, enc_S, N);
+        ggml_tensor * ca_out  = build_cross_attn(ctx, m, ly, norm_ca, enc, ca_mask, S, enc_S, N,
+                                                 capture, idx);
         hidden                = ggml_add(ctx, hidden, ca_out);
     }
 
@@ -795,14 +860,16 @@ bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<fl
     ggml_backend_tensor_set(input, in.input_latents, 0, (size_t) c.in_channels * T * N * sizeof(float));
     ggml_backend_tensor_set(t_val, &in.t, 0, sizeof(float));
     ggml_backend_tensor_set(tr_val, &in.t_r, 0, sizeof(float));
-    if (!cache_hit || in.constants_dirty) {
+    if (!cache_hit || in.cond_dirty) {
         ggml_backend_tensor_set(enc_hidden, in.enc_hidden, 0, (size_t) in.H_enc * enc_S * N * sizeof(float));
+        if (ca_mask) ggml_backend_tensor_set(ca_mask, in.ca_mask, 0, (size_t) enc_S * S * N * sizeof(uint16_t));
+    }
+    if (!cache_hit || in.constants_dirty) {
         std::vector<int32_t> pos((size_t) S * N);
         for (int n = 0; n < N; n++)
             for (int s = 0; s < S; s++) pos[(size_t) n * S + s] = s;
         ggml_backend_tensor_set(positions, pos.data(), 0, pos.size() * sizeof(int32_t));
         if (sa_mask) ggml_backend_tensor_set(sa_mask, in.sa_mask_sw, 0, (size_t) S * S * N * sizeof(uint16_t));
-        if (ca_mask) ggml_backend_tensor_set(ca_mask, in.ca_mask, 0, (size_t) enc_S * S * N * sizeof(uint16_t));
     }
 
     int rc = ggml_backend_graph_compute(m->backend, gf);
@@ -814,6 +881,188 @@ bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<fl
     velocity_out.resize((size_t) c.out_channels * T * N);
     ggml_backend_tensor_get(output, velocity_out.data(), 0, ggml_nbytes(output));
     return true;
+}
+
+static bool probe_inputs_valid(const DitConfig & c, const DitAttentionProbeInputs & in,
+                               const std::vector<DitAttentionHead> & heads) {
+    if (!in.context || !in.latent || !in.enc_hidden) return false;
+    if (in.T <= 0 || in.T % c.patch_size != 0 || in.num_steps <= 0) return false;
+    if (in.enc_S <= 0 || in.H_enc != c.enc_hidden_size) return false;
+    if (in.real_enc_S < 0 || in.real_enc_S > in.enc_S) return false;
+    if (heads.empty()) return false;
+    for (size_t i = 0; i < heads.size(); i++) {
+        if (heads[i].layer < 0 || heads[i].layer >= c.n_layers) return false;
+        if (heads[i].head < 0 || heads[i].head >= c.n_heads) return false;
+        for (size_t j = 0; j < i; j++) {
+            if (heads[i].layer == heads[j].layer && heads[i].head == heads[j].head) return false;
+        }
+    }
+    return true;
+}
+
+static float round_to_bf16(float value) {
+    return ggml_bf16_to_fp32(ggml_fp32_to_bf16(value));
+}
+
+// Probe latent: context channels stay verbatim; the trailing latent channels
+// carry x_t = t*noise + (1-t)*x0 rounded through bf16 (reference parity).
+static std::vector<float> build_probe_input(const DitAttentionProbeInputs & in, const DitConfig & c,
+                                            float timestep) {
+    const int          ctx_ch = c.in_channels - c.out_channels;
+    std::vector<float> noise((size_t) in.T * c.out_channels);
+    philox_randn(in.seed, noise.data(), (int) noise.size(), true);
+    std::vector<float> input((size_t) in.T * c.in_channels);
+    for (int frame = 0; frame < in.T; frame++) {
+        float * destination = input.data() + (size_t) frame * c.in_channels;
+        memcpy(destination, in.context + (size_t) frame * ctx_ch, (size_t) ctx_ch * sizeof(float));
+        for (int channel = 0; channel < c.out_channels; channel++) {
+            const size_t index = (size_t) frame * c.out_channels + channel;
+            const float  xt    = timestep * noise[index] + (1.0f - timestep) * in.latent[index];
+            destination[ctx_ch + channel] = round_to_bf16(xt);
+        }
+    }
+    return input;
+}
+
+static std::vector<uint16_t> build_probe_self_mask(const DitConfig & c, int S) {
+    std::vector<uint16_t> mask((size_t) S * S);
+    for (int qi = 0; qi < S; qi++) {
+        for (int ki = 0; ki < S; ki++) {
+            const int  dist   = qi > ki ? qi - ki : ki - qi;
+            const bool in_win = c.sliding_window <= 0 || S <= c.sliding_window || dist <= c.sliding_window;
+            mask[(size_t) qi * S + ki] = ggml_fp32_to_fp16(in_win ? 0.0f : -INFINITY);
+        }
+    }
+    return mask;
+}
+
+static std::vector<uint16_t> build_probe_cross_mask(int enc_S, int S, int real_enc_S) {
+    std::vector<uint16_t> mask((size_t) enc_S * S);
+    for (int qi = 0; qi < S; qi++) {
+        for (int ki = 0; ki < enc_S; ki++) {
+            mask[(size_t) qi * enc_S + ki] = ggml_fp32_to_fp16(ki < real_enc_S ? 0.0f : -INFINITY);
+        }
+    }
+    return mask;
+}
+
+static bool read_captured_heads(ggml_cgraph * gf, const std::vector<DitAttentionHead> & heads,
+                                int enc_S, int S, std::vector<std::vector<float>> & captured_out) {
+    for (const DitAttentionHead & head : heads) {
+        char name[64];
+        capture_name(name, sizeof(name), head.layer, head.head);
+        ggml_tensor * tensor = ggml_graph_get_tensor(gf, name);
+        if (!tensor || tensor->ne[0] != enc_S || tensor->ne[1] != S) {
+            fprintf(stderr, "[acestep-dit] probe: missing captured tensor %s\n", name);
+            return false;
+        }
+        std::vector<float> values((size_t) enc_S * S);
+        ggml_backend_tensor_get(tensor, values.data(), 0, values.size() * sizeof(float));
+        captured_out.push_back(std::move(values));
+    }
+    return true;
+}
+
+bool dit_probe_cross_attention(DitModel *                            m,
+                               const DitAttentionProbeInputs &       in,
+                               const std::vector<DitAttentionHead> & heads,
+                               std::vector<std::vector<float>> &     captured_out) {
+    captured_out.clear();
+    const DitConfig & c = m->cfg;
+    if (!probe_inputs_valid(c, in, heads)) {
+        fprintf(stderr, "[acestep-dit] probe: inputs do not match the DiT configuration\n");
+        return false;
+    }
+
+    const int   S        = in.T / c.patch_size;
+    const int   enc_S    = in.enc_S;
+    const float timestep = 1.0f / (float) in.num_steps;
+
+    const size_t     nodes = (size_t) 8192;
+    ggml_init_params gp{ ggml_tensor_overhead() * 2048 + ggml_graph_overhead_custom(nodes, false), nullptr, true };
+    ggml_context *   ctx = ggml_init(gp);
+    if (!ctx) return false;
+
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.in_channels, in.T, 1);
+    ggml_set_input(input);
+    ggml_tensor * enc_hidden = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, in.H_enc, enc_S, 1);
+    ggml_set_input(enc_hidden);
+    ggml_tensor * t_val = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_input(t_val);
+    ggml_tensor * tr_val = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_input(tr_val);
+    ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);
+    ggml_set_input(positions);
+    ggml_tensor * sa_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, S, S, 1, 1);
+    ggml_set_input(sa_mask);
+    ggml_tensor * ca_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, enc_S, S, 1, 1);
+    ggml_set_input(ca_mask);
+
+    ggml_tensor * tproj_t;
+    ggml_tensor * temb_t = build_temb(ctx, &m->time_embed, t_val, &tproj_t);
+    ggml_tensor * tproj_r;
+    ggml_tensor * t_diff = ggml_sub(ctx, t_val, tr_val);
+    build_temb(ctx, &m->time_embed_r, t_diff, &tproj_r);
+    (void) temb_t;
+    ggml_tensor * tproj = ggml_add(ctx, tproj_t, tproj_r);
+
+    ggml_tensor * patched = ggml_reshape_3d(ctx, input, (int64_t) c.in_channels * c.patch_size, S, 1);
+    ggml_tensor * hidden  = linear_b(ctx, m->proj_in_w, m->proj_in_b, patched);
+    ggml_tensor * enc     = linear_b(ctx, m->cond_emb_w, m->cond_emb_b, enc_hidden);
+
+    const DitAttentionCaptureConfig capture{ heads.data(), (int) heads.size() };
+    const int                       last_layer = capture_last_layer(&capture);
+    for (int i = 0; i <= last_layer; i++) {
+        ggml_tensor * sm = (m->layers[i].layer_type == 0) ? sa_mask : nullptr;
+        hidden = build_layer(ctx, m, i, hidden, tproj, enc, positions, sm, ca_mask, S, enc_S, 1, &capture);
+    }
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, nodes, false);
+    for (const DitAttentionHead & head : heads) {
+        char name[64];
+        capture_name(name, sizeof(name), head.layer, head.head);
+        ggml_tensor * tensor = ggml_get_tensor(ctx, name);
+        if (!tensor) {
+            fprintf(stderr, "[acestep-dit] probe: capture %s was not built\n", name);
+            ggml_free(ctx);
+            return false;
+        }
+        ggml_build_forward_expand(gf, tensor);
+    }
+
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
+    if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
+        fprintf(stderr, "[acestep-dit] probe: graph alloc failed (T=%d enc_S=%d)\n", in.T, enc_S);
+        if (ga) ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        return false;
+    }
+
+    const std::vector<float>    probe_input = build_probe_input(in, c, timestep);
+    const std::vector<uint16_t> self_mask   = build_probe_self_mask(c, S);
+    const std::vector<uint16_t> cross_mask  = build_probe_cross_mask(enc_S, S, in.real_enc_S);
+    std::vector<int32_t>        pos(S);
+    for (int i = 0; i < S; i++) pos[(size_t) i] = i;
+
+    ggml_backend_tensor_set(input, probe_input.data(), 0, probe_input.size() * sizeof(float));
+    ggml_backend_tensor_set(enc_hidden, in.enc_hidden, 0, (size_t) in.H_enc * enc_S * sizeof(float));
+    ggml_backend_tensor_set(t_val, &timestep, 0, sizeof(float));
+    ggml_backend_tensor_set(tr_val, &timestep, 0, sizeof(float));
+    ggml_backend_tensor_set(positions, pos.data(), 0, pos.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(sa_mask, self_mask.data(), 0, self_mask.size() * sizeof(uint16_t));
+    ggml_backend_tensor_set(ca_mask, cross_mask.data(), 0, cross_mask.size() * sizeof(uint16_t));
+
+    const int  rc = ggml_backend_graph_compute(m->backend, gf);
+    bool       ok = rc == GGML_STATUS_SUCCESS;
+    if (!ok) {
+        fprintf(stderr, "[acestep-dit] probe: compute failed (%d)\n", rc);
+    } else {
+        ok = read_captured_heads(gf, heads, enc_S, S, captured_out);
+        if (!ok) captured_out.clear();
+    }
+    ggml_gallocr_free(ga);
+    ggml_free(ctx);
+    return ok;
 }
 
 void dit_build_schedule(float shift, int num_steps, std::vector<float> & schedule_out) {
@@ -891,6 +1140,40 @@ static void preserve_repaint_latent(const DitSampleParams & params, size_t laten
         (size_t) params.T, params.repaint_crossfade_frames, channels);
 }
 
+static constexpr double DIT_APG_MOMENTUM       = -0.75;
+static constexpr double DIT_APG_NORM_THRESHOLD = 2.5;
+
+static void apg_accumulate_momentum(std::vector<double> & running, std::vector<double> & diff) {
+    for (size_t i = 0; i < diff.size(); i++) {
+        running[i] = diff[i] + DIT_APG_MOMENTUM * running[i];
+        diff[i]    = running[i];
+    }
+}
+
+static double apg_channel_norm(const double * values, int T, int Oc, int channel) {
+    double sum = 0.0;
+    for (int t = 0; t < T; t++) {
+        const double v = values[(size_t) t * Oc + channel];
+        sum += v * v;
+    }
+    return std::sqrt(sum);
+}
+
+static void apg_scale_channel(double * values, int T, int Oc, int channel, double scale) {
+    for (int t = 0; t < T; t++) {
+        values[(size_t) t * Oc + channel] *= scale;
+    }
+}
+
+static void apg_clip_channel_norms(double * diff, int T, int Oc) {
+    for (int c = 0; c < Oc; c++) {
+        const double norm = apg_channel_norm(diff, T, Oc, c);
+        if (norm > DIT_APG_NORM_THRESHOLD) {
+            apg_scale_channel(diff, T, Oc, c, DIT_APG_NORM_THRESHOLD / norm);
+        }
+    }
+}
+
 static void fill_ca_mask_rows(std::vector<uint16_t> & ca_mask, const int * real_enc_S,
                               int enc_S, int S, int N) {
     for (int b = 0; b < N; b++) {
@@ -902,6 +1185,89 @@ static void fill_ca_mask_rows(std::vector<uint16_t> & ca_mask, const int * real_
             }
         }
     }
+}
+
+static double apg_channel_norm_f32(const float * values, int T, int Oc, int channel) {
+    double sum = 0.0;
+    for (int t = 0; t < T; t++) {
+        const double v = values[(size_t) t * Oc + channel];
+        sum += v * v;
+    }
+    return std::sqrt(sum);
+}
+
+static void apg_remove_parallel_component(double * diff, const float * cond, int T, int Oc, int channel) {
+    const double norm = apg_channel_norm_f32(cond, T, Oc, channel);
+    if (norm <= 0.0) return;
+    const double inv_norm = 1.0 / norm;
+    double dot = 0.0;
+    for (int t = 0; t < T; t++) {
+        const size_t idx = (size_t) t * Oc + channel;
+        dot += diff[idx] * (double) cond[idx] * inv_norm;
+    }
+    for (int t = 0; t < T; t++) {
+        const size_t idx = (size_t) t * Oc + channel;
+        diff[idx] -= dot * (double) cond[idx] * inv_norm;
+    }
+}
+
+static void apg_project_orthogonal(double * diff, const float * cond, int T, int Oc) {
+    for (int c = 0; c < Oc; c++) {
+        apg_remove_parallel_component(diff, cond, T, Oc, c);
+    }
+}
+
+static std::vector<double> apg_velocity_difference(const std::vector<float> & velocity,
+                                                   const std::vector<float> & velocity_uncond) {
+    std::vector<double> diff(velocity.size());
+    for (size_t i = 0; i < diff.size(); i++) {
+        diff[i] = (double) velocity[i] - (double) velocity_uncond[i];
+    }
+    return diff;
+}
+
+static void apg_shape_batch_updates(std::vector<double> & diff, const std::vector<float> & velocity,
+                                    int T, int Oc, int N) {
+    const size_t n_per = (size_t) T * Oc;
+    for (int b = 0; b < N; b++) {
+        apg_clip_channel_norms(diff.data() + (size_t) b * n_per, T, Oc);
+        apg_project_orthogonal(diff.data() + (size_t) b * n_per, velocity.data() + (size_t) b * n_per, T, Oc);
+    }
+}
+
+static void apg_apply_guided_update(std::vector<float> & velocity, const std::vector<double> & diff,
+                                    float guidance_scale) {
+    const double weight = (double) guidance_scale - 1.0;
+    for (size_t i = 0; i < diff.size(); i++) {
+        velocity[i] = (float) ((double) velocity[i] + weight * diff[i]);
+    }
+}
+
+void dit_apg_guide(std::vector<float> &       velocity,
+                   const std::vector<float> & velocity_uncond,
+                   std::vector<double> &      momentum,
+                   float                      guidance_scale,
+                   int                        T,
+                   int                        Oc,
+                   int                        N) {
+    std::vector<double> diff = apg_velocity_difference(velocity, velocity_uncond);
+    apg_accumulate_momentum(momentum, diff);
+    apg_shape_batch_updates(diff, velocity, T, Oc, N);
+    apg_apply_guided_update(velocity, diff, guidance_scale);
+}
+
+static std::vector<float> make_null_enc_hidden(const float * null_emb, int H_enc, int enc_S, int N) {
+    std::vector<float> hidden((size_t) H_enc * enc_S * N);
+    for (int b = 0; b < N; b++) {
+        for (int s = 0; s < enc_S; s++) {
+            memcpy(&hidden[((size_t) b * enc_S + s) * H_enc], null_emb, (size_t) H_enc * sizeof(float));
+        }
+    }
+    return hidden;
+}
+
+static std::vector<uint16_t> make_visible_ca_mask(int enc_S, int S, int N) {
+    return std::vector<uint16_t>((size_t) enc_S * S * N, ggml_fp32_to_fp16(0.0f));
 }
 
 static void splice_context_channels(std::vector<float> & input_buf, const float * context,
@@ -967,6 +1333,18 @@ bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & la
         xt_before.resize(n_per * N);
         denoised.resize(n_per * N);
     }
+
+    const bool use_cfg = p.guidance_scale > 1.0f && p.null_cond_emb != nullptr && p.H_enc > 0;
+    std::vector<float>    vt_uncond;
+    std::vector<float>    null_enc_hidden;
+    std::vector<uint16_t> null_ca_mask;
+    std::vector<double>   apg_momentum;
+    if (use_cfg) {
+        null_enc_hidden = make_null_enc_hidden(p.null_cond_emb, p.H_enc, enc_S, N);
+        null_ca_mask    = make_visible_ca_mask(enc_S, S, N);
+        apg_momentum.assign(n_per * N, 0.0);
+    }
+
     const float * enc_hidden_active = p.enc_hidden;
     bool          cover_switched    = false;
     for (int step = 0; step < p.num_steps; step++) {
@@ -1000,18 +1378,32 @@ bool dit_sample(DitModel * m, const DitSampleParams & p, std::vector<float> & la
         fin.enc_S         = enc_S;
         fin.H_enc         = p.H_enc;
         fin.t             = t_curr;
-        // t_r == t (t_diff == 0, so time_embed_r sees 0). Holds for turbo
-        // text2music, which is also why the sampler runs a single conditional
-        // pass (N == 1, no CFG). base/sft (50-step, CFG) parity is not yet
-        // verified against the reference and would need t_r / uncond wiring.
+        // t_r == t (t_diff == 0, so time_embed_r sees 0) for both turbo and
+        // base/sft: the reference passes timestep_r = timestep unconditionally.
         fin.t_r             = t_curr;
         fin.sa_mask_sw      = sa_mask.data();
         fin.ca_mask         = ca_mask.data();
+        // CFG alternates cond/uncond enc_hidden and ca_mask on the shared graph
+        // cache, so their uploads can never be skipped; positions and sa_mask
+        // stay valid between steps and across the cond/uncond pair.
+        fin.cond_dirty      = constants_dirty || use_cfg;
         fin.constants_dirty = constants_dirty;
 
         if (!dit_model_forward(m, fin, vt)) {
             fprintf(stderr, "[acestep-dit] sample: forward failed at step %d\n", step);
             return false;
+        }
+
+        if (use_cfg) {
+            DitForwardInputs fin_uncond = fin;
+            fin_uncond.enc_hidden       = null_enc_hidden.data();
+            fin_uncond.ca_mask          = null_ca_mask.data();
+            fin_uncond.constants_dirty  = false;
+            if (!dit_model_forward(m, fin_uncond, vt_uncond)) {
+                fprintf(stderr, "[acestep-dit] sample: uncond forward failed at step %d\n", step);
+                return false;
+            }
+            dit_apg_guide(vt, vt_uncond, apg_momentum, p.guidance_scale, T, Oc, N);
         }
 
         // Euler ODE step. Final step integrates all the way to x0 (t_next = 0).

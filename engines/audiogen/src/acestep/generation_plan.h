@@ -16,13 +16,15 @@ struct GenerationPlan {
 
 inline GenerationPlan make_generation_plan(const GenerateParams & params, const GenerateTask & task) {
     const bool cover_nofsq = task.type == TASK_COVER_NOFSQ;
+    const bool lego        = is_lego_task(task.type);
+    const bool source_task = cover_nofsq || lego;
 
     GenerationPlan plan;
-    plan.encode_source          = cover_nofsq;
+    plan.encode_source          = source_task;
     plan.encode_reference       = !params.reference_audio.empty();
     plan.reuse_source_reference = cover_nofsq && params.reference_audio.empty();
-    plan.run_lm                 = !cover_nofsq;
-    plan.run_detokenizer        = !cover_nofsq;
+    plan.run_lm                 = !source_task;
+    plan.run_detokenizer        = !source_task;
     plan.blend_cover_noise      = cover_nofsq && task.cover_noise_strength > 0.0f;
     return plan;
 }

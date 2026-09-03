@@ -22,6 +22,7 @@ namespace fs = std::filesystem;
 constexpr int TEST_SAMPLE_RATE = 48000;
 constexpr int TEST_CHANNELS = 2;
 constexpr int TEST_SECONDS = 2;
+constexpr int TEST_LEGO_PARTIAL_HOP_FRAMES = 480;
 constexpr int TEST_STEPS = 2;
 constexpr float TEST_SHIFT = 3.0f;
 constexpr float TEST_NOISE_STRENGTH = 0.5f;
@@ -45,6 +46,9 @@ constexpr char TEST_FLOW_TARGET_CAPTION[] = "A warm evolving synth pad";
 constexpr char TEST_UNKNOWN_LANGUAGE[] = "unknown";
 constexpr char TEST_LM_STAGE[] = "lm";
 constexpr char TEST_TURBO_ERROR[] = "turbo DiT only";
+constexpr char TEST_LEGO_BASE_ERROR[] = "requires a base DiT";
+constexpr char TEST_LEGO_SKIP_FORMAT[] =
+    "[test-acestep-integration] lego skipped: fixture is not a base DiT\n";
 constexpr char TEST_FLOW_SKIP_FORMAT[] =
     "[test-acestep-integration] flow-edit skipped: supplied model is not turbo\n";
 
@@ -80,6 +84,12 @@ struct StageLog {
     bool contains_detailed_progress(const char *stage) const {
       return std::any_of(events.begin(), events.end(), [&](const Event &event) {
         return event.name == stage && event.total > 1 && event.step > 0;
+      });
+    }
+
+    bool contains_unknown_total_progress(const char *stage) const {
+      return std::any_of(events.begin(), events.end(), [&](const Event &event) {
+        return event.name == stage && event.total <= 0 && event.step > 0;
       });
     }
 };
@@ -401,11 +411,111 @@ void run_edit_vae_cancel_scenario(tts_cpp::acestep::Engine &engine,
   CHECK(result.pcm.empty());
 }
 
+// A cancel armed before generate() must cancel that run, not be erased at
+// entry and leave the caller waiting for the next one. Mirrors MiniMax's
+// verify_pre_armed_cancellation; the run after it must still succeed, proving
+// the flag was consumed rather than left latched.
+void run_pre_armed_cancel_scenario(tts_cpp::acestep::Engine & engine,
+                                   const EditFixture & fixture) {
+    engine.cancel();
+    bool progressed = false;
+    const tts_cpp::acestep::GenerateResult cancelled = engine.generate(
+        fixture.params, [&](const std::string &, int, int) {
+            progressed = true;
+            return true;
+        });
+    CHECK(cancelled.pcm.empty());
+    CHECK(!progressed);
+
+    const tts_cpp::acestep::GenerateResult subsequent =
+        engine.generate(fixture.params);
+    CHECK(!subsequent.pcm.empty());
+}
+
 void run_edit_scenarios(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir) {
     EditFixture fixture = make_edit_fixture();
     run_repaint_scenario(engine, dump_dir, fixture);
     run_flow_scenario(engine, dump_dir, fixture);
     run_edit_vae_cancel_scenario(engine, fixture);
+    run_pre_armed_cancel_scenario(engine, fixture);
+}
+
+tts_cpp::acestep::GenerateParams make_lego_params() {
+    tts_cpp::acestep::GenerateParams params = make_generate_params();
+    params.task_type = tts_cpp::acestep::TASK_LEGO;
+    params.track = "guitar";
+    params.caption = "Clean electric guitar layer integration test";
+    params.reference_audio.clear();
+    params.cover_noise_strength = 0.0f;
+    params.source_audio.resize(
+        params.source_audio.size() + (size_t) TEST_LEGO_PARTIAL_HOP_FRAMES * TEST_CHANNELS, 0.0f);
+    return params;
+}
+
+void inspect_lego_context_frame(const TensorDump & context, const TensorDump & source, int frame,
+                                bool & matches_source, bool & mask_always_active) {
+    const float * row = context.values.data() + (size_t) frame * context.columns;
+    for (int channel = 0; channel < TEST_LATENT_CHANNELS; ++channel) {
+        if (row[TEST_LATENT_CHANNELS + channel] != TEST_CONTEXT_ACTIVE_VALUE) mask_always_active = false;
+        if (frame < source.rows &&
+            row[channel] != source.values[(size_t) frame * source.columns + channel]) {
+            matches_source = false;
+        }
+    }
+}
+
+void verify_lego_source_context(const fs::path & dump_dir) {
+    const TensorDump context = read_tensor_dump(dump_dir / TEST_CONTEXT_DUMP);
+    const TensorDump source = read_tensor_dump(dump_dir / TEST_SOURCE_DUMP);
+    CHECK(!context.values.empty());
+    CHECK(context.columns == TEST_CONTEXT_CHANNELS);
+    CHECK(!source.values.empty());
+    CHECK(source.columns == TEST_LATENT_CHANNELS);
+    if (context.values.empty() || context.columns != TEST_CONTEXT_CHANNELS ||
+        source.values.empty() || source.columns != TEST_LATENT_CHANNELS) {
+        return;
+    }
+    bool matches_source = true;
+    bool mask_always_active = true;
+    for (int frame = 0; frame < context.rows; ++frame) {
+        inspect_lego_context_frame(context, source, frame, matches_source, mask_always_active);
+    }
+    CHECK(matches_source);
+    CHECK(mask_always_active);
+}
+
+void run_lego_checks(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir) {
+    using namespace tts_cpp::acestep;
+    GenerateParams params = make_lego_params();
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(stages.contains("source"));
+    CHECK(!stages.contains(TEST_LM_STAGE));
+    CHECK(!fs::exists(dump_dir / "01_lm_codes.bin"));
+    CHECK(result.pcm.size() == params.source_audio.size());
+    verify_lego_source_context(dump_dir);
+}
+
+void run_lego_scenario(tts_cpp::acestep::Engine & engine, const fs::path & dump_dir) {
+    try {
+        run_lego_checks(engine, dump_dir);
+    } catch (const std::invalid_argument & error) {
+        if (std::string(error.what()).find(TEST_LEGO_BASE_ERROR) == std::string::npos) throw;
+        std::fprintf(stderr, TEST_LEGO_SKIP_FORMAT);
+    }
+}
+
+// Optional base-model lane: when AUDIOGEN_TEST_BASE_MODELS_DIR is set, lego
+// must execute for real — a rejection there is a failure, not a skip.
+void run_lego_base_lane() {
+    const char * base_models_dir = std::getenv("AUDIOGEN_TEST_BASE_MODELS_DIR");
+    if (!base_models_dir || !*base_models_dir) return;
+    const fs::path dump_dir = make_dump_directory();
+    std::unique_ptr<tts_cpp::acestep::Engine> engine =
+        tts_cpp::acestep::Engine::create(make_engine_options(base_models_dir, dump_dir));
+    run_lego_checks(*engine, dump_dir);
+    fs::remove_all(dump_dir);
 }
 
 // Runs the autoregressive LM for real (phase-2 code generation) twice with one
@@ -435,6 +545,142 @@ void run_lm_generation_scenario(tts_cpp::acestep::Engine & engine, const fs::pat
     const TensorDump second_codes = read_tensor_dump(dump_dir / "01_lm_codes.bin");
     CHECK(vectors_match(first_codes.values, second_codes.values));
     CHECK(second.pcm == first.pcm);
+}
+
+// Quality scoring end to end: the generated codes are teacher-forced back
+// through the LM and the request earns a weighted score with a breakdown.
+void run_quality_score_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    GenerateParams params;
+    params.caption               = "acoustic quality scoring integration test";
+    params.lyrics                = "[verse]\nhello quality world";
+    params.duration              = 1.0f;
+    params.bpm                   = 120;
+    params.keyscale              = "C major";
+    params.inference_steps       = TEST_STEPS;
+    params.shift                 = TEST_SHIFT;
+    params.seed                  = TEST_SEED;
+    params.lm_phase1             = false;
+    params.compute_quality_score = true;
+
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(result.metadata.quality_score >= 0.0);
+    CHECK(result.metadata.quality_score <= 1.0);
+    CHECK(!result.metadata.quality_report.empty());
+    CHECK(result.metadata.quality_report.find("caption") != std::string::npos);
+    CHECK(result.metadata.quality_report.find("bpm") != std::string::npos);
+    CHECK(stages.contains_detailed_progress("score"));
+
+    GenerateParams unscored = params;
+    unscored.compute_quality_score = false;
+    const GenerateResult baseline  = engine.generate(unscored);
+    CHECK(baseline.metadata.quality_report.empty());
+    CHECK(baseline.pcm == result.pcm);
+}
+
+// Simple Mode end to end: a short query expands into a complete request (the
+// LM inspire pass writes lyrics and fills unset metadata) before synthesis.
+void run_simple_mode_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    GenerateParams params;
+    params.caption         = "a short upbeat electronic jingle with female vocals";
+    params.lyrics.clear();
+    params.simple_mode     = true;
+    params.duration        = 2.0f;
+    params.inference_steps = TEST_STEPS;
+    params.shift           = TEST_SHIFT;
+    params.seed            = TEST_SEED;
+
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(result.metadata.n_codes > 0);
+    CHECK(stages.contains(TEST_LM_STAGE));
+    CHECK(stages.contains_detailed_progress(TEST_LM_STAGE));
+    CHECK(stages.contains_unknown_total_progress(TEST_LM_STAGE));
+    CHECK(result.metadata.caption != params.caption);
+    CHECK(!result.metadata.caption.empty());
+    CHECK(!result.metadata.lyrics.empty());
+    CHECK(result.metadata.bpm > 0);
+    CHECK(!result.metadata.keyscale.empty());
+    CHECK(result.metadata.timesignature > 0);
+    CHECK(!result.metadata.vocal_language.empty());
+}
+
+tts_cpp::acestep::GenerateParams make_lm_cancel_params() {
+    tts_cpp::acestep::GenerateParams params;
+    params.caption         = "a cancelled simple mode request";
+    params.lyrics.clear();
+    params.simple_mode     = true;
+    params.duration        = 2.0f;
+    params.inference_steps = TEST_STEPS;
+    params.shift           = TEST_SHIFT;
+    params.seed            = TEST_SEED;
+    return params;
+}
+
+// Phase-1 inspire ticks report an unknown total; cancelling on the first one
+// must abort generation cleanly.
+void run_lm_phase1_cancel_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    bool cancelled_in_phase_one = false;
+    const GenerateResult result = engine.generate(
+        make_lm_cancel_params(), [&](const std::string & stage, int step, int total) {
+            if (stage == TEST_LM_STAGE && total <= 0 && step > 0) {
+                cancelled_in_phase_one = true;
+                return false;
+            }
+            return true;
+        });
+    CHECK(cancelled_in_phase_one);
+    CHECK(result.pcm.empty());
+}
+
+// Phase-2 code ticks carry the duration-derived total; cancelling mid-loop
+// must abort generation cleanly.
+void run_lm_phase2_cancel_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    bool cancelled_mid_codes = false;
+    const GenerateResult result = engine.generate(
+        make_lm_cancel_params(), [&](const std::string & stage, int step, int total) {
+            if (stage == TEST_LM_STAGE && total > 1 && step > 0) {
+                cancelled_mid_codes = true;
+                return false;
+            }
+            return true;
+        });
+    CHECK(cancelled_mid_codes);
+    CHECK(result.pcm.empty());
+}
+
+// Generates with known lyrics and asserts the LRC stage aligns them: LRC text
+// present, mm:ss.xx line stamps, and a confidence score inside [0, 1].
+void run_lrc_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    GenerateParams params;
+    params.caption         = "acoustic ballad integration test";
+    params.lyrics          = "[verse]\nhello world tonight\nsinging by the light";
+    params.duration        = 2.0f;
+    params.inference_steps = TEST_STEPS;
+    params.shift           = TEST_SHIFT;
+    params.seed            = TEST_SEED;
+    params.lm_phase1       = false;
+    params.generate_lrc    = true;
+
+    StageLog stages;
+    const GenerateResult result = generate_with_stage_log(engine, params, stages);
+    CHECK(!result.pcm.empty());
+    CHECK(!result.metadata.lrc.empty());
+    CHECK(result.metadata.lrc.rfind("[00:", 0) == 0);
+    CHECK(result.metadata.lyrics_score >= 0.0);
+    CHECK(result.metadata.lyrics_score <= 1.0);
 }
 
 void run_cover_strength_scenario(tts_cpp::acestep::Engine & engine) {
@@ -473,7 +719,14 @@ int run_integration(const char * models_dir) {
         verify_stage_dumps(dump_dir);
         run_cover_strength_scenario(*engine);
         run_edit_scenarios(*engine, dump_dir);
+        run_lego_scenario(*engine, dump_dir);
+        run_lego_base_lane();
         run_lm_generation_scenario(*engine, dump_dir);
+        run_quality_score_scenario(*engine);
+        run_simple_mode_scenario(*engine);
+        run_lm_phase1_cancel_scenario(*engine);
+        run_lm_phase2_cancel_scenario(*engine);
+        run_lrc_scenario(*engine);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "FAIL integration exception: %s\n", error.what());
         ++failures;

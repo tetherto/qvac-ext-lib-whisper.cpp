@@ -37,42 +37,6 @@ namespace {
 constexpr float k_score_neg_inf = std::numeric_limits<float>::lowest();
 constexpr float k_score_pos_inf = std::numeric_limits<float>::max();
 
-// Threshold speaker probabilities into time-sorted segments.
-void sf_threshold_segments(const std::vector<float> & speaker_probs,
-                           int T_enc, int num_spks,
-                           double frame_stride_s, float threshold,
-                           std::vector<SortformerSegment> & segments) {
-    segments.clear();
-    for (int s = 0; s < num_spks; ++s) {
-        bool active = false;
-        int  start_frame = 0;
-        for (int t = 0; t < T_enc; ++t) {
-            const bool a = speaker_probs[(size_t)t * num_spks + s] > threshold;
-            if (a && !active)  { start_frame = t; active = true; }
-            if (!a && active) {
-                SortformerSegment seg;
-                seg.speaker_id = s;
-                seg.start_s = start_frame * frame_stride_s;
-                seg.end_s   = t           * frame_stride_s;
-                segments.push_back(seg);
-                active = false;
-            }
-        }
-        if (active) {
-            SortformerSegment seg;
-            seg.speaker_id = s;
-            seg.start_s = start_frame * frame_stride_s;
-            seg.end_s   = T_enc       * frame_stride_s;
-            segments.push_back(seg);
-        }
-    }
-    std::sort(segments.begin(), segments.end(),
-              [](const SortformerSegment & a, const SortformerSegment & b) {
-                  if (a.start_s != b.start_s) return a.start_s < b.start_s;
-                  return a.speaker_id < b.speaker_id;
-              });
-}
-
 ggml_tensor * sf_layer_norm(ggml_context * ctx, ggml_tensor * x,
                             ggml_tensor * gamma, ggml_tensor * beta, float eps) {
     x = ggml_norm(ctx, x, eps);

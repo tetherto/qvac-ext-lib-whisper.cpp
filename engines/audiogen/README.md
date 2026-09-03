@@ -39,31 +39,52 @@ MiniMax uses two GGUF files: `mm3-lm-<quant>.gguf` for the Qwen3 global LM and
 `mm3-synth-<quant>.gguf` for the RVQ depth decoder, condition encoder, flow DiT,
 and vocoder. Set `EngineOptions::model_dir`, or provide `lm_model_path` and
 `synth_model_path` explicitly. Directory discovery matches quantized pairs
-case-insensitively, prefers `q8_0`, then `f16`, then `bf16`, and rejects
-duplicate candidates. The engine is desktop-only. It runs on CPU by default;
-`EngineOptions::device` (or, when that is empty, the `MM3_DEVICE` environment
-variable) accepts `cpu`, `gpu`, or `auto`. `gpu` requires a usable GPU backend
-and fails engine creation without one; `auto` takes a GPU when available and
-otherwise falls back to the CPU. On a GPU the weights and graphs live on the
-first usable backend the ggml registry offers (CUDA, Vulkan, Metal, ...) and a
-CPU backend backs any unsupported op; the full model pair must fit in device
-memory (~22 GB for the f16 pair). One MiniMax engine instance may be active at
-a time because its compute graphs are shared. The weight-free
+case-insensitively, prefers `q8_0`, then `f16`, then `bf16`, then the k-quant
+variants `acestep-quantize` can emit in descending fidelity (`q6_k`, `q5_k_m`,
+`q5_k_s`, `q4_k_m`, `q4_k_s`, `q3_k_l`, `q3_k_m`, `q3_k_s`, `q2_k`), then
+`f32` (a dequantized diagnostic pair, only picked when nothing else matches),
+and rejects duplicate candidates. The engine is desktop-only.
+It runs on CPU by default; `EngineOptions::device` (or, when that is empty,
+the `MM3_DEVICE` environment variable) accepts `cpu`, `gpu`, or `auto`. `gpu`
+requires a usable GPU backend and fails engine creation without one; `auto`
+takes a GPU when available and otherwise falls back to the CPU. On a GPU the
+weights and graphs live on the first usable backend the ggml registry offers
+(CUDA, Vulkan, Metal, ...) and a CPU backend backs any unsupported op; the
+full model pair must fit in device memory (~22 GB for the f16 pair, 12.7 GB
+for `q8_0`, 7.6 GB for `q4_k_m`). The LM's KV cache and compute buffers are
+released after the AR stage and rebuilt on the next generation, and the
+vocoder decodes in overlapped tiles whose interiors are bit-identical to a
+single-shot decode, so the `q4_k_m` pair completes full generations on a
+10 GiB GPU (RTX 3080, peak 9.4 GiB alongside a desktop) and on a 16 GB
+Apple-silicon Mac over Metal (peak RSS 8.4 GiB), both of which the `q8_0`
+pair cannot fit. The flow DiT runs with flash attention by default on a GPU
+backend (off on CPU); set `MM3_DIT_NO_FLASH=1` to force it off. The LM keeps
+non-flash attention by default because flash attention drifts its sampled
+logits; set `MM3_LM_FLASH=1` to opt it in on a GPU, or `MM3_LM_NO_FLASH=1` to
+force it off (this wins if both are set). One MiniMax engine instance may be
+active at a time because its compute graphs are shared. The weight-free
 `test-minimax-metal-ops` regression compares the 4096-channel condition
 projection and every DAC transposed-convolution stride against CPU on Metal.
 
-Vulkan and CUDA are the measured GPU backends, both on an RTX 5090. On each,
-`mm3-replay --mode replay` forcing the recorded official prompt tokens, codes,
-and noise reproduces the CPU rendering (time-domain audio correlation 0.9998
-on Vulkan, 0.9993 on CUDA), `--mode condcheck` confirms byte-identical DiT
-velocities across repeated computes, and `test-minimax-quality` lands the
-final flow latents on the learned manifold. Vulkan is measured with both the
-`q8_0` and the `f16` pair; the 22 GB `f16` pair far exceeds ggml's 1 GiB
-Vulkan suballocation block and loads through the chunked device buffers ggml
-creates automatically. The full `test-backend-ops` suite passes on the same
-device, including the `b_absmax=1e5` LM-shaped `mul_mat` stress cases.
-Metal and OpenCL remain unmeasured for MiniMax and take the same all-on-GPU
-placement, so measure them the same way before shipping them.
+Vulkan and CUDA are the measured GPU backends at `q8_0`/`f16`, both on an RTX
+5090. On each, `mm3-replay --mode replay` forcing the recorded official prompt
+tokens, codes, and noise reproduces the CPU rendering (time-domain audio
+correlation 0.9998 on Vulkan, 0.9993 on CUDA), `--mode condcheck` confirms
+byte-identical DiT velocities across repeated computes, and
+`test-minimax-quality` lands the final flow latents on the learned manifold.
+Vulkan is measured with both the `q8_0` and the `f16` pair; the 22 GB `f16`
+pair far exceeds ggml's 1 GiB Vulkan suballocation block and loads through the
+chunked device buffers ggml creates automatically. The full
+`test-backend-ops` suite passes on the same device, including the
+`b_absmax=1e5` LM-shaped `mul_mat` stress cases. The `q4_k_m` pair is
+measured on CPU, Metal (M5), Vulkan (Strix Halo RADV and RTX 3080), and CUDA
+(RTX 3080): teacher-forced replays of the same inputs agree with the
+F32-dequantized reference at 0.97 waveform correlation on every backend
+(the `q8_0` pair's own figure on the same probe is 0.9995), condcheck stays
+byte-identical, and `q4_k_m` generates faster than `q8_0` (Strix Vulkan
+94.7 s vs 105.5 s, CPU 397 s vs 471 s for the same 12 s clip). OpenCL
+remains unmeasured for MiniMax and takes the same all-on-GPU placement, so
+measure it the same way before shipping it.
 
 The frame rate, maximum frame count, flow defaults, and output sample rate come
 from GGUF metadata. Current converted files specify 25 frames per second, at
@@ -84,6 +105,26 @@ local directory. The converter emits the two-file contract and writes the
 MiniMax-Music3 Community License identifier into both files. Ship the upstream
 model license with converted weights.
 
+For a smaller footprint, quantize the `f16` pair to `Q4_K_M` (or `Q4_K_S`) with
+`acestep-quantize` (built with `AUDIOGEN_BUILD_EXECUTABLES`, shared with the
+ACE-Step engine):
+
+```sh
+./build/engines/audiogen/acestep-quantize models/minimax/mm3-lm-f16.gguf \
+                                          models/minimax/mm3-lm-q4_k_m.gguf Q4_K_M
+./build/engines/audiogen/acestep-quantize models/minimax/mm3-synth-f16.gguf \
+                                          models/minimax/mm3-synth-q4_k_m.gguf Q4_K_M
+```
+
+This quantizes the LM and, within the synth file, the flow DiT to the chosen
+k-quant while the RVQ depth decoder is held at `q8_0` (its per-frame matvec
+graphs need the integer fast path; F16 weights are several times slower on
+scalar-fp16 Vulkan devices), except `depth.pos_embd.weight`, which the depth
+graph views raw and which stays F32. The condition encoder and vocoder keep their
+converted (F16/F32) precision. Quantize from the `f16` pair, not `q8_0` —
+`acestep-quantize` only requantizes BF16/F16/F32 source tensors, so an
+already-`q8_0` tensor passes through untouched.
+
 `mm3-replay` (built with `AUDIOGEN_BUILD_EXECUTABLES`) is the MiniMax CLI and
 parity harness:
 
@@ -93,16 +134,25 @@ parity harness:
                                     --lyrics "[Instrumental]" --max-frames 300
 ```
 
-`--mode full` runs the pipeline from a caption/lyrics pair, `--mode
-replay` forces recorded prompt tokens, semantic/acoustic codes, and per-window
-initial noise through the native pipeline and dumps the per-window latents,
-frame hiddens, and stitched audio for 1:1 comparison against the official
-implementation, and `--mode condcheck` verifies the DiT emits byte-identical
-velocities across repeated computes. `test-minimax-quality` (built with
+`--mode full` runs the pipeline from a caption/lyrics pair and records the
+prompt token ids it used (`tokens.i32`) next to the emitted semantic/acoustic
+codes, so a full run's output directory doubles as a replay input set.
+`--mode replay` forces recorded prompt tokens, semantic/acoustic codes, and
+per-window initial noise through the native pipeline and dumps the per-window
+latents, frame hiddens, and stitched audio for 1:1 comparison against the
+official implementation, and `--mode condcheck` verifies the DiT emits
+byte-identical velocities across repeated computes. `--dump-iters N` (optionally with
+`--dump-dir <dir>`) additionally writes the first N AR iterations' semantic
+logits, CFG-guided logits, LM hidden states, feedback embeddings, and depth
+hiddens as raw f32 files; because the LM and depth decoder still run under
+forced tokens, replay-mode dumps are teacher-forced and directly comparable
+across quantization levels and backends. `test-minimax-quality` (built with
 `AUDIOGEN_BUILD_TESTS`, skipped unless `AUDIOGEN_TEST_MINIMAX_MODELS_DIR` is
 set) is the model-backed regression: it asserts DiT determinism and that a
 short generation's final flow latents land on the learned data manifold
 instead of stalling near the Gaussian noise they started from.
+`test-minimax-quality-q4` runs the same checks against the pair named by
+`AUDIOGEN_TEST_MINIMAX_Q4_MODELS_DIR`.
 
 ### ACE-Step audio editing
 
@@ -110,6 +160,49 @@ When `GenerateParams::edit_plan` is non-empty, the engine takes the editing
 path instead: it VAE-encodes `source_audio`, skips the LM and FSQ
 detokenizer, executes each `RepaintParams` or `FlowEditParams` operation in
 order, and VAE-decodes the final latent.
+
+### ACE-Step LRC generation
+
+With `GenerateParams::generate_lrc` set, the engine aligns the request lyrics
+with the generated audio and returns karaoke-style LRC timestamps in
+`GenerateResult::metadata.lrc`, plus an alignment confidence score in
+`metadata.lyrics_score` (`[0, 1]`). After sampling, one extra DiT forward at
+the final timestep runs with explicit softmax on the validated lyric
+cross-attention heads (the graph stops at the deepest captured layer), the
+captured matrices are converted from the ggml column-major layout, and DTW
+aligns each lyric line with the audio timeline. Requires lyrics — with Simple
+Mode the LM-written lyrics are aligned — and the official 24-layer/16-head
+DiT; the capture path is fully separate from the sampling graph, so normal
+inference is untouched when disabled.
+
+### ACE-Step Simple Mode
+
+With `GenerateParams::simple_mode` set, `caption` is a short natural-language
+query ("a romantic modern salsa with male lead vocals for a wedding") and the
+LM inspire pass composes the full request before synthesis: a detailed
+caption, complete lyrics, and every metadata field left unset — BPM,
+key/scale, time signature, vocal language, and duration when `duration <= 0`.
+Fields the caller sets are forced through the metadata FSM and kept. `lyrics`
+must be empty (the LM writes them) or `[Instrumental]`, which forwards the
+instrumental hint to the LM. Simple Mode requires the plain `text2music` task
+with no pre-supplied `audio_codes`; the composed request is reported back in
+`GenerateResult::metadata`. The inspire pass emits `lm` progress ticks and
+honors cancellation like every other stage.
+
+### ACE-Step quality scoring
+
+With `GenerateParams::compute_quality_score` set, the generated audio codes
+are teacher-forced back through the LM "understand" prompt and the request is
+scored: caption and lyrics earn a normalized PMI (their mean log-prob given
+the codes against the same text under a no-input prompt) and each set
+metadata field earns a rank-weighted top-k recall of its YAML line. The
+weight-normalized global score (caption 0.5, lyrics 0.3, metadata 0.2) lands
+in `GenerateResult::metadata.quality_score` in `[0, 1]` with the per-condition
+breakdown in `quality_report` — made for ranking a batch of takes (stem tasks
+on the base DiT vary strongly by seed) and keeping the best. Scoring runs
+extra LM forwards after code generation, reports `score` progress ticks, and
+honors cancellation; it requires the LM code path, so cover / lego tasks and
+the audio edit path reject it.
 
 ## Model stages
 
@@ -130,12 +223,30 @@ The most specific stems (`embedding`, `vae`) are tested first so no short token 
 
 ### DiT variants
 
-Detected from the `acestep.is_turbo` GGUF key; absent means base or sft.
+Detected from the `acestep.is_turbo` GGUF key (absent means base or sft) and
+`general.name` (an "sft" substring marks the sft fine-tune).
 
-| Variant | Default steps | Default shift | Notes |
-|---|--:|--:|---|
-| turbo | 8 | 3.0 | fastest, no CFG on the DiT |
-| base / sft | 50 | 1.0 | DiT CFG and APG (`guidance > 1`) are deferred |
+| Variant | Default steps | Default shift | Default guidance | Notes |
+|---|--:|--:|--:|---|
+| turbo | 8 | 3.0 | 1.0 | fastest; guidance-distilled, CFG overrides are clamped to 1.0 |
+| base | 50 | 1.0 | 7.0 | CFG via APG; the only variant supporting the lego stem task |
+| sft | 50 | 1.0 | 7.0 | CFG via APG; no stem tasks |
+
+### Multi-Track (lego)
+
+`task_type: "lego"` generates a new instrument layer that follows
+`source_audio` and returns only that stem, trimmed to the source length for
+sample-for-sample mixing. It requires a base DiT (turbo and sft are rejected)
+and a `track` name — one of vocals, backing_vocals, drums, bass, guitar,
+keyboard, percussion, strings, synth, fx, brass, woodwinds:
+
+```bash
+music-cli --models <dir> --task lego --track guitar \
+  --caption "clean electric guitar with syncopated fills" \
+  --lyrics "[Instrumental]" --src-audio song.wav --out stem.wav
+```
+
+`--guidance F` overrides the DiT guidance scale on base/sft (0 = auto).
 
 Weights load quantized. `f32`, `f16`, and `bf16` are handled for norms and biases, and the detokenizer's `special_tokens` may be `q8_0`. The stage GGUFs are built in tree by `scripts/convert-acestep-to-gguf.py` and the `acestep-quantize` binary (see [Model setup](#model-setup)), both adapted from [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp), the upstream C++/ggml implementation this port follows, which also publishes pre-quantized GGUFs at [Serveurperso/ACE-Step-1.5-GGUF](https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF).
 
@@ -427,6 +538,12 @@ combinations are rejected rather than silently ignored.
                   --lyrics "[Instrumental]" --bpm 128 --key "C major" --tsig 4/4 \
                   --lang en --steps 8 --shift 3.0 --gpu --out song.wav
 
+# Simple Mode: one short query becomes a complete song (caption, lyrics and
+# metadata composed by the LM; --dur 0 lets the LM pick the duration too)
+./build/audiogen/music-cli --models models/acestep --simple \
+                  --caption "a romantic modern salsa with male lead vocals for a wedding" \
+                  --dur 0 --gpu --out salsa.wav
+
 # condition generation with a 48 kHz PCM16 WAV timbre reference
 ./build/music-cli --models models/acestep --ref-audio reference-48k.wav \
                   --caption "warm Latin pop with a male lead vocal" \
@@ -463,8 +580,12 @@ combinations are rejected rather than silently ignored.
 | `--bpm N`, `--key STR`, `--tsig STR`, `--lang CODE` | inferred | optional metadata hints |
 | `--steps N`, `--shift F` | per variant | sampler overrides |
 | `--no-dcw` | DCW enabled | disable the official Haar low/high correction applied after each DiT step |
+| `--no-loudness` | normalization on | skip the percentile loudness normalization (99.999th percentile to 1.0, tail hard-clipped) applied to generation output; edits and lego stems are never normalized |
+| `--lrc out.lrc` | off | write synchronized lyric timestamps (LRC) next to the WAV; requires lyrics |
 | `--temp F`, `--topp F`, `--topk N`, `--cfg F` | `0.85`, `0.9`, off, `2.0` | LM sampling for the audio codes |
 | `--no-phase1` | off | skip the LM metadata auto-fill pass |
+| `--simple` | off | Simple Mode: expand `--caption` into a full request (lyrics regenerate unless `--lyrics "[Instrumental]"` is passed) |
+| `--score` | off | teacher-forced LM quality score of the generated codes, printed with its per-condition breakdown |
 | `--req FILE` | | request JSON; pre-supplied `audio_codes` skip the LM stage |
 | `--ref-audio FILE` | | 48 kHz PCM16 WAV used by ACE-Step's timbre-conditioning path |
 | `--src-audio FILE` | | 48 kHz PCM16 source WAV; required for editing |
@@ -553,10 +674,14 @@ cmake --build build/audiogen -j
 ctest --test-dir build/audiogen
 ```
 
-`test-acestep-units`, `test-acestep-converter`, `test-minimax-units`, and
-`test-minimax-converter` cover weight-free CPU logic and need no GGUFs. MiniMax coverage includes metadata
-compatibility, model-pair selection, Unicode token classes, frame validation,
-prompt assembly, unconditional masking, deterministic noise, flow scheduling,
+`test-acestep-units`, `test-acestep-converter`, `test-minimax-units`,
+`test-minimax-converter`, `test-minimax-quant-audit`, and
+`test-minimax-dump-compare` cover weight-free CPU logic and need no GGUFs.
+ACE-Step coverage includes the BPE tokenizer (UTF-8 decode, merges, byte
+fallback, decode round-trip) on a hand-built vocabulary. MiniMax coverage
+includes metadata compatibility, model-pair selection, Unicode token classes,
+frame validation, prompt assembly and the request-utils caption/lyrics
+cleanup helpers, unconditional masking, deterministic noise, flow scheduling,
 condition length, window stitching, sampler edge cases, and converter output
 transactions. Set `AUDIOGEN_TEST_MINIMAX_MODELS_DIR` to a directory containing
 the MiniMax GGUF pair to run `test-minimax-integration`, which covers model
@@ -573,15 +698,22 @@ self-hosted `qvac-macos26-arm64-gpu` runner and fails rather than passes if the
 test skips there.
 `test-acestep-integration` exercises the ACE-Step public API when model paths
 are supplied and otherwise reports a skipped test.
+`test-audiogen-comparison-lib` runs the engine-comparison harness's own
+`node:test` suites (`benchmarks/comparison/tests/`) on hosts with node,
+so the harness's adapters, aggregation, and report logic stay verified.
 
-Stage dumps are the tool for localising a backend divergence. Run the same prompt twice with `--dump-stages`, then compare:
+Dumps are the tool for localising a backend divergence. Run the same prompt twice with `--dump-stages` (ACE-Step stages) or `--dump-iters` (MiniMax AR iterations), then compare:
 
 | Script | Purpose |
 |---|---|
 | `scripts/stage_cos.py` | per-stage cosine and rel_l2 between two dump directories; fails under a worst-stage cosine of 0.999, and also on a missing, truncated, or mismatched counterpart |
 | `scripts/dequant_gguf.py` | rewrite a GGUF with every quantized tensor dequantized to F32, giving a ground-truth trajectory to compare a quantized run against |
+| `scripts/compare_ar_dumps.py` | finite-subset cosine, argmax agreement, and top-8 overlap between two `--dump-iters` directories; gates on `--min-cosine` / `--min-argmax-agree` and fails a pair it could not actually compare |
+| `scripts/audit_quant_types.py` | audit a quantized GGUF against the deny-list of tensors that must never be quantized, plus a per-type byte summary |
 
-Both need `numpy`; `dequant_gguf.py` also needs `gguf`.
+`stage_cos.py` and `dequant_gguf.py` need `numpy`; `dequant_gguf.py` and
+`audit_quant_types.py` also need `gguf`. `compare_ar_dumps.py` uses `numpy`
+when it is installed and falls back to an equivalent stdlib path when it is not.
 
 An informal local comparison against upstream `acestep.cpp` measured 0.98 to
 0.99 end-to-end correlation on identical codes, and LM greedy decoding matched

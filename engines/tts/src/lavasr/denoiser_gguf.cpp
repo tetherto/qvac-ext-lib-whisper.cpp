@@ -47,13 +47,17 @@ bool load_denoiser_gguf(const std::string & path, DenoiserWeights & out,
         return cleanup(fail("stream reader init failed"));
     }
 
+    // gguf_get_val_* GGML_ABORTs on a type mismatch, so a mistyped key would
+    // kill the process; fall back to the default instead.
     auto u32 = [&](const char * k, int fallback) -> int {
         const int64_t id = gguf_find_key(g, k);
-        return id < 0 ? fallback : static_cast<int>(gguf_get_val_u32(g, id));
+        if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_UINT32) return fallback;
+        return static_cast<int>(gguf_get_val_u32(g, id));
     };
     auto f32 = [&](const char * k, float fallback) -> float {
         const int64_t id = gguf_find_key(g, k);
-        return id < 0 ? fallback : gguf_get_val_f32(g, id);
+        if (id < 0 || gguf_get_kv_type(g, id) != GGUF_TYPE_FLOAT32) return fallback;
+        return gguf_get_val_f32(g, id);
     };
 
     out.n_fft            = u32("lavasr.denoiser.n_fft", 512);

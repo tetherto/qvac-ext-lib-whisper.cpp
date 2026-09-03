@@ -9,9 +9,13 @@
 #include "acestep/dit_gguf.h"  // DitGGUF: read DiT config + validate GGUF headers at create()
 #include "acestep/lm_ggml.h"
 #include "acestep/lm_pipeline.h"
+#include "acestep/loudness.h"
+#include "acestep/lyrics_alignment.h"
 #include "acestep/philox.h"
+#include "acestep/quality_score.h"
 #include "acestep/textenc_ggml.h"
 
+#include "acestep/cancellation_scope.h"
 #include "acestep/backend_registry.h"
 #include "acestep/audio_edit.h"
 #include "acestep/cover_noise.h"
@@ -33,6 +37,7 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 // ACE-Step end-to-end music engine. Wires the ported stages behind
@@ -93,6 +98,19 @@ const char * dbg_env(const char * k) {
 static const char * DIT_INSTR_TEXT2MUSIC = "Fill the audio semantic mask based on the given conditions:";
 static const char * DIT_INSTR_COVER      = "Generate audio semantic tokens based on the given conditions:";
 static const char * DIT_INSTR_REPAINT    = "Repaint the mask area based on the given conditions:";
+
+static std::string uppercase_track_name(const std::string & track) {
+    std::string upper = track;
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+                   [](unsigned char ch) { return (char) std::toupper(ch); });
+    return upper;
+}
+
+// Lego instruction, uppercase track per the reference implementation
+// (task_utils.py formats TASK_INSTRUCTIONS["lego"] with track_name.upper()).
+static std::string make_lego_instruction(const std::string & track) {
+    return "Generate the " + uppercase_track_name(track) + " track based on the audio context:";
+}
 
 namespace fs = std::filesystem;
 
@@ -504,9 +522,6 @@ static constexpr int TEMPO_SLOW_BPM_MAX     = 80;
 static constexpr int TEMPO_MODERATE_BPM_MAX = 120;
 static constexpr int TEMPO_FAST_BPM_MAX     = 160;
 
-static constexpr const char * DEFAULT_VOCAL_LANGUAGE = "en";
-static constexpr const char * EDIT_VOCAL_LANGUAGE    = "unknown";
-static constexpr const char * INSTRUMENTAL_LYRICS    = "[Instrumental]";
 static constexpr const char * EDIT_STAGE_SOURCE    = "source";
 static constexpr const char * EDIT_STAGE_REFERENCE = "reference";
 static constexpr const char * EDIT_STAGE_REPAINT   = "repaint";
@@ -599,7 +614,7 @@ static AcePrompt make_prompt(const GenerateParams & params, const std::string & 
                                 ? build_conditioning_caption(
                                       params.caption, params.bpm, params.timesignature, params.keyscale)
                                 : params.caption;
-    prompt.lyrics         = params.lyrics.empty() ? INSTRUMENTAL_LYRICS : params.lyrics;
+    prompt.lyrics         = resolve_prompt_lyrics(params);
     prompt.duration       = params.duration;
     prompt.bpm            = params.bpm;
     prompt.keyscale       = params.keyscale;
@@ -678,6 +693,8 @@ struct GenerationState {
     int code_frames = 0;
     int latent_frames = 0;
     bool low_memory = false;
+    double quality_score = 0.0;
+    std::string quality_report;
 };
 
 struct PromptEncoding {
@@ -690,6 +707,8 @@ struct PromptEncoding {
 struct EncoderConditioning {
     std::vector<float> context;
     std::vector<float> hidden;
+    std::vector<float> null_emb;
+    std::vector<int32_t> lyric_tokens;
     int frames = 0;
     int context_channels = 0;
     int sequence = 0;
@@ -724,10 +743,7 @@ static GenerationState make_generation_state(const GenerateParams & params, bool
     }
     state.plan = make_generation_plan(params, state.task);
     state.seed = resolve_seed(params.seed);
-    state.language = params.vocal_language.empty()
-                         ? (params.edit_plan.empty() ? DEFAULT_VOCAL_LANGUAGE
-                                                     : EDIT_VOCAL_LANGUAGE)
-                         : params.vocal_language;
+    state.language = resolve_prompt_language(params);
     if (params.augment_caption_with_metadata) {
         state.original_caption = params.caption;
     }
@@ -773,12 +789,46 @@ static LmSampleParams make_lm_sample_params(const GenerateParams & params, long 
     sample.cfg_scale = params.lm_cfg_scale;
     sample.seed = (uint32_t) seed;
     sample.verbose = verbose;
-    sample.on_step = [&](int current, int total) { report("lm", current, total); };
+    sample.on_step = [&](int current, int total) { return report("lm", current, total); };
     return sample;
 }
 
+static bool needs_lm_phase_one(const GenerateParams & params, const AcePrompt & prompt) {
+    if (params.simple_mode) return true;
+    return params.lm_phase1 && !has_complete_metadata(prompt);
+}
+
+// Fields simple mode left empty for the LM must never stay empty past Phase 1:
+// downstream prompt building and metadata reporting rely on them.
+static void finalize_simple_mode_prompt(GenerationState & state) {
+    if (state.prompt.lyrics.empty()) state.prompt.lyrics = INSTRUMENTAL_LYRICS;
+    if (state.prompt.vocal_language.empty()) state.prompt.vocal_language = DEFAULT_VOCAL_LANGUAGE;
+    state.language = state.prompt.vocal_language;
+}
+
+// Returns false only on cancellation. A plain Phase-1 failure falls back to the
+// provided/default metadata, except in simple mode, where the LM expansion is
+// the whole point of the request.
 template <typename EngineImpl>
-static void generate_audio_codes(EngineImpl & engine, const GenerateParams & params,
+static bool run_lm_phase_one(EngineImpl & engine, const GenerateParams & params,
+                             GenerationState & state, const LmSampleParams & sample) {
+    LmSampleParams phase_one = sample;
+    phase_one.max_new_tokens = 0;
+    if (lm_generate_phase1(engine.lm, engine.bpe_lm, state.prompt, phase_one,
+                           true, true, params.simple_mode)) {
+        if (params.simple_mode) finalize_simple_mode_prompt(state);
+        return true;
+    }
+    if (engine.cancel_flag.load()) return false;
+    if (params.simple_mode) {
+        throw std::runtime_error("acestep engine: simple_mode LM expansion failed");
+    }
+    fprintf(stderr, "[acestep-engine] Phase 1 failed; falling back to provided/default metas\n");
+    return true;
+}
+
+template <typename EngineImpl>
+static bool generate_audio_codes(EngineImpl & engine, const GenerateParams & params,
                                  GenerationState & state, const StageReporter & report,
                                  std::vector<int> & codes) {
     if (!params.audio_codes.empty()) {
@@ -786,22 +836,47 @@ static void generate_audio_codes(EngineImpl & engine, const GenerateParams & par
         if (engine.opts.verbose) {
             fprintf(stderr, "[acestep-engine] using %zu pre-supplied codes (LM skipped)\n", codes.size());
         }
-        return;
+        return true;
     }
 
     engine.ensure_lm();
     const LmSampleParams sample =
         make_lm_sample_params(params, state.seed, engine.opts.verbose, report);
-    if (params.lm_phase1 && !has_complete_metadata(state.prompt)) {
-        LmSampleParams phase_one = sample;
-        phase_one.max_new_tokens = 0;
-        if (!lm_generate_phase1(engine.lm, engine.bpe_lm, state.prompt, phase_one)) {
-            fprintf(stderr, "[acestep-engine] Phase 1 failed; falling back to provided/default metas\n");
-        }
+    if (needs_lm_phase_one(params, state.prompt)) {
+        if (!run_lm_phase_one(engine, params, state, sample)) return false;
     }
     if (!lm_generate_codes(engine.lm, engine.bpe_lm, state.prompt, sample, codes) || codes.empty()) {
+        if (engine.cancel_flag.load()) return false;
         throw std::runtime_error("acestep engine: LM produced no audio codes");
     }
+    return true;
+}
+
+template <typename EngineImpl>
+static bool run_quality_score_stage(EngineImpl & engine, const GenerateParams & params,
+                                    GenerationState & state, const StageReporter & report,
+                                    StageTimes & timing, const std::vector<int> & codes) {
+    if (!params.compute_quality_score) return true;
+
+    engine.ensure_lm();
+    QualityScoreParams score_params;
+    score_params.on_step = [&](int cur, int total) { return report("score", cur, total); };
+
+    QualityScoreResult score;
+    std::string        error;
+    if (!compute_quality_score(engine.lm, engine.bpe_lm, state.prompt, codes, score_params, score,
+                               error)) {
+        if (engine.cancel_flag.load()) return false;
+        throw std::runtime_error("acestep engine: quality scoring failed: " + error);
+    }
+    state.quality_score  = score.global_score;
+    state.quality_report = score.report;
+    timing.mark("score");
+    if (engine.opts.verbose) {
+        fprintf(stderr, "[acestep-engine] quality score %.4f\n%s\n", score.global_score,
+                score.report.c_str());
+    }
+    return true;
 }
 
 template <typename EngineImpl>
@@ -809,8 +884,9 @@ static bool run_lm_stage(EngineImpl & engine, const GenerateParams & params,
                          GenerationState & state, const StageReporter & report,
                          StageDump & dump, StageTimes & timing, std::vector<int> & codes) {
     if (!report("lm", 0, 1)) return false;
-    generate_audio_codes(engine, params, state, report, codes);
+    if (!generate_audio_codes(engine, params, state, report, codes)) return false;
     if (!report("lm", 1, 1)) return false;
+    if (!run_quality_score_stage(engine, params, state, report, timing, codes)) return false;
 
     if (state.low_memory) {
         if (engine.lm && engine.opts.verbose) fprintf(stderr, "[acestep-engine] freeing LM (low-mem)\n");
@@ -963,6 +1039,18 @@ static void encode_cross_attention(EngineImpl & engine, const PromptEncoding & p
     dump.write("06_enc_hidden", output.hidden, output.sequence, output.hidden_size);
 }
 
+static void validate_lego_model(const DitConfig & config, const GenerateTask & task) {
+    if (!is_lego_task(task.type)) return;
+    if (const std::string error = lego_model_error(config.is_turbo, config.is_sft); !error.empty()) {
+        throw std::invalid_argument(error);
+    }
+}
+
+static std::string resolve_dit_instruction(const GenerateTask & task) {
+    if (is_lego_task(task.type)) return make_lego_instruction(task.track);
+    return DIT_INSTR_COVER;
+}
+
 template <typename EngineImpl>
 static void encode_switch_hidden(EngineImpl & engine, const PromptEncoding & prompt,
                                  const GenerationState & state, EncoderConditioning & output) {
@@ -988,6 +1076,7 @@ static EncoderConditioning prepare_encoder_conditioning(EngineImpl & engine,
                                                          GenerationState & state,
                                                          StageDump & dump, StageTimes & timing) {
     const DitConfig & config = engine.dit_cfg;
+    validate_lego_model(config, state.task);
     const int patch = config.patch_size;
     EncoderConditioning output;
     output.frames = ((state.latent_frames + patch - 1) / patch) * patch;
@@ -997,14 +1086,17 @@ static EncoderConditioning prepare_encoder_conditioning(EngineImpl & engine,
     output.context = make_dit_context(
         state.context_latents, cond_model_silence_latent(engine.cond), output.frames,
         state.latent_frames, output.context_channels, config.out_channels);
+    output.null_emb = cond_model_null_emb(engine.cond);
     const bool needs_switch = needs_cover_conditioning_switch(state.task);
     if (needs_switch) {
         output.context_switch = make_dit_context(
             state.context_latents, cond_model_silence_latent(engine.cond), output.frames,
             0, output.context_channels, config.out_channels);
     }
+    const std::string instruction = resolve_dit_instruction(state.task);
     const PromptTokens tokens = tokenize_prompt(
-        engine.bpe_text, state.prompt, state.language, DIT_INSTR_COVER);
+        engine.bpe_text, state.prompt, state.language, instruction.c_str());
+    output.lyric_tokens = tokens.lyrics;
     const PromptEncoding prompt = encode_prompt(engine, tokens, state, dump, timing, !needs_switch);
     encode_cross_attention(engine, prompt, state, output, dump, timing, !needs_switch);
     if (needs_switch) {
@@ -1070,16 +1162,183 @@ static void dump_parity_inputs(const std::vector<float> & latent, const NoiseSch
 }
 #endif
 
+// Cross-attention heads whose lyric alignment the reference validated for the
+// official 24-layer / 16-head ACE-Step v15 DiT.
+static constexpr DitAttentionHead LRC_ALIGNMENT_HEADS[] = {
+    { 2, 6 }, { 3, 10 }, { 3, 11 }, { 4, 3 }, { 5, 8 }, { 5, 9 }, { 6, 8 },
+};
+static constexpr int   LRC_HEADS_N_LAYERS       = 24;
+static constexpr int   LRC_HEADS_N_HEADS        = 16;
+static constexpr float LRC_VIOLENCE_LEVEL       = 2.0f;
+static constexpr int   LRC_MEDIAN_FILTER_WIDTH  = 1;
+
+// Raw byte-level decode over arbitrary token prefixes. The alignment's
+// incremental prefix decoding needs the literal text of every piece, which
+// bpe_decode's tag expansion and code skipping would distort.
+static std::string decode_lyric_token_ids(const BpeTokenizer & bpe, const std::vector<int> & ids) {
+    std::unordered_map<std::string, char> encoded_bytes;
+    encoded_bytes.reserve(256);
+    for (int byte = 0; byte < 256; byte++) {
+        encoded_bytes[bpe.byte2str[byte]] = (char) byte;
+    }
+    std::string result;
+    for (int id : ids) {
+        if (id == bpe.eos_id) {
+            result += "<|endoftext|>";
+            continue;
+        }
+        if (id < 0 || id >= (int) bpe.id_to_str.size()) continue;
+        const std::string & piece  = bpe.id_to_str[(size_t) id];
+        size_t              offset = 0;
+        while (offset < piece.size()) {
+            int advance = 0;
+            bpe_utf8_codepoint(piece.c_str() + offset, &advance);
+            if (advance <= 0 || offset + (size_t) advance > piece.size()) break;
+            const std::string symbol = piece.substr(offset, (size_t) advance);
+            const auto        found  = encoded_bytes.find(symbol);
+            if (found != encoded_bytes.end()) {
+                result.push_back(found->second);
+            } else {
+                result += symbol;
+            }
+            offset += (size_t) advance;
+        }
+    }
+    return result;
+}
+
+struct LyricSegment {
+    int start = 0;
+    int end   = 0;
+};
+
+// The lyric branch opens the encoder sequence, so its token indices map
+// directly onto attention rows: the segment spans from just past the encoded
+// "# Languages/<lang>/# Lyric" header to the first end-of-text token.
+static LyricSegment resolve_lyric_segment(const BpeTokenizer & bpe,
+                                          const std::vector<int32_t> & lyric_tokens,
+                                          const std::string & language, int enc_S) {
+    const std::string header =
+        std::string("# Languages\n") + language + "\n\n# Lyric\n";
+    LyricSegment segment;
+    segment.start = (int) bpe_encode(bpe, header, false).size();
+    segment.end   = (int) lyric_tokens.size();
+    for (int i = segment.start; i < (int) lyric_tokens.size(); i++) {
+        if (lyric_tokens[(size_t) i] == bpe.eos_id) {
+            segment.end = i;
+            break;
+        }
+    }
+    if (segment.start >= segment.end || segment.end > enc_S) {
+        throw std::runtime_error("acestep engine: encoded lyric segment is empty or outside the attention matrix");
+    }
+    return segment;
+}
+
+static std::vector<lyrics::Matrix> slice_lyric_rows(const std::vector<std::vector<float>> & captured,
+                                                    const LyricSegment & segment, int enc_S, int S) {
+    std::vector<lyrics::Matrix> heads;
+    heads.reserve(captured.size());
+    for (const std::vector<float> & raw : captured) {
+        const lyrics::Matrix matrix =
+            lyrics::matrix_from_column_major(raw.data(), (size_t) enc_S, (size_t) S);
+        lyrics::Matrix sliced((size_t) (segment.end - segment.start), matrix.cols);
+        for (int token = segment.start; token < segment.end; token++) {
+            memcpy(sliced.values.data() + (size_t) (token - segment.start) * matrix.cols,
+                   matrix.values.data() + (size_t) token * matrix.cols,
+                   matrix.cols * sizeof(float));
+        }
+        heads.push_back(std::move(sliced));
+    }
+    return heads;
+}
+
+static std::vector<DitAttentionHead> resolve_lrc_heads(const DitConfig & config) {
+    if (config.n_layers != LRC_HEADS_N_LAYERS || config.n_heads != LRC_HEADS_N_HEADS) {
+        throw std::runtime_error(
+            "acestep engine: generate_lrc requires the official 24-layer/16-head DiT");
+    }
+    return std::vector<DitAttentionHead>(
+        LRC_ALIGNMENT_HEADS, LRC_ALIGNMENT_HEADS + sizeof(LRC_ALIGNMENT_HEADS) / sizeof(LRC_ALIGNMENT_HEADS[0]));
+}
+
+static void align_lyric_heads(const BpeTokenizer & bpe, const std::vector<lyrics::Matrix> & heads,
+                              const std::vector<int> & pure_ids, float duration,
+                              GenerateResult & result) {
+    const auto processed = lyrics::preprocess_alignment(heads, LRC_VIOLENCE_LEVEL, LRC_MEDIAN_FILTER_WIDTH);
+    const auto decoder   = [&bpe](const std::vector<int> & ids) { return decode_lyric_token_ids(bpe, ids); };
+    const std::vector<std::string> decoded = lyrics::decode_tokens_incrementally(pure_ids, decoder);
+    const auto token_stamps =
+        lyrics::token_timestamps(processed.calc_matrix, pure_ids, decoded, duration);
+    const auto sentences = lyrics::sentence_timestamps(token_stamps, decoder);
+    result.metadata.lrc  = lyrics::format_lrc(sentences);
+
+    const auto     scoring = lyrics::preprocess_scoring(heads, LRC_MEDIAN_FILTER_WIDTH);
+    lyrics::Matrix costs   = scoring.calc_matrix;
+    for (float & value : costs.values) value = -value;
+    const auto path       = lyrics::dtw(costs);
+    const auto type_mask  = lyrics::token_type_mask(decoded);
+    const auto metrics    = lyrics::compute_alignment_metrics(scoring.energy_matrix, path, type_mask);
+    result.metadata.lyrics_score = lyrics::calculate_lyrics_score(metrics);
+}
+
+// One extra DiT forward at the final timestep captures the lyric
+// cross-attention, then DTW aligns the lyric lines with the audio timeline.
+template <typename EngineImpl>
+static void run_lrc_stage(EngineImpl & engine, const GenerateParams & params,
+                          const GenerationState & state, const EncoderConditioning & conditioning,
+                          int num_steps, const std::vector<float> & latent,
+                          StageTimes & timing, GenerateResult & result) {
+    if (!params.generate_lrc) return;
+
+    const std::vector<DitAttentionHead> heads = resolve_lrc_heads(engine.dit_cfg);
+    const LyricSegment segment = resolve_lyric_segment(
+        engine.bpe_text, conditioning.lyric_tokens, state.language, conditioning.sequence);
+
+    DitAttentionProbeInputs probe;
+    probe.context    = conditioning.context.data();
+    probe.latent     = latent.data();
+    probe.enc_hidden = conditioning.hidden.data();
+    probe.T          = conditioning.frames;
+    probe.enc_S      = conditioning.sequence;
+    probe.H_enc      = conditioning.hidden_size;
+    probe.real_enc_S = conditioning.sequence;
+    probe.num_steps  = num_steps;
+    probe.seed       = state.seed;
+
+    std::vector<std::vector<float>> captured;
+    if (!dit_probe_cross_attention(engine.dit, probe, heads, captured)) {
+        throw std::runtime_error("acestep engine: lyric alignment probe failed");
+    }
+    if (state.low_memory) {
+        if (engine.dit && engine.opts.verbose) fprintf(stderr, "[acestep-engine] freeing DiT (low-mem)\n");
+        engine.free_dit();
+    }
+
+    const std::vector<lyrics::Matrix> lyric_heads =
+        slice_lyric_rows(captured, segment, conditioning.sequence, conditioning.frames / engine.dit_cfg.patch_size);
+    const std::vector<int> pure_ids(conditioning.lyric_tokens.begin() + segment.start,
+                                    conditioning.lyric_tokens.begin() + segment.end);
+    const float duration = (float) conditioning.frames / AUDIO_LATENT_RATE;
+    align_lyric_heads(engine.bpe_text, lyric_heads, pure_ids, duration, result);
+    if (result.metadata.lrc.empty()) {
+        throw std::runtime_error("acestep engine: lyric alignment produced no LRC lines");
+    }
+    timing.mark("lrc");
+}
+
 template <typename EngineImpl>
 static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params,
                               const GenerationState & state, EncoderConditioning & conditioning,
                               NoiseSchedule & noise, const StageReporter & report,
                               StageDump & dump, StageTimes & timing, std::vector<float> & latent) {
     const DitConfig & config = engine.dit_cfg;
+    const float guidance = resolve_guidance_scale(params.guidance_scale, config.is_turbo);
     const int cover_switch_step = resolve_cover_switch_step(state.task, noise.steps);
     if (engine.opts.verbose) {
-        fprintf(stderr, "[acestep-engine] DiT: turbo=%d steps=%d shift=%.2f T=%d task=%s cover_switch=%d\n",
-                (int) config.is_turbo, noise.steps, noise.shift,
+        fprintf(stderr,
+                "[acestep-engine] DiT: turbo=%d steps=%d shift=%.2f guidance=%.2f T=%d task=%s cover_switch=%d\n",
+                (int) config.is_turbo, noise.steps, noise.shift, guidance,
                 conditioning.frames, state.task.type.c_str(), cover_switch_step);
     }
     engine.ensure_dit();
@@ -1097,13 +1356,17 @@ static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params
     sample.schedule = noise.schedule.data();
     sample.num_steps = noise.steps;
     sample.real_enc_S = &conditioning.sequence;
+    sample.guidance_scale = guidance;
+    sample.null_cond_emb = conditioning.null_emb.size() >= (size_t) conditioning.hidden_size
+                               ? conditioning.null_emb.data()
+                               : nullptr;
     if (has_switch) {
         sample.context_switch = conditioning.context_switch.data();
         sample.enc_hidden_switch = conditioning.hidden_switch.data();
         sample.real_enc_S_switch = &conditioning.sequence_switch;
         sample.cover_switch_step = cover_switch_step;
     }
-    sample.dcw_enabled = params.dcw_enabled;
+    sample.dcw_enabled = resolve_dcw_enabled(params.dcw_enabled, config.is_turbo);
     sample.dcw_scaler = params.dcw_scaler;
     sample.dcw_high_scaler = params.dcw_high_scaler;
     sample.on_step = [&](int step, int total) { return report("dit", step, total); };
@@ -1115,7 +1378,7 @@ static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params
     if (!report("dit", noise.steps, noise.steps)) return false;
     timing.mark("dit");
     dump.write("08_dit_latent", latent, conditioning.frames, config.out_channels);
-    if (state.low_memory) {
+    if (state.low_memory && !params.generate_lrc) {
         if (engine.dit && engine.opts.verbose) fprintf(stderr, "[acestep-engine] freeing DiT (low-mem)\n");
         engine.free_dit();
     }
@@ -1154,6 +1417,15 @@ static bool decode_audio(EngineImpl & engine, const std::vector<float> & latent,
         engine.free_vae();
     }
     return true;
+}
+
+// A lego stem must mix sample-for-sample over its source. The decode length is
+// a whole multiple of the VAE hop rounded up to the DiT patch size, so it can
+// overshoot the source (trim) or undershoot it by up to one hop (pad silence).
+static void match_stem_to_source_length(const GenerateParams & params, const GenerationState & state,
+                                        GenerateResult & result) {
+    if (!is_lego_task(state.task.type)) return;
+    result.pcm.resize(params.source_audio.size(), 0.0f);
 }
 
 static AcePrompt make_edit_prompt(const GenerateParams & params, const std::string & caption,
@@ -1792,15 +2064,21 @@ static void populate_metadata(const GenerationState & state, GenerateResult & re
         state.prompt.timesignature.empty() ? 0 : atoi(state.prompt.timesignature.c_str());
     result.metadata.seed = state.seed;
     result.metadata.n_codes = state.code_frames;
+    result.metadata.quality_score = state.quality_score;
+    result.metadata.quality_report = state.quality_report;
 }
 
 GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn & progress) const {
     Impl & engine = *impl_;
-    engine.cancel_flag.store(false);
+    CancellationScope cancellation_scope(engine.cancel_flag);
 
     GenerateResult result;
     result.sample_rate = engine.sr;
     result.channels = AUDIO_CHANNELS;
+
+    if (engine.cancel_flag.load()) {
+        return result;
+    }
 
     const StageReporter report = [&](const char * stage, int step, int total) {
         if (progress && !progress(stage, step, total)) {
@@ -1832,9 +2110,14 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
                            report, dump, timing, latent)) {
         return result;
     }
+    run_lrc_stage(engine, params, state, conditioning, noise.steps, latent, timing, result);
     if (!decode_audio(engine, latent, conditioning, state.low_memory,
                       report, dump, timing, result)) {
         return result;
+    }
+    match_stem_to_source_length(params, state, result);
+    if (params.normalize_loudness && !is_lego_task(state.task.type)) {
+        normalize_loudness(result.pcm);
     }
     populate_metadata(state, result);
     return result;

@@ -99,6 +99,17 @@ FitResult fit_params(const FitOptions & opts) {
     r.model_variant = model.model_variant;
     r.device_name   = model_active_backend_name(model);
 
+    if (model.model_type == ParakeetModelType::NEMOTRON) {
+        // Nemotron's prompt-conditioned encoder and cache-aware streaming
+        // graphs (parakeet_nemotron.cpp) are not modelled by this projection
+        // yet -- the type landed after the fit slice, and projecting it with
+        // the standard encoder graph would understate the requirement.
+        // Refusing (Error) beats a wrong FITS; Nemotron support is a
+        // follow-up under QVAC-24283.
+        r.reason = "model-type-not-supported";
+        return r;
+    }
+
     ggml_backend_t backend = model_active_backend(model);
     ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
     if (!dev) {
@@ -219,6 +230,8 @@ FitResult fit_params(const FitOptions & opts) {
     DecoderFitMeasure dm;
     uint64_t extra_host = 0;  // decoder-side buffers that live in host RAM
     switch (model.model_type) {
+        case ParakeetModelType::NEMOTRON:
+            break;  // unreachable: rejected as model-type-not-supported above
         case ParakeetModelType::CTC:
             break;  // the CTC head lives inside the encoder graph, already measured
         case ParakeetModelType::RNNT:

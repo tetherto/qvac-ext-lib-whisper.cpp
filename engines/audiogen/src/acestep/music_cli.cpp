@@ -134,9 +134,13 @@ int main(int argc, char ** argv) {
                 "   or: music-cli --dit dit.gguf --lm lm.gguf --text emb.gguf --vae vae.gguf\n"
                 "  prompt:  [--caption \"...\"] [--lyrics \"...\"] [--bpm 128] [--key \"C major\"]\n"
                 "           [--tsig 4/4] [--lang en] [--req request.json]\n"
+                "           [--simple]  (Simple Mode: expand --caption into a full request;\n"
+                "           the LM writes lyrics unless --lyrics \"[Instrumental]\" is given,\n"
+                "           and fills any metadata left unset, duration included with --dur 0)\n"
                 "  audio:   [--ref-audio <48-kHz PCM16 WAV>]  (timbre reference)\n"
                 "           [--src-audio <48-kHz PCM16 WAV>]  (cover source structure)\n"
-                "           [--task text2music|cover-nofsq]   (default text2music)\n"
+                "           [--task text2music|cover-nofsq|lego]   (default text2music)\n"
+                "           [--track vocals|drums|bass|guitar|...]  (lego target layer)\n"
                 "           [--cover-strength F] [--cover-noise F]  (cover defaults 1.0 / 0.0)\n"
                 "  editing: [--repaint-start SEC] [--repaint-end SEC|-1]\n"
                 "           [--repaint-mode conservative|balanced|aggressive]\n"
@@ -147,10 +151,13 @@ int main(int argc, char ** argv) {
                 "           plan.json: {\"operations\":[{\"type\":\"repaint\",...},\n"
                 "             {\"type\":\"flow-edit\",\"source_caption\":\"...\",\n"
                 "              \"target_caption\":\"...\",\"n_min\":0,\"n_max\":1,\"n_avg\":1}]}\n"
-                "  sampler: [--steps N] [--shift F]  (default: auto from the DiT variant,\n"
-                "           turbo 8 / 3.0, base and sft 50 / 1.0)\n"
+                "  sampler: [--steps N] [--shift F] [--guidance F]  (default: auto from the\n"
+                "           DiT variant, turbo 8 / 3.0 / 1.0, base and sft 50 / 1.0 / 7.0)\n"
                 "           [--no-dcw]  (Haar DCW double mode is enabled by default)\n"
+                "           [--no-loudness]  (skip the percentile loudness normalization)\n"
+                "           [--lrc out.lrc]  (write synchronized lyric timestamps; needs lyrics)\n"
                 "  output:  [--normalize]  (peak-normalize edit output before PCM quantization)\n"
+                "           [--score]  (teacher-forced LM quality score of the generated codes)\n"
                 "           [--temp 0.85] [--cfg 2.0] [--topp 0.9] [--topk 0 (off)]\n"
                 "           [--no-phase1]  (values shown are the defaults)\n"
                 "  backend: [--gpu] [--threads N] [--backends-dir <dir>]\n"
@@ -176,6 +183,13 @@ int main(int argc, char ** argv) {
     if (arg_val(argc, argv, "--topp")) p.lm_top_p = (float) atof(arg_val(argc, argv, "--topp"));
     if (arg_flag(argc, argv, "--no-phase1")) p.lm_phase1 = false;
     if (arg_flag(argc, argv, "--no-dcw")) p.dcw_enabled = false;
+    if (arg_flag(argc, argv, "--no-loudness")) p.normalize_loudness = false;
+    if (arg_val(argc, argv, "--lrc")) p.generate_lrc = true;
+    if (arg_flag(argc, argv, "--simple")) {
+        p.simple_mode = true;
+        if (!arg_val(argc, argv, "--lyrics")) p.lyrics.clear();
+    }
+    if (arg_flag(argc, argv, "--score")) p.compute_quality_score = true;
 
     // --req <json>: load caption/lyrics/metas and (if present) audio_codes to
     // bypass our LM — used for parity against acestep.cpp's ace-lm output.
@@ -200,6 +214,8 @@ int main(int argc, char ** argv) {
         if (json_field(j, "dcw_scaler", v)) p.dcw_scaler = (float) atof(v.c_str());
         if (json_field(j, "dcw_high_scaler", v)) p.dcw_high_scaler = (float) atof(v.c_str());
         if (json_field(j, "task_type", v)) p.task_type = v;
+        if (json_field(j, "track", v)) p.track = v;
+        if (json_field(j, "guidance_scale", v)) p.guidance_scale = (float) atof(v.c_str());
         if (json_field(j, "audio_cover_strength", v)) p.audio_cover_strength = (float) atof(v.c_str());
         if (json_field(j, "cover_noise_strength", v)) p.cover_noise_strength = (float) atof(v.c_str());
         if (json_field(j, "audio_codes", v) && !v.empty()) {
@@ -232,6 +248,9 @@ int main(int argc, char ** argv) {
     if (!load_source_audio(argc, argv, p)) return 1;
 
     if (const char * task = arg_val(argc, argv, "--task")) p.task_type = task;
+    if (const char * track = arg_val(argc, argv, "--track")) p.track = track;
+    if (arg_val(argc, argv, "--guidance"))
+        p.guidance_scale = (float) atof(arg_val(argc, argv, "--guidance"));
     if (arg_val(argc, argv, "--cover-strength"))
         p.audio_cover_strength = (float) atof(arg_val(argc, argv, "--cover-strength"));
     if (arg_val(argc, argv, "--cover-noise"))
@@ -289,5 +308,23 @@ int main(int argc, char ** argv) {
             r.metadata.seed, frames, (float) frames / r.sample_rate);
     wav_write(out_path, r.pcm, frames, r.sample_rate,
               should_normalize_output(argc, argv, p));
+    if (const char * lrc_path = arg_val(argc, argv, "--lrc")) {
+        FILE * lrc_file = fopen(lrc_path, "wb");
+        if (!lrc_file) {
+            fprintf(stderr, "[music-cli] cannot write %s\n", lrc_path);
+            return 1;
+        }
+        const size_t written = fwrite(r.metadata.lrc.data(), 1, r.metadata.lrc.size(), lrc_file);
+        fclose(lrc_file);
+        if (written != r.metadata.lrc.size()) {
+            fprintf(stderr, "[music-cli] short write on %s\n", lrc_path);
+            return 1;
+        }
+        fprintf(stderr, "[music-cli] wrote %s (lyrics score %.4f)\n", lrc_path, r.metadata.lyrics_score);
+    }
+    if (p.compute_quality_score) {
+        fprintf(stderr, "[music-cli] quality score %.4f\n%s\n", r.metadata.quality_score,
+                r.metadata.quality_report.c_str());
+    }
     return 0;
 }

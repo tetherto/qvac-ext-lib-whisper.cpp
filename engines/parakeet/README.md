@@ -3,7 +3,8 @@
 Parakeet is a pure C++/ggml implementation of NVIDIA FastConformer ASR,
 end-of-turn detection, and Sortformer speaker diarization. Inference requires no
 Python, PyTorch, NeMo, or ONNX Runtime. A single `parakeet::Engine` loads CTC,
-RNN-T, TDT, EOU, or Sortformer GGUFs and selects the implementation from GGUF metadata.
+RNN-T, TDT, EOU, Nemotron, or Sortformer GGUFs and selects the implementation
+from GGUF metadata.
 
 ## Supported checkpoints
 
@@ -16,6 +17,7 @@ RNN-T, TDT, EOU, or Sortformer GGUFs and selects the implementation from GGUF me
 | `nvidia/parakeet-tdt-0.6b-v3` | TDT | 128 | 1024 × 24 | 8192 | 600 M | 715 MiB q8_0 / 1.34 GiB f16 | 0.006 q8_0 Metal | About 25 languages, with punctuation and capitalization |
 | `nvidia/parakeet-tdt-1.1b` | TDT | 80 | 1024 × 42 | 1024 | 1.1 B | 1225 MiB q8_0 | 0.027–0.079 Metal | English only; no punctuation or capitalization |
 | `nvidia/parakeet_realtime_eou_120m-v1` | RNN-T + `<EOU>` | 128 | 512 × 17 | 1027 | 120 M | 246 MiB f16 / 132 MiB q8_0 | 0.0052 Vulkan | English ASR and native end-of-turn token |
+| `nvidia/nemotron-3.5-asr-streaming-0.6b` | Prompt-conditioned RNN-T | 128 | 1024 × 24 | 13087 | 600 M | ~1.3 GiB f16 | 0.108 CPU | Locale-conditioned ASR; empty language selects `auto`; cache-aware streaming at 80/160/320/560/1120 ms |
 | `nvidia/diar_sortformer_4spk-v1` | Sortformer | 80 | 512 × 18 | n/a | 123 M | 263 MiB f16 / 141 MiB q8_0 / 75 MiB q4_0 | 0.0020 Vulkan | Up to four speakers; offline and sliding-history streaming |
 | `nvidia/diar_streaming_sortformer_4spk-v2` | Sortformer | 128 | 512 × 17 | n/a | 117 M | 251 MiB f16 / 134 MiB q8_0 / 72 MiB q4_0 | similar to v1 offline | Streaming-trained; sliding-history streaming |
 | `nvidia/diar_streaming_sortformer_4spk-v2.1` | Sortformer + AOSC | 128 | 512 × 17 | n/a | 117 M | 251 MiB f16 / 134 MiB q8_0 / 72 MiB q4_0 | similar to v1 offline | Audio-Online Speaker Cache preserves slots across long gaps |
@@ -29,6 +31,19 @@ Unified RNN-T uses standard greedy transducer decoding. Its encoder was trained
 with dynamic chunked convolution and attention, but this implementation runs it
 offline in full-context mode. Mode 2 and `StreamSession` use buffered window
 re-encoding; native NeMo cache-aware encoder state is not implemented.
+
+Nemotron offline inference uses the GGUF's default 320 ms operating point
+(`att_context_size=[56,3]`). `EngineOptions::language` accepts the locale aliases
+stored in the GGUF, and an empty value resolves to `auto`. The selected locale is
+broadcast as a 128-wide one-hot prompt, concatenated to every encoder frame, and
+projected before RNN-T decoding. The cache-aware streaming path incrementally
+converts arbitrary PCM bursts to mel frames, maintains bounded 56-frame
+attention and 8-frame convolution caches, and matches NeMo at all five supported
+operating points. Set `StreamingOptions::chunk_ms` to `80`, `160`, `320`, `560`,
+or `1120` to select the corresponding trained right-context configuration.
+Both callback streaming and live `StreamSession` input use the native caches;
+the sliding-window `left_context_ms` and `right_lookahead_ms` knobs are ignored
+for Nemotron.
 
 ## Build modes
 
@@ -86,7 +101,7 @@ defaults follow `SPEECH_BUILD_EXECUTABLES` and `SPEECH_BUILD_TESTS`, and force
 | `PARAKEET_GGML_LIB_PREFIX` | `ON` | no effect with system ggml | Name bundled libraries `speech-ggml-*` |
 | `PARAKEET_COREML` | `OFF` | `OFF` | Apple-only offline TDT encoder sidecar |
 | `PARAKEET_OPENMP` | `ON` | `ON` | Link OpenMP when available; auto-disabled on Windows non-MinGW unless explicitly overridden |
-| `PARAKEET_FLASH_ATTN` | Metal `ON`, otherwise `OFF` | same | Fused encoder attention |
+| `PARAKEET_FLASH_ATTN` | Metal and CUDA `ON`, otherwise `OFF` | same | Fused encoder attention with the rel-pos bias folded into the mask; selected per backend at load, the CPU path always keeps the unfused graph |
 | `PARAKEET_CCACHE` | `ON` | `ON` | Use ccache for Parakeet targets when available |
 
 ### Installed package
@@ -165,8 +180,29 @@ CUDA. CPU and OpenCL use the scalar decoder path; OpenCL lacks the graph
 operation support required by this decoder path. The EOU encoder can still run
 on OpenCL while its decoder runs scalar.
 
-The CUDA path is implemented, but hardware decoder parity is not yet covered by
-CI. Treat CUDA as available but not fully validated until that coverage lands.
+The graph decoder adapts to what the active backend reports through
+`ggml_backend_supports_op`, probed once at load. Where the backend runs the
+fused LSTM cell (`GGML_OP_LSTM_CELL`) and the transducer step control
+(`GGML_OP_TDT_STEP`), which ggml-speech implements for CPU, CUDA and Metal, the
+TDT decoder runs up to eight greedy steps per graph: the joint, argmax, LSTM
+update, duration bookkeeping and state selection stay on the device and the
+host reads the emitted tokens back once per graph. A backend without those
+ops keeps one graph per step. Either path produces the same token sequence as
+the sequential loop; the `test-tdt-unroll-parity` and `test-tdt-lstm-parity`
+harnesses guard that. The encoder applies the same rule to the conformer's
+depthwise convolution (`GGML_OP_CONV_2D_DW` in place where the backend
+reports it, `im2col` and matmul elsewhere; the subsampler switches only on a
+GPU that passed the probe, CPU keeps its previous lowering) and to the gated
+GLU (`a * sigmoid(b)` as one op where the backend reports it). Fused attention
+is a build option (`PARAKEET_FLASH_ATTN`) that only CUDA and Metal take, and
+only after the backend accepts the exact node the encoder builds; CPU, Vulkan
+and OpenCL keep the unfused graph in every build. The mel front-end runs on up
+to eight host threads with output byte-equal to the single-thread result.
+
+The CUDA path was validated on an RTX 3080 (TDT q8_0 and q4_0 transcripts,
+Sortformer and streaming output byte-equal to the pre-change build, LibriSpeech
+WER within noise of the CPU reference) but hardware decoder parity is not yet
+covered by CI.
 
 `GGML_BACKEND_DL=ON` builds load backend modules at runtime. Android defaults
 this on and builds Vulkan, OpenCL, and CPU variants. Pass a module directory via
@@ -301,10 +337,10 @@ Include `<parakeet/parakeet.h>` for the complete surface or individual headers.
 
 | API | Purpose |
 |---|---|
-| `Engine::transcribe` | One-shot WAV transcription for CTC, RNN-T, TDT, or EOU |
+| `Engine::transcribe` | One-shot WAV transcription for CTC, RNN-T, TDT, EOU, or Nemotron |
 | `Engine::transcribe_samples` | One-shot float PCM transcription |
-| `Engine::transcribe_stream` / `transcribe_samples_stream` | Mode 2: encode all audio once, then emit chunked callbacks |
-| `Engine::stream_start` | Mode 3 live session with rolling context and sliding-window re-encoding |
+| `Engine::transcribe_stream` / `transcribe_samples_stream` | Chunked callbacks; one offline encode for legacy families, native cache-aware streaming for Nemotron |
+| `Engine::stream_start` | Live session; rolling-window re-encoding for legacy families, native cache-aware streaming for Nemotron |
 | `StreamSession::feed_pcm_f32` / `feed_pcm_i16` | Push arbitrary-sized PCM blocks |
 | `Engine::diarize` / `diarize_samples` | Offline Sortformer diarization |
 | `Engine::diarize_start` | Live Sortformer session |
@@ -332,9 +368,11 @@ int main() {
 }
 ```
 
-Mode 3 is duplex rolling-context/sliding-window re-encoding. It re-runs the
-encoder for each window using `left_context_ms` and `right_lookahead_ms`; it
-does not maintain an encoder KV cache or convolution cache.
+Mode 3 is duplex rolling-context/sliding-window re-encoding for CTC, RNN-T, TDT,
+and EOU. It re-runs the encoder for each window using `left_context_ms` and
+`right_lookahead_ms`; it does not maintain an encoder KV cache or convolution
+cache. Nemotron Mode 3 uses the cache-aware encoder instead and ignores those
+window knobs.
 
 Always call `finalize()` to drain the partial tail. Destroying a
 `StreamSession` or `SortformerStreamSession` cancels it and does not finalize
@@ -347,7 +385,7 @@ wait for in-flight calls.
 call processing the audio. `StreamingSegment::is_eou_boundary` and
 `StreamEventType::EndOfTurn` mean the EOU model emitted `<EOU>`. They are not
 VAD state changes. Sortformer emits `VadStateChanged` from speaker
-probabilities. CTC/RNN-T/TDT can opt into RMS energy VAD with
+probabilities. CTC/RNN-T/TDT/Nemotron can opt into RMS energy VAD with
 `enable_energy_vad`; configure it with `energy_vad_threshold_db`,
 `energy_vad_window_ms`, and `energy_vad_hangover_ms`.
 
@@ -413,9 +451,14 @@ build-parakeet/parakeet \
 build-parakeet/parakeet \
   --model engines/parakeet/models/indic-conformer-600m-multilingual.q8_0.gguf \
   --wav engines/parakeet/test/samples/hi-16k.wav --language hi
+
+# Nemotron: locale alias or auto; empty also selects auto
+build-parakeet/parakeet \
+  --model engines/parakeet/models/nemotron-3.5-asr-streaming-0.6b.f16.gguf \
+  --wav engines/parakeet/test/samples/jfk.wav --language en-US
 ```
 
-`live-mic` runs CTC/RNN-T/TDT/EOU transcription or Sortformer diarization.
+`live-mic` runs CTC/RNN-T/TDT/EOU/Nemotron transcription or Sortformer diarization.
 `live-mic-attributed` combines a CTC/RNN-T/TDT/EOU ASR model with Sortformer.
 Both capture 16 kHz mono through miniaudio, accept independent streaming and
 backend options, and finalize tail audio on Ctrl-C.
@@ -488,12 +531,20 @@ ctest --test-dir build-parakeet --output-on-failure
 
 `download-all-models.sh` produces `.nemo` files, not runnable GGUFs. Missing
 model, audio, or reference fixtures cause individual tests to be registered as
-`DISABLED`, not failed. Configure again after adding a fixture. Test labels
-include `unit`, `fixture`, `cpu`, `gpu`, and `perf`; for example:
+`DISABLED`, not failed. Configure again after adding a fixture. Each test
+carries exactly one label out of `unit`, `fixture`, `cpu`, `gpu`, and `perf`.
+The fixture-free suite (the one CI runs) is selected by excluding the
+GPU-bound and timing-bound labels:
 
 ```bash
-ctest --test-dir build-parakeet -L cpu --output-on-failure
+ctest --test-dir build-parakeet -LE 'gpu|perf' --output-on-failure
 ```
+
+Model-free logic tests (`-L unit`) cover the CTC language mask, mel FFT
+parity and per-feature CMVN, RNN-T graph construction, long-form window
+planning, Sortformer finalization and probability thresholding, the
+streaming energy VAD, the SentencePiece detokenizer, and the NeMo
+converter (Python).
 
 Fixture roots are configurable with `PARAKEET_TEST_MODEL_DIR`,
 `PARAKEET_TEST_AUDIO_DIR`, and `PARAKEET_TEST_REF_DIR`. `test-gpu-vs-cpu`
@@ -525,6 +576,38 @@ Source: [workflow run 31603189415](https://github.com/tetherto/qvac/actions/runs
 `@qvac/asr-ggml@0.1.1` addon (released 2026-08-03, pinning `parakeet-cpp`
 2026-08-03).
 
+### TDT decode on CUDA and Metal
+
+The fused decoder ops, the unrolled greedy loop and the per-backend lowerings
+were measured against the engine as published before them, on the same
+machine in the same session: parakeet-tdt-0.6b-v3, `n_gpu_layers 1`,
+`--bench --bench-warmup 10 --bench-runs 20`, the two builds alternated, the
+median run time of each build kept. Cells read `before -> after ms (speedup)`.
+Ten warmup runs matter on Metal: the first two or three timed runs of a
+process are up to 30 % faster than the rest, so a short warmup reports a
+transient, not the sustained rate.
+
+| Backend | Quant | 30 s clip | 90 s clip | 306 s clip |
+|---|---|---:|---:|---:|
+| CUDA, RTX 3080, CUDA graphs on | q8_0 | 80.0 -> 32.0 (2.50x) | 308 -> 119 (2.59x) | 1292 -> 495 (2.61x) |
+| CUDA, RTX 3080, CUDA graphs on | q4_0 | 79.4 -> 30.8 (2.58x) | 305 -> 116 (2.63x) | 1275 -> 484 (2.64x) |
+| CUDA, RTX 3080, CUDA graphs off | q8_0 | 80.0 -> 34.9 (2.29x) | 308 -> 127 (2.42x) | not measured |
+| CUDA, RTX 3080, CUDA graphs off | q4_0 | 79.4 -> 33.5 (2.37x) | 305 -> 125 (2.45x) | not measured |
+| Metal, Apple M5 | q8_0 | 518 -> 281 (1.84x) | 2561 -> 1095 (2.34x) | 18130 -> 5531 (3.28x) |
+| Metal, Apple M5 | q4_0 | 486 -> 254 (1.91x) | 2416 -> 1020 (2.37x) | 17559 -> 5216 (3.37x) |
+
+The 306 s cells come from an earlier run with two warmups and seven timed
+runs, medians over six rounds; that clip's run-to-run drift is under 2 %, so
+the shorter warmup does not move it. CUDA graphs are a ggml build option
+(`GGML_CUDA_GRAPHS`) that is off by default; the 11 s clip lands between
+2.2x and 2.3x on CUDA and around 2x on Metal. The Metal host carried a
+1-minute load between 2 and 3 during these runs.
+
+Word error rate on the same 500-utterance LibriSpeech subset, Whisper text
+normalisation: CPU 2.22 %, CUDA q8_0 2.21 % and q4_0 2.28 %, Metal q8_0
+2.15 % and q4_0 2.24 %. Sortformer, streaming and ASR-plus-diarization
+outputs are byte-equal to the previous build on both backends.
+
 ## Repository layout
 
 | Path | Role |
@@ -544,4 +627,5 @@ Source: [workflow run 31603189415](https://github.com/tetherto/qvac/actions/runs
 
 Code is Apache-2.0. CTC, RNN-T, TDT, and Sortformer weights are CC-BY-4.0 unless
 their model card says otherwise. `parakeet_realtime_eou_120m-v1` uses the
-NVIDIA Open Model License. No weights are shipped by this repository.
+NVIDIA Open Model License. Nemotron 3.5 ASR Streaming 0.6B uses OpenMDW-1.1.
+No weights are shipped by this repository.

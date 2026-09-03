@@ -183,6 +183,63 @@ int section_stateful_vs_stateless_parity(const parakeet::MelConfig & cfg,
     return 0;
 }
 
+int section_incremental_short_input_parity(const parakeet::MelConfig & cfg) {
+    using namespace parakeet;
+
+    MelConfig incremental_cfg = cfg;
+    incremental_cfg.normalize = MelNormalize::None;
+    const int sample_counts[] = {
+        1,
+        incremental_cfg.hop_length - 1,
+        incremental_cfg.hop_length,
+        incremental_cfg.n_fft / 2 - 1,
+        incremental_cfg.n_fft / 2,
+        incremental_cfg.n_fft / 2 + 1,
+    };
+
+    for (const int sample_count : sample_counts) {
+        const std::vector<float> signal = make_signal(sample_count);
+        std::vector<float> offline_mel;
+        int offline_frames = 0;
+        if (compute_log_mel(
+                signal.data(), sample_count, incremental_cfg,
+                offline_mel, offline_frames) != 0) {
+            std::fprintf(stderr,
+                "[incremental-short] offline mel failed for %d samples\n",
+                sample_count);
+            return 1;
+        }
+
+        IncrementalMelState state;
+        std::vector<float> incremental_mel;
+        int incremental_frames = 0;
+        if (append_log_mel(
+                signal.data(), sample_count, true, incremental_cfg,
+                state, incremental_mel, incremental_frames) != 0) {
+            std::fprintf(stderr,
+                "[incremental-short] incremental mel failed for %d samples\n",
+                sample_count);
+            return 1;
+        }
+        if (incremental_frames != offline_frames) {
+            std::fprintf(stderr,
+                "[incremental-short] FAIL: frame count for %d samples "
+                "(%d vs %d)\n",
+                sample_count, incremental_frames, offline_frames);
+            return 1;
+        }
+        if (!bit_equal(incremental_mel, offline_mel)) {
+            report_first_diff(
+                offline_mel, incremental_mel, "incremental-short");
+            return 1;
+        }
+    }
+
+    std::fprintf(stderr,
+        "[incremental-short] PASS  finalized short inputs match offline mel\n");
+    return 0;
+}
+
 // Reference radix-2 complex FFT (textbook, no twiddle cache, no
 // trig precomputation). Used to derive a known-good power spectrum
 // for the FFT correctness gate. Decoupled from `mel_preprocess.cpp`
@@ -343,6 +400,164 @@ int section_real_fft_parity(const parakeet::MelConfig & cfg,
 
 }
 
+int section_per_feature_cmvn(void) {
+    using namespace parakeet;
+
+    const int n_frames = 4;
+    const int n_mels   = 2;
+    const double eps   = 1e-5;
+
+    std::vector<float> mel = {
+        1.0f, 5.0f,
+        2.0f, 5.0f,
+        3.0f, 5.0f,
+        4.0f, 5.0f,
+    };
+    std::vector<float> expected(mel.size());
+    for (int idx = 0; idx < n_mels; ++idx) {
+        double sum = 0.0;
+        for (int t = 0; t < n_frames; ++t) sum += mel[t * n_mels + idx];
+        const double mean = sum / n_frames;
+        double ss = 0.0;
+        for (int t = 0; t < n_frames; ++t) {
+            const double d = mel[t * n_mels + idx] - mean;
+            ss += d * d;
+        }
+        const double std_ = std::sqrt(ss / (n_frames - 1)) + eps;
+        for (int t = 0; t < n_frames; ++t) {
+            expected[t * n_mels + idx] = (float)
+                ((mel[t * n_mels + idx] - (float) mean) *
+                 (1.0f / (float) std_));
+        }
+    }
+
+    apply_per_feature_cmvn(mel, n_frames, n_mels);
+    if (!bit_equal(mel, expected)) {
+        report_first_diff(expected, mel, "cmvn");
+        return 1;
+    }
+    for (int t = 0; t < n_frames; ++t) {
+        if (mel[t * n_mels + 1] != 0.0f) {
+            std::fprintf(stderr,
+                "[cmvn] FAIL: constant feature not zeroed at frame %d\n", t);
+            return 1;
+        }
+    }
+
+    std::vector<float> single = {3.0f, -2.0f};
+    apply_per_feature_cmvn(single, 1, 2);
+    if (single[0] != 0.0f || single[1] != 0.0f) {
+        std::fprintf(stderr, "[cmvn] FAIL: single frame must normalize to 0\n");
+        return 1;
+    }
+
+    std::vector<float> untouched = {1.0f, 2.0f};
+    std::vector<float> before = untouched;
+    apply_per_feature_cmvn(untouched, 0, 2);
+    apply_per_feature_cmvn(untouched, 1, 0);
+    if (!bit_equal(untouched, before)) {
+        std::fprintf(stderr, "[cmvn] FAIL: degenerate dims must be a no-op\n");
+        return 1;
+    }
+
+    std::vector<float> partial = {
+        10.0f, 10.0f,
+        20.0f, 20.0f,
+        777.0f, 888.0f,
+    };
+    apply_per_feature_cmvn(partial, 2, 2);
+    if (partial[4] != 777.0f || partial[5] != 888.0f) {
+        std::fprintf(stderr,
+            "[cmvn] FAIL: frames past n_valid_frames were modified\n");
+        return 1;
+    }
+
+    std::fprintf(stderr, "[cmvn] PASS  per-feature CMVN matches the NeMo "
+                         "two-pass f64 reference\n");
+    return 0;
+}
+
+int section_per_feature_valid_frame_zeroing() {
+    using namespace parakeet;
+
+    MelConfig cfg = make_test_cfg();
+    cfg.normalize = MelNormalize::PerFeature;
+    const int n_samples = cfg.hop_length + 1;
+    const std::vector<float> signal = make_signal(n_samples);
+    std::vector<float> mel;
+    int n_frames = 0;
+    if (compute_log_mel(
+            signal.data(), n_samples, cfg, mel, n_frames) != 0) {
+        std::fprintf(stderr, "[valid-frames] compute_log_mel failed\n");
+        return 1;
+    }
+
+    const int expected_frames = 1 + n_samples / cfg.hop_length;
+    if (n_frames != expected_frames) {
+        std::fprintf(
+            stderr,
+            "[valid-frames] FAIL: n_frames=%d expected=%d\n",
+            n_frames,
+            expected_frames);
+        return 1;
+    }
+
+    const int last = n_frames - 1;
+    bool last_all_zero = true;
+    for (int m = 0; m < cfg.n_mels; ++m) {
+        if (mel[last * cfg.n_mels + m] != 0.0f) {
+            last_all_zero = false;
+            break;
+        }
+    }
+    if (last_all_zero) {
+        std::fprintf(
+            stderr,
+            "[valid-frames] FAIL: PerFeature hop+1 input used floor "
+            "seq_len and zeroed a valid frame\n");
+        return 1;
+    }
+
+    const int floor_n_samples = cfg.hop_length;
+    const std::vector<float> floor_signal = make_signal(floor_n_samples);
+    std::vector<float> floor_mel;
+    int floor_frames = 0;
+    if (compute_log_mel(
+            floor_signal.data(),
+            floor_n_samples,
+            cfg,
+            floor_mel,
+            floor_frames) != 0) {
+        std::fprintf(stderr, "[valid-frames] floor compute_log_mel failed\n");
+        return 1;
+    }
+    const int floor_seq_len = floor_n_samples / cfg.hop_length;
+    if (floor_frames <= floor_seq_len) {
+        std::fprintf(
+            stderr,
+            "[valid-frames] FAIL: expected a pad frame to zero\n");
+        return 1;
+    }
+    for (int t = floor_seq_len; t < floor_frames; ++t) {
+        for (int m = 0; m < cfg.n_mels; ++m) {
+            if (floor_mel[t * cfg.n_mels + m] != 0.0f) {
+                std::fprintf(
+                    stderr,
+                    "[valid-frames] FAIL: pad frame %d feature %d "
+                    "was not zeroed\n",
+                    t,
+                    m);
+                return 1;
+            }
+        }
+    }
+
+    std::fprintf(
+        stderr,
+        "[valid-frames] PASS  PerFeature ceil seq_len and pad zeroing\n");
+    return 0;
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     using namespace parakeet;
 
@@ -353,6 +568,9 @@ int main(int /*argc*/, char ** /*argv*/) {
     rc |= section_real_fft_parity(cfg, signal);
     rc |= section_stateful_vs_stateless_parity(cfg, signal);
     rc |= section_repeated_call_invariance(cfg, signal);
+    rc |= section_incremental_short_input_parity(cfg);
+    rc |= section_per_feature_cmvn();
+    rc |= section_per_feature_valid_frame_zeroing();
 
     if (rc != 0) {
         std::fprintf(stderr, "[test-mel-fft-parity] FAIL\n");
