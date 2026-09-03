@@ -1119,6 +1119,33 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "--model" "${_qvp_sf_q8_gguf}" "--wav" "${_qvp_diar_wav}" "--n-gpu-layers" "1"
         REQUIRES "${_qvp_sf_q8_gguf}" "${_qvp_diar_wav}")
 
+    # The subsampling runs on the valid mel prefix and zero-pads its output: a zero-tailed mel
+    # must match the truncated mel on the valid frames and hold the projection bias after them.
+    add_executable(test-subsampling-tail
+        test/test_subsampling_tail.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_nemotron.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-subsampling-tail PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-subsampling-tail PRIVATE include src ggml/include)
+    parakeet_apply_backend_defs(test-subsampling-tail)
+    parakeet_register_test(test-subsampling-tail
+        LABEL    "fixture"
+        ARGS     "--model" "${_qvp_tdt_q8_gguf}"
+        REQUIRES "${_qvp_tdt_q8_gguf}")
+    parakeet_register_test(test-subsampling-tail-gpu
+        LABEL    "gpu"
+        EXE      test-subsampling-tail
+        ARGS     "--model" "${_qvp_tdt_q8_gguf}" "--n-gpu-layers" "1"
+        REQUIRES "${_qvp_tdt_q8_gguf}")
+
     add_executable(test-tdt-encoder-parity
         test/test_tdt_encoder_parity.cpp
         src/parakeet_ctc.cpp
