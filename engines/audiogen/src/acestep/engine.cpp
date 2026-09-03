@@ -10,7 +10,9 @@
 #include "acestep/lm_ggml.h"
 #include "acestep/lm_pipeline.h"
 #include "acestep/loudness.h"
+#include "acestep/lyrics_alignment.h"
 #include "acestep/philox.h"
+#include "acestep/quality_score.h"
 #include "acestep/textenc_ggml.h"
 
 #include "acestep/cancellation_scope.h"
@@ -37,6 +39,7 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 // ACE-Step end-to-end music engine. Wires the ported stages behind
@@ -624,6 +627,8 @@ struct GenerationState {
     int code_frames = 0;
     int latent_frames = 0;
     bool low_memory = false;
+    double quality_score = 0.0;
+    std::string quality_report;
 };
 
 struct PromptEncoding {
@@ -637,6 +642,7 @@ struct EncoderConditioning {
     std::vector<float> context;
     std::vector<float> hidden;
     std::vector<float> null_emb;
+    std::vector<int32_t> lyric_tokens;
     int frames = 0;
     int context_channels = 0;
     int sequence = 0;
@@ -781,12 +787,40 @@ static bool generate_audio_codes(EngineImpl & engine, const GenerateParams & par
 }
 
 template <typename EngineImpl>
+static bool run_quality_score_stage(EngineImpl & engine, const GenerateParams & params,
+                                    GenerationState & state, const StageReporter & report,
+                                    StageTimes & timing, const std::vector<int> & codes) {
+    if (!params.compute_quality_score) return true;
+
+    engine.ensure_lm();
+    QualityScoreParams score_params;
+    score_params.on_step = [&](int cur, int total) { return report("score", cur, total); };
+
+    QualityScoreResult score;
+    std::string        error;
+    if (!compute_quality_score(engine.lm, engine.bpe_lm, state.prompt, codes, score_params, score,
+                               error)) {
+        if (engine.cancel_flag.load()) return false;
+        throw std::runtime_error("acestep engine: quality scoring failed: " + error);
+    }
+    state.quality_score  = score.global_score;
+    state.quality_report = score.report;
+    timing.mark("score");
+    if (engine.opts.verbose) {
+        fprintf(stderr, "[acestep-engine] quality score %.4f\n%s\n", score.global_score,
+                score.report.c_str());
+    }
+    return true;
+}
+
+template <typename EngineImpl>
 static bool run_lm_stage(EngineImpl & engine, const GenerateParams & params,
                          GenerationState & state, const StageReporter & report,
                          StageDump & dump, StageTimes & timing, std::vector<int> & codes) {
     if (!report("lm", 0, 1)) return false;
     if (!generate_audio_codes(engine, params, state, report, codes)) return false;
     if (!report("lm", 1, 1)) return false;
+    if (!run_quality_score_stage(engine, params, state, report, timing, codes)) return false;
 
     if (state.low_memory) {
         if (engine.lm && engine.opts.verbose) fprintf(stderr, "[acestep-engine] freeing LM (low-mem)\n");
@@ -996,6 +1030,7 @@ static EncoderConditioning prepare_encoder_conditioning(EngineImpl & engine,
     const std::string instruction = resolve_dit_instruction(state.task);
     const PromptTokens tokens = tokenize_prompt(
         engine.bpe_text, state.prompt, state.language, instruction.c_str());
+    output.lyric_tokens = tokens.lyrics;
     const PromptEncoding prompt = encode_prompt(engine, tokens, state, dump, timing, !needs_switch);
     encode_cross_attention(engine, prompt, state, output, dump, timing, !needs_switch);
     if (needs_switch) {
@@ -1061,6 +1096,171 @@ static void dump_parity_inputs(const std::vector<float> & latent, const NoiseSch
 }
 #endif
 
+// Cross-attention heads whose lyric alignment the reference validated for the
+// official 24-layer / 16-head ACE-Step v15 DiT.
+static constexpr DitAttentionHead LRC_ALIGNMENT_HEADS[] = {
+    { 2, 6 }, { 3, 10 }, { 3, 11 }, { 4, 3 }, { 5, 8 }, { 5, 9 }, { 6, 8 },
+};
+static constexpr int   LRC_HEADS_N_LAYERS       = 24;
+static constexpr int   LRC_HEADS_N_HEADS        = 16;
+static constexpr float LRC_VIOLENCE_LEVEL       = 2.0f;
+static constexpr int   LRC_MEDIAN_FILTER_WIDTH  = 1;
+
+// Raw byte-level decode over arbitrary token prefixes. The alignment's
+// incremental prefix decoding needs the literal text of every piece, which
+// bpe_decode's tag expansion and code skipping would distort.
+static std::string decode_lyric_token_ids(const BpeTokenizer & bpe, const std::vector<int> & ids) {
+    std::unordered_map<std::string, char> encoded_bytes;
+    encoded_bytes.reserve(256);
+    for (int byte = 0; byte < 256; byte++) {
+        encoded_bytes[bpe.byte2str[byte]] = (char) byte;
+    }
+    std::string result;
+    for (int id : ids) {
+        if (id == bpe.eos_id) {
+            result += "<|endoftext|>";
+            continue;
+        }
+        if (id < 0 || id >= (int) bpe.id_to_str.size()) continue;
+        const std::string & piece  = bpe.id_to_str[(size_t) id];
+        size_t              offset = 0;
+        while (offset < piece.size()) {
+            int advance = 0;
+            bpe_utf8_codepoint(piece.c_str() + offset, &advance);
+            if (advance <= 0 || offset + (size_t) advance > piece.size()) break;
+            const std::string symbol = piece.substr(offset, (size_t) advance);
+            const auto        found  = encoded_bytes.find(symbol);
+            if (found != encoded_bytes.end()) {
+                result.push_back(found->second);
+            } else {
+                result += symbol;
+            }
+            offset += (size_t) advance;
+        }
+    }
+    return result;
+}
+
+struct LyricSegment {
+    int start = 0;
+    int end   = 0;
+};
+
+// The lyric branch opens the encoder sequence, so its token indices map
+// directly onto attention rows: the segment spans from just past the encoded
+// "# Languages/<lang>/# Lyric" header to the first end-of-text token.
+static LyricSegment resolve_lyric_segment(const BpeTokenizer & bpe,
+                                          const std::vector<int32_t> & lyric_tokens,
+                                          const std::string & language, int enc_S) {
+    const std::string header =
+        std::string("# Languages\n") + language + "\n\n# Lyric\n";
+    LyricSegment segment;
+    segment.start = (int) bpe_encode(bpe, header, false).size();
+    segment.end   = (int) lyric_tokens.size();
+    for (int i = segment.start; i < (int) lyric_tokens.size(); i++) {
+        if (lyric_tokens[(size_t) i] == bpe.eos_id) {
+            segment.end = i;
+            break;
+        }
+    }
+    if (segment.start >= segment.end || segment.end > enc_S) {
+        throw std::runtime_error("acestep engine: encoded lyric segment is empty or outside the attention matrix");
+    }
+    return segment;
+}
+
+static std::vector<lyrics::Matrix> slice_lyric_rows(const std::vector<std::vector<float>> & captured,
+                                                    const LyricSegment & segment, int enc_S, int S) {
+    std::vector<lyrics::Matrix> heads;
+    heads.reserve(captured.size());
+    for (const std::vector<float> & raw : captured) {
+        const lyrics::Matrix matrix =
+            lyrics::matrix_from_column_major(raw.data(), (size_t) enc_S, (size_t) S);
+        lyrics::Matrix sliced((size_t) (segment.end - segment.start), matrix.cols);
+        for (int token = segment.start; token < segment.end; token++) {
+            memcpy(sliced.values.data() + (size_t) (token - segment.start) * matrix.cols,
+                   matrix.values.data() + (size_t) token * matrix.cols,
+                   matrix.cols * sizeof(float));
+        }
+        heads.push_back(std::move(sliced));
+    }
+    return heads;
+}
+
+static std::vector<DitAttentionHead> resolve_lrc_heads(const DitConfig & config) {
+    if (config.n_layers != LRC_HEADS_N_LAYERS || config.n_heads != LRC_HEADS_N_HEADS) {
+        throw std::runtime_error(
+            "acestep engine: generate_lrc requires the official 24-layer/16-head DiT");
+    }
+    return std::vector<DitAttentionHead>(
+        LRC_ALIGNMENT_HEADS, LRC_ALIGNMENT_HEADS + sizeof(LRC_ALIGNMENT_HEADS) / sizeof(LRC_ALIGNMENT_HEADS[0]));
+}
+
+static void align_lyric_heads(const BpeTokenizer & bpe, const std::vector<lyrics::Matrix> & heads,
+                              const std::vector<int> & pure_ids, float duration,
+                              GenerateResult & result) {
+    const auto processed = lyrics::preprocess_alignment(heads, LRC_VIOLENCE_LEVEL, LRC_MEDIAN_FILTER_WIDTH);
+    const auto decoder   = [&bpe](const std::vector<int> & ids) { return decode_lyric_token_ids(bpe, ids); };
+    const std::vector<std::string> decoded = lyrics::decode_tokens_incrementally(pure_ids, decoder);
+    const auto token_stamps =
+        lyrics::token_timestamps(processed.calc_matrix, pure_ids, decoded, duration);
+    const auto sentences = lyrics::sentence_timestamps(token_stamps, decoder);
+    result.metadata.lrc  = lyrics::format_lrc(sentences);
+
+    const auto     scoring = lyrics::preprocess_scoring(heads, LRC_MEDIAN_FILTER_WIDTH);
+    lyrics::Matrix costs   = scoring.calc_matrix;
+    for (float & value : costs.values) value = -value;
+    const auto path       = lyrics::dtw(costs);
+    const auto type_mask  = lyrics::token_type_mask(decoded);
+    const auto metrics    = lyrics::compute_alignment_metrics(scoring.energy_matrix, path, type_mask);
+    result.metadata.lyrics_score = lyrics::calculate_lyrics_score(metrics);
+}
+
+// One extra DiT forward at the final timestep captures the lyric
+// cross-attention, then DTW aligns the lyric lines with the audio timeline.
+template <typename EngineImpl>
+static void run_lrc_stage(EngineImpl & engine, const GenerateParams & params,
+                          const GenerationState & state, const EncoderConditioning & conditioning,
+                          int num_steps, const std::vector<float> & latent,
+                          StageTimes & timing, GenerateResult & result) {
+    if (!params.generate_lrc) return;
+
+    const std::vector<DitAttentionHead> heads = resolve_lrc_heads(engine.dit_cfg);
+    const LyricSegment segment = resolve_lyric_segment(
+        engine.bpe_text, conditioning.lyric_tokens, state.language, conditioning.sequence);
+
+    DitAttentionProbeInputs probe;
+    probe.context    = conditioning.context.data();
+    probe.latent     = latent.data();
+    probe.enc_hidden = conditioning.hidden.data();
+    probe.T          = conditioning.frames;
+    probe.enc_S      = conditioning.sequence;
+    probe.H_enc      = conditioning.hidden_size;
+    probe.real_enc_S = conditioning.sequence;
+    probe.num_steps  = num_steps;
+    probe.seed       = state.seed;
+
+    std::vector<std::vector<float>> captured;
+    if (!dit_probe_cross_attention(engine.dit, probe, heads, captured)) {
+        throw std::runtime_error("acestep engine: lyric alignment probe failed");
+    }
+    if (state.low_memory) {
+        if (engine.dit && engine.opts.verbose) fprintf(stderr, "[acestep-engine] freeing DiT (low-mem)\n");
+        engine.free_dit();
+    }
+
+    const std::vector<lyrics::Matrix> lyric_heads =
+        slice_lyric_rows(captured, segment, conditioning.sequence, conditioning.frames / engine.dit_cfg.patch_size);
+    const std::vector<int> pure_ids(conditioning.lyric_tokens.begin() + segment.start,
+                                    conditioning.lyric_tokens.begin() + segment.end);
+    const float duration = (float) conditioning.frames / AUDIO_LATENT_RATE;
+    align_lyric_heads(engine.bpe_text, lyric_heads, pure_ids, duration, result);
+    if (result.metadata.lrc.empty()) {
+        throw std::runtime_error("acestep engine: lyric alignment produced no LRC lines");
+    }
+    timing.mark("lrc");
+}
+
 template <typename EngineImpl>
 static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params,
                               const GenerationState & state, EncoderConditioning & conditioning,
@@ -1112,7 +1312,7 @@ static bool sample_dit_latent(EngineImpl & engine, const GenerateParams & params
     if (!report("dit", noise.steps, noise.steps)) return false;
     timing.mark("dit");
     dump.write("08_dit_latent", latent, conditioning.frames, config.out_channels);
-    if (state.low_memory) {
+    if (state.low_memory && !params.generate_lrc) {
         if (engine.dit && engine.opts.verbose) fprintf(stderr, "[acestep-engine] freeing DiT (low-mem)\n");
         engine.free_dit();
     }
@@ -1798,6 +1998,8 @@ static void populate_metadata(const GenerationState & state, GenerateResult & re
         state.prompt.timesignature.empty() ? 0 : atoi(state.prompt.timesignature.c_str());
     result.metadata.seed = state.seed;
     result.metadata.n_codes = state.code_frames;
+    result.metadata.quality_score = state.quality_score;
+    result.metadata.quality_report = state.quality_report;
 }
 
 GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn & progress) const {
@@ -1807,6 +2009,10 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
     GenerateResult result;
     result.sample_rate = engine.sr;
     result.channels = AUDIO_CHANNELS;
+
+    if (engine.cancel_flag.load()) {
+        return result;
+    }
 
     const StageReporter report = [&](const char * stage, int step, int total) {
         if (progress && !progress(stage, step, total)) {
@@ -1838,6 +2044,7 @@ GenerateResult Engine::generate(const GenerateParams & params, const ProgressFn 
                            report, dump, timing, latent)) {
         return result;
     }
+    run_lrc_stage(engine, params, state, conditioning, noise.steps, latent, timing, result);
     if (!decode_audio(engine, latent, conditioning, state.low_memory,
                       report, dump, timing, result)) {
         return result;

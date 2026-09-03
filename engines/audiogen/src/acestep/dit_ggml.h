@@ -114,6 +114,35 @@ struct DitForwardInputs {
 bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<float> & velocity_out,
                        size_t * measure_compute = nullptr);
 
+// One cross-attention head to capture during the lyric-alignment probe.
+struct DitAttentionHead {
+    int layer = 0;
+    int head  = 0;
+};
+
+// Inputs for the final-timestep probe used by lyric alignment: one forward at
+// t = 1/num_steps over the retained conditioning and the denoised latent.
+struct DitAttentionProbeInputs {
+    const float * context    = nullptr;  // [in_channels-out_channels, T] frame-major
+    const float * latent     = nullptr;  // [out_channels, T] denoised latent
+    const float * enc_hidden = nullptr;  // [H_enc, enc_S]
+    int           T          = 0;
+    int           enc_S      = 0;
+    int           H_enc      = 0;
+    int           real_enc_S = 0;
+    int           num_steps  = 0;
+    long long     seed       = 0;        // philox noise blended into the probe latent
+};
+
+// Runs the probe with explicit softmax on the captured cross-attention layers,
+// building the graph only up to the deepest captured layer. Appends one
+// [enc_S * S] buffer per head in ggml layout (enc_S contiguous per frame row).
+// Fully separate from the sampling graph cache: normal inference is untouched.
+bool dit_probe_cross_attention(DitModel *                            m,
+                               const DitAttentionProbeInputs &       in,
+                               const std::vector<DitAttentionHead> & heads,
+                               std::vector<std::vector<float>> &     captured_out);
+
 // Flow-matching timestep schedule (ACE-Step default):
 //   t_i = shift * t / (1 + (shift-1)*t),  t = 1 - i/num_steps.
 // Turbo: shift=3.0, num_steps=8. Base/SFT: shift=1.0, num_steps=50.

@@ -51,6 +51,9 @@ audiogen  caption + lyrics -> ACE-Step LM -> FSQ detokenizer -> text encoder
                            -> Oobleck VAE -> 48 kHz stereo
           short query -> LM inspire (Simple Mode) -> caption + lyrics + metadata
                            -> same ACE-Step pipeline
+          lyrics + generated audio -> DiT cross-attention probe -> DTW
+                           -> synchronized LRC timestamps
+          generated codes + request -> teacher-forced LM -> quality score
           caption + lyrics -> MiniMax Qwen3 LM -> RVQ depth decoder
                            -> condition encoder -> flow DiT -> vocoder -> stereo
 ```
@@ -87,13 +90,14 @@ engine-specific guides qualify model-level validation.
 | `whisper-large-v2` | whisper | 99 + translation | 1.55 B | `f16`, `q5_0`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | |
 | `whisper-large-v3` | whisper | 99 + translation | 1.55 B | `f16`, `q5_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | |
 | `whisper-large-v3-turbo` | whisper | 99 + translation | 809 M | `f16`, `q5_0`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | fastest large-class decode |
-| `silero-v5.1.2` | whisper | language agnostic | 2 M | `f16` | CPU | voice activity detection |
-| `silero-v6.2.0` | whisper | language agnostic | 2 M | `f16` | CPU | voice activity detection |
+| `silero-v5.1.2` | whisper | language agnostic | 2 M | `f16` | CPU, Metal, Vulkan, CUDA | voice activity detection; GPU is opt-in via `use_gpu`, default CPU |
+| `silero-v6.2.0` | whisper | language agnostic | 2 M | `f16` | CPU, Metal, Vulkan, CUDA | voice activity detection; GPU is opt-in via `use_gpu`, default CPU |
 | `nvidia/parakeet-ctc-0.6b` | parakeet | English | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA | offline + streaming + long-form |
 | `nvidia/parakeet-ctc-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | offline + streaming + long-form |
 | `ai4bharat/indic-conformer-600m-multilingual` | parakeet | 22 Indic (CTC-only export) | 600 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan | OpenCL/CUDA share the CTC path but remain unvalidated; requires `--language` / `EngineOptions::language` |
 | `nvidia/parakeet-tdt-0.6b-v3` | parakeet | ~25 + punctuation and capitalization | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA; Core ML offline encoder | graph decoder on Metal/Vulkan/CUDA; scalar on CPU/OpenCL |
 | `nvidia/parakeet-tdt-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA; Core ML offline encoder | no punctuation; graph decoder on Metal/Vulkan/CUDA |
+| `nvidia/nemotron-3.5-asr-streaming-0.6b` | parakeet | locale-conditioned multilingual | 600 M | `f16` | CPU, Metal, Vulkan, OpenCL, CUDA | cache-aware streaming at 80/160/320/560/1120 ms; empty language selects `auto` |
 
 ### End-of-utterance and diarization
 
@@ -104,8 +108,11 @@ engine-specific guides qualify model-level validation.
 | `nvidia/diar_streaming_sortformer_4spk-v2` | parakeet | diarization, up to 4 speakers | 117 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA | streaming-trained encoder |
 | `nvidia/diar_streaming_sortformer_4spk-v2.1` | parakeet | diarization, up to 4 speakers | 117 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA | Audio-Online Speaker Cache, stable slots across gaps |
 
-Parakeet's CUDA path is implemented but is not yet covered by hardware decoder
-parity CI. CUDA in these rows denotes availability, not completed validation.
+Parakeet's CUDA path was validated on an RTX 3080 (TDT q8_0 and q4_0
+transcripts, Sortformer and streaming output byte-equal to the previous build,
+LibriSpeech WER within noise of the CPU reference) but is not yet covered by
+hardware decoder parity CI. CUDA in these rows denotes hardware-validated
+availability, not CI coverage.
 
 Pair any CTC, TDT, or EOU GGUF with a Sortformer GGUF via `--diarization-model` for an attributed "who said what" transcript. See the [Parakeet backend, Core ML, streaming, conversion, and package guide](engines/parakeet/README.md).
 

@@ -106,6 +106,8 @@ set(AUDIOGEN_LIB_SOURCES
     src/acestep/lm_ggml.cpp
     src/acestep/bpe_tokenizer.cpp
     src/acestep/lm_pipeline.cpp
+    src/acestep/lyrics_alignment.cpp
+    src/acestep/quality_score.cpp
     src/acestep/detok_ggml.cpp
     src/acestep/engine.cpp
     # Memory-fit preflight (include/audiogen-cpp/acestep/fit.h + the

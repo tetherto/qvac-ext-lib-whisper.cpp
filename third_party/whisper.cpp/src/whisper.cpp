@@ -4738,7 +4738,10 @@ static ggml_tensor * whisper_vad_build_lstm_layer(ggml_context * ctx0,
     const whisper_vad_model & model = vctx.model;
     const int hdim = model.hparams.lstm_hidden_size;
 
-    struct ggml_tensor * x_t = ggml_transpose(ctx0, cur);
+    // QVAC: the transposed view has a 1-element column stride, which the CUDA
+    // mul-mat-vec kernel rejects (mmvf.cu asserts stride_col_y % 2 == 0) —
+    // make it contiguous before the matmul so VAD can run on the GPU.
+    struct ggml_tensor * x_t = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
 
     // Create operations using the input-to-hidden weights.
     struct ggml_tensor * inp_gate = ggml_mul_mat(ctx0, model.lstm_ih_weight, x_t);
@@ -4824,9 +4827,12 @@ static struct ggml_cgraph * whisper_vad_build_graph(whisper_vad_context & vctx) 
 static bool whisper_vad_init_context(whisper_vad_context * vctx) {
 
     auto whisper_context_params = whisper_context_default_params();
-    // TODO: GPU VAD is forced disabled until the performance is improved
-    //whisper_context_params.use_gpu    = vctx->params.use_gpu;
-    whisper_context_params.use_gpu    = false;
+    // QVAC: honor use_gpu so the compute backends match the weight placement
+    // done by whisper_vad_init_with_params — upstream forces the backends to
+    // CPU while the weights still land in GPU buffers, which aborts in
+    // ggml_backend_sched ("pre-allocated tensor in a buffer that cannot run
+    // the operation") on every GPU build (ggml-org/whisper.cpp#3508).
+    whisper_context_params.use_gpu    = vctx->params.use_gpu;
     whisper_context_params.gpu_device = vctx->params.gpu_device;
 
     vctx->backends = whisper_backend_init(whisper_context_params);

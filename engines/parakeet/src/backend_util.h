@@ -72,6 +72,16 @@ inline bool backend_is_cpu(ggml_backend_t b) {
     return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
+// Which attention graph the encoder builds. Fused attention is compiled in per
+// build (PARAKEET_FLASH_ATTN) but used only on the backends it was compared
+// against the unfused graph on, CUDA and Metal, and only when the backend
+// accepts the node; CPU, Vulkan and OpenCL keep the unfused graph whatever the
+// binary carries.
+struct AttnPath {
+    bool flash_attn    = false;
+    bool per_head_mask = false; // the fused kernel accepts one additive mask per head
+};
+
 inline bool backend_is_metal(ggml_backend_t b) {
     // Upstream ggml registered the Metal backend as "Metal" until mid-2026,
     // when the registry name changed to "MTL" (GGML_METAL_NAME). The pinned
@@ -79,6 +89,14 @@ inline bool backend_is_metal(ggml_backend_t b) {
     // Metal-specific gates keep firing across pin bumps.
     const char * n = backend_reg_name(b);
     return std::strcmp(n, "Metal") == 0 || std::strcmp(n, "MTL") == 0;
+}
+
+inline bool backend_is_cuda(ggml_backend_t b) {
+    return std::strcmp(backend_reg_name(b), "CUDA") == 0;
+}
+
+inline bool flash_attn_allowed(bool compiled_in, ggml_backend_t b) {
+    return compiled_in && b && (backend_is_cuda(b) || backend_is_metal(b));
 }
 
 inline void backend_set_n_threads(ggml_backend_t b, int n_threads) {
