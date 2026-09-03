@@ -90,8 +90,8 @@ engine-specific guides qualify model-level validation.
 | `whisper-large-v2` | whisper | 99 + translation | 1.55 B | `f16`, `q5_0`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | |
 | `whisper-large-v3` | whisper | 99 + translation | 1.55 B | `f16`, `q5_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | |
 | `whisper-large-v3-turbo` | whisper | 99 + translation | 809 M | `f16`, `q5_0`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA, Core ML | fastest large-class decode |
-| `silero-v5.1.2` | whisper | language agnostic | 2 M | `f16` | CPU, Vulkan, CUDA | voice activity detection; GPU is opt-in via `use_gpu`, default CPU |
-| `silero-v6.2.0` | whisper | language agnostic | 2 M | `f16` | CPU, Vulkan, CUDA | voice activity detection; GPU is opt-in via `use_gpu`, default CPU |
+| `silero-v5.1.2` | whisper | language agnostic | 2 M | `f16` | CPU, Metal, Vulkan, CUDA | voice activity detection; GPU is opt-in via `use_gpu`, default CPU |
+| `silero-v6.2.0` | whisper | language agnostic | 2 M | `f16` | CPU, Metal, Vulkan, CUDA | voice activity detection; GPU is opt-in via `use_gpu`, default CPU |
 | `nvidia/parakeet-ctc-0.6b` | parakeet | English | 600 M | `f32`, `f16`, `q8_0`, `q5_0`, `q4_0` | CPU, Metal, Vulkan, OpenCL, CUDA | offline + streaming + long-form |
 | `nvidia/parakeet-ctc-1.1b` | parakeet | English | 1.1 B | `f16`, `q8_0` | CPU, Metal, Vulkan, OpenCL, CUDA | offline + streaming + long-form |
 | `ai4bharat/indic-conformer-600m-multilingual` | parakeet | 22 Indic (CTC-only export) | 600 M | `f16`, `q8_0`, `q4_0` | CPU, Metal, Vulkan | OpenCL/CUDA share the CTC path but remain unvalidated; requires `--language` / `EngineOptions::language` |
