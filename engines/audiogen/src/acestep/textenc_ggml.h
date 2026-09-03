@@ -67,6 +67,6 @@ bool textenc_model_embed_lookup(TextEncModel * m, const int32_t * token_ids, int
 // Compute-buffer bytes the most recent real forward allocated (0 before the
 // first). Lets the fit parity tests compare the size-only projection against a
 // real allocation byte-for-byte.
-size_t textenc_model_last_compute_bytes(const TextEncModel * m);
+size_t textenc_model_compute_buffer_bytes(const TextEncModel * m);
 
 } // namespace tts_cpp::acestep

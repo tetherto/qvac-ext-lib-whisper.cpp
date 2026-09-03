@@ -15,6 +15,7 @@
 #include "ggml-backend.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 namespace tts_cpp::acestep {
@@ -104,6 +105,45 @@ inline void free_acestep_backends(AcestepBackends & b) {
     if (b.backend_cpu && b.backend_cpu != b.backend) ggml_backend_free(b.backend_cpu);
     if (b.backend) ggml_backend_free(b.backend);
     b = AcestepBackends{};
+}
+
+// ── VAE backend ──────────────────────────────────────────────────────────────
+// The VAE acquires its own backend (Vae::load) rather than borrowing the
+// primary one; the engine feeds it EngineOptions::n_gpu_layers with the
+// ACESTEP_VAE_GPU diagnostic override. Both pieces live here so Vae::load, the
+// engine, and the memory-fit projection resolve the same device by
+// construction -- a future change lands in all three at once.
+
+// ACESTEP_VAE_GPU forces the VAE backend independently of the other stages so
+// a decode can be compared CPU-vs-GPU on an identical latent (=1 -> GPU,
+// =0 -> CPU); leaves the LM/DiT backend untouched.
+inline int vae_gpu_layers_from_env(int n_gpu_layers) {
+    if (const char * e = std::getenv("ACESTEP_VAE_GPU")) {
+        return (e[0] == '1') ? 99 : 0;
+    }
+    return n_gpu_layers;
+}
+
+// GPU when requested and available (the two custom VAE ops have Metal/Vulkan/
+// validated-OpenCL kernels in the ggml-speech fork), CPU fallback otherwise,
+// with the CPU thread count applied. Returns null only when no CPU backend can
+// be initialised; the returned backend is owned by the caller.
+inline ggml_backend_t resolve_vae_backend(int n_gpu_layers, int n_threads, bool verbose) {
+    ggml_backend_t backend = nullptr;
+    if (n_gpu_layers > 0) {
+        backend = backend_gpu_init();
+        if (!backend && verbose) {
+            fprintf(stderr, "[acestep-vae] GPU requested but no GPU backend available; using CPU\n");
+        }
+    }
+    if (!backend) {
+        backend = backend_cpu_init();
+        if (!backend) return nullptr;
+        int nthreads = n_threads > 0 ? n_threads : (int) std::thread::hardware_concurrency();
+        if (nthreads <= 0) nthreads = 4;
+        backend_set_n_threads(backend, nthreads);
+    }
+    return backend;
 }
 
 }  // namespace tts_cpp::acestep

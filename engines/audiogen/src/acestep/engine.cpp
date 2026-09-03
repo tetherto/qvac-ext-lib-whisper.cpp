@@ -289,10 +289,9 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     vo.verbose      = v;
     vo.with_encoder = false;
     vo.n_threads    = nth;
-    vo.n_gpu_layers = opts.n_gpu_layers;  // validated on Metal, Vulkan, and Adreno OpenCL
-    if (const char * e = std::getenv("ACESTEP_VAE_GPU")) {
-        vo.n_gpu_layers = (e[0] == '1') ? 99 : 0;
-    }
+    // Validated on Metal, Vulkan, and Adreno OpenCL; the ACESTEP_VAE_GPU
+    // override lives in engine_backends.h, shared with the fit projection.
+    vo.n_gpu_layers = vae_gpu_layers_from_env(opts.n_gpu_layers);
     m->vae_opts = vo;
 
     // Read the DiT config from GGUF metadata up front so the context-build step in

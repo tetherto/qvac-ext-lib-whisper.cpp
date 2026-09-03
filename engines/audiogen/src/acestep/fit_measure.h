@@ -7,6 +7,16 @@
 // reads no tensor data. The returned model can build (and size) the real
 // compute graphs, but must never have tensor data read or written, and must
 // never be handed to a real forward/compute call.
+//
+// Parity-accessor convention: every stage exposes
+//     size_t <stage>_model_compute_buffer_bytes(const <Stage>Model *);
+// so the fit parity tests (test/test_fit_params.cpp) compare the size-only
+// projection against a real allocation byte-for-byte under one name. What the
+// accessor reads tracks the stage's allocation design: the DiT and LM hold a
+// persistent graph cache, so theirs report that cache's live gallocr buffer;
+// the text/cond encoders, the detokenizer, and the VAE allocate per call, so
+// theirs report the most recent real forward/decode's buffer(s) (0 before the
+// first call).
 
 #include <cstddef>
 

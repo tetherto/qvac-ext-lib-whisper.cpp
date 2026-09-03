@@ -36,7 +36,7 @@ CondModel * cond_model_load_metadata_only(const std::string & dit_gguf_path, ggm
 
 // Compute-buffer bytes of the most recent real cond_model_forward (0 before
 // the first); lets the fit parity tests compare projection vs real allocation.
-size_t cond_model_last_compute_bytes(const CondModel * m);
+size_t cond_model_compute_buffer_bytes(const CondModel * m);
 
 // null_condition_emb [2048] (F32), used by CFG on non-turbo runs.
 const std::vector<float> & cond_model_null_emb(const CondModel * m);

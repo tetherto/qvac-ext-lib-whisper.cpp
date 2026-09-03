@@ -258,7 +258,7 @@ CondModel * cond_model_load_metadata_only(const std::string & path, ggml_backend
     return cond_model_load_impl(path, backend, verbose, &measure);
 }
 
-size_t cond_model_last_compute_bytes(const CondModel * m) {
+size_t cond_model_compute_buffer_bytes(const CondModel * m) {
     return m ? m->last_compute_bytes : 0;
 }
 

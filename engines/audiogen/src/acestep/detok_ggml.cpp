@@ -180,7 +180,7 @@ DetokModel * detok_model_load_metadata_only(const std::string & path, ggml_backe
     return detok_model_load_impl(path, backend, verbose, &measure);
 }
 
-size_t detok_model_last_compute_bytes(const DetokModel * m) {
+size_t detok_model_compute_buffer_bytes(const DetokModel * m) {
     return m ? m->last_compute_bytes : 0;
 }
 

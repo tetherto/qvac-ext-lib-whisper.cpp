@@ -299,7 +299,7 @@ VaeModel * vae_model_load_metadata_only(const std::string & path, ggml_backend_t
     return vae_model_load_impl(path, backend, with_encoder, verbose, &measure);
 }
 
-size_t vae_model_last_compute_bytes(const VaeModel * m) {
+size_t vae_model_compute_buffer_bytes(const VaeModel * m) {
     return m ? m->last_compute_bytes : 0;
 }
 

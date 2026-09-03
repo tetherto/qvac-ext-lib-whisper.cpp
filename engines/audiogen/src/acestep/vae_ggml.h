@@ -53,7 +53,7 @@ bool vae_model_measure_encode(VaeModel * m, int frames, size_t & backend_bytes, 
 
 // Scheduler compute bytes of the most recent real decode window / encode (sum
 // over the sched's backends; 0 before the first). For the fit parity tests.
-size_t vae_model_last_compute_bytes(const VaeModel * m);
+size_t vae_model_compute_buffer_bytes(const VaeModel * m);
 
 // Decode a 64-ch latent (time-major, latent[t*64 + c]) into interleaved stereo
 // 48 kHz PCM. Returns T_audio frames (= T_latent * 1920) or -1 on failure.

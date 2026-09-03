@@ -158,7 +158,7 @@ TextEncModel * textenc_model_load_metadata_only(const std::string & path, ggml_b
     return textenc_model_load_impl(path, backend, verbose, &measure);
 }
 
-size_t textenc_model_last_compute_bytes(const TextEncModel * m) {
+size_t textenc_model_compute_buffer_bytes(const TextEncModel * m) {
     return m ? m->last_compute_bytes : 0;
 }
 

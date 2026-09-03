@@ -37,7 +37,7 @@ DetokModel * detok_model_load_metadata_only(const std::string & path, ggml_backe
 
 // Compute-buffer bytes of the most recent real detok_model_decode (0 before
 // the first); lets the fit parity tests compare projection vs real allocation.
-size_t detok_model_last_compute_bytes(const DetokModel * m);
+size_t detok_model_compute_buffer_bytes(const DetokModel * m);
 
 // Decode T_5Hz LM codes into context latents. context_out is filled with
 // [64, T_25Hz] (frame t of channel c at index t*64 + c), T_25Hz = T_5Hz * 5.

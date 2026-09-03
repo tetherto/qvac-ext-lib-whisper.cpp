@@ -4,12 +4,12 @@
 #include "vae_encode_windows.h"
 
 #include "acestep/backend_registry.h"
+#include "acestep/engine_backends.h"
 
 #include "ggml-backend.h"
 
 #include <cstdio>
 #include <stdexcept>
-#include <thread>
 
 namespace tts_cpp::acestep {
 
@@ -23,12 +23,6 @@ struct Vae::Impl {
         if (backend) ggml_backend_free(backend);
     }
 };
-
-static void vae_set_cpu_threads(ggml_backend_t backend, int n_threads) {
-    int nthreads = n_threads > 0 ? n_threads : (int) std::thread::hardware_concurrency();
-    if (nthreads <= 0) nthreads = 4;
-    backend_set_n_threads(backend, nthreads);
-}
 
 Vae::Vae() : impl_(std::make_unique<Impl>()) {}
 Vae::~Vae() = default;
@@ -45,18 +39,10 @@ std::unique_ptr<Vae> Vae::load(const std::string & gguf_path, const VaeOptions &
     // runs standalone (not via Engine), backends_dir loads the modules first.
     load_backends(opts.backends_dir);
 
-    ggml_backend_t backend = nullptr;
-    if (opts.n_gpu_layers > 0) {
-        backend = backend_gpu_init();
-        if (!backend && opts.verbose) {
-            fprintf(stderr, "[acestep-vae] GPU requested but no GPU backend available; using CPU\n");
-        }
-    }
-    if (!backend) {
-        backend = backend_cpu_init();
-        if (!backend) throw std::runtime_error("acestep-vae: failed to init CPU backend");
-        vae_set_cpu_threads(backend, opts.n_threads);
-    }
+    // Resolution shared with the engine and the memory-fit projection
+    // (engine_backends.h), so all three agree by construction.
+    ggml_backend_t backend = resolve_vae_backend(opts.n_gpu_layers, opts.n_threads, opts.verbose);
+    if (!backend) throw std::runtime_error("acestep-vae: failed to init CPU backend");
 
     VaeModel * model = vae_model_load(gguf_path, backend, opts.with_encoder, opts.verbose);
     if (!model) {

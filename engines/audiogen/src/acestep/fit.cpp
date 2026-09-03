@@ -144,6 +144,24 @@ FitResult fit_params(const FitOptions & opts) {
         r.reason = "invalid-arguments";
         return r;
     }
+    // Bound the token-derived shapes like the T/max_codes guard below bounds
+    // the duration-derived ones: parse_i32 accepts up to INT_MAX, and enc_S /
+    // the derived LM prompt sum several counts, so unbounded inputs would
+    // overflow int (UB) and hand the graph builders negative dimensions -- a
+    // preflight must refuse, not crash or wrap. Checked in uint64_t; the cap
+    // matches the T guard so every projected dimension stays comfortably
+    // inside int arithmetic.
+    {
+        const uint64_t token_cap = (uint64_t) std::numeric_limits<int>::max() / 4;
+        const uint64_t enc_s_u64 = sat_add(sat_add((uint64_t) opts.lyric_tokens, 1),
+                                           (uint64_t) opts.text_tokens);
+        if ((uint64_t) opts.text_tokens > token_cap || (uint64_t) opts.lyric_tokens > token_cap ||
+            (uint64_t) opts.lm_prompt_tokens > token_cap ||
+            (uint64_t) opts.lm_max_new_tokens > token_cap || enc_s_u64 > token_cap) {
+            r.reason = "workload-too-large";
+            return r;
+        }
+    }
 
     // ── Paths: same classification as Engine::create ────────────────────────
     EngineOptions paths;
@@ -170,18 +188,9 @@ FitResult fit_params(const FitOptions & opts) {
 
     // The VAE creates its own backend inside Vae::load with the same GPU
     // request (engine.cpp saves it into vae_opts; ACESTEP_VAE_GPU overrides).
-    int vae_gpu_layers = opts.n_gpu_layers;
-    if (const char * e = std::getenv("ACESTEP_VAE_GPU")) {
-        vae_gpu_layers = (e[0] == '1') ? 99 : 0;
-    }
-    ggml_backend_t vae_backend = nullptr;
-    if (vae_gpu_layers > 0) {
-        vae_backend = backend_gpu_init();
-    }
-    if (!vae_backend) {
-        vae_backend = backend_cpu_init();
-        if (vae_backend) backend_set_n_threads(vae_backend, rb.nth);
-    }
+    // Resolution shared with Vae::load via engine_backends.h, by construction.
+    ggml_backend_t vae_backend = resolve_vae_backend(
+        vae_gpu_layers_from_env(opts.n_gpu_layers), opts.n_threads, opts.verbose);
 
     struct Cleanup {
         AcestepBackends * rb;

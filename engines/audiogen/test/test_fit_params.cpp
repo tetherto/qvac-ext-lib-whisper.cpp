@@ -132,13 +132,13 @@ int main(int argc, char ** argv) {
             std::vector<int32_t> ids((size_t) S, 0);
             expect(textenc_model_forward(meta, nullptr, S, out, &projected), "textenc measure forward");
             expect(textenc_model_forward(real, ids.data(), S, out), "textenc real forward");
-            expect_eq(projected, textenc_model_last_compute_bytes(real), "textenc compute parity");
+            expect_eq(projected, textenc_model_compute_buffer_bytes(real), "textenc compute parity");
 
             size_t projected_lookup = 0;
             expect(textenc_model_embed_lookup(meta, nullptr, S, out, &projected_lookup),
                    "textenc measure embed lookup");
             expect(textenc_model_embed_lookup(real, ids.data(), S, out), "textenc real embed lookup");
-            expect_eq(projected_lookup, textenc_model_last_compute_bytes(real),
+            expect_eq(projected_lookup, textenc_model_compute_buffer_bytes(real),
                       "textenc embed-lookup compute parity");
         }
         if (meta) textenc_model_free(meta);
@@ -170,7 +170,7 @@ int main(int argc, char ** argv) {
             expect(cond_model_forward(real, text.data(), S_text, lyric.data(), S_lyric,
                                       nullptr, 0, out, &out_S),
                    "cond real forward");
-            expect_eq(projected, cond_model_last_compute_bytes(real), "cond compute parity");
+            expect_eq(projected, cond_model_compute_buffer_bytes(real), "cond compute parity");
         }
         if (meta) cond_model_free(meta);
         if (real) cond_model_free(real);
@@ -192,7 +192,7 @@ int main(int argc, char ** argv) {
             const int          code = 0;
             std::vector<float> ctx_out((size_t) 64 * 5, 0.0f);
             expect(detok_model_decode(real, &code, 1, ctx_out.data()) == 5, "detok real decode");
-            expect_eq(projected, detok_model_last_compute_bytes(real), "detok compute parity");
+            expect_eq(projected, detok_model_compute_buffer_bytes(real), "detok compute parity");
         }
         if (meta) detok_model_free(meta);
         if (real) detok_model_free(real);
@@ -287,7 +287,7 @@ int main(int argc, char ** argv) {
             std::vector<float> pcm;
             expect(vae_model_decode(real, latent.data(), T_latent, pcm) == T_latent * 1920,
                    "vae real decode");
-            expect_eq(backend_b + cpu_b, vae_model_last_compute_bytes(real), "vae compute parity");
+            expect_eq(backend_b + cpu_b, vae_model_compute_buffer_bytes(real), "vae compute parity");
         }
         if (meta) vae_model_free(meta);
         if (real) vae_model_free(real);
