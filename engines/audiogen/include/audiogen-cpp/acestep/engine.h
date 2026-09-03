@@ -261,9 +261,37 @@ struct GenerateResult {
     GenerateMetadata   metadata;
 };
 
+// Reverse pipeline (audio understanding): audio in, musical description out.
+struct UnderstandParams {
+    // Required: normalized interleaved stereo PCM at 48 kHz, [t*2 + ch].
+    std::vector<float> audio;
+    // Optional language hint (e.g. "es"); forced through the metadata FSM and
+    // echoed to the result instead of the LM's guess.
+    std::string vocal_language;
+    // LM sampling. Defaults mirror the generation LM.
+    float     lm_temperature = 0.85f;
+    float     lm_top_p       = 0.9f;
+    int       lm_top_k       = 0;   // 0 = disabled (top_p only)
+    long long seed           = -1;  // <0 = random
+};
+
+// What the listener heard. Lyrics are intentionally NOT reported: the LM's
+// transcription hallucinates on real songs, so the field is unsupported.
+struct UnderstandResult {
+    std::string      caption;         // descriptive caption of the audio
+    int              bpm = 0;
+    float            duration = 0.0f; // LM estimate in seconds (codes fix the true length)
+    std::string      keyscale;
+    std::string      timesignature;
+    std::string      vocal_language;
+    std::vector<int> audio_codes;     // recovered FSQ codes; reusable as GenerateParams::audio_codes
+    long long        seed = 0;
+};
+
 // Optional progress callback: stage name
-// ("reference"|"source"|"lm"|"score"|"dit"|"vae"), current step, total steps
-// (total <= 0 when unknown). Return false to request cancellation.
+// ("reference"|"source"|"lm"|"score"|"tok"|"understand"|"dit"|"vae"),
+// current step, total steps (total <= 0 when unknown). Return false to
+// request cancellation.
 using ProgressFn = std::function<bool(const std::string & stage, int step, int total)>;
 
 class AUDIOGEN_API Engine {
@@ -281,7 +309,15 @@ public:
     // Generate music from a text prompt. Empty pcm on cancellation.
     GenerateResult generate(const GenerateParams & params, const ProgressFn & progress = {}) const;
 
-    // Cooperative cancel for an in-flight generate() on another thread.
+    // Describe audio: VAE-encode it, FSQ-tokenize the latents, and let the LM
+    // report metadata, caption, and the recovered codes. Stages report as
+    // "source" (VAE encode), "tok", and "understand" (LM decode, unknown
+    // total). Empty caption and codes on cancellation. Throws
+    // std::runtime_error on invalid input or a failed stage.
+    UnderstandResult understand(const UnderstandParams & params, const ProgressFn & progress = {}) const;
+
+    // Cooperative cancel for an in-flight generate() or understand() on
+    // another thread.
     void cancel() const;
 
     int         sample_rate() const;  // 48000

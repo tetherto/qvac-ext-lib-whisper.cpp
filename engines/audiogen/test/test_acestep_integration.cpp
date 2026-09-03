@@ -549,6 +549,58 @@ void run_lm_generation_scenario(tts_cpp::acestep::Engine & engine, const fs::pat
 
 // Quality scoring end to end: the generated codes are teacher-forced back
 // through the LM and the request earns a weighted score with a breakdown.
+// Reverse pipeline end to end: synthesize a short clip, then understand it —
+// the listener must recover codes for the full length and describe the audio.
+void run_understand_scenario(tts_cpp::acestep::Engine & engine) {
+    using namespace tts_cpp::acestep;
+
+    GenerateParams params;
+    params.caption         = "acoustic understand integration test";
+    params.lyrics          = "[Instrumental]";
+    params.duration        = 2.0f;
+    params.inference_steps = TEST_STEPS;
+    params.shift           = TEST_SHIFT;
+    params.seed            = TEST_SEED;
+    params.lm_phase1       = false;
+    const GenerateResult rendered = engine.generate(params);
+    CHECK(!rendered.pcm.empty());
+
+    UnderstandParams up;
+    up.audio = rendered.pcm;
+    up.seed  = TEST_SEED;
+
+    StageLog stages;
+    const UnderstandResult heard = engine.understand(
+        up, [&](const std::string & stage, int step, int total) {
+            return stages.record(stage, step, total);
+        });
+    CHECK(!heard.audio_codes.empty());
+    const int latent_frames = (int) (rendered.pcm.size() / 2 / 1920);
+    CHECK((int) heard.audio_codes.size() == (latent_frames + 4) / 5);
+    CHECK(!heard.caption.empty());
+    CHECK(stages.contains("source"));
+    CHECK(stages.contains("tok"));
+    CHECK(stages.contains("understand"));
+
+    UnderstandParams hinted = up;
+    hinted.vocal_language   = "es";
+    const UnderstandResult forced = engine.understand(hinted);
+    CHECK(forced.vocal_language == "es");
+
+    // Generated audio is always a whole number of latent groups; a clip of 51
+    // latent frames (not a multiple of 5) forces the tokenizer to pad the tail
+    // group with silence: ceil(51 / 5) = 11 codes.
+    UnderstandParams truncated = up;
+    truncated.audio.resize(51 * 1920 * 2);
+    const UnderstandResult padded = engine.understand(truncated);
+    CHECK((int) padded.audio_codes.size() == (51 + 4) / 5);
+
+    engine.cancel();
+    const UnderstandResult cancelled = engine.understand(up);
+    CHECK(cancelled.audio_codes.empty());
+    CHECK(cancelled.caption.empty());
+}
+
 void run_quality_score_scenario(tts_cpp::acestep::Engine & engine) {
     using namespace tts_cpp::acestep;
 
@@ -753,6 +805,7 @@ int run_integration(const char * models_dir) {
         run_lego_base_lane();
         run_lm_generation_scenario(*engine, dump_dir);
         run_quality_score_scenario(*engine);
+        run_understand_scenario(*engine);
         run_simple_mode_scenario(*engine);
         run_query_rewrite_scenario(*engine);
         run_lm_phase1_cancel_scenario(*engine);
