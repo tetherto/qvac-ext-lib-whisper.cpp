@@ -159,6 +159,16 @@ FitResult fit_params(const FitOptions & opts) {
             return r;
         }
         ref_frames = std::max(1, (int) frames_u);
+        // encode_positions multiplies n_frames * frame_size in int, so widen
+        // the product check first: a near-INT_MAX ref_frames would
+        // sign-overflow (UB) and a wrapped-negative position count would slip
+        // PAST the max_frames rejection below into a ggml abort. Anything
+        // whose sample count exceeds int is over every RoPE table anyway.
+        if ((long long) ref_frames * ehp.frame_size >
+            (long long) std::numeric_limits<int>::max()) {
+            r.reason = "workload-too-large";
+            return r;
+        }
         // The encoder's own transformer is the first RoPE table to run out
         // (check_encodable); a reference it cannot encode is not projectable.
         if (detail::encode_positions(m.encoder, ref_frames) > ehp.max_frames) {

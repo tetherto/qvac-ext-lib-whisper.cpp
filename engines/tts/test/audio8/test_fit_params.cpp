@@ -20,7 +20,9 @@
 //     the full-pipeline gates on real fixtures -- everything above via
 //     fit_params, plus codec parity: projected decode arenas (latent +
 //     planned synthesis block) == what a real decode_codes leaves in
-//     model.allocr / model.block_allocr.
+//     model.allocr / model.block_allocr; and near-INT_MAX workloads
+//     (prompt_tokens, reference_seconds) are Error/"workload-too-large",
+//     never a sign-overflowed graph shape.
 //
 // Exit 0 on success; non-zero with a FAIL line per broken invariant.
 
@@ -38,6 +40,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -354,6 +357,32 @@ void run_fixture_gates(const std::string & lm_path, const std::string & dec_path
             }
         }
         free_codec(real);
+    }
+
+    // Near-INT_MAX workloads are rejected strictly (Error /
+    // "workload-too-large"), never priced through wrapped-int graph shapes --
+    // a preflight that crashes on the inputs it exists to reject violates its
+    // own contract.
+    {
+        tts_cpp::audio8::FitOptions huge = fopts;
+        huge.prompt_tokens = std::numeric_limits<int>::max();
+        const tts_cpp::FitResult fr = tts_cpp::audio8::fit_params(huge);
+        expect(fr.status == tts_cpp::FitStatus::Error,
+               "near-INT_MAX prompt_tokens was not Error");
+        expect(fr.reason == "workload-too-large",
+               "near-INT_MAX prompt_tokens reason was '" + fr.reason + "'");
+    }
+    if (!enc_path.empty()) {
+        // A reference whose sample count exceeds int must trip the widened
+        // encode_positions product guard (or the RoPE-table check, whichever
+        // bites first), never sign-overflow inside encoder_positions.
+        tts_cpp::audio8::FitOptions huge = fopts;
+        huge.reference_seconds = 2.0e5f;  // >= 2^31 samples at any real rate
+        const tts_cpp::FitResult fr = tts_cpp::audio8::fit_params(huge);
+        expect(fr.status == tts_cpp::FitStatus::Error,
+               "over-int reference_seconds was not Error");
+        expect(fr.reason == "workload-too-large",
+               "over-int reference_seconds reason was '" + fr.reason + "'");
     }
 }
 

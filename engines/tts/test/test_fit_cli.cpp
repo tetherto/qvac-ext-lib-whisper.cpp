@@ -64,11 +64,21 @@ void test_strict_parsers() {
     expect(!parse_i32("", i),               "parse_i32 rejects empty");
     expect(!parse_i32("99999999999999", i), "parse_i32 rejects overflow");
 
+    // ERANGE coverage: strtol/strtoull clamp instead of failing, and on
+    // LLP64 (Windows) long is 32-bit, so a pure range comparison passes
+    // exactly-clamped values. These must be rejected on EVERY platform.
+    expect(!parse_i32("3000000000", i),
+           "parse_i32 rejects a value that clamps to LONG_MAX on LLP64");
+    expect(!parse_i32("-3000000000", i),
+           "parse_i32 rejects a value that clamps to LONG_MIN on LLP64");
+
     uint64_t u = 1;
     expect(parse_u64("0", u) && u == 0,     "parse_u64 accepts 0");
     expect(parse_u64("123456789012", u) && u == 123456789012ull, "parse_u64 big value");
     expect(!parse_u64("-1", u),             "parse_u64 rejects negatives");
     expect(!parse_u64("12a", u),            "parse_u64 rejects trailing junk");
+    expect(!parse_u64("99999999999999999999", u),
+           "parse_u64 rejects an out-of-range value (ERANGE clamp)");
 }
 
 void test_json_escape() {
@@ -78,6 +88,20 @@ void test_json_escape() {
     expect(json_escape("a\nb") == "a\\nb",  "newline escaped");
     expect(json_escape(std::string(1, '\x01')) == "\\u0001", "control chars escaped");
     expect(json_escape("naïve") == "naïve", "UTF-8 bytes pass through");
+
+    // Malformed UTF-8 (GGUF metadata / driver strings are untrusted) must
+    // come out as U+FFFD, never as raw bytes a strict JSON parser rejects.
+    const std::string fffd = "\xEF\xBF\xBD";
+    expect(json_escape("a\xffz") == "a" + fffd + "z",
+           "json_escape replaces an invalid byte");
+    expect(json_escape("caf\xc3") == "caf" + fffd,
+           "json_escape replaces a truncated tail sequence");
+    expect(json_escape("\xc0\xaf") == fffd + fffd,
+           "json_escape replaces an overlong encoding byte-by-byte");
+    expect(json_escape("\xed\xa0\x80") == fffd + fffd + fffd,
+           "json_escape replaces a surrogate encoding");
+    expect(json_escape("\xf0\x9f\x8e\xb5") == "\xf0\x9f\x8e\xb5",
+           "json_escape passes a valid 4-byte sequence through");
 }
 
 // Both CLI mains live in the library; drive them with crafted argv and check

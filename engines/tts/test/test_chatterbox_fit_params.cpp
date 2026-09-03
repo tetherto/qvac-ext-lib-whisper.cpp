@@ -17,7 +17,11 @@
 //      s3gen_synthesize_to_wav of the same token count leaves allocated;
 //   5. the projection grows with n_predict (no false saturation: every
 //      chatterbox stage scales with the utterance);
-//   6. a missing model file is Error/"model-unreadable", never Success.
+//   6. a missing model file is Error/"model-unreadable", never Success;
+//   7. a near-INT_MAX --text-tokens is Error/"workload-too-large" -- the
+//      prompt sum is widened before the n_ctx comparison, so it can never
+//      sign-overflow into a negative tensor dim and a ggml abort (the
+//      preflight must not crash on the inputs it exists to reject).
 //
 // Usage: test-chatterbox-fit-params <t3.gguf> <s3gen.gguf> [n_gpu_layers]
 // (CMake registers the CPU form; pass e.g. 99 manually to check parity on a
@@ -36,6 +40,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -240,6 +245,21 @@ int main(int argc, char ** argv) {
         expect(fr.reason == "model-unreadable",
                "missing model reason was '" + fr.reason + "'");
         expect(!fr.fits, "missing model reported fits");
+    }
+
+    // 7. A near-INT_MAX workload is rejected strictly, never evaluated: the
+    //    prompt sum is widened before the n_ctx check, so it cannot
+    //    sign-overflow into a negative tensor dim (a preflight that crashes
+    //    on its input violates its own contract).
+    {
+        tts_cpp::chatterbox::FitOptions huge = fopts;
+        huge.text_tokens = std::numeric_limits<int>::max() - 1;
+        const tts_cpp::FitResult fr = tts_cpp::chatterbox::fit_params(huge);
+        expect(fr.status == tts_cpp::FitStatus::Error,
+               "near-INT_MAX text_tokens was not Error");
+        expect(fr.reason == "workload-too-large",
+               "near-INT_MAX text_tokens reason was '" + fr.reason + "'");
+        expect(!fr.fits, "near-INT_MAX text_tokens reported fits");
     }
 
     if (g_failures == 0) {

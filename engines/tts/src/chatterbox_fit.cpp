@@ -111,13 +111,18 @@ FitResult fit_params(const FitOptions & opts) {
     }
 
     // ── Workload → graph shapes, as the eval functions derive them ─────────
-    const int prompt_len = mtl
-        ? (1 + hp.perceiver_queries + (hp.emotion_adv ? 1 : 0)) + opts.text_tokens + 2
-        : 1 + hp.cond_prompt_len + opts.text_tokens + 1;
-    if (prompt_len >= hp.n_ctx) {
+    // Widen before summing: a near-INT_MAX --text-tokens would sign-overflow
+    // the int sum (UB) before the n_ctx comparison could reject it. n_ctx is
+    // clamped to the model's own table by the loader, so a prompt that passes
+    // this check always fits int.
+    const long long prompt_len_ll = mtl
+        ? (1ll + hp.perceiver_queries + (hp.emotion_adv ? 1 : 0)) + opts.text_tokens + 2
+        : 1ll + hp.cond_prompt_len + opts.text_tokens + 1;
+    if (prompt_len_ll >= (long long) hp.n_ctx) {
         r.reason = "workload-too-large";  // eval_prompt would refuse it
         return r;
     }
+    const int prompt_len = (int) prompt_len_ll;
     // The decode loop appends one token per step until the budget or the
     // context runs out; the deepest step sees every earlier token.
     const int n_gen      = std::min(opts.n_predict, hp.n_ctx - prompt_len);
