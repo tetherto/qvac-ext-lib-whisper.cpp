@@ -1209,9 +1209,15 @@ static_assert(sizeof(SortformerWeights) ==
 // CPU backend. Used on Mali-Vulkan, where the head runs on CPU while its encoder
 // stays on the GPU: the head graph must read weights that live on the same
 // backend it executes on. Returns false on allocation failure.
+//
+// Measure mode (`measure_bytes != nullptr`, fit projection): the same shadow
+// tensors are created into a throwaway context, their CPU buffer is *sized*
+// into `*measure_bytes` instead of allocated, no weight bytes are copied, and
+// `impl` / `dst` are left untouched.
 static bool build_sortformer_cpu_weights(ParakeetCtcModel::Impl * impl,
                                          const SortformerWeights & src,
-                                         SortformerWeights & dst) {
+                                         SortformerWeights & dst,
+                                         size_t * measure_bytes = nullptr) {
     dst = SortformerWeights{};
     dst.transformer.resize(src.transformer.size());
 
@@ -1243,16 +1249,26 @@ static bool build_sortformer_cpu_weights(ParakeetCtcModel::Impl * impl,
         /*mem_buffer=*/ nullptr,
         /*no_alloc=*/   true,
     };
-    impl->sortformer_cpu_ctx = ggml_init(p);
-    if (!impl->sortformer_cpu_ctx) return false;
+    ggml_context * cpu_ctx = ggml_init(p);
+    if (!cpu_ctx) return false;
 
     for (Field & f : fields) {
-        ggml_tensor * t = ggml_new_tensor(impl->sortformer_cpu_ctx, f.src->type,
+        ggml_tensor * t = ggml_new_tensor(cpu_ctx, f.src->type,
                                           GGML_MAX_DIMS, f.src->ne);
         ggml_set_name(t, ggml_get_name(f.src));
         *f.dst = t;
     }
 
+    if (measure_bytes) {
+        // dst now holds handles into cpu_ctx, which is freed below: the caller
+        // must pass a throwaway dst in measure mode and discard it.
+        *measure_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            cpu_ctx, ggml_backend_get_default_buffer_type(impl->backend_cpu));
+        ggml_free(cpu_ctx);
+        return true;
+    }
+
+    impl->sortformer_cpu_ctx = cpu_ctx;
     impl->sortformer_cpu_buffer =
         ggml_backend_alloc_ctx_tensors(impl->sortformer_cpu_ctx, impl->backend_cpu);
     if (!impl->sortformer_cpu_buffer) return false;
@@ -1352,8 +1368,17 @@ static bool cpu_extra_buft_supports_mul_mat(ggml_backend_dev_t dev,
 // when the platform has no repack kernels for these weights). The subsequent
 // whole-tensor ggml_backend_tensor_set in the GGUF data loop performs the
 // actual repack on upload.
+//
+// Measure mode (`measure_bytes != nullptr`, fit projection): the selection
+// loop runs identically, but instead of allocating the buffers the padded
+// group sizes are summed into `*measure_bytes` and the selected tensors are
+// marked externally-allocated (dummy non-NULL `data`) -- the same "claimed"
+// signal a real ggml_tallocr placement leaves -- so the later
+// ggml_backend_alloc_ctx_tensors_from_buft_size sweep skips them exactly like
+// the real allocation pass would. Returns no buffers.
 static std::vector<ggml_backend_buffer_t> alloc_cpu_repack_weights(
-        ggml_context * ctx, ggml_backend_t backend_cpu, bool verbose) {
+        ggml_context * ctx, ggml_backend_t backend_cpu, bool verbose,
+        size_t * measure_bytes = nullptr) {
     std::vector<ggml_backend_buffer_t> buffers;
 
     ggml_backend_dev_t cpu_dev = ggml_backend_get_device(backend_cpu);
@@ -1383,6 +1408,14 @@ static std::vector<ggml_backend_buffer_t> alloc_cpu_repack_weights(
             group_bytes += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
         }
         if (group.empty()) {
+            continue;
+        }
+
+        if (measure_bytes) {
+            *measure_bytes += group_bytes;
+            for (ggml_tensor * t : group) {
+                t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+            }
             continue;
         }
 
@@ -1451,11 +1484,16 @@ static void maybe_init_coreml_encoder(const std::string & gguf_path,
 }
 #endif  // PARAKEET_USE_COREML
 
-int load_from_gguf(const std::string & gguf_path,
-                   ParakeetCtcModel  & out_model,
-                   int                 n_threads,
-                   int                 n_gpu_layers,
-                   bool                verbose) {
+// Shared body of load_from_gguf and load_from_gguf_metadata_only. When
+// `measure` is non-null the load is metadata-only: every allocation the real
+// path makes is sized into `measure` instead of performed and no tensor data
+// is read; see the declaration comments in parakeet_ctc.h.
+static int load_from_gguf_impl(const std::string & gguf_path,
+                               ParakeetCtcModel  & out_model,
+                               int                 n_threads,
+                               int                 n_gpu_layers,
+                               bool                verbose,
+                               GgufLoadMeasure   * measure) {
     auto impl = std::make_shared<ParakeetCtcModel::Impl>();
 
     impl->backend_cpu = init_cpu_backend();
@@ -1541,18 +1579,26 @@ int load_from_gguf(const std::string & gguf_path,
     // tensor this pass leaves unallocated. Skipped when the model lives on a
     // GPU backend (the weights aren't in CPU memory at all).
     if (impl->backend_active == impl->backend_cpu) {
-        impl->weights_extra_buffers =
-            alloc_cpu_repack_weights(impl->ctx, impl->backend_cpu, verbose);
+        if (measure) {
+            alloc_cpu_repack_weights(impl->ctx, impl->backend_cpu, verbose,
+                                     &measure->repack_bytes);
+        } else {
+            impl->weights_extra_buffers =
+                alloc_cpu_repack_weights(impl->ctx, impl->backend_cpu, verbose);
+        }
     }
 
-    impl->weights_buffer = ggml_backend_alloc_ctx_tensors(impl->ctx, impl->backend_active);
-    if (!impl->weights_buffer) {
-        PARAKEET_LOG_ERROR("gguf: ggml_backend_alloc_ctx_tensors failed\n");
-        return 12;
-    }
-    ggml_backend_buffer_set_usage(impl->weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    if (measure) {
+        measure->weights_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            impl->ctx, ggml_backend_get_default_buffer_type(impl->backend_active));
+    } else {
+        impl->weights_buffer = ggml_backend_alloc_ctx_tensors(impl->ctx, impl->backend_active);
+        if (!impl->weights_buffer) {
+            PARAKEET_LOG_ERROR("gguf: ggml_backend_alloc_ctx_tensors failed\n");
+            return 12;
+        }
+        ggml_backend_buffer_set_usage(impl->weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    {
         std::ifstream f(gguf_path, std::ios::binary);
         if (!f) {
             PARAKEET_LOG_ERROR("gguf: cannot reopen %s for tensor data\n", gguf_path.c_str());
@@ -1788,8 +1834,10 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.mel_filterbank = require_tensor(impl->ctx, "preproc.mel_filterbank");
     out_model.window         = require_tensor(impl->ctx, "preproc.window");
 
-    out_model.mel_cfg.filterbank = read_filterbank_to_vector(out_model.mel_filterbank);
-    out_model.mel_cfg.window     = read_filterbank_to_vector(out_model.window);
+    if (!measure) {  // reads tensor data; a metadata-only model never runs the mel front-end
+        out_model.mel_cfg.filterbank = read_filterbank_to_vector(out_model.mel_filterbank);
+        out_model.mel_cfg.window     = read_filterbank_to_vector(out_model.window);
+    }
 
     out_model.subsampling.conv0_w    = require_tensor(impl->ctx, "encoder.subsampling.conv0.weight");
     out_model.subsampling.conv0_b    = maybe_tensor(impl->ctx, "encoder.subsampling.conv0.bias");
@@ -1951,20 +1999,46 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.impl = impl;
 
 #ifdef PARAKEET_USE_COREML
-    maybe_init_coreml_encoder(gguf_path, out_model, verbose);
+    if (!measure) {
+        maybe_init_coreml_encoder(gguf_path, out_model, verbose);
+    }
 #endif
 
     if (out_model.model_type == ParakeetModelType::SORTFORMER &&
         impl->sortformer_force_cpu) {
-        if (!build_sortformer_cpu_weights(impl.get(), out_model.sortformer,
-                                          out_model.sortformer_cpu)) {
+        if (measure) {
+            SortformerWeights scratch;  // measure mode leaves handles into a freed ctx; discard
+            if (!build_sortformer_cpu_weights(impl.get(), out_model.sortformer,
+                                              scratch,
+                                              &measure->sortformer_cpu_bytes)) {
+                PARAKEET_LOG_ERROR(
+                    "parakeet: failed to size CPU-resident Sortformer head weights\n");
+                return 15;
+            }
+        } else if (!build_sortformer_cpu_weights(impl.get(), out_model.sortformer,
+                                                 out_model.sortformer_cpu)) {
             PARAKEET_LOG_ERROR(
                 "parakeet: failed to build CPU-resident Sortformer head weights\n");
             return 15;
         }
-        if (verbose) PARAKEET_LOG_INFO(
+        if (!measure && verbose) PARAKEET_LOG_INFO(
             "parakeet: built CPU-resident Sortformer head weights "
             "(diarization head runs on CPU; encoder stays on the Mali GPU)\n");
+    }
+
+    if (measure) {
+        // Mark every still-unclaimed weight tensor externally-allocated
+        // (dummy non-NULL data, same trick ggml's own measure paths use) so
+        // graph measurement via ggml_gallocr excludes the weights from the
+        // measured compute buffers instead of counting them as graph-owned
+        // leafs. The model must never have tensor data read/written after
+        // this -- see load_from_gguf_metadata_only.
+        for (ggml_tensor * t = ggml_get_first_tensor(impl->ctx); t;
+             t = ggml_get_next_tensor(impl->ctx, t)) {
+            if (!t->data && !t->view_src) {
+                t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+            }
+        }
     }
 
     if (verbose) {
@@ -1975,6 +2049,44 @@ int load_from_gguf(const std::string & gguf_path,
         PARAKEET_LOG_INFO("  backend: %s  (threads=%d)\n", be, resolved_threads);
     }
     return 0;
+}
+
+int load_from_gguf(const std::string & gguf_path,
+                   ParakeetCtcModel  & out_model,
+                   int                 n_threads,
+                   int                 n_gpu_layers,
+                   bool                verbose) {
+    return load_from_gguf_impl(gguf_path, out_model, n_threads, n_gpu_layers,
+                               verbose, /*measure=*/nullptr);
+}
+
+int load_from_gguf_metadata_only(const std::string & gguf_path,
+                                 ParakeetCtcModel  & out_model,
+                                 int                 n_threads,
+                                 int                 n_gpu_layers,
+                                 bool                verbose,
+                                 GgufLoadMeasure   & out_measure) {
+    out_measure = GgufLoadMeasure{};
+    return load_from_gguf_impl(gguf_path, out_model, n_threads, n_gpu_layers,
+                               verbose, &out_measure);
+}
+
+size_t model_weights_buffer_bytes(const ParakeetCtcModel & m) {
+    if (!m.impl) return 0;
+    size_t bytes = 0;
+    if (m.impl->weights_buffer) {
+        bytes += ggml_backend_buffer_get_size(m.impl->weights_buffer);
+    }
+    for (ggml_backend_buffer_t b : m.impl->weights_extra_buffers) {
+        if (b) bytes += ggml_backend_buffer_get_size(b);
+    }
+    return bytes;
+}
+
+size_t model_encoder_compute_buffer_bytes(const ParakeetCtcModel & m) {
+    if (!m.impl || m.impl->encoder_graphs.empty()) return 0;
+    const EncoderGraph & g = *m.impl->encoder_graphs.back();
+    return g.alloc ? ggml_gallocr_get_buffer_size(g.alloc, 0) : 0;
 }
 
 bool model_has_gpu_backend(const ParakeetCtcModel & m) {
@@ -2900,6 +3012,12 @@ static void restore_encoder_graph_srcs(EncoderGraph & g) {
     }
 }
 
+// `measure_compute` (fit projection): when non-null the graph is built
+// normally but its compute buffer is only *sized* into `*measure_compute`
+// (ggml_gallocr_reserve_n_size) instead of reserved; `g.alloc` stays null and
+// the returned graph must be discarded, never run. Requires the model's
+// weight tensors to be marked externally-allocated (metadata-only load), or
+// the measurement would count the weights as graph-owned leafs.
 static int build_encoder_graph_cached(const ParakeetCtcModel & model,
                                       EncoderGraph & g,
                                       int n_mel_frames, int n_mels,
@@ -2907,7 +3025,8 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
                                       bool all_valid,
                                       ggml_backend_t backend,
                                       bool bypass_pre_encode = false,
-                                      int  T_enc_override   = 0) {
+                                      int  T_enc_override   = 0,
+                                      size_t * measure_compute = nullptr) {
     const EncoderConfig & enc = model.encoder_cfg;
     const int C_sub = enc.subsampling_channels;
     const int d_model = enc.d_model;
@@ -3134,6 +3253,22 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     // graph is ever mutated in place. Dormant on the current encoder path (the
     // gallocr below never splits), kept defensively.
     snapshot_encoder_graph_srcs(g);
+
+    if (measure_compute) {
+        ggml_gallocr_t pricer =
+            ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!pricer) {
+            return -3;
+        }
+        *measure_compute = 0;
+        ggml_gallocr_reserve_n_size(pricer, g.cgraph, nullptr, nullptr, measure_compute);
+        ggml_gallocr_free(pricer);
+        g.T_mel = bypass_pre_encode ? 0 : n_mel_frames;
+        g.T_enc = T;
+        g.all_valid = all_valid;
+        g.bypass_pre_encode = bypass_pre_encode;
+        return 0;
+    }
 
     // Persistent per-graph allocator (see EncoderGraph::alloc). Reserve once here so
     // every reuse just re-runs ggml_gallocr_alloc_graph with stable offsets.
@@ -3501,6 +3636,22 @@ int run_encoder(ParakeetCtcModel   & model,
     copy_tensor(g.logits_node,          out.logits);
 
     return 0;
+}
+
+int measure_encoder_compute(ParakeetCtcModel & model,
+                            int                n_mel_frames,
+                            int                n_mels,
+                            size_t           & out_bytes) {
+    if (!model.impl || !model.impl->backend_active) return -1;
+    out_bytes = 0;
+    EncoderGraph tmp;  // RAII: destructor frees the graph ctx (no gallocr is created)
+    return build_encoder_graph_cached(model, tmp, n_mel_frames, n_mels,
+                                      /*n_run_layers_override=*/-1,
+                                      /*all_valid=*/true,
+                                      model.impl->backend_active,
+                                      /*bypass_pre_encode=*/false,
+                                      /*T_enc_override=*/0,
+                                      &out_bytes);
 }
 
 int run_encoder_bypass_pre_encode(ParakeetCtcModel & model,

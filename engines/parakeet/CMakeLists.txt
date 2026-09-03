@@ -258,11 +258,15 @@ set(PARAKEET_LIB_SOURCES
     src/mel_preprocess.cpp
     src/sentencepiece_bpe.cpp
     src/energy_vad.cpp
+    # Memory-fit preflight (include/parakeet/fit.h + parakeet-fit-params).
+    src/parakeet_fit.cpp
     # Lives in the library so `parakeet_cli_main` (declared in
     # the umbrella header `parakeet.h`) is actually a library
     # symbol that consumers / host applications can link against.
     # The CLI executable below is a thin shim that just calls into it.
     src/main.cpp
+    # Same shape for `parakeet_fit_cli_main` (the parakeet-fit-params tool).
+    src/fit_main.cpp
 )
 
 if (PARAKEET_BUILD_LIBRARY)
@@ -453,6 +457,10 @@ if (PARAKEET_BUILD_EXECUTABLES)
     target_link_libraries(parakeet-cli PRIVATE qvac-parakeet)
     set_target_properties(parakeet-cli PROPERTIES OUTPUT_NAME parakeet)
     parakeet_apply_ccache(parakeet-cli)
+
+    add_executable(parakeet-fit-params src/fit_cli_main.cpp)
+    target_link_libraries(parakeet-fit-params PRIVATE qvac-parakeet)
+    parakeet_apply_ccache(parakeet-fit-params)
 endif()
 
 if (PARAKEET_BUILD_TESTS)
@@ -1245,6 +1253,65 @@ if (PARAKEET_BUILD_TESTS)
         EXE      test-tdt-decoder-parity
         ARGS     "${_qvp_tdt_q8_gguf}" "${_qvp_fr_multipiece_wav}"
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_fr_multipiece_wav}")
+
+    # Fit-projection parity (include/parakeet/fit.h): metadata-only projection
+    # vs the buffers a real load/encode actually allocates, on the CPU backend.
+    # One binary, registered once per model family fixture present.
+    add_executable(test-fit-params
+        test/test_fit_params.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_fit.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp)
+    target_link_libraries(test-fit-params PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-fit-params PRIVATE include src ggml/include)
+    parakeet_apply_backend_defs(test-fit-params)
+    parakeet_register_test(test-fit-params
+        LABEL    "fixture"
+        ARGS     "${_qvp_rnnt_q8_gguf}"
+        REQUIRES "${_qvp_rnnt_q8_gguf}")
+    parakeet_register_test(test-fit-params-ctc
+        LABEL    "fixture"
+        EXE      test-fit-params
+        ARGS     "${_qvp_ctc_q8_gguf}"
+        REQUIRES "${_qvp_ctc_q8_gguf}")
+    parakeet_register_test(test-fit-params-tdt
+        LABEL    "fixture"
+        EXE      test-fit-params
+        ARGS     "${_qvp_tdt_q8_gguf}"
+        REQUIRES "${_qvp_tdt_q8_gguf}")
+    parakeet_register_test(test-fit-params-eou
+        LABEL    "fixture"
+        EXE      test-fit-params
+        ARGS     "${_qvp_eou_q8_gguf}"
+        REQUIRES "${_qvp_eou_q8_gguf}")
+    parakeet_register_test(test-fit-params-sortformer
+        LABEL    "fixture"
+        EXE      test-fit-params
+        ARGS     "${_qvp_sf_q8_gguf}"
+        REQUIRES "${_qvp_sf_q8_gguf}")
+
+    # Model-free CLI-layer unit tests: strict parsers, saturating arithmetic,
+    # JSON escaping, and the parakeet-fit-params exit-code contract.
+    add_executable(test-fit-cli
+        test/test_fit_cli.cpp
+        src/fit_main.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_fit.cpp
+        src/parakeet_log.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp)
+    target_link_libraries(test-fit-cli PRIVATE ggml parakeet-backend-defs)
+    target_include_directories(test-fit-cli PRIVATE include src ggml/include)
+    parakeet_apply_backend_defs(test-fit-cli)
+    parakeet_register_test(test-fit-cli LABEL "unit")
 
     add_executable(test-eou-decoder-parity
         test/test_eou_decoder_parity.cpp

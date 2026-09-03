@@ -431,6 +431,60 @@ int load_from_gguf(const std::string & gguf_path,
                    int                 n_gpu_layers,
                    bool                verbose);
 
+// ── Memory-fit measurement (see include/parakeet/fit.h) ───────────────────
+
+// Byte totals collected by load_from_gguf_metadata_only.
+struct GgufLoadMeasure {
+    size_t weights_bytes        = 0;  // default-buft weight buffers on the active backend
+    size_t repack_bytes         = 0;  // CPU extra-buft (repack) weight buffers, CPU runs only
+    size_t sortformer_cpu_bytes = 0;  // Mali-Vulkan CPU head weight copies
+};
+
+// Metadata-only twin of load_from_gguf: identical backend resolution, GGUF
+// parsing, and tensor wiring, but every allocation a real load makes is
+// *sized* into `out_measure` instead of performed, and no tensor data is ever
+// read (weight upload, mel filterbank/window, Core ML sidecar, and the
+// Sortformer CPU head copy are all skipped). On success every weight tensor
+// is marked externally-allocated (dummy non-NULL `data`), so the model can
+// build and measure compute graphs -- ggml_gallocr then excludes the weights
+// from the measured compute buffers -- but it must NEVER be used for
+// inference or have tensor data read/written through it.
+int load_from_gguf_metadata_only(const std::string & gguf_path,
+                                 ParakeetCtcModel  & out_model,
+                                 int                 n_threads,
+                                 int                 n_gpu_layers,
+                                 bool                verbose,
+                                 GgufLoadMeasure   & out_measure);
+
+// Measure the compute buffer the offline encoder graph at `n_mel_frames`
+// would allocate on the model's active backend, without allocating or
+// executing it. Requires a model from load_from_gguf_metadata_only (a
+// real-loaded model works too, but pays nothing less). Returns the
+// build_encoder_graph rc contract (0 = ok).
+int measure_encoder_compute(ParakeetCtcModel & model,
+                            int                n_mel_frames,
+                            int                n_mels,
+                            size_t           & out_bytes);
+
+// Byte totals for a decoder runtime (transducer LSTM/joint or EOU predictor),
+// measured without allocating. Filled by tdt_measure_runtime /
+// eou_measure_runtime against a load_from_gguf_metadata_only model.
+struct DecoderFitMeasure {
+    size_t device_state_bytes   = 0;  // persistent decoder state (h/c/pred/enc_proj)
+    size_t device_compute_bytes = 0;  // fixed-shape decode graphs + worst-case enc_proj graph
+    size_t host_bytes           = 0;  // host-dequantised f32 weights (CPU decode path)
+};
+
+// Actually-allocated byte counts on a REAL-loaded model, for fit-parity tests
+// and stats. Both return 0 on a metadata-only model.
+//
+// Total bytes of the allocated weight buffers (default buffer + CPU repack
+// extra buffers; excludes the Mali Sortformer CPU head copy).
+size_t model_weights_buffer_bytes(const ParakeetCtcModel & m);
+// Backend buffer held by the most recently built cached encoder graph's
+// allocator (0 when no encoder graph has been built yet).
+size_t model_encoder_compute_buffer_bytes(const ParakeetCtcModel & m);
+
 void print_model_summary(const ParakeetCtcModel & m);
 const char * model_type_name(ParakeetModelType model_type);
 
