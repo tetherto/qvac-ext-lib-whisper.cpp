@@ -355,12 +355,12 @@ if (PARAKEET_BUILD_LIBRARY)
     #             should flip and bench. Vulkan validation harness
     #             (test/test_vk_vs_cpu.cpp) is the natural home for
     #             that A/B once a non-Tegra Vulkan device is available.
-    if (GGML_METAL OR GGML_CUDA)
+    if (GGML_METAL OR GGML_CUDA OR GGML_VULKAN)
         set(PARAKEET_FLASH_ATTN_DEFAULT ON)
     else()
         set(PARAKEET_FLASH_ATTN_DEFAULT OFF)
     endif()
-    option(PARAKEET_FLASH_ATTN "parakeet: enable fused flash-attn in MHA (default ON for Metal and CUDA; OFF elsewhere pending per-backend A/B)" ${PARAKEET_FLASH_ATTN_DEFAULT})
+    option(PARAKEET_FLASH_ATTN "parakeet: enable fused flash-attn in MHA (default ON for Metal, CUDA and Vulkan; OFF elsewhere pending per-backend A/B)" ${PARAKEET_FLASH_ATTN_DEFAULT})
     if (PARAKEET_FLASH_ATTN)
         target_compile_definitions(qvac-parakeet PRIVATE PARAKEET_EXPERIMENTAL_FLASH_ATTN)
     endif()
