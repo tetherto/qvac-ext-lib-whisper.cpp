@@ -14,10 +14,6 @@ namespace tts_cpp::acestep {
 
 namespace {
 
-constexpr const char * LM_UNDERSTAND_INSTRUCTION =
-    "Understand the given musical conditions and describe the audio semantics accordingly:";
-constexpr const char * UNCONDITIONAL_USER_INPUT = "NO USER INPUT";
-
 struct TeacherForcedStats {
     double                mean_log_prob  = -std::numeric_limits<double>::infinity();
     double                weighted_top_k = 0.0;
@@ -44,37 +40,6 @@ struct ScoreProgress {
 void append_text(const BpeTokenizer & bpe, const std::string & text, std::vector<int> & ids) {
     const std::vector<int> part = bpe_encode(bpe, text, false);
     ids.insert(ids.end(), part.begin(), part.end());
-}
-
-std::vector<int> build_understand_prompt(const BpeTokenizer & bpe, const std::vector<int> & codes) {
-    std::vector<int> ids;
-    ids.push_back(TOKEN_IM_START);
-    append_text(bpe, std::string("system\n# Instruction\n") + LM_UNDERSTAND_INSTRUCTION + "\n\n", ids);
-    ids.push_back(TOKEN_IM_END);
-    append_text(bpe, "\n", ids);
-    ids.push_back(TOKEN_IM_START);
-    append_text(bpe, "user\n", ids);
-    for (int code : codes) ids.push_back(AUDIO_CODE_BASE + code);
-    ids.push_back(TOKEN_IM_END);
-    append_text(bpe, "\n", ids);
-    ids.push_back(TOKEN_IM_START);
-    append_text(bpe, "assistant\n", ids);
-    return ids;
-}
-
-std::vector<int> build_unconditional_prompt(const BpeTokenizer & bpe) {
-    std::vector<int> ids;
-    ids.push_back(TOKEN_IM_START);
-    append_text(bpe, std::string("system\n# Instruction\n") + LM_UNDERSTAND_INSTRUCTION + "\n\n", ids);
-    ids.push_back(TOKEN_IM_END);
-    append_text(bpe, "\n", ids);
-    ids.push_back(TOKEN_IM_START);
-    append_text(bpe, std::string("user\n") + UNCONDITIONAL_USER_INPUT + "\n", ids);
-    ids.push_back(TOKEN_IM_END);
-    append_text(bpe, "\n", ids);
-    ids.push_back(TOKEN_IM_START);
-    append_text(bpe, "assistant\n", ids);
-    return ids;
 }
 
 bool validate_target_fits(const LMModel * m, const std::vector<int> & prompt,
@@ -486,8 +451,8 @@ bool compute_quality_score(LMModel * m, const BpeTokenizer & bpe, const AcePromp
         }
     }
 
-    const std::vector<int>         conditional_prompt   = build_understand_prompt(bpe, codes);
-    const std::vector<int>         unconditional_prompt = build_unconditional_prompt(bpe);
+    const std::vector<int>         conditional_prompt   = lm_understand_prompt(bpe, codes.data(), (int) codes.size());
+    const std::vector<int>         unconditional_prompt = lm_understand_unconditional_prompt(bpe);
     const std::vector<ScoreTarget> targets              = build_targets(bpe, prompt);
     if (targets.empty()) {
         error = "no conditions to evaluate";
