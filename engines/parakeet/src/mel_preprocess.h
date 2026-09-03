@@ -42,6 +42,10 @@ struct MelConfig {
 
     std::vector<float> filterbank;
     std::vector<float> window;
+
+    // Worker threads for the per-frame FFT and filterbank loops; 0 picks
+    // from the frame count and the hardware, capped internally.
+    int n_threads = 0;
 };
 
 int load_wav_mono_f32(const std::string & wav_path,

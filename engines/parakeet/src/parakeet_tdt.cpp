@@ -200,28 +200,202 @@ void host_joint_step(const TdtRuntimeWeights & W,
              logits.data(), Vo, H);
 }
 
+// A layer can share one GEMV only when both matrices agree on type and shape
+// and the input width is a whole number of quantisation blocks (otherwise the
+// row-wise stack would need requantisation).
+bool lstm_layer_concatenable(const TdtLstmLayer & w, int H) {
+    if (!w.w_ih || !w.w_hh || !w.b_ih || !w.b_hh) return false;
+    if (w.w_ih->type != w.w_hh->type) return false;
+    if (!ggml_is_contiguous(w.w_ih) || !ggml_is_contiguous(w.w_hh)) return false;
+    if (w.w_ih->ne[0] != H || w.w_hh->ne[0] != H) return false;
+    if (w.w_ih->ne[1] != 4 * (int64_t) H || w.w_hh->ne[1] != 4 * (int64_t) H) return false;
+    if (ggml_nelements(w.b_ih) != 4 * (int64_t) H) return false;
+    if (ggml_nelements(w.b_hh) != 4 * (int64_t) H) return false;
+    return H % ggml_blck_size(w.w_ih->type) == 0;
+}
+
+void upload_lstm_cat_weight(ggml_tensor * dst, const TdtLstmLayer & src) {
+    std::vector<uint8_t> ih(ggml_nbytes(src.w_ih));
+    std::vector<uint8_t> hh(ggml_nbytes(src.w_hh));
+    ggml_backend_tensor_get(src.w_ih, ih.data(), 0, ih.size());
+    ggml_backend_tensor_get(src.w_hh, hh.data(), 0, hh.size());
+
+    std::vector<uint8_t> packed(ggml_nbytes(dst));
+    pack_lstm_input_rows(src.w_ih->ne[1],
+                         ggml_row_size(src.w_ih->type, src.w_ih->ne[0]),
+                         ggml_row_size(src.w_hh->type, src.w_hh->ne[0]),
+                         ih.data(), hh.data(), packed.data());
+    ggml_backend_tensor_set(dst, packed.data(), 0, packed.size());
+}
+
+void upload_lstm_cat_bias(ggml_tensor * dst, const TdtLstmLayer & src) {
+    std::vector<float> b_ih;
+    std::vector<float> b_hh;
+    dequantize_to_f32(src.b_ih, b_ih);
+    dequantize_to_f32(src.b_hh, b_hh);
+    for (size_t i = 0; i < b_ih.size(); ++i) b_ih[i] += b_hh[i];
+    ggml_backend_tensor_set(dst, b_ih.data(), 0, b_ih.size() * sizeof(float));
+}
+
+// Allocate and fill the per-layer [w_ih | w_hh] stacks on the active backend.
+// Returns false (leaving concat disabled) when any layer is ineligible.
+bool build_lstm_input_concat(TdtRuntimeWeights & W) {
+    const int H = W.H_pred;
+    for (int l = 0; l < W.L; ++l) {
+        if (!lstm_layer_concatenable(W.weights->lstm[l], H)) return false;
+    }
+
+    ggml_init_params p = {};
+    p.mem_size   = ggml_tensor_overhead() * (size_t) (2 * W.L + 2);
+    p.mem_buffer = nullptr;
+    p.no_alloc   = true;
+    W.lstm_cat_ctx = ggml_init(p);
+    if (!W.lstm_cat_ctx) return false;
+
+    W.lstm_cat.resize(W.L);
+    for (int l = 0; l < W.L; ++l) {
+        const TdtLstmLayer & src = W.weights->lstm[l];
+        W.lstm_cat[l].w = ggml_new_tensor_2d(W.lstm_cat_ctx, src.w_ih->type, 2 * H, 4 * H);
+        W.lstm_cat[l].b = ggml_new_tensor_1d(W.lstm_cat_ctx, GGML_TYPE_F32, 4 * H);
+        const std::string base = "tdt.lstm_cat." + std::to_string(l);
+        ggml_set_name(W.lstm_cat[l].w, (base + ".w").c_str());
+        ggml_set_name(W.lstm_cat[l].b, (base + ".b").c_str());
+    }
+
+    W.lstm_cat_buffer = ggml_backend_alloc_ctx_tensors(W.lstm_cat_ctx, W.backend);
+    if (!W.lstm_cat_buffer) return false;
+
+    for (int l = 0; l < W.L; ++l) {
+        upload_lstm_cat_weight(W.lstm_cat[l].w, W.weights->lstm[l]);
+        upload_lstm_cat_bias  (W.lstm_cat[l].b, W.weights->lstm[l]);
+    }
+    return true;
+}
+
+// Offsets into the packed [h | c] state row of layer `l`.
+size_t state_row_offset(int H, int l)   { return (size_t) l * 2 * H * sizeof(float); }
+size_t state_c_offset  (int H, int l)   { return state_row_offset(H, l) + (size_t) H * sizeof(float); }
+
 // Append the LSTM body to `gctx` and return:
-//   - cpy nodes that write the freshly computed h, c into rt.h_persist /
-//     rt.c_persist in place, and
-//   - the cpy node aliasing rt.pred_persist (last-layer h_new).
+//   - cpy nodes that write the freshly computed state into rt.hc_persist in
+//     place, and
+//   - the last layer's h write, which the joint reads as the fresh pred.
 //
 // `token_in` must be an i32[1] input tensor in `gctx`. The graph builder
 // is shared between the init-only `g_lstm` graph and the fused
 // `g_lstm_joint` graph so they stay numerically identical.
 struct LstmBodyOuts {
     ggml_tensor * pred_cpy;
-    // ALL layers' h/c state-write cpy nodes. Every one must be marked as a graph
+    // ALL layers' state-write cpy nodes. Every one must be marked as a graph
     // output and forward-expanded, otherwise ggml_build_forward_expand prunes the
     // writes for layers whose result no downstream node reads (i.e. every layer
-    // except the last): those layers' h_persist/c_persist never update on the
+    // except the last): those layers' hc_persist rows never update on the
     // device path and the predictor loses its recurrence -> dropped word-final
     // subwords. The host path loops all layers, which is why it stays correct.
     std::vector<ggml_tensor *> state_cpy;
 };
 
-LstmBodyOuts build_lstm_body(TdtRuntimeWeights & rt,
-                             ggml_context * gctx,
-                             ggml_tensor * token_in) {
+// gates = w_ih @ x + b_ih + b_hh + w_hh @ h_prev   ->  [4H]
+ggml_tensor * build_lstm_gates_split(ggml_context * gctx,
+                                     const TdtLstmLayer & w,
+                                     ggml_tensor * x,
+                                     ggml_tensor * h_l_in) {
+    ggml_tensor * gates = ggml_mul_mat(gctx, w.w_ih, x);
+    gates = ggml_add(gctx, gates, w.b_ih);
+    gates = ggml_add(gctx, gates, w.b_hh);
+    return ggml_add(gctx, gates, ggml_mul_mat(gctx, w.w_hh, h_l_in));
+}
+
+// Same gates from one GEMV over the load-time [w_ih | w_hh] stack and the
+// pre-summed bias. Cuts three nodes per layer; float summation order differs
+// from build_lstm_gates_split, so it is not bit-exact with it.
+ggml_tensor * build_lstm_gates_concat(ggml_context * gctx,
+                                      const TdtLstmCatWeights & w,
+                                      ggml_tensor * x,
+                                      ggml_tensor * h_l_in) {
+    ggml_tensor * xh = ggml_concat(gctx, x, h_l_in, 0);
+    return ggml_add(gctx, ggml_mul_mat(gctx, w.w, xh), w.b);
+}
+
+// One ggml_cpy per layer: ggml_lstm_cell already returns [h | c], which is
+// exactly the packed state row.
+std::vector<ggml_tensor *> write_back_fused_state(ggml_context * gctx,
+                                                  ggml_tensor * hc_persist,
+                                                  const std::vector<ggml_tensor *> & hc_per_layer,
+                                                  int H) {
+    std::vector<ggml_tensor *> cpy;
+    for (size_t l = 0; l < hc_per_layer.size(); ++l) {
+        ggml_tensor * dst = ggml_view_1d(gctx, hc_persist, 2 * H, state_row_offset(H, (int) l));
+        cpy.push_back(ggml_cpy(gctx, hc_per_layer[l], dst));
+    }
+    return cpy;
+}
+
+// Decomposed path: h and c land in the two halves of the layer's state row.
+std::vector<ggml_tensor *> write_back_split_state(ggml_context * gctx,
+                                                  ggml_tensor * hc_persist,
+                                                  const std::vector<ggml_tensor *> & h_per_layer,
+                                                  const std::vector<ggml_tensor *> & c_per_layer,
+                                                  int H) {
+    std::vector<ggml_tensor *> cpy;
+    for (size_t l = 0; l < h_per_layer.size(); ++l) {
+        ggml_tensor * h_dst = ggml_view_1d(gctx, hc_persist, H, state_row_offset(H, (int) l));
+        ggml_tensor * c_dst = ggml_view_1d(gctx, hc_persist, H, state_c_offset(H, (int) l));
+        cpy.push_back(ggml_cpy(gctx, h_per_layer[l], h_dst));
+        cpy.push_back(ggml_cpy(gctx, c_per_layer[l], c_dst));
+    }
+    return cpy;
+}
+
+// Previous h and c for each layer, kept as separate [H] tensors so the LSTM
+// body reads them the same way whether they live in hc_persist or in the
+// packed rows an unrolled step produced.
+struct LstmStateRows {
+    std::vector<ggml_tensor *> h;
+    std::vector<ggml_tensor *> c;
+};
+
+// Fresh per-layer state from one LSTM pass: the fused cell already returns the
+// packed [h | c] row, the decomposed path returns the halves separately.
+struct LstmCellOuts {
+    std::vector<ggml_tensor *> hc;
+    std::vector<ggml_tensor *> h;
+    std::vector<ggml_tensor *> c;
+};
+
+// Per-step select for the fused cell: a layer keeps rows[l] when `update` is
+// zero, so the state update needs no blend afterwards.
+struct LstmCellMask {
+    const std::vector<ggml_tensor *> * rows = nullptr;
+    ggml_tensor * update = nullptr;
+};
+
+LstmStateRows persist_state_rows(ggml_context * gctx, ggml_tensor * hc_persist, int H, int L) {
+    LstmStateRows rows;
+    for (int l = 0; l < L; ++l) {
+        rows.h.push_back(ggml_view_1d(gctx, hc_persist, H, state_row_offset(H, l)));
+        rows.c.push_back(ggml_view_1d(gctx, hc_persist, H, state_c_offset(H, l)));
+    }
+    return rows;
+}
+
+// Same split, over packed [2H] rows that are graph tensors rather than views
+// of the persistent buffer.
+LstmStateRows packed_state_rows(ggml_context * gctx,
+                                const std::vector<ggml_tensor *> & packed, int H) {
+    LstmStateRows rows;
+    for (ggml_tensor * row : packed) {
+        rows.h.push_back(ggml_view_1d(gctx, row, H, 0));
+        rows.c.push_back(ggml_view_1d(gctx, row, H, (size_t) H * sizeof(float)));
+    }
+    return rows;
+}
+
+LstmCellOuts build_lstm_cells(TdtRuntimeWeights & rt,
+                              ggml_context * gctx,
+                              ggml_tensor * token_in,
+                              const LstmStateRows & prev,
+                              const LstmCellMask & mask = {}) {
     const int H = rt.H_pred;
     const int L = rt.L;
 
@@ -230,20 +404,25 @@ LstmBodyOuts build_lstm_body(TdtRuntimeWeights & rt,
     ggml_tensor * x = ggml_get_rows(gctx, rt.weights->predict_embed, token_in);
     x = ggml_reshape_1d(gctx, x, H);
 
-    std::vector<ggml_tensor *> h_new_per_layer(L);
-    std::vector<ggml_tensor *> c_new_per_layer(L);
+    LstmCellOuts outs;
 
     for (int l = 0; l < L; ++l) {
         const auto & w = rt.weights->lstm[l];
-        ggml_tensor * h_l_in = ggml_view_1d(gctx, rt.h_persist, H, (size_t) l * H * sizeof(float));
-        ggml_tensor * c_l_in = ggml_view_1d(gctx, rt.c_persist, H, (size_t) l * H * sizeof(float));
+        ggml_tensor * h_l_in = prev.h[l];
+        ggml_tensor * c_l_in = prev.c[l];
 
-        // gates = w_ih @ x + b_ih + b_hh + w_hh @ h_prev   ->  [4H]
-        ggml_tensor * gates = ggml_mul_mat(gctx, w.w_ih, x);
-        gates = ggml_add(gctx, gates, w.b_ih);
-        gates = ggml_add(gctx, gates, w.b_hh);
-        ggml_tensor * gates_h = ggml_mul_mat(gctx, w.w_hh, h_l_in);
-        gates = ggml_add(gctx, gates, gates_h);
+        ggml_tensor * gates = rt.concat_lstm_input
+                                ? build_lstm_gates_concat(gctx, rt.lstm_cat[l], x, h_l_in)
+                                : build_lstm_gates_split(gctx, w, x, h_l_in);
+
+        if (rt.fused_lstm_cell) {
+            ggml_tensor * hc = mask.update
+                                 ? ggml_lstm_cell_masked(gctx, gates, (*mask.rows)[l], mask.update)
+                                 : ggml_lstm_cell(gctx, gates, c_l_in);
+            outs.hc.push_back(hc);
+            x = ggml_view_1d(gctx, hc, H, 0);
+            continue;
+        }
 
         const size_t H_bytes = (size_t) H * sizeof(float);
         ggml_tensor * i_part = ggml_view_1d(gctx, gates, H, 0 * H_bytes);
@@ -268,21 +447,34 @@ LstmBodyOuts build_lstm_body(TdtRuntimeWeights & rt,
         h_new = ggml_cont(gctx, h_new);
         c_new = ggml_cont(gctx, c_new);
 
-        h_new_per_layer[l] = h_new;
-        c_new_per_layer[l] = c_new;
+        outs.h.push_back(h_new);
+        outs.c.push_back(c_new);
 
         // Next layer feeds on this layer's hidden output.
         x = h_new;
     }
 
+    return outs;
+}
+
+LstmBodyOuts build_lstm_body(TdtRuntimeWeights & rt,
+                             ggml_context * gctx,
+                             ggml_tensor * token_in) {
+    const int H = rt.H_pred;
+
+    LstmCellOuts cells = build_lstm_cells(rt, gctx, token_in,
+                                          persist_state_rows(gctx, rt.hc_persist, H, rt.L));
+
     LstmBodyOuts out{};
-    for (int l = 0; l < L; ++l) {
-        ggml_tensor * h_dst = ggml_view_1d(gctx, rt.h_persist, H, (size_t) l * H * sizeof(float));
-        ggml_tensor * c_dst = ggml_view_1d(gctx, rt.c_persist, H, (size_t) l * H * sizeof(float));
-        out.state_cpy.push_back(ggml_cpy(gctx, h_new_per_layer[l], h_dst));
-        out.state_cpy.push_back(ggml_cpy(gctx, c_new_per_layer[l], c_dst));
-    }
-    out.pred_cpy = ggml_cpy(gctx, h_new_per_layer[L - 1], rt.pred_persist);
+    out.state_cpy = rt.fused_lstm_cell
+                      ? write_back_fused_state(gctx, rt.hc_persist, cells.hc, H)
+                      : write_back_split_state(gctx, rt.hc_persist, cells.h, cells.c, H);
+    // The joint must read pred through the write-back node, not through
+    // rt.pred_persist, so gallocr orders the LSTM update before the joint
+    // mat_muls inside one compute_graph.
+    out.pred_cpy = rt.fused_lstm_cell
+                     ? ggml_view_1d(gctx, out.state_cpy.back(), H, 0)
+                     : out.state_cpy[out.state_cpy.size() - 2];
     return out;
 }
 
@@ -334,13 +526,8 @@ TransducerGraphOutputs build_joint_body(TdtRuntimeWeights & rt,
                                             (size_t) 0);
     tok_logits = ggml_cont(gctx, tok_logits);
 
-    TransducerGraphOutputs argmax_outputs =
-        build_transducer_argmax_outputs(gctx, logits, V_p1, D_n);
-    rt.argmax_on_gpu =
-        ggml_backend_supports_op(rt.backend, argmax_outputs.token);
-
     if (rt.argmax_on_gpu) {
-        return argmax_outputs;
+        return build_transducer_argmax_outputs(gctx, logits, V_p1, D_n);
     }
 
     TransducerGraphOutputs outs;
@@ -366,22 +553,14 @@ void build_lstm_graph(TdtRuntimeWeights & rt) {
 
     LstmBodyOuts outs = build_lstm_body(rt, gctx, rt.lstm_token_in);
     rt.lstm_pred_out = outs.pred_cpy;
-    // state_cpy is the single source of truth for the state write-backs; its last
-    // two entries are the final layer's h,c writes, kept here only for debug names.
-    rt.lstm_h_out    = outs.state_cpy[outs.state_cpy.size() - 2];
-    rt.lstm_c_out    = outs.state_cpy.back();
-    ggml_set_name(rt.lstm_h_out,    "lstm.h_out");
-    ggml_set_name(rt.lstm_c_out,    "lstm.c_out");
     ggml_set_name(rt.lstm_pred_out, "lstm.pred_out");
-    ggml_set_output(rt.lstm_pred_out);
-    // Mark EVERY layer's h/c state write as an output (not just the last), else
+    // Mark EVERY layer's state write as an output (not just the last), else
     // forward_expand prunes the non-last layers' writes and their state never
     // advances. See LstmBodyOuts::state_cpy.
     for (ggml_tensor * n : outs.state_cpy) ggml_set_output(n);
 
     rt.g_lstm = ggml_new_graph_custom(gctx, /*size*/ 256, /*grads*/ false);
     for (ggml_tensor * n : outs.state_cpy) ggml_build_forward_expand(rt.g_lstm, n);
-    ggml_build_forward_expand(rt.g_lstm, rt.lstm_pred_out);
 }
 
 // (2) Joint-only graph. Used after a blank emission, when pred_persist
@@ -451,9 +630,9 @@ void build_lstm_joint_graph(TdtRuntimeWeights & rt) {
         ggml_set_name(rt.lj_dur_out, rt.argmax_on_gpu ? "lstm_joint.dur_argmax" : "lstm_joint.dur_logits");
         ggml_set_output(rt.lj_dur_out);
     }
-    // Mark EVERY layer's h/c state write as an output so gallocr keeps them alive
-    // (their memory IS h_persist / c_persist). Without this, forward_expand prunes
-    // the dead-end intermediate writes for all but the last layer, so those layers'
+    // Mark EVERY layer's state write as an output so gallocr keeps them alive
+    // (their memory IS hc_persist). Without this, forward_expand prunes the
+    // dead-end intermediate writes for all but the last layer, so those layers'
     // recurrent state never advances on the device path -> dropped word-final
     // subwords. See LstmBodyOuts::state_cpy.
     for (ggml_tensor * n : lstm_outs.state_cpy) ggml_set_output(n);
@@ -464,6 +643,220 @@ void build_lstm_joint_graph(TdtRuntimeWeights & rt) {
         ggml_build_forward_expand(rt.g_lstm_joint, rt.lj_dur_out);
     }
     for (ggml_tensor * n : lstm_outs.state_cpy) ggml_build_forward_expand(rt.g_lstm_joint, n);
+}
+
+// ---- (4) unrolled K-step decode graph ----
+//
+// Every greedy step is joint -> (token, duration) argmax -> LSTM over the
+// emitted token -> ggml_tdt_step control -> masked state update. Chaining K of
+// them in one graph replaces K command-buffer commits and K host readbacks with
+// one of each; steps that fall past the window, and steps that decoded a blank,
+// carry a zero update mask and leave the state as it was. The path needs the
+// fused LSTM cell: its masked form is what keeps a held step bit-exact.
+
+// Tensor-slot allowances per unrolled step, several times what each part
+// builds: the joint body (two GEMVs, biases, relu, views, argmax), one fused
+// LSTM layer (GEMV, gates, cell, views, state copy) and the control op with
+// its views, casts and pair writes.
+constexpr size_t k_unroll_slots_joint     = 64;
+constexpr size_t k_unroll_slots_per_layer = 48;
+constexpr size_t k_unroll_slots_control   = 32;
+constexpr size_t k_unroll_slots_base      = 64;
+
+size_t unroll_slots_per_step(int L) {
+    return k_unroll_slots_joint + k_unroll_slots_per_layer * (size_t) L + k_unroll_slots_control;
+}
+
+ggml_tensor * step_out_view(ggml_context * ctx, ggml_tensor * ctl, int slot) {
+    return ggml_view_1d(ctx, ctl, 1, (size_t) slot * sizeof(float));
+}
+
+// hc_persist's rows as packed [2H] tensors: the state the first step reads.
+std::vector<ggml_tensor *> persist_packed_rows(ggml_context * ctx, ggml_tensor * hc_persist,
+                                               int H, int L) {
+    std::vector<ggml_tensor *> rows;
+    for (int l = 0; l < L; ++l) {
+        rows.push_back(ggml_view_1d(ctx, hc_persist, 2 * H, state_row_offset(H, l)));
+    }
+    return rows;
+}
+
+std::vector<ggml_tensor *> write_back_packed_rows(ggml_context * ctx, ggml_tensor * hc_persist,
+                                                  const std::vector<ggml_tensor *> & rows, int H) {
+    std::vector<ggml_tensor *> cpy;
+    for (size_t l = 0; l < rows.size(); ++l) {
+        ggml_tensor * dst = ggml_view_1d(ctx, hc_persist, 2 * H, state_row_offset(H, (int) l));
+        cpy.push_back(ggml_cpy(ctx, rows[l], dst));
+    }
+    return cpy;
+}
+
+struct UnrollStepOuts {
+    ggml_tensor * token         = nullptr;
+    ggml_tensor * duration      = nullptr;
+    ggml_tensor * counters_next = nullptr;  // f32[GGML_TDT_STEP_N_INS]
+    ggml_tensor * frame_next    = nullptr;  // i32[1]
+    std::vector<ggml_tensor *> state;       // packed [2H] per layer
+};
+
+UnrollStepOuts build_unroll_step(TdtRuntimeWeights & rt, ggml_context * ctx,
+                                 const std::vector<ggml_tensor *> & state_in,
+                                 ggml_tensor * counters_in,
+                                 ggml_tensor * frame_idx_in,
+                                 int blank_id, int max_symbols) {
+    const int H = rt.H_pred;
+
+    UnrollStepOuts out;
+    ggml_tensor * pred = ggml_view_1d(ctx, state_in.back(), H, 0);
+    TransducerGraphOutputs joint = build_joint_body(rt, ctx, pred, frame_idx_in);
+    out.token    = joint.token;
+    out.duration = joint.duration;
+
+    ggml_tensor * ctl = ggml_tdt_step(ctx, out.token,
+                                      out.duration ? out.duration : rt.zero_dur_idx,
+                                      counters_in, rt.dur_table,
+                                      blank_id, max_symbols, rt.rnnt_mode ? 1 : 0);
+
+    // The masked cell selects held vs fresh inside the kernel, so the packed
+    // [h | c] rows it returns are the next state as is.
+    LstmCellMask mask;
+    mask.rows   = &state_in;
+    mask.update = step_out_view(ctx, ctl, GGML_TDT_STEP_OUT_UPDATE);
+    LstmCellOuts cells = build_lstm_cells(rt, ctx, out.token,
+                                          packed_state_rows(ctx, state_in, H), mask);
+
+    out.state         = cells.hc;
+    out.counters_next = ggml_view_1d(ctx, ctl, GGML_TDT_STEP_N_INS, 0);
+    out.frame_next    = ggml_cast(ctx, step_out_view(ctx, ctl, GGML_TDT_STEP_OUT_FRAME),
+                                  GGML_TYPE_I32);
+    return out;
+}
+
+void free_unroll_graph(TdtRuntimeWeights & rt) {
+    if (rt.alloc_unroll) { ggml_gallocr_free(rt.alloc_unroll); rt.alloc_unroll = nullptr; }
+    if (rt.unroll_ctx)   { ggml_free(rt.unroll_ctx);           rt.unroll_ctx   = nullptr; }
+    rt.g_unroll        = nullptr;
+    rt.un_counters_in  = nullptr;
+    rt.un_out          = nullptr;
+    rt.unroll_blank_id    = -1;
+    rt.unroll_max_symbols = 0;
+}
+
+bool graph_runs_on_backend(ggml_backend_t backend, ggml_cgraph * cg) {
+    for (int i = 0; i < ggml_graph_n_nodes(cg); ++i) {
+        if (!ggml_backend_supports_op(backend, ggml_graph_node(cg, i))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Slots per step in un_out: the token, then the duration index.
+constexpr int k_unroll_pair_slots = 2;
+
+// Copy one step's (token, duration index) into its two slots of un_out, so the
+// host reads every pair of the launch back with a single transfer.
+std::vector<ggml_tensor *> write_unroll_pair(ggml_context * ctx, ggml_tensor * out, int k,
+                                             ggml_tensor * token, ggml_tensor * dur_idx) {
+    const size_t base = (size_t) k * k_unroll_pair_slots * sizeof(int32_t);
+    return { ggml_cpy(ctx, token,   ggml_view_1d(ctx, out, 1, base)),
+             ggml_cpy(ctx, dur_idx, ggml_view_1d(ctx, out, 1, base + sizeof(int32_t))) };
+}
+
+// Chain K steps, writing the pair each one decoded into un_out, and return the
+// per-layer state rows the last step left. The first frame index is derived
+// from the uploaded counters on the device, so a launch uploads one tensor.
+std::vector<ggml_tensor *> chain_unroll_steps(TdtRuntimeWeights & rt, ggml_context * ctx,
+                                              int K, int blank_id, int max_symbols,
+                                              std::vector<ggml_tensor *> & pair_writes) {
+    std::vector<ggml_tensor *> state = persist_packed_rows(ctx, rt.hc_persist, rt.H_pred, rt.L);
+    ggml_tensor * counters = rt.un_counters_in;
+    ggml_tensor * frame    = ggml_cast(ctx, step_out_view(ctx, counters, GGML_TDT_STEP_IN_T),
+                                       GGML_TYPE_I32);
+
+    for (int k = 0; k < K; ++k) {
+        UnrollStepOuts step = build_unroll_step(rt, ctx, state, counters, frame,
+                                                blank_id, max_symbols);
+        for (ggml_tensor * w : write_unroll_pair(ctx, rt.un_out, k, step.token,
+                                                 step.duration ? step.duration : rt.zero_dur_idx)) {
+            pair_writes.push_back(w);
+        }
+        state    = std::move(step.state);
+        counters = step.counters_next;
+        frame    = step.frame_next;
+    }
+    return state;
+}
+
+void expand_unroll_outputs(TdtRuntimeWeights & rt,
+                           const std::vector<ggml_tensor *> & pair_writes,
+                           const std::vector<ggml_tensor *> & state_writes) {
+    for (ggml_tensor * n : pair_writes)  ggml_build_forward_expand(rt.g_unroll, n);
+    for (ggml_tensor * n : state_writes) ggml_build_forward_expand(rt.g_unroll, n);
+}
+
+bool build_unroll_graph(TdtRuntimeWeights & rt, int blank_id, int max_symbols) {
+    free_unroll_graph(rt);
+
+    const int K = rt.unroll_steps;
+    const int H = rt.H_pred;
+
+    const size_t slots = unroll_slots_per_step(rt.L) * (size_t) K + k_unroll_slots_base;
+    ggml_init_params p = {};
+    p.mem_size   = ggml_tensor_overhead() * slots + ggml_graph_overhead_custom(slots, false);
+    p.mem_buffer = nullptr;
+    p.no_alloc   = true;
+    rt.unroll_ctx = ggml_init(p);
+    if (!rt.unroll_ctx) return false;
+
+    ggml_context * ctx = rt.unroll_ctx;
+    rt.un_counters_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, GGML_TDT_STEP_N_INS);
+    rt.un_out         = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, k_unroll_pair_slots * K);
+    ggml_set_name(rt.un_counters_in, "unroll.counters_in");
+    ggml_set_name(rt.un_out,         "unroll.out");
+    ggml_set_input(rt.un_counters_in);
+    ggml_set_output(rt.un_out);
+
+    // Single write-back: the intermediate steps keep their state in graph
+    // tensors, so hc_persist is touched once per graph.
+    std::vector<ggml_tensor *> pair_writes;
+    std::vector<ggml_tensor *> state_writes = write_back_packed_rows(
+        ctx, rt.hc_persist, chain_unroll_steps(rt, ctx, K, blank_id, max_symbols, pair_writes), H);
+    for (ggml_tensor * n : pair_writes)  ggml_set_output(n);
+    for (ggml_tensor * n : state_writes) ggml_set_output(n);
+
+    rt.g_unroll = ggml_new_graph_custom(ctx, slots, /*grads*/ false);
+    expand_unroll_outputs(rt, pair_writes, state_writes);
+
+    if (!graph_runs_on_backend(rt.backend, rt.g_unroll)) {
+        free_unroll_graph(rt);
+        return false;
+    }
+
+    rt.alloc_unroll = ggml_gallocr_new(ggml_backend_get_default_buffer_type(rt.backend));
+    if (!rt.alloc_unroll || !ggml_gallocr_alloc_graph(rt.alloc_unroll, rt.g_unroll)) {
+        free_unroll_graph(rt);
+        return false;
+    }
+
+    rt.unroll_blank_id    = blank_id;
+    rt.unroll_max_symbols = max_symbols;
+    return true;
+}
+
+// Build (or rebuild) the unrolled graph for this decode's blank id and symbol
+// cap. Leaves g_unroll null when the path does not apply, and the sequential
+// per-step loop runs instead.
+void ensure_unroll_graph(TdtRuntimeWeights & rt, int blank_id, int max_symbols) {
+    if (!rt.use_graphs || !rt.fused_lstm_cell || !rt.argmax_on_gpu || rt.unroll_steps < 1 ||
+        !rt.dur_table || !rt.zero_dur_idx || max_symbols < 1) {
+        free_unroll_graph(rt);
+        return;
+    }
+    if (rt.g_unroll && rt.unroll_blank_id == blank_id && rt.unroll_max_symbols == max_symbols) {
+        return;
+    }
+    build_unroll_graph(rt, blank_id, max_symbols);
 }
 
 // Build the full-window encoder-side projection graph for a given frame
@@ -565,7 +958,7 @@ TdtRuntimeWeights::TdtRuntimeWeights(TdtRuntimeWeights && o) noexcept { *this = 
 
 TdtRuntimeWeights & TdtRuntimeWeights::operator=(TdtRuntimeWeights && o) noexcept {
     if (this == &o) return *this;
-    this->~TdtRuntimeWeights();
+    release();
 
     H_pred       = o.H_pred;
     H_joint      = o.H_joint;
@@ -578,6 +971,8 @@ TdtRuntimeWeights & TdtRuntimeWeights::operator=(TdtRuntimeWeights && o) noexcep
     backend      = o.backend;        o.backend = nullptr;
     n_threads    = o.n_threads;
     use_graphs   = o.use_graphs;
+    fused_lstm_cell = o.fused_lstm_cell;
+    argmax_on_gpu   = o.argmax_on_gpu;
     embed        = std::move(o.embed);
     host_lstm    = std::move(o.host_lstm);
     host_joint_enc_w  = std::move(o.host_joint_enc_w);
@@ -586,19 +981,21 @@ TdtRuntimeWeights & TdtRuntimeWeights::operator=(TdtRuntimeWeights && o) noexcep
     host_joint_pred_b = std::move(o.host_joint_pred_b);
     host_joint_out_w  = std::move(o.host_joint_out_w);
     host_joint_out_b  = std::move(o.host_joint_out_b);
+    concat_lstm_input = o.concat_lstm_input;
     gctx         = o.gctx;           o.gctx = nullptr;
+    lstm_cat_ctx    = o.lstm_cat_ctx;    o.lstm_cat_ctx    = nullptr;
+    lstm_cat_buffer = o.lstm_cat_buffer; o.lstm_cat_buffer = nullptr;
+    lstm_cat        = std::move(o.lstm_cat);
+    o.lstm_cat.clear();
     persist_ctx     = o.persist_ctx;     o.persist_ctx = nullptr;
     persist_buffer  = o.persist_buffer;  o.persist_buffer = nullptr;
-    h_persist        = o.h_persist;        o.h_persist = nullptr;
-    c_persist        = o.c_persist;        o.c_persist = nullptr;
+    hc_persist       = o.hc_persist;       o.hc_persist = nullptr;
     pred_persist     = o.pred_persist;     o.pred_persist = nullptr;
     enc_proj_persist = o.enc_proj_persist; o.enc_proj_persist = nullptr;
     enc_proj_T_max   = o.enc_proj_T_max;
     g_lstm       = o.g_lstm;         o.g_lstm = nullptr;
     alloc_lstm   = o.alloc_lstm;     o.alloc_lstm = nullptr;
     lstm_token_in = o.lstm_token_in; o.lstm_token_in = nullptr;
-    lstm_h_out   = o.lstm_h_out;     o.lstm_h_out = nullptr;
-    lstm_c_out   = o.lstm_c_out;     o.lstm_c_out = nullptr;
     lstm_pred_out = o.lstm_pred_out; o.lstm_pred_out = nullptr;
     g_joint      = o.g_joint;        o.g_joint = nullptr;
     alloc_joint  = o.alloc_joint;    o.alloc_joint = nullptr;
@@ -611,16 +1008,36 @@ TdtRuntimeWeights & TdtRuntimeWeights::operator=(TdtRuntimeWeights && o) noexcep
     lj_frame_idx_in = o.lj_frame_idx_in; o.lj_frame_idx_in = nullptr;
     lj_token_out    = o.lj_token_out;    o.lj_token_out = nullptr;
     lj_dur_out      = o.lj_dur_out;      o.lj_dur_out = nullptr;
+    rnnt_mode          = o.rnnt_mode;
+    unroll_steps       = o.unroll_steps;
+    unroll_blank_id    = o.unroll_blank_id;    o.unroll_blank_id    = -1;
+    unroll_max_symbols = o.unroll_max_symbols; o.unroll_max_symbols = 0;
+    dur_table       = o.dur_table;       o.dur_table = nullptr;
+    zero_dur_idx    = o.zero_dur_idx;    o.zero_dur_idx = nullptr;
+    unroll_ctx      = o.unroll_ctx;      o.unroll_ctx = nullptr;
+    g_unroll        = o.g_unroll;        o.g_unroll = nullptr;
+    alloc_unroll    = o.alloc_unroll;    o.alloc_unroll = nullptr;
+    un_counters_in  = o.un_counters_in;  o.un_counters_in = nullptr;
+    un_out          = o.un_out;          o.un_out = nullptr;
     enc_proj_cache = std::move(o.enc_proj_cache);
     o.enc_proj_cache.clear();
     return *this;
 }
 
-TdtRuntimeWeights::~TdtRuntimeWeights() {
+TdtRuntimeWeights::~TdtRuntimeWeights() { release(); }
+
+// Frees every ggml handle and empties the caches; the C++ members stay alive so
+// the object can be assigned into afterwards.
+void TdtRuntimeWeights::release() {
     for (auto & g : enc_proj_cache) {
         free_enc_proj_graph(g);
     }
     enc_proj_cache.clear();
+    lstm_cat.clear();
+    if (lstm_cat_buffer) { ggml_backend_buffer_free(lstm_cat_buffer); lstm_cat_buffer = nullptr; }
+    if (lstm_cat_ctx)    { ggml_free(lstm_cat_ctx);                  lstm_cat_ctx    = nullptr; }
+    if (alloc_unroll) { ggml_gallocr_free(alloc_unroll); alloc_unroll = nullptr; }
+    if (unroll_ctx)   { ggml_free(unroll_ctx);           unroll_ctx   = nullptr; }
     if (alloc_lstm_joint) { ggml_gallocr_free(alloc_lstm_joint); alloc_lstm_joint = nullptr; }
     if (alloc_joint) { ggml_gallocr_free(alloc_joint); alloc_joint = nullptr; }
     if (alloc_lstm)  { ggml_gallocr_free(alloc_lstm);  alloc_lstm  = nullptr; }
@@ -630,7 +1047,54 @@ TdtRuntimeWeights::~TdtRuntimeWeights() {
     // backend is owned by ParakeetCtcModel::Impl; don't free here.
 }
 
-int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
+// Whether the joint's argmax over the token and duration logits runs on the backend.
+bool backend_runs_transducer_argmax(ggml_backend_t backend, int V_out, int V_p1, int D_n) {
+    if (!backend) return false;
+    ggml_init_params ip = { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, V_out, 1);
+    const bool ok = ggml_backend_supports_op(backend, build_transducer_argmax_outputs(ctx, logits, V_p1, D_n).token);
+    ggml_free(ctx);
+    return ok;
+}
+
+bool backend_runs_lstm_cell(ggml_backend_t backend, int H) {
+    if (!backend) return false;
+    ggml_init_params ip = { ggml_tensor_overhead() * 4, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    ggml_tensor * gates = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4 * H);
+    ggml_tensor * c     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+    const bool ok = ggml_backend_supports_op(backend, ggml_lstm_cell(ctx, gates, c));
+    ggml_free(ctx);
+    return ok;
+}
+
+bool backend_runs_concat(ggml_backend_t backend, int H) {
+    if (!backend) return false;
+    ggml_init_params ip = { ggml_tensor_overhead() * 4, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) return false;
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+    ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+    const bool ok = ggml_backend_supports_op(backend, ggml_concat(ctx, a, b, 0));
+    ggml_free(ctx);
+    return ok;
+}
+
+// Frame advance per duration index, exactly as the host applies it: an empty
+// GGUF duration list means the index itself is the advance.
+std::vector<float> build_duration_table(const ParakeetCtcModel & model, int num_durations) {
+    std::vector<float> table((size_t) std::max(1, num_durations));
+    for (size_t i = 0; i < table.size(); ++i) {
+        table[i] = model.tdt_durations.empty() ? (float) i : (float) model.tdt_durations[i];
+    }
+    return table;
+}
+
+int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W,
+                        bool allow_fused_lstm, bool allow_concat_lstm) {
     W = TdtRuntimeWeights{};
 
     const bool is_nemotron =
@@ -660,6 +1124,7 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
             ? model.encoder_cfg.rnnt_pred_rnn_layers
             : model.encoder_cfg.tdt_pred_rnn_layers);
     W.num_durations = is_rnnt ? 0 : model.encoder_cfg.tdt_num_durations;
+    W.rnnt_mode     = is_rnnt;
     W.V_plus_1      = (int) model.vocab_size + 1;
     W.V_out         = W.V_plus_1 + W.num_durations;
 
@@ -700,6 +1165,8 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
     if (W.use_graphs && std::strcmp(backend_reg_name(W.backend), "OpenCL") == 0) {
         W.use_graphs = false;
     }
+    W.fused_lstm_cell = W.use_graphs && allow_fused_lstm && backend_runs_lstm_cell(W.backend, W.H_pred);
+    W.argmax_on_gpu   = W.use_graphs && backend_runs_transducer_argmax(W.backend, W.V_out, W.V_plus_1, W.num_durations);
 
     if (!W.use_graphs) {
         // ---- CPU fallback: dequantise weights to host f32 ----
@@ -747,14 +1214,26 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
         const int L       = W.L;
         const int T_max   = TdtRuntimeWeights::k_enc_proj_T_max;
 
-        W.h_persist        = ggml_new_tensor_2d(W.persist_ctx, GGML_TYPE_F32, H_pred,  L);
-        W.c_persist        = ggml_new_tensor_2d(W.persist_ctx, GGML_TYPE_F32, H_pred,  L);
-        W.pred_persist     = ggml_new_tensor_1d(W.persist_ctx, GGML_TYPE_F32, H_pred);
+        W.hc_persist       = ggml_new_tensor_2d(W.persist_ctx, GGML_TYPE_F32, 2 * H_pred, L);
+        // Pred is the last layer's h, so it is a view rather than its own tensor:
+        // the LSTM write-back updates it for free.
+        W.pred_persist     = ggml_view_1d(W.persist_ctx, W.hc_persist, H_pred,
+                                          (size_t) (L - 1) * 2 * H_pred * sizeof(float));
         W.enc_proj_persist = ggml_new_tensor_2d(W.persist_ctx, GGML_TYPE_F32, H_joint, T_max);
-        ggml_set_name(W.h_persist,        "tdt.h_persist");
-        ggml_set_name(W.c_persist,        "tdt.c_persist");
+        ggml_set_name(W.hc_persist,       "tdt.hc_persist");
         ggml_set_name(W.pred_persist,     "tdt.pred_persist");
         ggml_set_name(W.enc_proj_persist, "tdt.enc_proj_persist");
+
+        // Control-op inputs. Left null when the GGUF duration list is shorter
+        // than the duration head, which keeps the unrolled decode graph off.
+        if (model.tdt_durations.empty() ||
+            (int) model.tdt_durations.size() >= W.num_durations) {
+            W.dur_table    = ggml_new_tensor_1d(W.persist_ctx, GGML_TYPE_F32,
+                                                std::max(1, W.num_durations));
+            W.zero_dur_idx = ggml_new_tensor_1d(W.persist_ctx, GGML_TYPE_I32, 1);
+            ggml_set_name(W.dur_table,    "tdt.dur_table");
+            ggml_set_name(W.zero_dur_idx, "tdt.zero_dur_idx");
+        }
 
         W.persist_buffer = ggml_backend_alloc_ctx_tensors(W.persist_ctx, W.backend);
         if (!W.persist_buffer) {
@@ -762,6 +1241,13 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
             return 4;
         }
         W.enc_proj_T_max = T_max;
+
+        if (W.dur_table) {
+            const std::vector<float> table = build_duration_table(model, W.num_durations);
+            const int32_t zero = 0;
+            ggml_backend_tensor_set(W.dur_table, table.data(), 0, table.size() * sizeof(float));
+            ggml_backend_tensor_set(W.zero_dur_idx, &zero, 0, sizeof(int32_t));
+        }
     }
 
     const size_t graph_slots = 2048;
@@ -777,6 +1263,11 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
         std::fprintf(stderr, "tdt_prepare_runtime: ggml_init failed\n");
         return 5;
     }
+
+    W.concat_lstm_input = allow_concat_lstm &&
+                          backend_runs_concat(W.backend, W.H_pred) &&
+                          build_lstm_input_concat(W);
+    if (!W.concat_lstm_input) W.lstm_cat.clear();
 
     build_lstm_graph(W);
     build_joint_graph(W);
@@ -797,6 +1288,11 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
     }
 
     return 0;
+}
+
+void tdt_set_unroll_steps(TdtRuntimeWeights & W, int steps) {
+    W.unroll_steps = steps;
+    free_unroll_graph(W);
 }
 
 namespace {
@@ -913,6 +1409,93 @@ bool run_enc_proj(TdtRuntimeWeights & rt,
     return true;
 }
 
+// Read the (token, duration index) pairs of the launch back in one transfer.
+void read_unroll_outputs(TdtRuntimeWeights & rt,
+                         std::vector<int32_t> & toks,
+                         std::vector<int32_t> & durs) {
+    const size_t K = (size_t) ggml_nelements(rt.un_out) / k_unroll_pair_slots;
+    std::vector<int32_t> pairs(K * k_unroll_pair_slots);
+    ggml_backend_tensor_get(rt.un_out, pairs.data(), 0, pairs.size() * sizeof(int32_t));
+    toks.resize(K);
+    durs.resize(K);
+    for (size_t k = 0; k < K; ++k) {
+        toks[k] = pairs[k * k_unroll_pair_slots];
+        durs[k] = pairs[k * k_unroll_pair_slots + 1];
+    }
+}
+
+// One launch of the unrolled graph from the current loop counters.
+bool run_unroll_graph(TdtRuntimeWeights & rt, int t, int symbols, int n_frames,
+                      std::vector<int32_t> & toks, std::vector<int32_t> & durs) {
+    float counters[GGML_TDT_STEP_N_INS];
+    counters[GGML_TDT_STEP_IN_T] = (float) t;
+    counters[GGML_TDT_STEP_IN_S] = (float) symbols;
+    counters[GGML_TDT_STEP_IN_N] = (float) n_frames;
+
+    ggml_backend_tensor_set(rt.un_counters_in, counters, 0, sizeof(counters));
+
+    if (!compute_graph(rt, rt.g_unroll)) {
+        std::fprintf(stderr, "tdt: unrolled decode graph compute failed\n");
+        return false;
+    }
+    read_unroll_outputs(rt, toks, durs);
+    return true;
+}
+
+// Replay on the host the integer rules the control op applied on the device,
+// emitting tokens and advancing the window cursor. Stops at the first step past
+// the window: the device masked those steps into no-ops, so the state it leaves
+// behind is the state after the last replayed step. Returns the steps taken.
+int replay_unroll_steps(const ParakeetCtcModel & model, const TdtDecodeOptions & opts,
+                        const std::vector<int32_t> & toks, const std::vector<int32_t> & durs,
+                        int n_frames, TdtDecodeState & state, int & t,
+                        std::vector<int32_t> & out_tokens) {
+    const bool is_rnnt = model.model_type == ParakeetModelType::RNNT;
+    const int  blank   = (int) model.blank_id;
+
+    int steps = 0;
+    for (size_t k = 0; k < toks.size() && t < n_frames; ++k) {
+        ++steps;
+        const int best_dur = is_rnnt
+                               ? 0
+                               : (model.tdt_durations.empty()
+                                    ? durs[k]
+                                    : model.tdt_durations[durs[k]]);
+
+        if (toks[k] == blank) {
+            t += is_rnnt ? 1 : std::max(1, best_dur);
+            state.symbols_this_step = 0;
+            continue;
+        }
+
+        out_tokens.push_back(toks[k]);
+        ++state.symbols_this_step;
+        const bool force_advance =
+            state.symbols_this_step >= opts.max_symbols_per_step;
+        if ((!is_rnnt && best_dur > 0) || force_advance) {
+            t += is_rnnt ? 1 : std::max(1, best_dur);
+            state.symbols_this_step = 0;
+        }
+    }
+    return steps;
+}
+
+// Decode the window K steps per graph: launch from the current counters, then
+// replay what came back.
+int decode_window_unrolled(const ParakeetCtcModel & model, TdtRuntimeWeights & W,
+                           const TdtDecodeOptions & opts, int n_frames,
+                           TdtDecodeState & state, int & t,
+                           std::vector<int32_t> & out_tokens, int & out_steps) {
+    std::vector<int32_t> toks;
+    std::vector<int32_t> durs;
+    while (t < n_frames) {
+        if (!run_unroll_graph(W, t, state.symbols_this_step, n_frames, toks, durs)) return 7;
+        out_steps += replay_unroll_steps(model, opts, toks, durs, n_frames,
+                                         state, t, out_tokens);
+    }
+    return 0;
+}
+
 }  // anonymous namespace
 
 void tdt_init_state(TdtRuntimeWeights & W, int blank_id, TdtDecodeState & state) {
@@ -923,7 +1506,7 @@ void tdt_init_state(TdtRuntimeWeights & W, int blank_id, TdtDecodeState & state)
     state.carry_frames      = 0;
 
     if (W.use_graphs) {
-        // Zero h, c on-device (~5 KB memset), then run one blank-token
+        // Zero the LSTM state on-device (~10 KB memset), then run one blank-token
         // LSTM step so pred_persist holds the canonical "no tokens yet"
         // prediction (matches NeMo's RNNT_TDT init).
         //
@@ -937,12 +1520,9 @@ void tdt_init_state(TdtRuntimeWeights & W, int blank_id, TdtDecodeState & state)
         // tdt_decode_window call (~5 KB upload) and only paid when the
         // backend doesn't accelerate the memset path -- negligible vs
         // the ~150 us-per-step Metal command-buffer cost.
-        const size_t h_bytes = ggml_nbytes(W.h_persist);
-        const size_t c_bytes = ggml_nbytes(W.c_persist);
-        std::vector<uint8_t> zeros;
-        zeros.assign(std::max(h_bytes, c_bytes), 0);
-        ggml_backend_tensor_set(W.h_persist, zeros.data(), 0, h_bytes);
-        ggml_backend_tensor_set(W.c_persist, zeros.data(), 0, c_bytes);
+        const size_t hc_bytes = ggml_nbytes(W.hc_persist);
+        std::vector<uint8_t> zeros(hc_bytes, 0);
+        ggml_backend_tensor_set(W.hc_persist, zeros.data(), 0, hc_bytes);
         if (!run_lstm_init_step(W, blank_id)) {
             throw std::runtime_error("tdt_init_state: LSTM graph compute failed");
         }
@@ -1003,6 +1583,7 @@ int tdt_decode_window(const ParakeetCtcModel & model,
     // per-step gemv inside host_joint_step (better cache locality).
     if (W.use_graphs) {
         if (!run_enc_proj(W, encoder_out_window, n_frames)) return 6;
+        ensure_unroll_graph(W, blank, opts.max_symbols_per_step);
     }
 
     std::vector<float> logits((size_t) V_out);
@@ -1015,6 +1596,20 @@ int tdt_decode_window(const ParakeetCtcModel & model,
     if (!is_rnnt && state.carry_frames > 0) {
         t = std::min(state.carry_frames, n_frames);
         state.carry_frames -= t;
+    }
+
+    // K greedy steps per graph. Exact by construction: the control op applies
+    // the same integer rules the replay below applies, and masked steps leave
+    // the predictor state untouched, so the token stream matches the sequential
+    // loop.
+    if (W.use_graphs && W.g_unroll) {
+        if (int rc = decode_window_unrolled(model, W, opts, n_frames, state, t,
+                                            out_tokens, out_steps);
+            rc != 0) {
+            return rc;
+        }
+        state.carry_frames = is_rnnt ? 0 : std::max(0, t - n_frames);
+        return 0;
     }
 
     // After a non-blank emission the next iteration runs the fused LSTM+joint

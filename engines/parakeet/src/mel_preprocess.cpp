@@ -9,6 +9,9 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <exception>
+#include <thread>
+#include <utility>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -206,6 +209,89 @@ void rfft_power_radix2(const float * __restrict x_real,
     }
 }
 
+// Frames are independent, so the FFT and filterbank loops fan out over a few
+// short-lived threads that join before the encoder starts. Capped so a many-core
+// host does not burn cores on ~5 us frames; small inputs stay single-threaded.
+constexpr int k_mel_max_threads      = 8;
+constexpr int k_mel_frames_per_thread = 256;
+
+int mel_thread_count(int n_frames, int requested) {
+    if (requested > 0) return requested;
+    const int by_work = n_frames / k_mel_frames_per_thread;
+    const int by_hw   = (int) std::thread::hardware_concurrency();
+    return std::max(1, std::min({k_mel_max_threads, by_work, by_hw}));
+}
+
+// Joins every started worker on scope exit, so a throw anywhere never destroys
+// a joinable thread.
+struct JoinedThreads {
+    explicit JoinedThreads(int n) { threads.reserve((size_t) n); }
+    ~JoinedThreads() { for (std::thread & t : threads) t.join(); }
+    template <typename F> void start(F && f) { threads.emplace_back(std::forward<F>(f)); }
+    std::vector<std::thread> threads;
+};
+
+// fn(t0, t1) handles frames [t0, t1); the calling thread takes the last range.
+// A worker's exception is carried back and rethrown on the calling thread.
+template <typename Fn>
+void parallel_over_frames(int n_frames, int requested_threads, Fn && fn) {
+    const int n_threads = mel_thread_count(n_frames, requested_threads);
+    if (n_threads == 1) { fn(0, n_frames); return; }
+    const int per = (n_frames + n_threads - 1) / n_threads;
+    std::vector<std::exception_ptr> errors((size_t) n_threads);
+    {
+        JoinedThreads workers(n_threads - 1);
+        for (int i = 0; i < n_threads - 1; ++i) {
+            workers.start([&fn, &errors, i, t0 = i * per, t1 = std::min(n_frames, (i + 1) * per)] {
+                try { fn(t0, t1); } catch (...) { errors[(size_t) i] = std::current_exception(); }
+            });
+        }
+        try {
+            fn(std::min(n_frames, (n_threads - 1) * per), n_frames);
+        } catch (...) {
+            errors[(size_t) n_threads - 1] = std::current_exception();
+        }
+    }
+    for (const std::exception_ptr & e : errors) {
+        if (e) std::rethrow_exception(e);
+    }
+}
+
+// Window + real FFT for frames [t0, t1) with this thread's own scratch.
+void power_spectrum_rows(int t0, int t1, int n_fft, int hop, int n_bins,
+                         const float * __restrict x_padded, const float * __restrict window_padded,
+                         float * __restrict power_data) {
+    std::vector<float>               windowed((size_t) n_fft);
+    std::vector<std::complex<float>> tbuf((size_t) n_fft / 2);
+    float               * __restrict windowed_data = windowed.data();
+    std::complex<float> * __restrict tbuf_data     = tbuf.data();
+    for (int t = t0; t < t1; ++t) {
+        const int start = t * hop;
+        for (int i = 0; i < n_fft; ++i) {
+            windowed_data[i] = x_padded[start + i] * window_padded[i];
+        }
+        rfft_power_radix2(windowed_data, power_data + (size_t) t * n_bins, n_fft, tbuf_data);
+    }
+}
+
+// Mel filterbank projection for frames [t0, t1): out[t,m] = sum_k fb[m,k] * power[t,k].
+// The inner loop is left exactly as the serial version so the reduction order is unchanged.
+void filterbank_rows(int t0, int t1, int n_bins, int n_mels,
+                     const float * __restrict fb, const float * __restrict power_data,
+                     float * __restrict mel_data) {
+    for (int t = t0; t < t1; ++t) {
+        const float * __restrict frame_power = power_data + t * n_bins;
+        float * __restrict mel_t = mel_data + t * n_mels;
+        for (int m = 0; m < n_mels; ++m) {
+            const float * __restrict row = fb + m * n_bins;
+            float acc = 0.0f;
+            #pragma GCC ivdep
+            for (int k = 0; k < n_bins; ++k) acc += row[k] * frame_power[k];
+            mel_t[m] = acc;
+        }
+    }
+}
+
 void apply_preemph(std::vector<float> & x, float preemph) {
     if (preemph == 0.0f || x.size() < 2) return;
     for (size_t t = x.size() - 1; t >= 1; --t) {
@@ -306,59 +392,23 @@ int compute_log_mel_impl(const float        * samples,
     float                  * __restrict power_data = state.power.data();
     const float            * __restrict x_padded   = state.x_padded.data();
 
-    // NOTE on threading: this loop was experimentally parallelised with
-    // `#pragma omp parallel { local tbuf; #pragma omp for ... }` during
-    // the optimization audit. On a 16-thread Ryzen the
-    // result was a +120 % regression with stdev of 18 ms because the
-    // ggml-cpu encoder also uses an OpenMP thread pool and the two
-    // pools oversubscribe the cores during the encoder warmup window.
-    // Kept serial; the real-FFT change below + the precomputed twiddle
-    // table from a prior patch already get mel under ~3 ms median.
-    //
     // Per-frame work: pre-multiply by the analysis window into a
     // n_fft-long real buffer, then run the real-input radix-2 FFT
     // which packs into n_fft/2 complex points, FFTs, and unpacks
-    // straight into power[0..n_fft/2]. Roughly 2x fewer butterflies
-    // than the previous complex-on-real path. `tbuf` only needs
-    // n_fft/2 complex slots now.
-    std::vector<float>               windowed((size_t) cfg.n_fft);
-    std::vector<std::complex<float>> tbuf((size_t) cfg.n_fft / 2);
-    float               * __restrict windowed_data = windowed.data();
-    std::complex<float> * __restrict tbuf_data     = tbuf.data();
-
-    for (int t = 0; t < n_frames; ++t) {
-        const int start = t * cfg.hop_length;
-        // Pre-multiply by the window in a single pass.
-        for (int i = 0; i < cfg.n_fft; ++i) {
-            windowed_data[i] = x_padded[start + i] * window_padded[i];
-        }
-        rfft_power_radix2(windowed_data,
-                          power_data + (size_t) t * n_bins,
-                          cfg.n_fft,
-                          tbuf_data);
-    }
+    // straight into power[0..n_fft/2]. Each worker thread owns its
+    // window/FFT scratch; the frames themselves are independent, and the
+    // workers join before ggml-cpu's pool wakes for the encoder.
+    parallel_over_frames(n_frames, cfg.n_threads, [&](int t0, int t1) {
+        power_spectrum_rows(t0, t1, cfg.n_fft, cfg.hop_length, n_bins, x_padded, window_padded, power_data);
+    });
 
     const int n_mels = cfg.n_mels;
     out_mel.resize((size_t) n_frames * n_mels);
     const float * __restrict fb = cfg.filterbank.data();
-    // Mel filterbank projection: out[t,m] = sum_k fb[m,k] * power[t,k].
-    // Per-frame outer loop is independent; SIMD inner is handled by
-    // `__restrict` + `#pragma GCC ivdep` so gcc-13 emits AVX2 FMA at
-    // 8 lanes wide. The same threading caveat as the FFT loop above
-    // applies (parallelising this regressed the bench during the
-    // optimization audit because of OpenMP oversubscription with
-    // ggml-cpu's encoder thread pool).
-    for (int t = 0; t < n_frames; ++t) {
-        const float * __restrict frame_power = power_data + t * n_bins;
-        float * __restrict mel_t = out_mel.data() + t * n_mels;
-        for (int m = 0; m < n_mels; ++m) {
-            const float * __restrict row = fb + m * n_bins;
-            float acc = 0.0f;
-            #pragma GCC ivdep
-            for (int k = 0; k < n_bins; ++k) acc += row[k] * frame_power[k];
-            mel_t[m] = acc;
-        }
-    }
+    float * __restrict mel_data = out_mel.data();
+    parallel_over_frames(n_frames, cfg.n_threads, [&](int t0, int t1) {
+        filterbank_rows(t0, t1, n_bins, n_mels, fb, power_data, mel_data);
+    });
 
     const float guard = cfg.log_zero_guard_value;
     #pragma GCC ivdep
