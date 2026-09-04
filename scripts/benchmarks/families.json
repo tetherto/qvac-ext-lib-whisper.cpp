@@ -18,9 +18,9 @@
   },
 
   "whisper": {
-    "cmake_target": "whisper-bench",
+    "cmake_target": "whisper-cli",
     "bench_kind":   "time-wrapped",
-    "binary":       "bin/whisper-bench",
+    "binary":       "bin/whisper-cli",
     "source":       "huggingface",
     "hf_repo":      "ggerganov/whisper.cpp",
     "hf_ref":       "5359861c739e955e79d9a303bcbc70fb988958b1",
@@ -29,9 +29,9 @@
       "base":  {"name": "ggml-base.bin"},
       "small": {"name": "ggml-small.bin"}
     },
-    "args":                    ["-m", "${MODEL_PATH}", "-t", "4"],
-    "audio_duration_seconds":  null,
-    "notes": "Vanilla whisper GGMLs live on HuggingFace, not the tetherto S3 bucket (only fine-tuned language variants like whisper-english/... are S3-hosted). hf_ref is the same commit whisper-ci.yml pins. sha256 is left off intentionally — the registry-server prod snapshot doesn't record hashes for these files either; adding them later is a strict improvement, not a blocker."
+    "args":                    ["-m", "${MODEL_PATH}", "-f", "${AUDIO_DIR}/jfk.wav", "-t", "4", "-nt"],
+    "audio_duration_seconds":  11.0,
+    "notes": "Real ASR wall-time via whisper-cli on jfk.wav (11.0 s). RTF is wall_ms / 11000 — meaningful because the input is fixed-length. -nt suppresses timestamps in transcript output. Vanilla whisper GGMLs live on HuggingFace; hf_ref is the commit whisper-ci.yml pins."
   },
 
   "parakeet": {
