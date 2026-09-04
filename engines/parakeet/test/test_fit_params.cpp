@@ -18,7 +18,18 @@
 //   5. a missing model file is Error/"model-unreadable", never Success;
 //   6. Sortformer only: the projected head compute equals the scheduler
 //      buffer a real diarize actually reserves (the head allocates through
-//      the shared sched, and the projection uses the sched's size-only twin).
+//      the shared sched, and the projection uses the sched's size-only twin);
+//   7. Nemotron only: the projected encoder compute decomposes into the
+//      window graph + prompt-projection graph + streaming step graph +
+//      per-chunk pre-encode graph, and each component equals the buffer the
+//      real path allocates -- the prompt graph's gallocr after a real
+//      run_nemotron_prompt_projection, the step graph's gallocr after real
+//      cache-aware stream steps, and the shared sched's buffers after the
+//      steady-state per-chunk subsampling run. Plus: an unsupported
+//      nemotron_chunk_ms is Error/"invalid-arguments", the default (largest)
+//      operating point bounds every explicit one, and the device projection
+//      GROWS with audio length (the full-length prompt conditioning),
+//      unlike the saturating legacy families.
 //
 // Usage: test-fit-params <model.gguf> [n_gpu_layers]
 // (CMake registers the CPU form, n_gpu_layers omitted = 0 -- the only backend
@@ -29,9 +40,11 @@
 #include "long_form.h"
 #include "parakeet_ctc.h"
 #include "parakeet_sortformer.h"
+#include "parakeet_tdt.h"
 
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -127,10 +140,142 @@ int main(int argc, char ** argv) {
             return g_failures;
         }
         const size_t real_compute = parakeet::model_encoder_compute_buffer_bytes(model);
-        expect(real_compute == fit.device.encoder_compute_bytes,
-               "encoder compute parity: projected " +
-               std::to_string(fit.device.encoder_compute_bytes) +
-               " != reserved " + std::to_string(real_compute));
+        if (fit.model_type != "nemotron") {
+            expect(real_compute == fit.device.encoder_compute_bytes,
+                   "encoder compute parity: projected " +
+                   std::to_string(fit.device.encoder_compute_bytes) +
+                   " != reserved " + std::to_string(real_compute));
+        }
+
+        // 7. Nemotron: the projected encoder compute decomposes into window
+        //    graph + prompt graph + streaming step graph + per-chunk
+        //    pre-encode graph, and each component matches what the real path
+        //    allocates.
+        if (fit.model_type == "nemotron") {
+            const auto & rcs = model.nemotron_cfg.allowed_right_context_frames;
+            const int rc_max = *std::max_element(rcs.begin(), rcs.end());
+            const int stream_enc = rc_max + 1;
+            const int total_enc = encoder_out_frames(model.encoder_cfg, n_mel_frames);
+            const int prompt_frames = std::max(total_enc, stream_enc);
+
+            // 7a. Composition: reproduce fit_params' component sum with the
+            //     same measure APIs (default operating point = largest rc).
+            size_t prompt_bytes = 0;
+            parakeet::NemotronStreamFitMeasure nsm;
+            if (parakeet::measure_nemotron_prompt_compute(model, prompt_frames,
+                                                          prompt_bytes) != 0 ||
+                parakeet::nemotron_measure_stream(model, rc_max, nsm) != 0) {
+                fail("nemotron measure APIs failed on a real-loaded model");
+                return g_failures;
+            }
+            const size_t expected_enc = real_compute + prompt_bytes +
+                                        nsm.device_step_graph_bytes +
+                                        nsm.device_subsampling_bytes;
+            expect(expected_enc == fit.device.encoder_compute_bytes,
+                   "nemotron encoder compute composition: projected " +
+                   std::to_string(fit.device.encoder_compute_bytes) +
+                   " != window " + std::to_string(real_compute) +
+                   " + prompt " + std::to_string(prompt_bytes) +
+                   " + step " + std::to_string(nsm.device_step_graph_bytes) +
+                   " + pre-encode " + std::to_string(nsm.device_subsampling_bytes));
+
+            // 7b. Prompt-graph parity: a real projection at the same frame
+            //     count must allocate exactly the projected buffer.
+            {
+                const int32_t prompt_id =
+                    parakeet::resolve_nemotron_prompt_id(model, "");
+                std::vector<float> projected;
+                if (parakeet::run_nemotron_prompt_projection(
+                        model, enc_out.encoder_out.data(), enc_out.n_enc_frames,
+                        enc_out.d_model, prompt_id, projected) != 0) {
+                    fail("real run_nemotron_prompt_projection failed");
+                } else {
+                    expect(enc_out.n_enc_frames == prompt_frames,
+                           "prompt parity precondition: real projection ran at " +
+                           std::to_string(enc_out.n_enc_frames) +
+                           " frames, projection priced " +
+                           std::to_string(prompt_frames));
+                    const size_t real_prompt =
+                        parakeet::model_nemotron_prompt_buffer_bytes(model);
+                    expect(real_prompt == prompt_bytes,
+                           "nemotron prompt parity: projected " +
+                           std::to_string(prompt_bytes) + " != allocated " +
+                           std::to_string(real_prompt));
+                }
+            }
+
+            // 7c. Streaming step-graph parity: drive a real cache-aware
+            //     session at the projected operating point to its steady
+            //     state (two chunks -- the second carries the 9-frame mel
+            //     history, the per-chunk peak) and compare the session's
+            //     step-graph gallocr and, on single-backend runs, the shared
+            //     sched's subsampling reservation.
+            {
+                parakeet::TdtRuntimeWeights rt;
+                parakeet::NemotronStreamState state;
+                if (parakeet::tdt_prepare_runtime(model, rt) != 0 ||
+                    parakeet::init_nemotron_stream_state(model, "", rc_max,
+                                                         state) != 0) {
+                    fail("nemotron stream session init failed");
+                } else {
+                    const int factor = model.encoder_cfg.subsampling_factor;
+                    const int feed_frames = (1 + factor * rc_max)      // first chunk
+                                          + factor * (rc_max + 1);     // one steady chunk
+                    std::vector<float> zero_chunk(
+                        (size_t) feed_frames * n_mels, 0.0f);
+                    int steps = 0;
+                    if (parakeet::append_nemotron_mel_frames(
+                            state, zero_chunk.data(), feed_frames, n_mels) != 0) {
+                        fail("nemotron append_nemotron_mel_frames failed");
+                    }
+                    for (; steps < 2; ++steps) {
+                        std::vector<float> sig;
+                        int nf = 0;
+                        if (parakeet::next_nemotron_processed_signal(
+                                state, n_mels, /*finalize=*/false, sig, nf) != 1) {
+                            break;
+                        }
+                        parakeet::NemotronStreamStepResult step;
+                        if (parakeet::run_nemotron_stream_step(
+                                model, rt, sig.data(), nf, n_mels,
+                                /*finalize=*/false, state, step) != 0) {
+                            fail("real nemotron stream step failed");
+                            break;
+                        }
+                    }
+                    expect(steps == 2, "nemotron stream did not reach steady state (" +
+                           std::to_string(steps) + " steps)");
+                    const size_t real_step =
+                        parakeet::nemotron_stream_graph_buffer_bytes(state);
+                    expect(real_step == nsm.device_step_graph_bytes,
+                           "nemotron step-graph parity: projected " +
+                           std::to_string(nsm.device_step_graph_bytes) +
+                           " != allocated " + std::to_string(real_step));
+                    // On the Nemotron path the shared scheduler is used ONLY
+                    // by the per-chunk subsampling graph (encoder, prompt,
+                    // step, and decode graphs own their gallocrs), so the
+                    // sched buffer sum isolates it on every backend --
+                    // including any per-op CPU fallback the projection's
+                    // single-buffer measure would miss.
+                    {
+                        ggml_backend_sched_t sched = parakeet::model_sched(model);
+                        size_t real_sub = 0;
+                        const int nb = sched ? ggml_backend_sched_get_n_backends(sched) : 0;
+                        for (int i = 0; i < nb; ++i) {
+                            real_sub += ggml_backend_sched_get_buffer_size(
+                                sched, ggml_backend_sched_get_backend(sched, i));
+                        }
+                        const size_t projected_sub =
+                            nsm.device_subsampling_bytes +
+                            nsm.host_subsampling_input_bytes;
+                        expect(real_sub == projected_sub,
+                               "nemotron pre-encode parity: projected " +
+                               std::to_string(projected_sub) +
+                               " != sched reserved " + std::to_string(real_sub));
+                    }
+                }
+            }
+        }
 
         // 4b. The windowed projection prices run_encoder's RESIDENT graph
         //     cache (first + middle + last window graphs stay alive in the
@@ -198,7 +343,9 @@ int main(int argc, char ** argv) {
     // 4. Device-side projection saturates at the long-form window; host extras
     //    keep growing with the audio. (Sortformer diarization does not window
     //    -- its device bytes DO grow -- but the CI fixtures here are
-    //    transcription models.)
+    //    transcription models. Nemotron's device projection also grows: the
+    //    locale-prompt projection graph runs over the FULL stitched encoder
+    //    output, so it scales with audio_seconds by design.)
     if (fit.model_type != "sortformer") {
         parakeet::FitOptions a = fopts;  a.audio_seconds = 600.0f;
         parakeet::FitOptions b = fopts;  b.audio_seconds = 7200.0f;
@@ -206,12 +353,45 @@ int main(int argc, char ** argv) {
         const parakeet::FitResult fb = parakeet::fit_params(b);
         expect(fa.status != parakeet::FitStatus::Error, "600 s projection errored");
         expect(fb.status != parakeet::FitStatus::Error, "7200 s projection errored");
-        expect(fa.device.total_bytes == fb.device.total_bytes,
-               "device projection did not saturate at the long-form window: 600 s -> " +
-               std::to_string(fa.device.total_bytes) + ", 7200 s -> " +
-               std::to_string(fb.device.total_bytes));
+        if (fit.model_type == "nemotron") {
+            expect(fb.device.total_bytes > fa.device.total_bytes,
+                   "nemotron device projection did not grow with audio length "
+                   "(the full-length prompt projection must scale): 600 s -> " +
+                   std::to_string(fa.device.total_bytes) + ", 7200 s -> " +
+                   std::to_string(fb.device.total_bytes));
+        } else {
+            expect(fa.device.total_bytes == fb.device.total_bytes,
+                   "device projection did not saturate at the long-form window: 600 s -> " +
+                   std::to_string(fa.device.total_bytes) + ", 7200 s -> " +
+                   std::to_string(fb.device.total_bytes));
+        }
         expect(fb.host_bytes > fa.host_bytes,
                "host extras did not grow with audio length");
+    }
+
+    // 7d. Nemotron operating-point knob: an unsupported chunk_ms is
+    //     Error/"invalid-arguments" (mirroring Engine::stream_start), and the
+    //     default (largest) operating point bounds every explicit one.
+    if (fit.model_type == "nemotron") {
+        parakeet::FitOptions bad = fopts;
+        bad.nemotron_chunk_ms = 123;  // not an allowed operating point
+        const parakeet::FitResult fr = parakeet::fit_params(bad);
+        expect(fr.status == parakeet::FitStatus::Error,
+               "unsupported nemotron_chunk_ms was not Error");
+        expect(fr.reason == "invalid-arguments",
+               "unsupported nemotron_chunk_ms reason was '" + fr.reason + "'");
+
+        parakeet::FitOptions smallest = fopts;
+        smallest.nemotron_chunk_ms = 80;  // smallest trained operating point
+        const parakeet::FitResult fs = parakeet::fit_params(smallest);
+        expect(fs.status != parakeet::FitStatus::Error,
+               "chunk_ms=80 projection errored (" + fs.reason + ")");
+        expect(fs.device.encoder_compute_bytes <= fit.device.encoder_compute_bytes,
+               "default operating point does not bound chunk_ms=80: " +
+               std::to_string(fs.device.encoder_compute_bytes) + " > " +
+               std::to_string(fit.device.encoder_compute_bytes));
+        expect(fs.host_bytes <= fit.host_bytes,
+               "default operating point does not bound chunk_ms=80 host extras");
     }
 
     // 5. Errors are reported as Error, never Success.

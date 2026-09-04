@@ -1262,6 +1262,7 @@ if (PARAKEET_BUILD_TESTS)
         src/parakeet_ctc.cpp
         src/parakeet_fit.cpp
         src/parakeet_log.cpp
+        src/parakeet_nemotron.cpp
         src/parakeet_tdt.cpp
         src/parakeet_eou.cpp
         src/parakeet_sortformer.cpp
@@ -1294,6 +1295,11 @@ if (PARAKEET_BUILD_TESTS)
         EXE      test-fit-params
         ARGS     "${_qvp_sf_q8_gguf}"
         REQUIRES "${_qvp_sf_q8_gguf}")
+    parakeet_register_test(test-fit-params-nemotron
+        LABEL    "fixture"
+        EXE      test-fit-params
+        ARGS     "${_qvp_nemotron_f16_gguf}"
+        REQUIRES "${_qvp_nemotron_f16_gguf}")
 
     # Model-free CLI-layer unit tests: strict parsers, saturating arithmetic,
     # JSON escaping, and the parakeet-fit-params exit-code contract.
@@ -1303,6 +1309,7 @@ if (PARAKEET_BUILD_TESTS)
         src/parakeet_ctc.cpp
         src/parakeet_fit.cpp
         src/parakeet_log.cpp
+        src/parakeet_nemotron.cpp
         src/parakeet_tdt.cpp
         src/parakeet_eou.cpp
         src/parakeet_sortformer.cpp
