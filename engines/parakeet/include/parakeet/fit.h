@@ -72,6 +72,9 @@ struct FitOptions {
     // engine slides the encoder over longer inputs), so the device projection
     // saturates once audio_seconds exceeds one window; the host-side buffers
     // (full-input mel, encoder-output slab, ...) keep growing with it.
+    // Exceptions that keep growing on the device too: Sortformer (no
+    // windowing) and Nemotron (its locale-prompt projection graph runs over
+    // the full stitched encoder output).
     float audio_seconds = 300.0f;
 
     // Same semantics as the EngineOptions fields of the same name (0 = auto).
@@ -110,12 +113,12 @@ struct FitResult {
     FitStatus   status = FitStatus::Error;
     bool        fits   = false;  // status == Success
     // "fits" | "does-not-fit" | "model-unreadable" | "no-backend-device" |
-    // "measurement-failed" | "invalid-arguments" | "workload-too-large" |
-    // "model-type-not-supported" (Nemotron: its prompt-conditioned encoder
-    // is not modelled yet; refusing beats a wrong projection)
+    // "measurement-failed" | "invalid-arguments" | "workload-too-large"
+    // ("model-type-not-supported" is retired: every model type the loader
+    // accepts is now modelled, Nemotron included)
     std::string reason;
 
-    std::string model_type;     // "ctc" | "rnnt" | "tdt" | "eou" | "sortformer"
+    std::string model_type;     // "ctc" | "rnnt" | "tdt" | "eou" | "nemotron" | "sortformer"
     std::string model_variant;  // GGUF parakeet.model_variant, may be empty
 
     // Resolved compute device, after the same runtime tiering and fallbacks a

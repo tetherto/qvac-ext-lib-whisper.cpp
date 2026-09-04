@@ -494,12 +494,26 @@ resident (`run_encoder`'s 3-slot LRU), and all of them are counted.
 Sortformer diarization does not window — its device projection grows with
 the full input (`O(T^2)` head attention).
 
+Nemotron is fully modelled, and both of its exceptional properties are
+priced: its device projection also grows with the audio (the locale-prompt
+projection graph runs over the **full** stitched encoder output, not per
+window), and its native cache-aware streaming is projected explicitly — the
+result covers one offline transcribe **plus** one live streaming session
+(step graph, per-chunk pre-encode graph, per-layer channel/time caches and
+the other host-resident session state). `--nemotron-chunk-ms` selects the
+streaming operating point to project (one of the GGUF's allowed values,
+80/160/320/560/1120 on the shipped checkpoint); the default projects the
+largest operating point, which bounds every other.
+
 The projection is exact where it can be: `test-fit-params` asserts the
-projected weight, encoder-compute, and Sortformer-head bytes equal what a
-real load/encode/diarize allocates, byte for byte. The projection covers the
-offline paths; streaming sessions build smaller per-chunk graphs but rotate
-through the same graph cache with session-dependent keys, so treat the
-offline projection as a guide, not a proven bound, for streaming.
+projected weight, encoder-compute, Sortformer-head, and Nemotron
+prompt/step/pre-encode bytes equal what a real load/encode/diarize/stream
+allocates, byte for byte. For the legacy families (CTC/RNN-T/TDT/EOU) the
+projection covers the offline paths; their streaming sessions build smaller
+per-chunk graphs but rotate through the same graph cache with
+session-dependent keys, so treat the offline projection as a guide, not a
+proven bound, for streaming. Nemotron streaming is a modelled part of the
+projection, not a guide.
 
 ## Tests and NeMo parity
 
