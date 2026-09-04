@@ -31,6 +31,15 @@ namespace tts_cpp::chatterbox::test_hooks {
 // distinct t-values per process; Turbo = up to 3 (t_span = [0, 0.5, 1]).
 size_t time_mlp_result_cache_size();
 
+// Number of entries in the process-wide time_mlp GRAPH cache (backend
+// scaffolding: ctx + graph + gallocr), keyed by backend pointer.  One
+// entry per live backend that ran compute_time_mlp; 0 before any synth
+// and 0 again after s3gen_unload().  The cache is deliberately not
+// thread_local: a thread_local destructor freeing backend memory at
+// worker-thread exit runs under the Windows loader lock, where CUDA
+// frees fail with cudaErrorInitializationError and abort the process.
+size_t time_mlp_graph_cache_size();
+
 // Number of ((t_val, r_val)) entries in the time_mixed result cache used
 // only by the Turbo meanflow path.  Multilingual never populates this.
 size_t time_emb_result_cache_size();
@@ -162,5 +171,23 @@ size_t t3_step_graph_cache_misses();
 // gallocators in cached entries release against a still-valid
 // backend.
 void t3_release_caches();
+
+// ---------- Memory-fit parity (include/tts-cpp/chatterbox/fit.h) -------
+//
+// Byte-exact backend-buffer sizes of the resident S3Gen allocations, so
+// test_chatterbox_fit_params.cpp can assert that the metadata-only
+// projection equals what a real synthesis actually allocated.  0 when
+// the corresponding cache / model is not built.
+
+// Weight buffer of the process-cached S3Gen model (s3gen_preload /
+// s3gen_synthesize_to_wav), in bytes.
+size_t s3gen_cached_weights_bytes();
+
+// Gallocr buffer held by each resident stage graph cache, in bytes.
+size_t encoder_graph_cache_buffer_bytes();
+size_t cfm_estimator_cache_buffer_bytes();
+size_t f0_graph_cache_buffer_bytes();
+size_t stft_graph_cache_buffer_bytes();
+size_t hift_graph_cache_buffer_bytes();
 
 }  // namespace tts_cpp::chatterbox::test_hooks

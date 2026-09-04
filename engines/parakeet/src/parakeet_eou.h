@@ -200,6 +200,13 @@ struct EouDecodeResult {
 
 int eou_prepare_runtime(const ParakeetCtcModel & model, EouRuntimeWeights & out);
 
+// Fit projection: size everything eou_prepare_runtime would allocate (see
+// DecoderFitMeasure in parakeet_ctc.h) without allocating. Requires a
+// load_from_gguf_metadata_only model. `worst_enc_frames` sizes the worst-case
+// per-window enc-projection graph (clamped to k_enc_proj_T_max).
+int eou_measure_runtime(const ParakeetCtcModel & model, int worst_enc_frames,
+                        DecoderFitMeasure & out);
+
 // Zeroes the predictor state and primes it with one blank-token LSTM step.
 // Returns 0 on success, non-zero if the GPU-path graph compute fails (same
 // rc convention as eou_decode_window).

@@ -1,5 +1,6 @@
 #include "vae_ggml.h"
 
+#include "fit_measure.h"
 #include "vae_gguf.h"
 
 #include "acestep/backend_registry.h"
@@ -34,6 +35,9 @@ struct VaeModel {
     Decoder               dec        = {};
     Encoder               enc        = {};
     bool                  has_enc    = false;
+
+    bool   measuring          = false;  // metadata-only load: weights sized, never read
+    size_t last_compute_bytes = 0;      // sched buffers of the most recent real window
 };
 
 // ----------------------------------------------------------------- ops
@@ -224,7 +228,11 @@ static ggml_tensor * build_encode(ggml_context * ctx, Encoder * m, ggml_tensor *
 }
 
 // ----------------------------------------------------------------- public
-VaeModel * vae_model_load(const std::string & path, ggml_backend_t backend, bool with_encoder, bool verbose) {
+// Shared body of vae_model_load and vae_model_load_metadata_only. When
+// `measure` is non-null the load is metadata-only: the weight allocation is
+// sized into `measure` instead of performed and no tensor data is read.
+static VaeModel * vae_model_load_impl(const std::string & path, ggml_backend_t backend, bool with_encoder,
+                                      bool verbose, AcestepStageMeasure * measure) {
     VaeGGUF g;
     if (!vae_gguf_open(g, path)) return nullptr;
 
@@ -243,6 +251,22 @@ VaeModel * vae_model_load(const std::string & path, ggml_backend_t backend, bool
 
     decoder_create(m->dec, m->weight_ctx);
     if (with_encoder) encoder_create(m->enc, m->weight_ctx);
+
+    if (measure) {
+        measure->weights_alloc_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            m->weight_ctx, ggml_backend_get_default_buffer_type(backend));
+        m->measuring = true;
+        // Mark the weights externally-allocated so graph sizing excludes them
+        // (see textenc_model_load_impl). No data is read after this.
+        for (ggml_tensor * t = ggml_get_first_tensor(m->weight_ctx); t;
+             t = ggml_get_next_tensor(m->weight_ctx, t)) {
+            if (!t->data && !t->view_src) {
+                t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+            }
+        }
+        vae_gguf_close(g);
+        return m;
+    }
 
     m->weight_buf = ggml_backend_alloc_ctx_tensors(m->weight_ctx, backend);
     if (!m->weight_buf) {
@@ -263,6 +287,20 @@ VaeModel * vae_model_load(const std::string & path, ggml_backend_t backend, bool
                 with_encoder ? "encoder+decoder" : "decoder");
     }
     return m;
+}
+
+VaeModel * vae_model_load(const std::string & path, ggml_backend_t backend, bool with_encoder, bool verbose) {
+    return vae_model_load_impl(path, backend, with_encoder, verbose, /*measure=*/nullptr);
+}
+
+VaeModel * vae_model_load_metadata_only(const std::string & path, ggml_backend_t backend, bool with_encoder,
+                                        bool verbose, AcestepStageMeasure & measure) {
+    measure = AcestepStageMeasure{};
+    return vae_model_load_impl(path, backend, with_encoder, verbose, &measure);
+}
+
+size_t vae_model_compute_buffer_bytes(const VaeModel * m) {
+    return m ? m->last_compute_bytes : 0;
 }
 
 void vae_model_free(VaeModel * m) {
@@ -409,6 +447,11 @@ static int vae_decode_window(VaeModel * m, const float * latent, int T_latent, s
         if (cpu_fallback) ggml_backend_free(cpu_fallback);
         ggml_free(ctx);
         return -1;
+    }
+    {
+        size_t total = 0;
+        for (int i = 0; i < n_backends; ++i) total += ggml_backend_sched_get_buffer_size(sched, backends[i]);
+        m->last_compute_bytes = total;
     }
 
     // input ggml [T_latent(ne0), 64(ne1)] channel-major: idx = c*T_latent + t
@@ -597,6 +640,11 @@ int vae_model_encode(VaeModel * m, const float * pcm, int frames,
         ggml_free(ctx);
         return -1;
     }
+    {
+        size_t total = 0;
+        for (int i = 0; i < n_backends; ++i) total += ggml_backend_sched_get_buffer_size(sched, backends[i]);
+        m->last_compute_bytes = total;
+    }
 
     // input ggml [frames(ne0), 2(ne1)] channel-major: idx = c*frames + t
     std::vector<float> ain((size_t) frames * 2);
@@ -626,6 +674,89 @@ int vae_model_encode(VaeModel * m, const float * pcm, int frames,
     if (cpu_fallback) ggml_backend_free(cpu_fallback);
     ggml_free(ctx);
     return T_lat;
+}
+
+// ── Size-only measure paths (memory-fit preflight) ──────────────────────────
+
+int vae_model_decode_window_frames(VaeModel * m) {
+    return vae_decode_core_frames(m);
+}
+
+// Price one graph through the same scheduler construction the real decode /
+// encode uses, via the sched's size-only reserve. `sizes[0]` lands on m's
+// backend, `sizes[1]` on the CPU-fallback slot (0 when m's backend IS the CPU).
+static bool vae_measure_graph_sched(VaeModel * m, ggml_cgraph * gf,
+                                    size_t & backend_bytes, size_t & cpu_fallback_bytes) {
+    const bool backend_is_cpu =
+        ggml_backend_dev_type(ggml_backend_get_device(m->backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    ggml_backend_t cpu_fallback = backend_is_cpu ? nullptr : backend_cpu_init();
+    ggml_backend_t backends[2]  = { m->backend, cpu_fallback };
+    const int      n_backends   = backend_is_cpu ? 1 : 2;
+
+    ggml_backend_sched_t sched =
+        ggml_backend_sched_new(backends, nullptr, n_backends, /*graph_size=*/8192,
+                               /*parallel=*/false, /*op_offload=*/false);
+    if (!sched) {
+        if (cpu_fallback) ggml_backend_free(cpu_fallback);
+        return false;
+    }
+    size_t sizes[2] = { 0, 0 };
+    ggml_backend_sched_reserve_size(sched, gf, sizes);
+    backend_bytes      = sizes[0];
+    cpu_fallback_bytes = n_backends == 2 ? sizes[1] : 0;
+
+    ggml_backend_sched_free(sched);
+    if (cpu_fallback) ggml_backend_free(cpu_fallback);
+    return true;
+}
+
+bool vae_model_measure_decode(VaeModel * m, int T_latent, size_t & backend_bytes, size_t & cpu_fallback_bytes) {
+    backend_bytes      = 0;
+    cpu_fallback_bytes = 0;
+    if (!m || T_latent <= 0) return false;
+
+    // The worst resident window of the chunked decode: a short latent decodes
+    // in one T_latent window; a long one peaks at a middle window of
+    // WIN_CORE + 2*WIN_OV frames (the same WIN_CORE the real decode resolves,
+    // backend cap and ACESTEP_VAE_WIN_CORE included).
+    const int core  = vae_decode_core_frames(m);
+    const int T_win = T_latent <= core ? T_latent : std::min(T_latent, core + 2 * WIN_OV);
+
+    ggml_init_params gp{ ggml_tensor_overhead() * 1024 + ggml_graph_overhead_custom(8192, false), nullptr, true };
+    ggml_context * ctx = ggml_init(gp);
+    if (!ctx) return false;
+
+    ggml_tensor * lat = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_win, 64);
+    ggml_set_input(lat);
+    ggml_tensor * out = build_decode(ctx, &m->dec, lat);
+    ggml_set_output(out);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
+    ggml_build_forward_expand(gf, out);
+
+    const bool ok = vae_measure_graph_sched(m, gf, backend_bytes, cpu_fallback_bytes);
+    ggml_free(ctx);
+    return ok;
+}
+
+bool vae_model_measure_encode(VaeModel * m, int frames, size_t & backend_bytes, size_t & cpu_fallback_bytes) {
+    backend_bytes      = 0;
+    cpu_fallback_bytes = 0;
+    if (!m || !m->has_enc || frames <= 0) return false;
+
+    ggml_init_params gp{ ggml_tensor_overhead() * 1024 + ggml_graph_overhead_custom(8192, false), nullptr, true };
+    ggml_context * ctx = ggml_init(gp);
+    if (!ctx) return false;
+
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, frames, 2);
+    ggml_set_input(a);
+    ggml_tensor * z = build_encode(ctx, &m->enc, a);
+    ggml_set_output(z);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
+    ggml_build_forward_expand(gf, z);
+
+    const bool ok = vae_measure_graph_sched(m, gf, backend_bytes, cpu_fallback_bytes);
+    ggml_free(ctx);
+    return ok;
 }
 
 } // namespace tts_cpp::acestep

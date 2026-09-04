@@ -61,6 +61,10 @@ int sample_top_k_p(float * logits, int V, float temperature, float top_p, int to
 // running sample_top_k_p, including its RNG consumption and r==0 edge case.
 int lm_consume_forced(int token, float temperature, std::mt19937 & rng);
 
+// YAML CoT block for the prompt's set fields (Python yaml.dump parity:
+// sorted keys, captions wrapped past column 80). Shared with quality scoring.
+std::string lm_cot_yaml(const AcePrompt & prompt);
+
 // Build the Qwen3 chat prompt with an injected CoT metadata block (Phase 2).
 // The assistant turn stays open so the LM emits audio codes then <|im_end|>.
 std::vector<int> build_lm_prompt_with_cot(const BpeTokenizer & bpe, const AcePrompt & prompt);
@@ -69,15 +73,33 @@ std::vector<int> build_lm_prompt_with_cot(const BpeTokenizer & bpe, const AcePro
 // when the caller explicitly requested "[Instrumental]" lyrics.
 std::string lm_inspire_user_message(const std::string & caption, const std::string & lyrics);
 
+// Phase-1 expansion mode.
+enum class LmPhase1Mode {
+    // Gap-fill: only empty fields are generated; a bare caption (no lyrics)
+    // runs the INSPIRE expansion.
+    Auto,
+    // Simple Mode: always run the INSPIRE expansion — the caption is rewritten
+    // and lyrics are written even when metadata is complete. "[Instrumental]"
+    // lyrics forward the instrumental hint.
+    Inspire,
+    // Query Rewriting: FORMAT the request — the caption is rewritten into a
+    // detailed musical description and the lyrics are regenerated preserving
+    // their content ("# Caption / # Lyric" user message).
+    Format,
+};
+
+// User message for the FORMAT prompt (Query Rewriting).
+std::string lm_format_user_message(const std::string & caption, const std::string & lyrics);
+
 // Phase 1: auto-generate missing metadata (bpm/keyscale/duration/timesignature/
 // language) — and lyrics for a bare caption — via FSM-constrained decoding.
-// Mutates `prompt` in place (gap-fill: only empty fields are overwritten).
-// use_fsm=false lets the LM free-run (lower reliability). force_inspire runs
-// the INSPIRE expansion even when lyrics are present: "[Instrumental]" lyrics
-// forward the instrumental hint and the caption is always rewritten (Simple
-// Mode). Returns false on failure or cancellation via params.on_step.
+// Mutates `prompt` in place (gap-fill: only empty fields are overwritten;
+// Inspire/Format also rewrite the caption and lyrics). use_fsm=false lets the
+// LM free-run (lower reliability). Returns false on failure or cancellation
+// via params.on_step.
 bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & prompt, const LmSampleParams & params,
-                        bool use_fsm = true, bool use_cot_caption = true, bool force_inspire = false);
+                        bool use_fsm = true, bool use_cot_caption = true,
+                        LmPhase1Mode mode = LmPhase1Mode::Auto);
 
 // Phase 2: generate FSQ audio semantic codes for a fully-specified prompt.
 // Single sequence, no CFG. Returns the raw codes (already offset-subtracted,
@@ -87,5 +109,29 @@ bool lm_generate_codes(LMModel *              m,
                        const AcePrompt &      prompt,
                        const LmSampleParams & params,
                        std::vector<int> &     codes_out);
+
+// Understand ("listener") prompt: the system understand instruction with the
+// FSQ codes as the user turn's raw audio tokens (AUDIO_CODE_BASE + code).
+// The no-input variant is the unconditional baseline quality scoring uses.
+std::vector<int> lm_understand_prompt(const BpeTokenizer & bpe, const int * codes, int n_codes);
+std::vector<int> lm_understand_unconditional_prompt(const BpeTokenizer & bpe);
+
+// Decode-token budget for lm_understand: the caller's request (or the 2048
+// default) capped to the KV room left after the prompt, never negative.
+// Pure; exposed for unit testing.
+int lm_understand_token_budget(int max_seq_len, size_t prompt_tokens, int requested);
+
+// Reverse pipeline decode: describe FSQ audio codes as metadata + caption.
+// FSM-constrained CoT for the metadata block; decoding stops at </think> (the
+// caption lives inside the CoT block and the reference's post-think lyric
+// text is unused here). A non-empty language_hint is forced into the FSM and
+// echoed to the output. Honors params.on_step for progress/cancellation.
+// Returns false on failure or cancellation.
+bool lm_understand(LMModel *              m,
+                   const BpeTokenizer &   bpe,
+                   const std::vector<int> & codes,
+                   const LmSampleParams & params,
+                   const std::string &    language_hint,
+                   AcePrompt &            out);
 
 } // namespace tts_cpp::acestep

@@ -161,6 +161,20 @@ path instead: it VAE-encodes `source_audio`, skips the LM and FSQ
 detokenizer, executes each `RepaintParams` or `FlowEditParams` operation in
 order, and VAE-decodes the final latent.
 
+### ACE-Step LRC generation
+
+With `GenerateParams::generate_lrc` set, the engine aligns the request lyrics
+with the generated audio and returns karaoke-style LRC timestamps in
+`GenerateResult::metadata.lrc`, plus an alignment confidence score in
+`metadata.lyrics_score` (`[0, 1]`). After sampling, one extra DiT forward at
+the final timestep runs with explicit softmax on the validated lyric
+cross-attention heads (the graph stops at the deepest captured layer), the
+captured matrices are converted from the ggml column-major layout, and DTW
+aligns each lyric line with the audio timeline. Requires lyrics — with Simple
+Mode the LM-written lyrics are aligned — and the official 24-layer/16-head
+DiT; the capture path is fully separate from the sampling graph, so normal
+inference is untouched when disabled.
+
 ### ACE-Step Simple Mode
 
 With `GenerateParams::simple_mode` set, `caption` is a short natural-language
@@ -174,6 +188,48 @@ instrumental hint to the LM. Simple Mode requires the plain `text2music` task
 with no pre-supplied `audio_codes`; the composed request is reported back in
 `GenerateResult::metadata`. The inspire pass emits `lm` progress ticks and
 honors cancellation like every other stage.
+
+### ACE-Step Query Rewriting
+
+With `GenerateParams::rewrite_query` set, the LM FORMAT pass reworks a full
+request before synthesis: the caption is rewritten into a detailed musical
+description and the lyrics are regenerated preserving their content, with any
+unset metadata filled through the same FSM the inspire pass uses. Unlike
+Simple Mode — which expands a bare query and writes lyrics from scratch —
+Query Rewriting takes caption AND lyrics as input, so both are required; the
+two modes are mutually exclusive. The rewritten request is reported back in
+`GenerateResult::metadata`. Faithful rewriting needs the 1.7B LM
+(`acestep-5Hz-lm-1.7B`): the 0.6B drifts genre, voice, and language.
+
+### ACE-Step quality scoring
+
+With `GenerateParams::compute_quality_score` set, the generated audio codes
+are teacher-forced back through the LM "understand" prompt and the request is
+scored: caption and lyrics earn a normalized PMI (their mean log-prob given
+the codes against the same text under a no-input prompt) and each set
+metadata field earns a rank-weighted top-k recall of its YAML line. The
+weight-normalized global score (caption 0.5, lyrics 0.3, metadata 0.2) lands
+in `GenerateResult::metadata.quality_score` in `[0, 1]` with the per-condition
+breakdown in `quality_report` — made for ranking a batch of takes (stem tasks
+on the base DiT vary strongly by seed) and keeping the best. Scoring runs
+extra LM forwards after code generation, reports `score` progress ticks, and
+honors cancellation; it requires the LM code path, so cover / lego tasks and
+the audio edit path reject it.
+
+### ACE-Step audio understanding
+
+`Engine::understand` runs the reverse pipeline: 48 kHz stereo audio is
+VAE-encoded, the FSQ tokenizer (an attention pooler in the DiT GGUF under
+`tokenizer.*`) turns the latents into 5 Hz semantic codes, and the LM
+"listener" describes them — a descriptive caption plus BPM, key/scale, time
+signature, duration estimate, and vocal language, decoded through the same
+FSM-constrained metadata block generation uses. `UnderstandResult` also
+returns the recovered codes, directly reusable as
+`GenerateParams::audio_codes`. Lyrics are intentionally NOT reported: the
+LM's transcription hallucinates on real songs, so the field is unsupported.
+An optional `vocal_language` hint is forced through the FSM instead of the
+LM's guess. Stages report as `source`, `tok`, and `understand` (unknown
+total), all cancellable.
 
 ## Model stages
 
@@ -552,9 +608,13 @@ combinations are rejected rather than silently ignored.
 | `--steps N`, `--shift F` | per variant | sampler overrides |
 | `--no-dcw` | DCW enabled | disable the official Haar low/high correction applied after each DiT step |
 | `--no-loudness` | normalization on | skip the percentile loudness normalization (99.999th percentile to 1.0, tail hard-clipped) applied to generation output; edits and lego stems are never normalized |
+| `--lrc out.lrc` | off | write synchronized lyric timestamps (LRC) next to the WAV; requires lyrics |
 | `--temp F`, `--topp F`, `--topk N`, `--cfg F` | `0.85`, `0.9`, off, `2.0` | LM sampling for the audio codes |
 | `--no-phase1` | off | skip the LM metadata auto-fill pass |
 | `--simple` | off | Simple Mode: expand `--caption` into a full request (lyrics regenerate unless `--lyrics "[Instrumental]"` is passed) |
+| `--rewrite` | off | Query Rewriting: the LM formats `--caption` and `--lyrics` into a detailed request, preserving the lyric content (needs the 1.7B LM) |
+| `--score` | off | teacher-forced LM quality score of the generated codes, printed with its per-condition breakdown |
+| `--understand FILE` | | reverse pipeline: describe a 48 kHz PCM16 WAV (metadata + caption + recovered codes) instead of generating |
 | `--req FILE` | | request JSON; pre-supplied `audio_codes` skip the LM stage |
 | `--ref-audio FILE` | | 48 kHz PCM16 WAV used by ACE-Step's timbre-conditioning path |
 | `--src-audio FILE` | | 48 kHz PCM16 source WAV; required for editing |
@@ -633,6 +693,28 @@ and encodes it in overlapping VAE windows for bounded memory on long inputs.
 ```
 
 The first form is the default mode: it decodes a synthetic latent, which checks that real weights load and that the decode graph (`ggml_col2im_1d` + `ggml_snake`) runs on the selected backend. `--roundtrip` encodes a real WAV and prints the per-channel reconstruction correlation, the audible end-to-end VAE check. Both forms take `--gpu`.
+
+### acestep-fit-params
+
+```sh
+./build/audiogen/acestep-fit-params --models-dir /path/to/acestep --duration 60 --n-gpu-layers 99
+```
+
+Memory-fit preflight: projects whether the four stage GGUFs plus a generation
+workload fit the memory available right now, reading only GGUF metadata (no
+weights load, nothing runs). It resolves the same backends and stage placement
+`Engine::create` would, drives each stage loader in metadata-only mode, and
+prices the real compute graphs at the workload's shapes through ggml's
+size-only allocator APIs, so the projection tracks the runtime by construction.
+The default projection follows the per-stage low-memory residency above (the
+peak phase per memory pool); `--keep-stages 1` (or `ACESTEP_KEEP_STAGES`)
+projects the everything-resident mode. Exit code follows the `@qvac/model-fit`
+contract: 0 = fits, 1 = does not fit (a valid answer), 2 = error. `--json`
+emits the projection for the SDK; the library entry point is
+`tts_cpp::acestep::fit_params` (`include/audiogen-cpp/acestep/fit.h`), and
+hosts can link the CLI as `acestep_fit_cli_main`. Workload knobs: `--duration`,
+`--text-tokens`, `--lyric-tokens`, `--lm-cfg`, `--guidance`,
+`--with-source-audio`, `--margin-mib`.
 
 ## Tests and parity
 

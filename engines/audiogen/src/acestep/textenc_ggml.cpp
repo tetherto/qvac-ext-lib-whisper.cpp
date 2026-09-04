@@ -1,5 +1,6 @@
 #include "textenc_ggml.h"
 
+#include "fit_measure.h"
 #include "qwen3_block.h"  // shared Qwen3 loaders + graph builders (uses DitGGUF IO)
 
 #include "ggml.h"
@@ -40,6 +41,9 @@ struct TextEncModel {
     bool                  mapped  = false;
     bool                  use_flash_attn = false;
     size_t                mapped_bytes = 0;  // sum of mmapped weight nbytes
+
+    bool   measuring          = false;  // metadata-only load: weights sized, never read
+    size_t last_compute_bytes = 0;      // gallocr buffer of the most recent real forward
 };
 
 static Qwen3Config to_q3(const TextEncConfig & c) {
@@ -56,7 +60,11 @@ static Qwen3Config to_q3(const TextEncConfig & c) {
     return q;
 }
 
-TextEncModel * textenc_model_load(const std::string & path, ggml_backend_t backend, bool verbose) {
+// Shared body of textenc_model_load and textenc_model_load_metadata_only. When
+// `measure` is non-null the load is metadata-only: the weight allocation is
+// sized into `measure` instead of performed and no tensor data is read.
+static TextEncModel * textenc_model_load_impl(const std::string & path, ggml_backend_t backend, bool verbose,
+                                              AcestepStageMeasure * measure) {
     DitGGUF g;
     if (!dit_gguf_open(g, path)) {
         fprintf(stderr, "[acestep-txt] failed to parse %s\n", path.c_str());
@@ -85,22 +93,44 @@ TextEncModel * textenc_model_load(const std::string & path, ggml_backend_t backe
         q3_create_layer(ctx, g, "layers." + std::to_string(i), m->layers[i], map_buf);
     }
 
-    m->weight_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (!m->weight_buf) {
-        fprintf(stderr, "[acestep-txt] failed to allocate weight buffer\n");
-        if (map_buf) ggml_backend_buffer_free(map_buf);
-        ggml_free(ctx);
-        dit_gguf_close(g);
-        delete m;
-        return nullptr;
-    }
+    if (measure) {
+        // Size what ggml_backend_alloc_ctx_tensors would allocate (mapped
+        // tensors already carry data pointers into the mmap and are skipped by
+        // the sweep exactly like the real allocation skips them).
+        measure->weights_alloc_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            ctx, ggml_backend_get_default_buffer_type(backend));
+        m->measuring = true;
+    } else {
+        m->weight_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (!m->weight_buf) {
+            fprintf(stderr, "[acestep-txt] failed to allocate weight buffer\n");
+            if (map_buf) ggml_backend_buffer_free(map_buf);
+            ggml_free(ctx);
+            dit_gguf_close(g);
+            delete m;
+            return nullptr;
+        }
 
-    q3_load_raw(m->embed_tokens, g, "embed_tokens.weight");
-    q3_load_f32(m->final_norm, g, "norm.weight");
-    for (int i = 0; i < c.n_layers; i++) {
-        q3_load_layer(g, "layers." + std::to_string(i), m->layers[i]);
+        q3_load_raw(m->embed_tokens, g, "embed_tokens.weight");
+        q3_load_f32(m->final_norm, g, "norm.weight");
+        for (int i = 0; i < c.n_layers; i++) {
+            q3_load_layer(g, "layers." + std::to_string(i), m->layers[i]);
+        }
     }
     m->mapped_bytes = mapped ? dit_gguf_mapped_bytes(ctx, g) : 0;
+    if (measure) {
+        measure->weights_mapped_bytes = m->mapped_bytes;
+        // Mark every still-unallocated weight tensor externally-allocated
+        // (dummy non-NULL data, the same trick ggml's own measure paths use)
+        // so graph sizing via ggml_gallocr excludes the weights from the
+        // measured compute buffers instead of counting them as graph-owned
+        // leafs. The model must never have tensor data read/written after this.
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data && !t->view_src) {
+                t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+            }
+        }
+    }
 
     if (verbose) {
         fprintf(stderr, TEXTENC_LOAD_FORMAT, path.c_str(),
@@ -116,6 +146,20 @@ TextEncModel * textenc_model_load(const std::string & path, ggml_backend_t backe
         dit_gguf_close(g);
     }
     return m;
+}
+
+TextEncModel * textenc_model_load(const std::string & path, ggml_backend_t backend, bool verbose) {
+    return textenc_model_load_impl(path, backend, verbose, /*measure=*/nullptr);
+}
+
+TextEncModel * textenc_model_load_metadata_only(const std::string & path, ggml_backend_t backend,
+                                                bool verbose, AcestepStageMeasure & measure) {
+    measure = AcestepStageMeasure{};
+    return textenc_model_load_impl(path, backend, verbose, &measure);
+}
+
+size_t textenc_model_compute_buffer_bytes(const TextEncModel * m) {
+    return m ? m->last_compute_bytes : 0;
 }
 
 void textenc_model_free(TextEncModel * m) {
@@ -135,7 +179,8 @@ size_t textenc_model_weight_bytes(const TextEncModel * m) {
     return alloc + m->mapped_bytes;  // allocated (F32) + mmapped weights
 }
 
-bool textenc_model_forward(TextEncModel * m, const int32_t * token_ids, int S, std::vector<float> & hidden_out) {
+bool textenc_model_forward(TextEncModel * m, const int32_t * token_ids, int S, std::vector<float> & hidden_out,
+                           size_t * measure_compute) {
     const Qwen3Config & c = m->q3;
     const int           H = c.hidden_size;
 
@@ -164,12 +209,26 @@ bool textenc_model_forward(TextEncModel * m, const int32_t * token_ids, int S, s
     ggml_build_forward_expand(gf, out);
 
     ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
-    if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
-        fprintf(stderr, "[acestep-txt] forward alloc failed (S=%d)\n", S);
-        if (ga) ggml_gallocr_free(ga);
+    if (!ga) {
+        fprintf(stderr, "[acestep-txt] forward gallocr init failed (S=%d)\n", S);
         ggml_free(ctx);
         return false;
     }
+    if (measure_compute) {
+        // Size-only twin of the alloc below: same graph, same buffer type.
+        *measure_compute = 0;
+        ggml_gallocr_reserve_n_size(ga, gf, nullptr, nullptr, measure_compute);
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        return true;
+    }
+    if (!ggml_gallocr_alloc_graph(ga, gf)) {
+        fprintf(stderr, "[acestep-txt] forward alloc failed (S=%d)\n", S);
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        return false;
+    }
+    m->last_compute_bytes = ggml_gallocr_get_buffer_size(ga, 0);
 
     ggml_backend_tensor_set(t_ids, token_ids, 0, (size_t) S * sizeof(int32_t));
     std::vector<int32_t> pos(S);
@@ -197,7 +256,8 @@ bool textenc_model_forward(TextEncModel * m, const int32_t * token_ids, int S, s
     return true;
 }
 
-bool textenc_model_embed_lookup(TextEncModel * m, const int32_t * token_ids, int S, std::vector<float> & embed_out) {
+bool textenc_model_embed_lookup(TextEncModel * m, const int32_t * token_ids, int S, std::vector<float> & embed_out,
+                                size_t * measure_compute) {
     const int H = m->q3.hidden_size;
 
     const size_t     nodes = 64;
@@ -213,9 +273,21 @@ bool textenc_model_embed_lookup(TextEncModel * m, const int32_t * token_ids, int
     ggml_build_forward_expand(gf, out);
 
     ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
-    if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
+    if (!ga) {
+        fprintf(stderr, "[acestep-txt] embed lookup gallocr init failed (S=%d)\n", S);
+        ggml_free(ctx);
+        return false;
+    }
+    if (measure_compute) {
+        *measure_compute = 0;
+        ggml_gallocr_reserve_n_size(ga, gf, nullptr, nullptr, measure_compute);
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        return true;
+    }
+    if (!ggml_gallocr_alloc_graph(ga, gf)) {
         fprintf(stderr, "[acestep-txt] embed lookup alloc failed (S=%d)\n", S);
-        if (ga) ggml_gallocr_free(ga);
+        ggml_gallocr_free(ga);
         ggml_free(ctx);
         return false;
     }

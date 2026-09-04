@@ -18,7 +18,8 @@
 
 namespace tts_cpp::acestep {
 
-struct VaeModel;  // opaque: weight tensors + backend weight buffer
+struct VaeModel;             // opaque: weight tensors + backend weight buffer
+struct AcestepStageMeasure;  // fit_measure.h
 
 // Load VAE weights from `path` onto `backend` (borrowed). Loads the decoder
 // always; the encoder only when `with_encoder` (needed for the reconstruction
@@ -27,6 +28,32 @@ VaeModel * vae_model_load(const std::string & path, ggml_backend_t backend, bool
 void       vae_model_free(VaeModel * m);
 bool       vae_model_has_encoder(const VaeModel * m);
 size_t     vae_model_weight_bytes(const VaeModel * m);
+
+// Metadata-only load for the memory-fit preflight: identical tensor wiring to
+// vae_model_load, but the weight allocation is SIZED into `measure` instead of
+// performed and no tensor data is read. Only good for the measure calls below;
+// free with vae_model_free.
+VaeModel * vae_model_load_metadata_only(const std::string & path, ggml_backend_t backend, bool with_encoder,
+                                        bool verbose, AcestepStageMeasure & measure);
+
+// The chunked-decode window core this model/backend would use (the same
+// backend-adaptive probe vae_model_decode runs, ACESTEP_VAE_WIN_CORE
+// included). Exposed for the memory-fit preflight and its parity tests.
+int vae_model_decode_window_frames(VaeModel * m);
+
+// Size-only twins of one decode window / one encode window, for the memory-fit
+// preflight: build the identical graph and scheduler the real call would use
+// for a T_latent-frame decode (its worst resident window when chunked) or an
+// `frames`-frame encode window, and write the scheduler's buffer sizes --
+// `backend_bytes` on m's backend, `cpu_fallback_bytes` on the scheduler's CPU
+// fallback slot (0 when m's backend IS the CPU). Nothing is allocated,
+// uploaded, or computed. Returns false on graph/scheduler construction failure.
+bool vae_model_measure_decode(VaeModel * m, int T_latent, size_t & backend_bytes, size_t & cpu_fallback_bytes);
+bool vae_model_measure_encode(VaeModel * m, int frames, size_t & backend_bytes, size_t & cpu_fallback_bytes);
+
+// Scheduler compute bytes of the most recent real decode window / encode (sum
+// over the sched's backends; 0 before the first). For the fit parity tests.
+size_t vae_model_compute_buffer_bytes(const VaeModel * m);
 
 // Decode a 64-ch latent (time-major, latent[t*64 + c]) into interleaved stereo
 // 48 kHz PCM. Returns T_audio frames (= T_latent * 1920) or -1 on failure.

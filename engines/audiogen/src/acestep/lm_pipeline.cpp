@@ -20,12 +20,20 @@ namespace tts_cpp::acestep {
 static const char * LM_INSTRUCTION = "Generate audio semantic tokens based on the given conditions:";
 static const char * LM_INSPIRE_INSTRUCTION =
     "Expand the user's input into a more detailed and specific musical description:";
+static const char * LM_FORMAT_INSTRUCTION =
+    "Format the user's input into a more detailed and specific musical description:";
+static const char * LM_UNDERSTAND_INSTRUCTION =
+    "Understand the given musical conditions and describe the audio semantics accordingly:";
 static const char * LM_INSTRUMENTAL_LYRICS       = "[Instrumental]";
 static const char * LM_INSPIRE_INSTRUMENTAL_HINT = "\n\ninstrumental: true";
 
 std::string lm_inspire_user_message(const std::string & caption, const std::string & lyrics) {
     if (lyrics == LM_INSTRUMENTAL_LYRICS) return caption + LM_INSPIRE_INSTRUMENTAL_HINT;
     return caption;
+}
+
+std::string lm_format_user_message(const std::string & caption, const std::string & lyrics) {
+    return "# Caption\n" + caption + "\n\n# Lyric\n" + lyrics;
 }
 
 struct TokenProb {
@@ -40,6 +48,9 @@ static double lm_ms_since(std::chrono::steady_clock::time_point t0) {
 // Phase 1 stops at <|im_end|> long before its token cap, so its length is
 // unknowable up front and its ticks report the engine's unknown-total marker.
 static constexpr int LM_PROGRESS_UNKNOWN_TOTAL = -1;
+
+// Understand decode cap when the caller sets none; matches Phase 1's default.
+static constexpr int LM_UNDERSTAND_DEFAULT_MAX_NEW = 2048;
 
 // Throttled progress for the decode loops: every 8 tokens (each step is a full
 // LM forward, so this is cheap relative to the work) plus the final step.
@@ -171,7 +182,7 @@ int sample_top_k_p(float * logits, int V, float temperature, float top_p, int to
 
 // YAML CoT block (acestep.cpp prompt.h build_cot_yaml). Matches Python
 // yaml.dump(allow_unicode=True, sort_keys=True): break + 2-space indent past col 80.
-static std::string build_cot_yaml(const AcePrompt & prompt) {
+std::string lm_cot_yaml(const AcePrompt & prompt) {
     auto yaml_wrap = [](const std::string & key, const std::string & val) -> std::string {
         std::string result = key + ":";
         int         col    = (int) (key.size() + 1);
@@ -206,7 +217,7 @@ static std::string build_cot_yaml(const AcePrompt & prompt) {
 }
 
 std::vector<int> build_lm_prompt_with_cot(const BpeTokenizer & bpe, const AcePrompt & prompt) {
-    std::string      cot = build_cot_yaml(prompt);
+    std::string      cot = lm_cot_yaml(prompt);
     std::vector<int> ids;
     auto             append = [&](const std::string & text) {
         auto t = bpe_encode(bpe, text, false);
@@ -385,16 +396,17 @@ static std::vector<int> build_custom_prompt(const BpeTokenizer & bpe, const std:
 }
 
 bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & prompt, const LmSampleParams & params,
-                        bool use_fsm, bool use_cot_caption, bool force_inspire) {
+                        bool use_fsm, bool use_cot_caption, LmPhase1Mode mode) {
     const LMConfig & cfg = lm_model_config(m);
     const int        V   = cfg.vocab_size;
 
     const AcePrompt base        = prompt;
+    const bool      format      = mode == LmPhase1Mode::Format;
     const bool      need_lyrics = base.lyrics.empty();
-    const bool      gen_lyrics  = need_lyrics || force_inspire;
+    const bool      inspire     = !format && (need_lyrics || mode == LmPhase1Mode::Inspire);
+    const bool      gen_lyrics  = format || inspire || need_lyrics;
     const bool      lyrics_mode = gen_lyrics;
     const bool      stop_at_reasoning = !gen_lyrics;
-    const bool      inspire     = need_lyrics || force_inspire;  // bare caption -> INSPIRE expansion
 
     // With the FSM active and the reasoning stop set, no sampled token can ever
     // reach the audio-code band, so the forward projects only the prefix head.
@@ -402,7 +414,10 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     const int V_eff = V_lim > 0 ? V_lim : V;
 
     std::vector<int> prompt_tokens;
-    if (inspire) {
+    if (format) {
+        prompt_tokens = build_custom_prompt(bpe, std::string("# Instruction\n") + LM_FORMAT_INSTRUCTION,
+                                            lm_format_user_message(base.caption, base.lyrics));
+    } else if (inspire) {
         prompt_tokens = build_custom_prompt(bpe, std::string("# Instruction\n") + LM_INSPIRE_INSTRUCTION,
                                             lm_inspire_user_message(base.caption, base.lyrics));
     } else {
@@ -413,7 +428,7 @@ bool lm_generate_phase1(LMModel * m, const BpeTokenizer & bpe, AcePrompt & promp
     MetadataFSM fsm;
     if (use_fsm) {
         fsm.init(bpe, V_eff, params.verbose);
-        fsm.skip_caption = !use_cot_caption && !inspire;
+        fsm.skip_caption = !use_cot_caption && !inspire && !format;
         if (base.bpm > 0)               fsm.force_field(bpe, MetadataFSM::BPM_VALUE, std::to_string(base.bpm));
         if (base.duration > 0)          fsm.force_field(bpe, MetadataFSM::DURATION_VALUE,
                                                         std::to_string((int) base.duration));
@@ -699,6 +714,121 @@ bool lm_generate_codes(LMModel *              m,
             csv += std::to_string(codes_out[i]);
         }
         fprintf(stderr, "[lm-pipeline] codes: %s\n", csv.c_str());
+    }
+    return true;
+}
+
+std::vector<int> lm_understand_prompt(const BpeTokenizer & bpe, const int * codes, int n_codes) {
+    std::vector<int> ids;
+    auto             append = [&](const std::string & text) {
+        auto t = bpe_encode(bpe, text, false);
+        ids.insert(ids.end(), t.begin(), t.end());
+    };
+    ids.push_back(TOKEN_IM_START);
+    append(std::string("system\n# Instruction\n") + LM_UNDERSTAND_INSTRUCTION + "\n\n");
+    ids.push_back(TOKEN_IM_END);
+    append("\n");
+    ids.push_back(TOKEN_IM_START);
+    append("user\n");
+    for (int i = 0; i < n_codes; i++) ids.push_back(AUDIO_CODE_BASE + codes[i]);
+    ids.push_back(TOKEN_IM_END);
+    append("\n");
+    ids.push_back(TOKEN_IM_START);
+    append("assistant\n");
+    return ids;
+}
+
+std::vector<int> lm_understand_unconditional_prompt(const BpeTokenizer & bpe) {
+    // The trailing newline matters: the reference's system text ends "\n\n"
+    // before <|im_end|>, and the conditional understand prompt does too. A
+    // single "\n" here would silently shift the quality-score baseline.
+    return build_custom_prompt(bpe, std::string("# Instruction\n") + LM_UNDERSTAND_INSTRUCTION + "\n",
+                               "NO USER INPUT");
+}
+
+static int lm_understand_sample(MetadataFSM & fsm, float * logits, int V,
+                                const LmSampleParams & params, std::mt19937 & rng) {
+    const int forced = fsm.enabled ? fsm.forced_token() : -1;
+    if (forced >= 0) return lm_consume_forced(forced, params.temperature, rng);
+    if (fsm.enabled) fsm.apply_mask(logits);
+    return sample_top_k_p(logits, V, params.temperature, params.top_p, params.top_k, rng);
+}
+
+int lm_understand_token_budget(int max_seq_len, size_t prompt_tokens, int requested) {
+    const int room = max_seq_len - (int) prompt_tokens;
+    if (room <= 0) return 0;
+    const int wanted = requested > 0 ? requested : LM_UNDERSTAND_DEFAULT_MAX_NEW;
+    return wanted < room ? wanted : room;
+}
+
+bool lm_understand(LMModel * m, const BpeTokenizer & bpe, const std::vector<int> & codes,
+                   const LmSampleParams & params, const std::string & language_hint,
+                   AcePrompt & out) {
+    out = {};
+    if (!m || codes.empty()) return false;
+
+    const int V = lm_model_config(m).vocab_size;
+
+    MetadataFSM fsm;
+    fsm.init(bpe, V, params.verbose);
+    if (!language_hint.empty() && language_hint != "unknown") {
+        fsm.force_field(bpe, MetadataFSM::LANGUAGE_VALUE, language_hint);
+    }
+
+    const std::vector<int>     prompt = lm_understand_prompt(bpe, codes.data(), (int) codes.size());
+    const std::vector<int32_t> prompt32(prompt.begin(), prompt.end());
+    if (prompt.size() + 1 > (size_t) lm_model_config(m).max_seq_len) {
+        fprintf(stderr, "[lm-understand] prompt needs %zu tokens, exceeding LM max_seq %d\n",
+                prompt.size(), lm_model_config(m).max_seq_len);
+        return false;
+    }
+
+    std::vector<float> logits;
+    lm_reset(m, 0);
+    if (!lm_model_forward(m, prompt32.data(), (int) prompt32.size(), logits)) {
+        fprintf(stderr, "[lm-understand] prefill failed\n");
+        return false;
+    }
+    if (params.verbose) {
+        fprintf(stderr, "[lm-understand] prefill %zu tokens (%zu codes + framing)\n", prompt.size(),
+                codes.size());
+    }
+
+    std::mt19937     rng(params.seed);
+    std::vector<int> gen_tokens;
+    // The description lives entirely inside the CoT block (caption included),
+    // so decoding stops at </think>: the lyric text the reference generates
+    // afterwards is unused here and would only burn KV budget. The budget is
+    // capped to the KV room left after the prompt — a long clip's code prompt
+    // can leave far less than the default.
+    const int max_new = lm_understand_token_budget(lm_model_config(m).max_seq_len, prompt.size(),
+                                                   params.max_new_tokens);
+
+    for (int step = 0; step < max_new; step++) {
+        if (!lm_report_progress(params, step, max_new, LM_PROGRESS_UNKNOWN_TOTAL)) {
+            fprintf(stderr, "[lm-understand] cancelled at step %d\n", step);
+            return false;
+        }
+        const int tok = lm_understand_sample(fsm, logits.data(), V, params, rng);
+        if (tok == TOKEN_IM_END) break;
+        if (fsm.enabled) fsm.update(tok);
+        gen_tokens.push_back(tok);
+        if (tok == TOKEN_THINK_END) break;
+
+        const int32_t t = (int32_t) tok;
+        if (!lm_model_forward(m, &t, 1, logits)) {
+            fprintf(stderr, "[lm-understand] decode step %d failed\n", step);
+            return false;
+        }
+    }
+
+    const std::string text = bpe_decode(bpe, gen_tokens);
+    if (params.verbose) {
+        fprintf(stderr, "[lm-understand] generated %zu tokens:\n%s\n", gen_tokens.size(), text.c_str());
+    }
+    parse_cot_and_lyrics(text, out);
+    if (!language_hint.empty() && language_hint != "unknown") {
+        out.vocal_language = language_hint;
     }
     return true;
 }

@@ -338,12 +338,49 @@ bool t3_dispatch_compute(const chatterbox_model & model, ggml_cgraph * gf,
                          int n_threads, bool use_sched,
                          const char * caller, int n_past = -1);
 
+// ── Memory-fit measurement (include/tts-cpp/chatterbox/fit.h) ──────────────
+// When a t3_load_measure pointer is passed to the loaders, the load is
+// metadata-only: same variant peek, hparam reads, backend + KV-type
+// resolution and tensor wiring, but every allocation the real path makes is
+// SIZED into the measure struct instead of performed and no tensor data is
+// read.  Weight / KV / wqkv-stack tensors come back marked externally
+// allocated (dummy non-null data, the same trick ggml's own measure paths
+// use) so graph pricing excludes them; a model loaded this way must never
+// have tensor data read or written, and must only be used to build graphs
+// for size-only pricing.
+struct t3_load_measure {
+    size_t weights_bytes = 0;  // buffer_w (MTL: incl. the local rope_freq_factors)
+    size_t kv_bytes      = 0;  // buffer_kv at the resolved kv_type / n_ctx
+    size_t stack_bytes   = 0;  // MTL fused wqkv stack (non-CPU backends only)
+};
+
+// Mark every unallocated tensor in `ctx` externally allocated (dummy non-null
+// data) so graph pricing over a metadata-only model excludes it; defined in
+// main.cpp, shared with t3_mtl.cpp.
+void t3_mark_externally_allocated(ggml_context * ctx);
+
 bool load_model_gguf(
     const std::string & path,
     chatterbox_model &  model,
     int                 requested_ctx,
     int                 n_gpu_layers,
-    ggml_type           kv_type = GGML_TYPE_F32);
+    ggml_type           kv_type = GGML_TYPE_F32,
+    t3_load_measure *   measure = nullptr);
+
+// Price the T3 compute arena for one synthesis: the prompt graph at
+// n_text_tokens and the deepest decode-step graph at n_past, through the
+// same dual-path dispatch (Engine::Impl::allocr vs the [backend, CPU-last]
+// scheduler) eval_prompt/eval_step allocate with.  The two graphs share one
+// allocator, so the resident figure is the max of the two on each side.
+// Variant-dispatching (Turbo B=1 / MTL B=2 on GPU / MTL B=1 on CPU).
+// Returns false on a pricing failure.
+bool t3_measure_compute(const chatterbox_model & model, int n_text_tokens, int n_past,
+                        uint64_t & device_bytes, uint64_t & host_bytes);
+
+// MTL half of t3_measure_compute; implemented in t3_mtl.cpp next to the
+// graph builders it prices.
+bool t3_measure_compute_mtl(const chatterbox_model & model, int n_text_tokens, int n_past,
+                            uint64_t & device_bytes, uint64_t & host_bytes);
 
 bool eval_prompt(
     const chatterbox_model &     model,
@@ -402,7 +439,8 @@ bool load_model_gguf_mtl(
     chatterbox_model &  model,
     int                 requested_ctx,
     int                 n_gpu_layers,
-    ggml_type           kv_type = GGML_TYPE_F32);
+    ggml_type           kv_type = GGML_TYPE_F32,
+    t3_load_measure *   measure = nullptr);
 
 bool eval_prompt_mtl(
     const chatterbox_model &     model,

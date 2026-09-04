@@ -55,7 +55,8 @@ inline bool is_sft_model_name(const std::string & model_name) {
     return model_name.find("sft") != std::string::npos;
 }
 
-struct DitModel;  // opaque: fused weight tensors + backend weight buffer
+struct DitModel;             // opaque: fused weight tensors + backend weight buffer
+struct AcestepStageMeasure;  // fit_measure.h
 
 // Load DiT weights from `path` onto `backend` (borrowed). Returns nullptr on
 // failure. Reads config from GGUF metadata; fuses QKV / gate-up when tensor
@@ -64,6 +65,18 @@ DitModel *        dit_model_load(const std::string & path, ggml_backend_t backen
 void              dit_model_free(DitModel * m);
 const DitConfig & dit_model_config(const DitModel * m);
 size_t            dit_model_weight_bytes(const DitModel * m);
+
+// Metadata-only load for the memory-fit preflight: identical tensor wiring to
+// dit_model_load, but the weight allocation is SIZED into `measure` instead of
+// performed and no tensor data is read. Only good for the measure-mode forward
+// below; free with dit_model_free.
+DitModel * dit_model_load_metadata_only(const std::string & path, ggml_backend_t backend,
+                                        bool verbose, AcestepStageMeasure & measure);
+
+// Compute-buffer bytes of the persistent forward-graph cache (0 when no graph
+// has been built); lets the fit parity tests compare projection vs the real
+// resident allocation.
+size_t dit_model_compute_buffer_bytes(const DitModel * m);
 
 // Inputs for one DiT forward (velocity prediction). N = batch (CFG uses N=2).
 struct DitForwardInputs {
@@ -92,7 +105,43 @@ struct DitForwardInputs {
 
 // Run one forward pass. Writes velocity [out_channels, T, N] (channel-major per
 // frame) to `velocity_out`. Returns false on failure.
-bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<float> & velocity_out);
+// When `measure_compute` is non-null the call builds the identical graph for
+// `in`'s shapes but only SIZES its compute buffer (the size-only twin of the
+// persistent graph-cache allocation) -- nothing is allocated, uploaded, or
+// computed, and the graph cache is left untouched. The data pointers in `in`
+// may then be null; `sa_mask_sw` / `ca_mask` still select the masked graph
+// shape by non-nullness (pass any non-null pointer, as dit_sample always does).
+bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<float> & velocity_out,
+                       size_t * measure_compute = nullptr);
+
+// One cross-attention head to capture during the lyric-alignment probe.
+struct DitAttentionHead {
+    int layer = 0;
+    int head  = 0;
+};
+
+// Inputs for the final-timestep probe used by lyric alignment: one forward at
+// t = 1/num_steps over the retained conditioning and the denoised latent.
+struct DitAttentionProbeInputs {
+    const float * context    = nullptr;  // [in_channels-out_channels, T] frame-major
+    const float * latent     = nullptr;  // [out_channels, T] denoised latent
+    const float * enc_hidden = nullptr;  // [H_enc, enc_S]
+    int           T          = 0;
+    int           enc_S      = 0;
+    int           H_enc      = 0;
+    int           real_enc_S = 0;
+    int           num_steps  = 0;
+    long long     seed       = 0;        // philox noise blended into the probe latent
+};
+
+// Runs the probe with explicit softmax on the captured cross-attention layers,
+// building the graph only up to the deepest captured layer. Appends one
+// [enc_S * S] buffer per head in ggml layout (enc_S contiguous per frame row).
+// Fully separate from the sampling graph cache: normal inference is untouched.
+bool dit_probe_cross_attention(DitModel *                            m,
+                               const DitAttentionProbeInputs &       in,
+                               const std::vector<DitAttentionHead> & heads,
+                               std::vector<std::vector<float>> &     captured_out);
 
 // Flow-matching timestep schedule (ACE-Step default):
 //   t_i = shift * t / (1 + (shift-1)*t),  t = 1 - i/num_steps.

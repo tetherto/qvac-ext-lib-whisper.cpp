@@ -105,6 +105,18 @@ struct SortformerSpeakerCache {
 // Reset to a fresh empty state. Allocates mean_sil_emb to D zeros.
 void sortformer_cache_reset(SortformerSpeakerCache & cache, int D);
 
+// Fit projection: size the compute buffers of the diarization head graph at
+// `T_enc` encoder frames, without allocating or executing it, using the SAME
+// allocator the real path uses (the shared scheduler normally, a gallocr on
+// the Mali force-CPU path). `out_active_bytes` is the resolved head backend's
+// buffer (all host RAM on the force-CPU path -- route by
+// model_sortformer_on_cpu); `out_cpu_fallback_bytes` is the scheduler's
+// per-op CPU fallback buffer (host RAM). Requires a
+// load_from_gguf_metadata_only model.
+int  sortformer_measure_head(const ParakeetCtcModel & model, int T_enc,
+                             size_t & out_active_bytes,
+                             size_t & out_cpu_fallback_bytes);
+
 // The diarization head backend is resolved internally via model_sortformer_backend
 // (CPU on Mali-Vulkan, the active backend otherwise) so callers cannot accidentally
 // drive the CPU-resident force-CPU path through the GPU.

@@ -28,6 +28,11 @@ namespace detail {
 
 constexpr int AUDIO8_MAX_NODES = 8192;
 
+// EngineOptions::max_frames == 0 resolves to this, the reference default
+// (~24 s of audio). Shared with the fit projector so the projected workload
+// is the one the engine would run.
+constexpr int AUDIO8_DEFAULT_MAX_FRAMES = 512;
+
 // Adds the wall time of its scope to `sink`, in milliseconds. Stages are timed
 // by accumulation because most of them are entered once per generated frame.
 class stage_timer {
@@ -296,6 +301,27 @@ bool load_lm(const std::string & path, int n_gpu_layers, lm_model & model,
              std::string * error);
 void free_lm(lm_model & model);
 
+// ── Memory-fit measurement (include/tts-cpp/audio8/fit.h) ──────────────────
+// Metadata-only twins of load_lm / load_codec: same backend resolution, same
+// hparam reads and tensor wiring, but every allocation the real path makes is
+// SIZED into `measure` instead of performed, and no tensor data is read.
+// Weight and KV tensors come back marked externally allocated (dummy non-null
+// data, the same trick ggml's own measure paths use) so graph pricing
+// excludes them from compute buffers; a model loaded this way must never have
+// tensor data read or written, and must only be used to build graphs for
+// size-only pricing.
+struct fit_load_measure {
+    size_t weights_bytes = 0;
+    size_t kv_bytes      = 0;  // LM only: the slow + fast KV slabs
+};
+
+bool load_lm_metadata_only(const std::string & path, int n_gpu_layers,
+                           lm_model & model, fit_load_measure & measure,
+                           std::string * error);
+bool load_codec_metadata_only(const std::string & path, int n_gpu_layers,
+                              codec_model & model, fit_load_measure & measure,
+                              std::string * error);
+
 // What a codec GGUF says about itself: which half it holds and the shapes it
 // was converted with.
 struct codec_header {
@@ -351,6 +377,35 @@ using code_picker = std::function<int(const std::vector<float> & logits, int pos
 bool fast_step(lm_model & model, const std::vector<float> & fast_input, int semantic,
                int n_threads, const code_picker & pick, std::vector<int32_t> & codes_out,
                std::string * error);
+
+// Fit builders: the exact graphs fast_pass / fast_frame build (position 0
+// primes from the slow transformer's hidden state; later positions read a
+// code embedding), exposed so the fit projector can price them without
+// running. build_slow_graph above already serves the slow transformer.
+void build_fast_fit_graph(lm_model & model, scratch & build, int position, bool prime);
+void build_fast_frame_fit_graph(lm_model & model, scratch & build);
+
+// Codec graph measurement for the fit projector. Decode prices the
+// full-sequence latent graph plus the synthesis block the runtime's own
+// planner (plan_blocks) would pick against the memory available right now;
+// encode prices the worst convolution block and the full-reference analysis
+// graph. The device/host split follows the same dual-path dispatch
+// (direct gallocr vs [backend, CPU] scheduler) prepare_graph uses.
+// Returns false on a build/measure failure.
+struct codec_fit_measure {
+    uint64_t device_bytes = 0;
+    uint64_t host_bytes   = 0;
+    int      block_frames = 0;  // decode only: the planned synthesis block width
+    int      block_span   = 0;  // decode only: width + causal context actually priced
+};
+bool measure_decode_memory(codec_model & model, int n_frames, codec_fit_measure & out);
+bool measure_encode_memory(codec_model & model, int n_frames, codec_fit_measure & out);
+
+// Encoder shape queries the fit projector sizes host slabs and RoPE-table
+// checks with: transformer positions for an n_frames reference (4 per frame),
+// and the width of one feature column the convolution stack hands over.
+int encode_positions(const codec_model & model, int n_frames);
+int encode_feature_width(const codec_model & model);
 
 // fast_step's greedy equivalent in one graph instead of num_codebooks graphs,
 // picking each code on the backend. One submission rather than ten: worth roughly

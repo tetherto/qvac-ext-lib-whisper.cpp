@@ -157,6 +157,19 @@ target_compile_definitions(${VAD_TEST} PRIVATE
 add_test(NAME ${VAD_TEST} COMMAND ${VAD_TEST})
 set_tests_properties(${VAD_TEST} PROPERTIES LABELS "unit;vad")
 
+# VAD use_gpu contract test (QVAC patch, see PATCHES.md): use_gpu=true must
+# initialize and produce CPU-matching probabilities. Exercises the real GPU
+# path on GPU builds and falls back to CPU-vs-CPU elsewhere.
+set(VAD_TEST test-vad-gpu)
+add_executable(${VAD_TEST} ${VAD_TEST}.cpp)
+target_include_directories(${VAD_TEST} PRIVATE ../include ../ggml/include ../examples)
+target_link_libraries(${VAD_TEST} PRIVATE common)
+target_compile_definitions(${VAD_TEST} PRIVATE
+    VAD_MODEL_PATH="${PROJECT_SOURCE_DIR}/models/for-tests-silero-v6.2.0-ggml.bin"
+    SAMPLE_PATH="${PROJECT_SOURCE_DIR}/samples/jfk.wav")
+add_test(NAME ${VAD_TEST} COMMAND ${VAD_TEST})
+set_tests_properties(${VAD_TEST} PROPERTIES LABELS "unit;vad")
+
 if (WHISPER_BUILD_PARAKEET) # QVAC patch, see PATCHES.md: these link the gated `parakeet` target
 # Parakeet model loading test
 set(PARAKEET_TEST test-parakeet)
