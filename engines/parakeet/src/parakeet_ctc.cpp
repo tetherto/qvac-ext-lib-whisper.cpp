@@ -2875,6 +2875,65 @@ ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,
 
 }
 
+// Standalone subsampling graph (run_subsampling / measure_subsampling_compute):
+// tensor metadata + cgraph for one L0-mel-frame pre-encode forward. Both
+// callers build through this so the fit projection prices exactly the graph
+// the per-chunk streaming path executes. The caller owns `ctx` (RAII below).
+namespace {
+struct SubsamplingGraphBuild {
+    ggml_context * ctx     = nullptr;
+    ggml_cgraph  * gf      = nullptr;
+    ggml_tensor  * mel_in  = nullptr;
+    ggml_tensor  * mask_t0 = nullptr;
+    ggml_tensor  * mask_t1 = nullptr;
+    ggml_tensor  * mask_t2 = nullptr;
+    ggml_tensor  * mask_t3 = nullptr;
+    ggml_tensor  * out     = nullptr;
+    ~SubsamplingGraphBuild() { if (ctx) ggml_free(ctx); }
+};
+}  // namespace
+
+static int build_subsampling_graph_ctx(ParakeetCtcModel & model,
+                                       int L0, int L1, int L2, int L3,
+                                       int n_mels,
+                                       SubsamplingGraphBuild & g) {
+    const int C_sub   = model.encoder_cfg.subsampling_channels;
+    const int d_model = model.encoder_cfg.d_model;
+
+    const size_t overhead = ggml_tensor_overhead() * (GGML_DEFAULT_GRAPH_SIZE + 64)
+                          + ggml_graph_overhead();
+    ggml_init_params gp = { overhead, nullptr, /*no_alloc=*/ true };
+    g.ctx = ggml_init(gp);
+    if (!g.ctx) return -2;
+
+    g.mel_in  = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, n_mels, L0, 1, 1);
+    ggml_set_name(g.mel_in, "mel_in");
+    ggml_set_input(g.mel_in);
+    g.mask_t0 = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, 1, L0, 1, 1);
+    g.mask_t1 = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, 1, L1, 1, 1);
+    g.mask_t2 = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, 1, L2, 1, 1);
+    g.mask_t3 = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, 1, L3, 1, 1);
+    ggml_set_name(g.mask_t0, "mask_t0");
+    ggml_set_name(g.mask_t1, "mask_t1");
+    ggml_set_name(g.mask_t2, "mask_t2");
+    ggml_set_name(g.mask_t3, "mask_t3");
+    ggml_set_input(g.mask_t0);
+    ggml_set_input(g.mask_t1);
+    ggml_set_input(g.mask_t2);
+    ggml_set_input(g.mask_t3);
+
+    g.out = subsampling_graph(g.ctx, g.mel_in, model.subsampling, C_sub, d_model,
+                              g.mask_t0, g.mask_t1, g.mask_t2, g.mask_t3, false,
+                              model.encoder_cfg.causal_downsampling,
+                              model.impl->dw_direct_planar);
+    ggml_set_name(g.out, "sub_out");
+    ggml_set_output(g.out);
+
+    g.gf = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.gf, g.out);
+    return 0;
+}
+
 int run_subsampling(ParakeetCtcModel   & model,
                     const float        * mel,
                     int                  n_mel_frames,
@@ -2882,9 +2941,6 @@ int run_subsampling(ParakeetCtcModel   & model,
                     std::vector<float> & out_feats,
                     int                & out_n_frames) {
     if (!model.impl || !model.impl->backend_active || !model.impl->sched) return -1;
-
-    const int C_sub = model.encoder_cfg.subsampling_channels;
-    const int d_model = model.encoder_cfg.d_model;
 
     int mel_valid = 0;
     for (int t = 0; t < n_mel_frames; ++t) {
@@ -2921,63 +2977,101 @@ int run_subsampling(ParakeetCtcModel   & model,
     std::vector<float> m2 = make_mask(L2, V2);
     std::vector<float> m3 = make_mask(L3, V3);
 
-    const size_t overhead = ggml_tensor_overhead() * (GGML_DEFAULT_GRAPH_SIZE + 64)
-                          + ggml_graph_overhead();
-    ggml_init_params gp = { overhead, nullptr, /*no_alloc=*/ true };
-    ggml_context * gctx = ggml_init(gp);
-    if (!gctx) return -2;
-
-    ggml_tensor * mel_in  = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_mels, L0, 1, 1);
-    ggml_set_name(mel_in, "mel_in");
-    ggml_set_input(mel_in);
-    ggml_tensor * mask_t0 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L0, 1, 1);
-    ggml_tensor * mask_t1 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L1, 1, 1);
-    ggml_tensor * mask_t2 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L2, 1, 1);
-    ggml_tensor * mask_t3 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L3, 1, 1);
-    ggml_set_name(mask_t0, "mask_t0");
-    ggml_set_name(mask_t1, "mask_t1");
-    ggml_set_name(mask_t2, "mask_t2");
-    ggml_set_name(mask_t3, "mask_t3");
-    ggml_set_input(mask_t0);
-    ggml_set_input(mask_t1);
-    ggml_set_input(mask_t2);
-    ggml_set_input(mask_t3);
-
-    ggml_tensor * out = subsampling_graph(gctx, mel_in, model.subsampling, C_sub, d_model,
-                                          mask_t0, mask_t1, mask_t2, mask_t3, false,
-                                          causal_ds, model.impl->dw_direct_planar);
-    ggml_set_name(out, "sub_out");
-    ggml_set_output(out);
-
-    ggml_cgraph * gf = ggml_new_graph(gctx);
-    ggml_build_forward_expand(gf, out);
+    SubsamplingGraphBuild g;
+    if (int rc = build_subsampling_graph_ctx(model, L0, L1, L2, L3, n_mels, g);
+        rc != 0) {
+        return rc;
+    }
 
     // Reset at the HEAD (the previous run already downloaded its outputs to host);
     // the shared sched owns allocation. Never reset at the tail.
     ggml_backend_sched_reset(model.impl->sched);
-    if (!ggml_backend_sched_alloc_graph(model.impl->sched, gf)) {
-        ggml_free(gctx);
+    if (!ggml_backend_sched_alloc_graph(model.impl->sched, g.gf)) {
         return -3;
     }
 
-    ggml_backend_tensor_set(mel_in, mel, 0, (size_t) n_mels * L0 * sizeof(float));
-    ggml_backend_tensor_set(mask_t0, m0.data(), 0, m0.size() * sizeof(float));
-    ggml_backend_tensor_set(mask_t1, m1.data(), 0, m1.size() * sizeof(float));
-    ggml_backend_tensor_set(mask_t2, m2.data(), 0, m2.size() * sizeof(float));
-    ggml_backend_tensor_set(mask_t3, m3.data(), 0, m3.size() * sizeof(float));
+    ggml_backend_tensor_set(g.mel_in, mel, 0, (size_t) n_mels * L0 * sizeof(float));
+    ggml_backend_tensor_set(g.mask_t0, m0.data(), 0, m0.size() * sizeof(float));
+    ggml_backend_tensor_set(g.mask_t1, m1.data(), 0, m1.size() * sizeof(float));
+    ggml_backend_tensor_set(g.mask_t2, m2.data(), 0, m2.size() * sizeof(float));
+    ggml_backend_tensor_set(g.mask_t3, m3.data(), 0, m3.size() * sizeof(float));
 
-    if (ggml_backend_sched_graph_compute(model.impl->sched, gf) != GGML_STATUS_SUCCESS) {
-        ggml_free(gctx);
+    if (ggml_backend_sched_graph_compute(model.impl->sched, g.gf) != GGML_STATUS_SUCCESS) {
         return -4;
     }
 
-    const int H_out = (int) out->ne[1];
-    const int W_out = (int) out->ne[0];
+    const int H_out = (int) g.out->ne[1];
+    const int W_out = (int) g.out->ne[0];
     out_feats.resize((size_t) W_out * H_out);
-    ggml_backend_tensor_get(out, out_feats.data(), 0, out_feats.size() * sizeof(float));
+    ggml_backend_tensor_get(g.out, out_feats.data(), 0, out_feats.size() * sizeof(float));
     out_n_frames = H_out;
 
-    ggml_free(gctx);
+    return 0;
+}
+
+int measure_subsampling_compute(ParakeetCtcModel & model,
+                                int                n_mel_frames,
+                                int                n_mels,
+                                size_t           & out_active_bytes,
+                                size_t           & out_host_input_bytes) {
+    out_active_bytes     = 0;
+    out_host_input_bytes = 0;
+    if (!model.impl || !model.impl->backend_active) return -1;
+    if (n_mel_frames <= 0 || n_mels <= 0) return -1;
+
+    const bool causal_ds = model.encoder_cfg.causal_downsampling;
+    auto sub_out_len = [&](int Lin) {
+        return causal_ds ? (Lin / 2 + 1) : _conv_out_len(Lin, 3, 2, 1);
+    };
+    const int L0 = n_mel_frames;
+    const int L1 = sub_out_len(L0);
+    const int L2 = sub_out_len(L1);
+    const int L3 = sub_out_len(L2);
+
+    SubsamplingGraphBuild g;
+    if (int rc = build_subsampling_graph_ctx(model, L0, L1, L2, L3, n_mels, g);
+        rc != 0) {
+        return rc;
+    }
+
+    // Price with a plain gallocr on the active backend's default buffer type.
+    // The real per-chunk path allocates through the shared scheduler, but the
+    // subsampling ops are fully supported on every active backend -- the
+    // offline encoder graph embeds the same ops and runs single-split (1
+    // split / 0 copies) everywhere -- so the scheduler's reservation is one
+    // buffer on the active backend with the same layout the gallocr
+    // computes; test-fit-params asserts that byte equality against the
+    // scheduler buffer a real streaming session reserves. Pricing through
+    // ggml_backend_sched_reserve_size itself is not possible on a
+    // metadata-only model: its externally-marked weights carry no backend
+    // buffer, the scheduler's leaf resolution leaves them unassigned
+    // (GGML_ASSERT(buffer_id >= 0) inside the reserve), and explicit
+    // ggml_backend_sched_set_tensor_backend pins do not survive the reset at
+    // the head of reserve_size.
+    ggml_gallocr_t pricer = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(model.impl->backend_active));
+    if (!pricer) {
+        return -3;
+    }
+    ggml_gallocr_reserve_n_size(pricer, g.gf, nullptr, nullptr, &out_active_bytes);
+    ggml_gallocr_free(pricer);
+
+    // On a GPU backend the scheduler assigns graph INPUTS to the CPU (last)
+    // backend and copies them into the device split, so the originals occupy
+    // a second, CPU-side scheduler buffer the single-buft measure above does
+    // not see. Size that host portion explicitly (per-tensor, padded to the
+    // CPU buffer alignment like the scheduler's gallocr does); zero on
+    // CPU-only runs where the originals ARE the measured allocations.
+    if (!backend_is_cpu(model.impl->backend_active) && model.impl->backend_cpu) {
+        ggml_backend_buffer_type_t cpu_buft =
+            ggml_backend_get_default_buffer_type(model.impl->backend_cpu);
+        const size_t align = ggml_backend_buft_get_alignment(cpu_buft);
+        for (ggml_tensor * in : { g.mel_in, g.mask_t0, g.mask_t1,
+                                  g.mask_t2, g.mask_t3 }) {
+            out_host_input_bytes +=
+                GGML_PAD(ggml_backend_buft_get_alloc_size(cpu_buft, in), align);
+        }
+    }
     return 0;
 }
 
@@ -3350,6 +3444,96 @@ static int run_encoder_coreml(ParakeetCtcModel & model,
 }
 #endif  // PARAKEET_USE_COREML
 
+// Build (and, unless measuring, allocate) the two-layer locale-prompt
+// projection graph at `n_frames` encoder frames. Shared by
+// run_nemotron_prompt_projection and measure_nemotron_prompt_compute so the
+// fit projection prices exactly the graph the runtime builds.
+//
+// `measure_bytes` (fit projection): when non-null the graph is built normally
+// but its compute buffer is only *sized* into `*measure_bytes*`
+// (ggml_gallocr_reserve_n_size) instead of allocated; `out.allocator` stays
+// null and `out` must be discarded after reading the size.
+static int build_nemotron_prompt_graph(
+    const ParakeetCtcModel & model,
+    int n_frames,
+    NemotronPromptGraph & out,
+    size_t * measure_bytes = nullptr) {
+    out.clear();
+    const int input_width = model.nemotron_cfg.prompt_input_width;
+
+    constexpr size_t graph_size = 64;
+    const size_t graph_memory =
+        ggml_tensor_overhead() * graph_size +
+        ggml_graph_overhead_custom(graph_size, false) +
+        16 * 1024;
+    ggml_init_params params = {};
+    params.mem_size = graph_memory;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    out.context = ggml_init(params);
+    if (!out.context) {
+        return -3;
+    }
+
+    out.input = ggml_new_tensor_2d(
+        out.context, GGML_TYPE_F32, input_width, n_frames);
+    ggml_set_input(out.input);
+    ggml_tensor * hidden = ggml_mul_mat(
+        out.context, model.nemotron.prompt.proj_0_w, out.input);
+    hidden = ggml_add(
+        out.context, hidden, model.nemotron.prompt.proj_0_b);
+    hidden = ggml_relu(out.context, hidden);
+    out.output = ggml_mul_mat(
+        out.context, model.nemotron.prompt.proj_2_w, hidden);
+    out.output = ggml_add(
+        out.context, out.output, model.nemotron.prompt.proj_2_b);
+    ggml_set_output(out.output);
+
+    out.graph =
+        ggml_new_graph_custom(out.context, graph_size, false);
+    ggml_build_forward_expand(out.graph, out.output);
+
+    ggml_backend_t backend = model.impl->backend_active;
+    if (measure_bytes) {
+        ggml_gallocr_t pricer = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+        if (!pricer) {
+            return -4;
+        }
+        *measure_bytes = 0;
+        ggml_gallocr_reserve_n_size(pricer, out.graph, nullptr, nullptr,
+                                    measure_bytes);
+        ggml_gallocr_free(pricer);
+        return 0;
+    }
+    out.allocator = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    if (!out.allocator ||
+        !ggml_gallocr_alloc_graph(out.allocator, out.graph)) {
+        return -4;
+    }
+    out.n_frames = n_frames;
+    return 0;
+}
+
+int measure_nemotron_prompt_compute(ParakeetCtcModel & model,
+                                    int                n_frames,
+                                    size_t           & out_bytes) {
+    out_bytes = 0;
+    if (model.model_type != ParakeetModelType::NEMOTRON ||
+        !model.impl || !model.impl->backend_active || n_frames <= 0) {
+        return -1;
+    }
+    NemotronPromptGraph tmp;  // RAII: destructor frees the graph ctx
+    return build_nemotron_prompt_graph(model, n_frames, tmp, &out_bytes);
+}
+
+size_t model_nemotron_prompt_buffer_bytes(const ParakeetCtcModel & m) {
+    if (!m.impl || !m.impl->nemotron_prompt_graph) return 0;
+    const NemotronPromptGraph & g = *m.impl->nemotron_prompt_graph;
+    return g.allocator ? ggml_gallocr_get_buffer_size(g.allocator, 0) : 0;
+}
+
 int run_nemotron_prompt_projection(
     ParakeetCtcModel & model,
     const float * encoder_out,
@@ -3387,51 +3571,14 @@ int run_nemotron_prompt_projection(
         destination[d_model + prompt_id] = 1.0f;
     }
 
-    constexpr size_t graph_size = 64;
     auto & cached = model.impl->nemotron_prompt_graph;
     if (!cached || cached->n_frames != n_frames) {
         cached = std::make_unique<NemotronPromptGraph>();
-        const size_t graph_memory =
-            ggml_tensor_overhead() * graph_size +
-            ggml_graph_overhead_custom(graph_size, false) +
-            16 * 1024;
-        ggml_init_params params = {};
-        params.mem_size = graph_memory;
-        params.mem_buffer = nullptr;
-        params.no_alloc = true;
-        cached->context = ggml_init(params);
-        if (!cached->context) {
+        if (int rc = build_nemotron_prompt_graph(model, n_frames, *cached);
+            rc != 0) {
             cached.reset();
-            return -3;
+            return rc;
         }
-
-        cached->input = ggml_new_tensor_2d(
-            cached->context, GGML_TYPE_F32, input_width, n_frames);
-        ggml_set_input(cached->input);
-        ggml_tensor * hidden = ggml_mul_mat(
-            cached->context, model.nemotron.prompt.proj_0_w, cached->input);
-        hidden = ggml_add(
-            cached->context, hidden, model.nemotron.prompt.proj_0_b);
-        hidden = ggml_relu(cached->context, hidden);
-        cached->output = ggml_mul_mat(
-            cached->context, model.nemotron.prompt.proj_2_w, hidden);
-        cached->output = ggml_add(
-            cached->context, cached->output, model.nemotron.prompt.proj_2_b);
-        ggml_set_output(cached->output);
-
-        cached->graph =
-            ggml_new_graph_custom(cached->context, graph_size, false);
-        ggml_build_forward_expand(cached->graph, cached->output);
-
-        ggml_backend_t backend = model.impl->backend_active;
-        cached->allocator = ggml_gallocr_new(
-            ggml_backend_get_default_buffer_type(backend));
-        if (!cached->allocator ||
-            !ggml_gallocr_alloc_graph(cached->allocator, cached->graph)) {
-            cached.reset();
-            return -4;
-        }
-        cached->n_frames = n_frames;
     }
 
     NemotronPromptGraph & graph = *cached;
