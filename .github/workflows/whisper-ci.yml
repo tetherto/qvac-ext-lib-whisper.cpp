@@ -27,9 +27,12 @@ on:
 permissions:
   contents: read
 
+# One run per (workflow, ref): a newer push or dispatch supersedes the in-flight
+# run. The guard below previously excluded every event but pull_request, so a
+# push or a re-dispatch stacked a second run instead of replacing the first.
 concurrency:
   group: whisper-ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 env:
   GGML_REPO: https://github.com/tetherto/qvac-ext-ggml.git

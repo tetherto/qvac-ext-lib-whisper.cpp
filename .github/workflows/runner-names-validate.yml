@@ -20,6 +20,12 @@ on:
 permissions:
   contents: read
 
+# One run per (workflow, ref): a newer push or dispatch supersedes the in-flight
+# validation.
+concurrency:
+  group: runner-names-validate-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate:
     runs-on: ubuntu-latest
