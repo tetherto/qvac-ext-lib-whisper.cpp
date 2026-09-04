@@ -150,13 +150,12 @@
     ],
     "args": [
       "--model-dir",     "${MODEL_DIR}",
-      "--n-gpu-layers",  "999",
       "--runs",          "${RUNS}",
       "--warmup",        "${WARMUP}",
       "--json-out",      "${JSON_OUT}"
     ],
     "audio_duration_seconds":  null,
-    "notes": "Model-dir mode: bench discovers the six shards under one directory. --n-gpu-layers 999 for the macOS Metal path (no-op on Linux without GPU compiled)."
+    "notes": "Model-dir mode: bench discovers the six shards under one directory."
   },
 
   "audio8": {

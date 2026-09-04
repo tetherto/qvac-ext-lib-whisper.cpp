@@ -377,6 +377,14 @@ run_native() {
       > "$stderr_log.stdout" 2>> "$stderr_log"; then
     :
   else
+    # Surface the child's actual failure to the step log so debugging a
+    # run-failed cell doesn't require local repro.
+    { echo "--- native bench failed; last 30 lines of stdout ---"
+      tail -n 30 "$stderr_log.stdout" 2>/dev/null || true
+      echo "--- last 30 lines of stderr ---"
+      tail -n 30 "$stderr_log"        2>/dev/null || true
+      echo "--- end ---"
+    } >&2
     return 1
   fi
 
