@@ -206,16 +206,24 @@ fetch_from_s3() {
 
   # `mapfile -t` is bash 4+, so the macOS self-hosted runner would break if
   # /usr/bin/env bash resolved to the system 3.2. Use a portable read loop.
+  # Each row is "s3-key<TAB>rename-to" — rename-to is empty for string
+  # entries and the engine-expected filename for object entries like
+  # {"s3": "2026-07-23/voice-en.gguf", "as": "voice.gguf"} (cosyvoice's
+  # baked voice is stored language-suffixed in S3 but the engine looks
+  # for the canonical `voice.gguf`).
   local -a keys=()
   local line
   while IFS= read -r line; do keys+=("$line"); done < <(jq -r --arg family "$FAMILY" \
-    '.[$family].models[]?' "$FAMILIES_JSON")
+    '.[$family].models[]? | if type == "string" then "\(.)\t" else "\(.s3)\t\(.as // "")" end' \
+    "$FAMILIES_JSON")
   if [[ ${#keys[@]} -eq 0 ]]; then
     return 65      # minimax shape: no S3 path
   fi
 
-  for key in "${keys[@]}"; do
-    local basename="${key##*/}"
+  for row in "${keys[@]}"; do
+    local key="${row%%$'\t'*}"
+    local rename_to="${row#*$'\t'}"
+    local basename="${rename_to:-${key##*/}}"
     local dest="$MODEL_DIR/$basename"
     if [[ -f "$dest" ]]; then continue; fi
     local s3url="s3://$bucket/qvac_models_compiled/ggml/$S3_PREFIX/$key"
