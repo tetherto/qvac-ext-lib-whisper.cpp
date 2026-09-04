@@ -308,21 +308,21 @@ FitResult fit_params(const FitOptions & opts) {
             }
             break;
         case ParakeetModelType::SORTFORMER: {
-            size_t head_active = 0, head_cpu_fallback = 0;
+            size_t head_active = 0, head_host_input = 0;
             if (sortformer_measure_head(model, window_enc,
-                                        head_active, head_cpu_fallback) != 0) {
+                                        head_active, head_host_input) != 0) {
                 r.reason = "measurement-failed";
                 return r;
             }
             // On Mali-Vulkan the head is force-routed to CPU: its compute
             // buffer is host RAM, like the head weight copies already counted
-            // in lm.sortformer_cpu_bytes. The scheduler's per-op CPU fallback
-            // portion is host RAM on every backend.
+            // in lm.sortformer_cpu_bytes. On GPU runs the scheduler keeps the
+            // head's graph-input original in a CPU-side buffer (host RAM).
             if (model_sortformer_on_cpu(model)) {
-                extra_host = sat_add(extra_host, sat_add(head_active, head_cpu_fallback));
+                extra_host = sat_add(extra_host, sat_add(head_active, head_host_input));
             } else {
                 dm.device_compute_bytes = head_active;
-                extra_host = sat_add(extra_host, head_cpu_fallback);
+                extra_host = sat_add(extra_host, head_host_input);
             }
             break;
         }

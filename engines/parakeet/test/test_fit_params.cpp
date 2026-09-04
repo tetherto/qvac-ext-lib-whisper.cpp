@@ -16,9 +16,14 @@
 //      and the windowed projection prices the RESIDENT graph cache
 //      (run_encoder keeps up to 3 window graphs alive), not a single graph;
 //   5. a missing model file is Error/"model-unreadable", never Success;
-//   6. Sortformer only: the projected head compute equals the scheduler
-//      buffer a real diarize actually reserves (the head allocates through
-//      the shared sched, and the projection uses the sched's size-only twin);
+//   6. Sortformer only: the projected head bytes (gallocr measure + CPU-side
+//      graph-input term) equal the scheduler reservation a real diarize
+//      actually makes -- byte for byte on CPU, bounded from above within one
+//      device-side x_in slot on GPU (the sched's input copy is reusable, a
+//      user input leaf is not; strict direction only) -- and the measure
+//      itself must WORK on a metadata-only model (regression: the sched's
+//      own size-only reserve aborts there, which used to crash fit_params on
+//      every Sortformer GGUF);
 //   7. Nemotron only: the projected encoder compute decomposes into the
 //      window graph + prompt-projection graph + streaming step graph +
 //      per-chunk pre-encode graph, and each component equals the buffer the
@@ -308,23 +313,36 @@ int main(int argc, char ** argv) {
             }
         }
 
-        // 6. Sortformer head parity: the projection prices the head with the
-        //    scheduler's size-only reserve; a real diarize must land on the
-        //    same scheduler buffer, byte for byte. (Single-backend runs only:
-        //    with a GPU + CPU sched the projection splits the CPU-fallback
-        //    portion into host_bytes, which this sum cannot isolate.)
-        if (fit.model_type == "sortformer" && n_gpu_layers == 0) {
+        // 6. Sortformer head parity: the projection prices the head with a
+        //    gallocr on the head backend plus an explicit CPU-side
+        //    graph-input term (the scheduler's size-only reserve cannot run
+        //    on a metadata-only model); a real diarize's scheduler
+        //    reservation must equal that sum byte for byte. The shared sched
+        //    is used only by the head on this path, so the buffer sum
+        //    isolates it on every backend -- including any per-op CPU
+        //    fallback the single-buffer measure would miss.
+        if (fit.model_type == "sortformer") {
             const long long total_mel = (long long) std::ceil(
                 (double) kAudioSeconds * model.mel_cfg.sample_rate / model.mel_cfg.hop_length);
             const int T = encoder_out_frames(model.encoder_cfg, total_mel);
             const int D = model.encoder_cfg.sortformer_fc_d_model;
+            size_t head_active = 0, head_host_input = 0;
+            if (parakeet::sortformer_measure_head(model, T, head_active,
+                                                  head_host_input) != 0) {
+                fail("sortformer_measure_head failed on a real-loaded model");
+            } else if (!parakeet::model_sortformer_on_cpu(model)) {
+                expect(head_active == fit.device.decoder_compute_bytes,
+                       "sortformer head projection: fit decoder compute " +
+                       std::to_string(fit.device.decoder_compute_bytes) +
+                       " != measured head " + std::to_string(head_active));
+            }
             std::vector<float> zero_enc((size_t) T * D, 0.0f);
             parakeet::SortformerDiarizationOptions sopts;
             parakeet::SortformerDiarizationResult  sres;
             if (parakeet::sortformer_diarize_ggml(model, zero_enc.data(), T, D,
                                                   sopts, sres) != 0) {
                 fail("real sortformer_diarize_ggml failed");
-            } else {
+            } else if (!parakeet::model_sortformer_on_cpu(model)) {
                 ggml_backend_sched_t sched = parakeet::model_sched(model);
                 size_t real_head = 0;
                 const int nb = sched ? ggml_backend_sched_get_n_backends(sched) : 0;
@@ -332,10 +350,31 @@ int main(int argc, char ** argv) {
                     real_head += ggml_backend_sched_get_buffer_size(
                         sched, ggml_backend_sched_get_backend(sched, i));
                 }
-                expect(real_head == fit.device.decoder_compute_bytes,
-                       "sortformer head parity: projected " +
-                       std::to_string(fit.device.decoder_compute_bytes) +
-                       " != sched reserved " + std::to_string(real_head));
+                const size_t projected_head = head_active + head_host_input;
+                if (nb <= 1) {
+                    // CPU-only sched: the reservation IS the gallocr layout.
+                    expect(real_head == projected_head,
+                           "sortformer head parity: projected " +
+                           std::to_string(projected_head) +
+                           " != sched reserved " + std::to_string(real_head));
+                } else {
+                    // GPU sched: the device-side input copy is a reusable
+                    // node, so the real reservation may come in below the
+                    // measure by at most one x_in slot -- never above
+                    // (strict direction). The slack term allows for buffer
+                    // alignment padding on the device side.
+                    const size_t x_in_slack =
+                        (size_t) T * (size_t) D * sizeof(float) + 1024;
+                    expect(real_head <= projected_head,
+                           "sortformer head UNDER-projection: projected " +
+                           std::to_string(projected_head) +
+                           " < sched reserved " + std::to_string(real_head));
+                    expect(projected_head <= real_head + x_in_slack,
+                           "sortformer head over-projection beyond the input "
+                           "slot: projected " + std::to_string(projected_head) +
+                           " > reserved " + std::to_string(real_head) +
+                           " + x_in slack " + std::to_string(x_in_slack));
+                }
             }
         }
     }
