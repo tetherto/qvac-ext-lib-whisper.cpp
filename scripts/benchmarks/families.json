@@ -106,14 +106,15 @@
     "s3_prefix":    "supertonic",
     "models": ["2026-06-15/supertonic3-q8_0.gguf"],
     "args": [
-      "--model",     "${MODEL_DIR}/supertonic3-q8_0.gguf",
-      "--text",      "benchmark run",
-      "--runs",      "${RUNS}",
-      "--warmup",    "${WARMUP}",
-      "--json-out",  "${JSON_OUT}"
+      "--model",         "${MODEL_DIR}/supertonic3-q8_0.gguf",
+      "--text",          "benchmark run",
+      "--n-gpu-layers",  "999",
+      "--runs",          "${RUNS}",
+      "--warmup",        "${WARMUP}",
+      "--json-out",      "${JSON_OUT}"
     ],
     "audio_duration_seconds":  null,
-    "notes": "Native bench: --json-out reports both e2e wall and RTF."
+    "notes": "Native bench: --json-out reports both e2e wall and RTF. --n-gpu-layers 999 means 'all layers on GPU' — on Linux this is a no-op (no GPU compiled into ggml on the hosted-Linux perf build); on the self-hosted macOS runner it flips supertonic-bench onto the Metal backend that GGML_METAL=ON provides."
   },
 
   "parler": {
@@ -123,14 +124,15 @@
     "s3_prefix":    "parler-tts",
     "models": ["2026-07-20/parler-mini-v1-q8_0.gguf"],
     "args": [
-      "--model",     "${MODEL_DIR}/parler-mini-v1-q8_0.gguf",
-      "--text",      "benchmark run",
-      "--runs",      "${RUNS}",
-      "--warmup",    "${WARMUP}",
-      "--json-out",  "${JSON_OUT}"
+      "--model",         "${MODEL_DIR}/parler-mini-v1-q8_0.gguf",
+      "--text",          "benchmark run",
+      "--n-gpu-layers",  "999",
+      "--runs",          "${RUNS}",
+      "--warmup",        "${WARMUP}",
+      "--json-out",      "${JSON_OUT}"
     ],
     "audio_duration_seconds":  null,
-    "notes": "Native bench; JSON schema matches supertonic-bench."
+    "notes": "Native bench; JSON schema matches supertonic-bench. --n-gpu-layers 999 for the macOS Metal path (no-op on Linux without GPU compiled)."
   },
 
   "cosyvoice": {
@@ -147,13 +149,14 @@
       "2026-08-14/cosyvoice3-campplus-f32.gguf"
     ],
     "args": [
-      "--model-dir", "${MODEL_DIR}",
-      "--runs",      "${RUNS}",
-      "--warmup",    "${WARMUP}",
-      "--json-out",  "${JSON_OUT}"
+      "--model-dir",     "${MODEL_DIR}",
+      "--n-gpu-layers",  "999",
+      "--runs",          "${RUNS}",
+      "--warmup",        "${WARMUP}",
+      "--json-out",      "${JSON_OUT}"
     ],
     "audio_duration_seconds":  null,
-    "notes": "Model-dir mode: bench discovers the six shards under one directory."
+    "notes": "Model-dir mode: bench discovers the six shards under one directory. --n-gpu-layers 999 for the macOS Metal path (no-op on Linux without GPU compiled)."
   },
 
   "audio8": {
