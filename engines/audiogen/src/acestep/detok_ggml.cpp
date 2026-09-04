@@ -1,5 +1,6 @@
 #include "detok_ggml.h"
 
+#include "fit_measure.h"
 #include "qwen3_block.h"  // shared Qwen3 loaders + builders + DitGGUF IO
 
 #include "ggml.h"
@@ -68,9 +69,16 @@ struct DetokModel {
     ggml_backend_buffer_t map_buf = nullptr;
     bool                  mapped  = false;
     size_t                mapped_bytes = 0;  // sum of mmapped weight nbytes
+
+    bool   measuring          = false;  // metadata-only load: weights sized, never read
+    size_t last_compute_bytes = 0;      // gallocr buffer of the most recent real decode
 };
 
-DetokModel * detok_model_load(const std::string & path, ggml_backend_t backend, bool verbose) {
+// Shared body of detok_model_load and detok_model_load_metadata_only. When
+// `measure` is non-null the load is metadata-only: the weight allocation is
+// sized into `measure` instead of performed and no tensor data is read.
+static DetokModel * detok_model_load_impl(const std::string & path, ggml_backend_t backend, bool verbose,
+                                          AcestepStageMeasure * measure) {
     DitGGUF g;
     if (!dit_gguf_open(g, path)) {
         fprintf(stderr, "[acestep-detok] failed to parse %s\n", path.c_str());
@@ -108,28 +116,44 @@ DetokModel * detok_model_load(const std::string & path, ggml_backend_t backend, 
         q3_create_layer(ctx, g, "detokenizer.layers." + std::to_string(i), m->layers[i], map_buf);
     }
 
-    m->weight_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (!m->weight_buf) {
-        fprintf(stderr, "[acestep-detok] failed to allocate weight buffer\n");
-        if (map_buf) ggml_backend_buffer_free(map_buf);
-        ggml_free(ctx);
-        dit_gguf_close(g);
-        delete m;
-        return nullptr;
-    }
+    if (measure) {
+        measure->weights_alloc_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            ctx, ggml_backend_get_default_buffer_type(backend));
+        m->measuring = true;
+    } else {
+        m->weight_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (!m->weight_buf) {
+            fprintf(stderr, "[acestep-detok] failed to allocate weight buffer\n");
+            if (map_buf) ggml_backend_buffer_free(map_buf);
+            ggml_free(ctx);
+            dit_gguf_close(g);
+            delete m;
+            return nullptr;
+        }
 
-    q3_load_f32(m->fsq_proj_w, g, "tokenizer.quantizer.project_out.weight");
-    q3_load_f32(m->fsq_proj_b, g, "tokenizer.quantizer.project_out.bias");
-    q3_load_raw(m->embed_w, g, "detokenizer.embed_tokens.weight");
-    q3_load_f32(m->embed_b, g, "detokenizer.embed_tokens.bias");
-    q3_load_f32(m->special_tok, g, "detokenizer.special_tokens");
-    q3_load_f32(m->norm, g, "detokenizer.norm.weight");
-    q3_load_raw(m->proj_out_w, g, "detokenizer.proj_out.weight");
-    q3_load_f32(m->proj_out_b, g, "detokenizer.proj_out.bias");
-    for (int i = 0; i < m->cfg.n_layers; i++) {
-        q3_load_layer(g, "detokenizer.layers." + std::to_string(i), m->layers[i]);
+        q3_load_f32(m->fsq_proj_w, g, "tokenizer.quantizer.project_out.weight");
+        q3_load_f32(m->fsq_proj_b, g, "tokenizer.quantizer.project_out.bias");
+        q3_load_raw(m->embed_w, g, "detokenizer.embed_tokens.weight");
+        q3_load_f32(m->embed_b, g, "detokenizer.embed_tokens.bias");
+        q3_load_f32(m->special_tok, g, "detokenizer.special_tokens");
+        q3_load_f32(m->norm, g, "detokenizer.norm.weight");
+        q3_load_raw(m->proj_out_w, g, "detokenizer.proj_out.weight");
+        q3_load_f32(m->proj_out_b, g, "detokenizer.proj_out.bias");
+        for (int i = 0; i < m->cfg.n_layers; i++) {
+            q3_load_layer(g, "detokenizer.layers." + std::to_string(i), m->layers[i]);
+        }
     }
     m->mapped_bytes = mapped ? dit_gguf_mapped_bytes(ctx, g) : 0;
+    if (measure) {
+        measure->weights_mapped_bytes = m->mapped_bytes;
+        // Mark still-unallocated weights externally-allocated so graph sizing
+        // excludes them (see textenc_model_load_impl). No data is read after.
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data && !t->view_src) {
+                t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+            }
+        }
+    }
 
     if (verbose) {
         fprintf(stderr, "[acestep-detok] loaded %s: %.1f MB, FSQ(6->2048) + %dL encoder(S=5, 2048->64)\n",
@@ -144,6 +168,20 @@ DetokModel * detok_model_load(const std::string & path, ggml_backend_t backend, 
         dit_gguf_close(g);
     }
     return m;
+}
+
+DetokModel * detok_model_load(const std::string & path, ggml_backend_t backend, bool verbose) {
+    return detok_model_load_impl(path, backend, verbose, /*measure=*/nullptr);
+}
+
+DetokModel * detok_model_load_metadata_only(const std::string & path, ggml_backend_t backend,
+                                            bool verbose, AcestepStageMeasure & measure) {
+    measure = AcestepStageMeasure{};
+    return detok_model_load_impl(path, backend, verbose, &measure);
+}
+
+size_t detok_model_compute_buffer_bytes(const DetokModel * m) {
+    return m ? m->last_compute_bytes : 0;
 }
 
 void detok_model_free(DetokModel * m) {
@@ -161,16 +199,20 @@ size_t detok_model_weight_bytes(const DetokModel * m) {
     return alloc + m->mapped_bytes;  // allocated (F32) + mmapped weights
 }
 
-int detok_model_decode(DetokModel * m, const int * codes, int T_5Hz, float * context_out) {
+int detok_model_decode(DetokModel * m, const int * codes, int T_5Hz, float * context_out,
+                       size_t * measure_compute) {
     if (T_5Hz <= 0) return 0;
     const int H      = DETOK_H;
     const int P      = POOL;
     const int T_25Hz = T_5Hz * P;
 
     // FSQ decode all indices on CPU -> [6, T_5Hz] (per-token 6 floats).
-    std::vector<float> fsq_decoded((size_t) T_5Hz * FSQ_NDIMS);
-    for (int g = 0; g < T_5Hz; g++) {
-        fsq_decode_index(codes[g], fsq_decoded.data() + (size_t) g * FSQ_NDIMS);
+    std::vector<float> fsq_decoded;
+    if (!measure_compute) {
+        fsq_decoded.resize((size_t) T_5Hz * FSQ_NDIMS);
+        for (int g = 0; g < T_5Hz; g++) {
+            fsq_decode_index(codes[g], fsq_decoded.data() + (size_t) g * FSQ_NDIMS);
+        }
     }
 
     // Build the per-token graph once (S = 5 fixed), reuse across tokens.
@@ -206,12 +248,27 @@ int detok_model_decode(DetokModel * m, const int * codes, int T_5Hz, float * con
     ggml_build_forward_expand(gf, output);
 
     ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
-    if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
-        fprintf(stderr, "[acestep-detok] forward alloc failed\n");
-        if (ga) ggml_gallocr_free(ga);
+    if (!ga) {
+        fprintf(stderr, "[acestep-detok] forward gallocr init failed\n");
         ggml_free(ctx);
         return -1;
     }
+    if (measure_compute) {
+        // Size-only twin of the alloc below (the graph is shape-fixed at S=5
+        // and replayed per token, so one measurement covers the whole decode).
+        *measure_compute = 0;
+        ggml_gallocr_reserve_n_size(ga, gf, nullptr, nullptr, measure_compute);
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        return T_25Hz;
+    }
+    if (!ggml_gallocr_alloc_graph(ga, gf)) {
+        fprintf(stderr, "[acestep-detok] forward alloc failed\n");
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        return -1;
+    }
+    m->last_compute_bytes = ggml_gallocr_get_buffer_size(ga, 0);
 
     int32_t pos_data[POOL] = { 0, 1, 2, 3, 4 };
 

@@ -2,6 +2,7 @@
 
 #include "audio_edit.h"
 #include "dit_gguf.h"
+#include "fit_measure.h"
 #include "philox.h"
 
 #include "ggml.h"
@@ -98,6 +99,8 @@ struct DitModel {
     ggml_backend_buffer_t map_buf = nullptr;
     bool                  mapped  = false;
     size_t                mapped_bytes = 0;  // sum of mmapped weight nbytes
+
+    bool measuring = false;  // metadata-only load: weights sized, never read
 
     DitConfig cfg;
 
@@ -573,7 +576,11 @@ static ggml_tensor * build_layer(ggml_context * ctx, DitModel * m, int idx, ggml
 }
 
 // ------------------------------------------------------------------ public
-DitModel * dit_model_load(const std::string & path, ggml_backend_t backend, bool verbose) {
+// Shared body of dit_model_load and dit_model_load_metadata_only. When
+// `measure` is non-null the load is metadata-only: the weight allocation is
+// sized into `measure` instead of performed and no tensor data is read.
+static DitModel * dit_model_load_impl(const std::string & path, ggml_backend_t backend, bool verbose,
+                                      AcestepStageMeasure * measure) {
     DitGGUF g;
     if (!dit_gguf_open(g, path)) return nullptr;
 
@@ -643,6 +650,32 @@ DitModel * dit_model_load(const std::string & path, ggml_backend_t backend, bool
     m->proj_out_b      = create_f32_like(ctx, g, "decoder.proj_out.1.bias");
     m->scalar_one      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
     ggml_set_name(m->scalar_one, "scalar_one");
+
+    if (measure) {
+        // Size-only twin of the allocation below: sizes only the tensors still
+        // lacking data, exactly like ggml_backend_alloc_ctx_tensors skips the
+        // mapped ones. All uploads (including scalar_one) are skipped.
+        measure->weights_alloc_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            ctx, ggml_backend_get_default_buffer_type(backend));
+        m->measuring    = true;
+        m->mapped_bytes = mapped ? dit_gguf_mapped_bytes(ctx, g) : 0;
+        measure->weights_mapped_bytes = m->mapped_bytes;
+        // Mark still-unallocated weights externally-allocated so graph sizing
+        // excludes them (see textenc_model_load_impl). No data is read after.
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data && !t->view_src) {
+                t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+            }
+        }
+        if (mapped) {
+            m->mapped  = true;
+            m->map_buf = map_buf;
+            m->gguf    = g;
+        } else {
+            dit_gguf_close(g);
+        }
+        return m;
+    }
 
     // Allocates only the tensors still lacking data (the F32-converted / permuted
     // ones); every mapped weight has ->data set already and is skipped.
@@ -719,6 +752,20 @@ DitModel * dit_model_load(const std::string & path, ggml_backend_t backend, bool
     return m;
 }
 
+DitModel * dit_model_load(const std::string & path, ggml_backend_t backend, bool verbose) {
+    return dit_model_load_impl(path, backend, verbose, /*measure=*/nullptr);
+}
+
+DitModel * dit_model_load_metadata_only(const std::string & path, ggml_backend_t backend,
+                                        bool verbose, AcestepStageMeasure & measure) {
+    measure = AcestepStageMeasure{};
+    return dit_model_load_impl(path, backend, verbose, &measure);
+}
+
+size_t dit_model_compute_buffer_bytes(const DitModel * m) {
+    return (m && m->graph_cache.ga) ? ggml_gallocr_get_buffer_size(m->graph_cache.ga, 0) : 0;
+}
+
 void dit_model_free(DitModel * m) {
     if (!m) return;
     m->graph_cache.release();
@@ -738,7 +785,8 @@ size_t dit_model_weight_bytes(const DitModel * m) {
     return alloc + m->mapped_bytes;  // allocated (F32/permuted) + mmapped weights
 }
 
-bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<float> & velocity_out) {
+bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<float> & velocity_out,
+                       size_t * measure_compute) {
     const DitConfig & c = m->cfg;
     const int         P = c.patch_size;
     const int         H = c.hidden_size;
@@ -756,7 +804,10 @@ bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<fl
     const bool has_ca = in.ca_mask != nullptr;
 
     DitGraphCache & gc        = m->graph_cache;
-    const bool      cache_hit = gc.ctx != nullptr && gc.T == T && gc.N == N && gc.enc_S == enc_S &&
+    // Measure mode always rebuilds locally and never touches the cache, so a
+    // projection on a live model cannot evict (or upload into) its real graph.
+    const bool      cache_hit = !measure_compute &&
+                                gc.ctx != nullptr && gc.T == T && gc.N == N && gc.enc_S == enc_S &&
                                 gc.H_enc == in.H_enc && gc.has_sa == has_sa && gc.has_ca == has_ca;
 
     ggml_context * ctx = nullptr;
@@ -773,7 +824,7 @@ bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<fl
         t_val  = gc.t_val;  tr_val = gc.tr_val; positions = gc.positions;
         sa_mask = gc.sa_mask; ca_mask = gc.ca_mask; output = gc.output;
     } else {
-        gc.release();
+        if (!measure_compute) gc.release();
 
         const size_t nodes = (size_t) 8192;
         ggml_init_params gp{ ggml_tensor_overhead() * 2048 + ggml_graph_overhead_custom(nodes, false), nullptr, true };
@@ -840,9 +891,22 @@ bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<fl
         ggml_build_forward_expand(gf, output);
 
         ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
-        if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
+        if (!ga) {
+            fprintf(stderr, "[acestep-dit] forward gallocr init failed (T=%d N=%d)\n", T, N);
+            ggml_free(ctx);
+            return false;
+        }
+        if (measure_compute) {
+            // Size-only twin of the persistent graph-cache allocation below.
+            *measure_compute = 0;
+            ggml_gallocr_reserve_n_size(ga, gf, nullptr, nullptr, measure_compute);
+            ggml_gallocr_free(ga);
+            ggml_free(ctx);
+            return true;
+        }
+        if (!ggml_gallocr_alloc_graph(ga, gf)) {
             fprintf(stderr, "[acestep-dit] forward alloc failed (T=%d N=%d)\n", T, N);
-            if (ga) ggml_gallocr_free(ga);
+            ggml_gallocr_free(ga);
             ggml_free(ctx);
             return false;
         }

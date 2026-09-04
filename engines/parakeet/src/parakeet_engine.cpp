@@ -117,28 +117,9 @@ int decode_transducer(const ParakeetCtcModel & model,
 }
 
 // ── Long-form offline encoder windowing ───────────────────────────────────
-// See EngineOptions::long_form_window_frames and src/long_form.h.
-
-// Auto per-window encoder-frame ceiling (~300 s at 80 ms/frame). Caps the
-// O(T_enc^2) attention score tensor at a few hundred MB per window while still
-// giving the decoder long committed spans, so a multi-hour input needs only a
-// handful of windows. Overridden downward by the model's pos_emb_max_len.
-constexpr int kLongFormAutoWindowFrames  = 3750;
-// Shared context each side (~20 s at 80 ms/frame). Comfortably exceeds the
-// deepest shipped encoder's convolutional receptive field (24 conformer layers
-// x depthwise kernel 9 ~= 100 frames each side) plus the subsampling stack, so
-// committed centre frames closely match the single-pass encoder.
-constexpr int kLongFormAutoContextFrames = 256;
-// Floor so a pathologically small pos_emb_max_len can't collapse the centre.
-constexpr int kLongFormMinWindowFrames   = 256;
-
-struct LongFormPlan {
-    bool enabled        = false;
-    int  window_frames  = 0;  // encoder frames per window (center + 2 * context)
-    int  context_frames = 0;  // encoder frames of shared context each side
-    int  center_frames  = 0;  // committed encoder frames per window
-    int  sub            = 0;  // subsampling factor (mel frames per encoder frame)
-};
+// See EngineOptions::long_form_window_frames and src/long_form.h. The window
+// policy itself (constants + LongFormPlan + the pure resolver) lives in
+// long_form.h so the fit projector (parakeet_fit.cpp) shares it.
 
 // Resolve the effective long-form window from EngineOptions + model config and
 // decide whether the mel-spectrogram is long enough to need windowing at all.
@@ -146,53 +127,11 @@ struct LongFormPlan {
 LongFormPlan resolve_long_form_plan(const ParakeetCtcModel & model,
                                     const EngineOptions & opts,
                                     int n_mel_frames) {
-    LongFormPlan plan;
-
-    if (opts.long_form_window_frames < 0) {
-        return plan;
-    }
-
-    const int sub = model.encoder_cfg.subsampling_factor > 0
-                  ? model.encoder_cfg.subsampling_factor : 8;
-    if (sub <= 0) {
-        return plan;
-    }
-    plan.sub = sub;
-
-    const int window_frames = resolve_long_form_window_frames(
-        opts.long_form_window_frames, model.encoder_cfg.pos_emb_max_len,
-        kLongFormAutoWindowFrames, kLongFormMinWindowFrames);
-
-    int context_frames = opts.long_form_context_frames;
-    if (context_frames == 0) {
-        context_frames = kLongFormAutoContextFrames;
-    }
-    if (context_frames < 0) {
-        context_frames = 0;
-    }
-    if (context_frames > window_frames / 4) {
-        context_frames = window_frames / 4;
-    }
-
-    // Defense-in-depth: the window/4 context clamp above keeps
-    // center = window - 2*context >= window/2 > 0, so this cannot trigger under
-    // the current policy; it guards a future window/context tuning that could.
-    const int center_frames = window_frames - 2 * context_frames;
-    if (center_frames <= 0) {
-        return plan;
-    }
-
-    // Only window when a single-pass encoder run would exceed the ceiling; the
-    // encoder emits roughly n_mel_frames / sub frames.
-    if ((long long) n_mel_frames <= (long long) window_frames * sub) {
-        return plan;
-    }
-
-    plan.enabled        = true;
-    plan.window_frames  = window_frames;
-    plan.context_frames = context_frames;
-    plan.center_frames  = center_frames;
-    return plan;
+    return resolve_long_form_plan_frames(opts.long_form_window_frames,
+                                         opts.long_form_context_frames,
+                                         model.encoder_cfg.pos_emb_max_len,
+                                         model.encoder_cfg.subsampling_factor,
+                                         n_mel_frames);
 }
 
 struct WindowedEncoderStats {

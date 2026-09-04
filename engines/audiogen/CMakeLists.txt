@@ -111,6 +111,10 @@ set(AUDIOGEN_LIB_SOURCES
     src/acestep/detok_ggml.cpp
     src/acestep/tok_ggml.cpp
     src/acestep/engine.cpp
+    # Memory-fit preflight (include/audiogen-cpp/acestep/fit.h + the
+    # acestep-fit-params CLI entry point, linkable by hosts).
+    src/acestep/fit.cpp
+    src/acestep/fit_cli.cpp
 )
 
 if (AUDIOGEN_BUILD_MINIMAX)
@@ -213,7 +217,8 @@ if (AUDIOGEN_BUILD_EXECUTABLES)
              lmgen_smoke:lmgen-smoke
              detok_smoke:detok-smoke
              quantize_cli:acestep-quantize
-             music_cli:music-cli)
+             music_cli:music-cli
+             fit_cli_main:acestep-fit-params)
         string(REPLACE ":" ";" _pair ${_tool})
         list(GET _pair 0 _src)
         list(GET _pair 1 _exe)
@@ -263,6 +268,20 @@ if (AUDIOGEN_BUILD_TESTS)
     audiogen_link_in_tree_binary(test-acestep-integration)
     audiogen_register_test(test-acestep-integration LABEL "integration")
     set_property(TEST test-acestep-integration PROPERTY SKIP_RETURN_CODE 77)
+
+    # Memory-fit preflight. test-fit-cli is model-free (strict parsers,
+    # saturating arithmetic, JSON escaping, CLI exit codes). test-fit-params
+    # asserts the metadata-only projection matches real allocations
+    # byte-for-byte; it reads the same AUDIOGEN_TEST_MODELS_DIR fixture as the
+    # integration test and self-skips (77) where it is not staged.
+    add_executable(test-fit-cli test/test_fit_cli.cpp)
+    audiogen_link_in_tree_binary(test-fit-cli)
+    audiogen_register_test(test-fit-cli LABEL "unit")
+
+    add_executable(test-fit-params test/test_fit_params.cpp)
+    audiogen_link_in_tree_binary(test-fit-params)
+    audiogen_register_test(test-fit-params LABEL "integration")
+    set_property(TEST test-fit-params PROPERTY SKIP_RETURN_CODE 77)
 
     find_package(Python3 COMPONENTS Interpreter)
     if (Python3_Interpreter_FOUND)

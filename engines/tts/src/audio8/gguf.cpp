@@ -3,6 +3,7 @@
 #include "audio8/graph.h"
 #include "backend_selection.h"
 #include "backend_util.h"
+#include "ggml-alloc.h"
 #include "gguf.h"
 #include "gguf_stream.h"
 
@@ -150,14 +151,39 @@ bool stream_weights(const gguf_file & file, ggml_context * ctx) {
     return true;
 }
 
+// Mark every unallocated tensor in `ctx` externally allocated (dummy non-null
+// data, the same trick ggml's own measure paths use) so graph pricing via
+// ggml_gallocr / ggml_backend_sched excludes it from the measured compute
+// buffers instead of counting it as a graph-owned leaf. The context must
+// never have tensor data read or written after this.
+void mark_externally_allocated(ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t;
+         t = ggml_get_next_tensor(ctx, t)) {
+        if (!t->data && !t->view_src) {
+            t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+        }
+    }
+}
+
+// When `measure_bytes` is non-null the load is metadata-only: the weight
+// buffer the real path allocates is SIZED instead (the size-only twin of
+// ggml_backend_alloc_ctx_tensors runs the same buffer-type sizing sweep) and
+// no tensor data leaves the disk.
 bool load_weights(const gguf_file & file, ggml_backend_t backend, ggml_context ** ctx,
-                  ggml_backend_buffer_t * buffer, std::string * error) {
+                  ggml_backend_buffer_t * buffer, std::string * error,
+                  size_t * measure_bytes = nullptr) {
     *ctx = new_weight_context(gguf_get_n_tensors(file.ctx()));
     if (!*ctx) {
         if (error) *error = "audio8: failed to create the weight context";
         return false;
     }
     clone_tensor_headers(file.meta(), *ctx);
+    if (measure_bytes) {
+        *measure_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            *ctx, ggml_backend_get_default_buffer_type(backend));
+        mark_externally_allocated(*ctx);
+        return true;
+    }
     *buffer = ggml_backend_alloc_ctx_tensors(*ctx, backend);
     if (!*buffer) {
         if (error) *error = "audio8: failed to allocate the weight buffer";
@@ -276,7 +302,11 @@ void read_tokenizer(raw_metadata & meta, TokenizerData & data) {
 
 // K is position-major so a step appends whole rows; V is channel-major so the
 // value matmul reads runs of positions without transposing the prefix.
-bool alloc_kv(ggml_backend_t backend, int layers, int width, int capacity, kv_cache & cache) {
+// In measure mode (`measure_bytes` non-null) the slab is sized, not
+// allocated, and the tensors come back marked externally allocated so graph
+// pricing can still build the cache views over them.
+bool alloc_kv(ggml_backend_t backend, int layers, int width, int capacity, kv_cache & cache,
+              size_t * measure_bytes = nullptr) {
     ggml_init_params params = {4 * ggml_tensor_overhead(), nullptr, /*no_alloc=*/true};
     cache.ctx = ggml_init(params);
     if (!cache.ctx) return false;
@@ -286,6 +316,12 @@ bool alloc_kv(ggml_backend_t backend, int layers, int width, int capacity, kv_ca
                                  static_cast<int64_t>(capacity) * layers);
     cache.v = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, capacity,
                                  static_cast<int64_t>(width) * layers);
+    if (measure_bytes) {
+        *measure_bytes += ggml_backend_alloc_ctx_tensors_from_buft_size(
+            cache.ctx, ggml_backend_get_default_buffer_type(backend));
+        mark_externally_allocated(cache.ctx);
+        return true;
+    }
     cache.buffer = ggml_backend_alloc_ctx_tensors(cache.ctx, backend);
     return cache.buffer != nullptr;
 }
@@ -509,8 +545,12 @@ bool backend_picks_codes(ggml_backend_t backend, const lm_hparams & hp) {
 
 }  // namespace
 
-bool load_lm(const std::string & path, int n_gpu_layers, lm_model & model,
-             std::string * error) {
+// Shared body of load_lm and load_lm_metadata_only. When `measure` is
+// non-null the load is metadata-only: every allocation the real path makes is
+// sized into `measure` instead of performed and no tensor data is read; see
+// the declaration comments in internal.h.
+static bool load_lm_impl(const std::string & path, int n_gpu_layers, lm_model & model,
+                         std::string * error, fit_load_measure * measure) {
     gguf_file file(path);
     if (!file.ok()) {
         if (error) *error = "audio8: failed to open " + path;
@@ -536,7 +576,8 @@ bool load_lm(const std::string & path, int n_gpu_layers, lm_model & model,
         return false;
     }
     model.precise_outputs = ::tts_cpp::detail::backend_is_metal(model.backend);
-    if (!load_weights(file, model.backend, &model.ctx_w, &model.buffer_w, error)) {
+    if (!load_weights(file, model.backend, &model.ctx_w, &model.buffer_w, error,
+                      measure ? &measure->weights_bytes : nullptr)) {
         return false;
     }
 
@@ -560,10 +601,11 @@ bool load_lm(const std::string & path, int n_gpu_layers, lm_model & model,
     }
 
     const lm_hparams & hp = model.hp;
+    size_t * kv_measure = measure ? &measure->kv_bytes : nullptr;
     if (!alloc_kv(model.backend, hp.depth, hp.n_kv * hp.head_dim, hp.max_seq_len,
-                  model.slow_kv) ||
+                  model.slow_kv, kv_measure) ||
         !alloc_kv(model.backend, hp.fast_depth, hp.fast_n_kv * hp.fast_head_dim,
-                  hp.num_codebooks, model.fast_kv)) {
+                  hp.num_codebooks, model.fast_kv, kv_measure)) {
         if (error) *error = "audio8: failed to allocate the KV cache";
         return false;
     }
@@ -577,6 +619,18 @@ bool load_lm(const std::string & path, int n_gpu_layers, lm_model & model,
     }
     model.picks_codes = backend_picks_codes(model.backend, model.hp);
     return true;
+}
+
+bool load_lm(const std::string & path, int n_gpu_layers, lm_model & model,
+             std::string * error) {
+    return load_lm_impl(path, n_gpu_layers, model, error, /*measure=*/nullptr);
+}
+
+bool load_lm_metadata_only(const std::string & path, int n_gpu_layers,
+                           lm_model & model, fit_load_measure & measure,
+                           std::string * error) {
+    measure = fit_load_measure{};
+    return load_lm_impl(path, n_gpu_layers, model, error, &measure);
 }
 
 void free_lm(lm_model & model) {
@@ -607,8 +661,10 @@ bool peek_codec_header(const std::string & path, codec_header & header,
     return read_codec_header(file, header, error);
 }
 
-bool load_codec(const std::string & path, int n_gpu_layers, codec_model & model,
-                std::string * error) {
+// Shared body of load_codec and load_codec_metadata_only; same measure
+// semantics as load_lm_impl.
+static bool load_codec_impl(const std::string & path, int n_gpu_layers, codec_model & model,
+                            std::string * error, fit_load_measure * measure) {
     gguf_file file(path);
     if (!file.ok()) {
         if (error) *error = "audio8: failed to open " + path;
@@ -639,7 +695,8 @@ bool load_codec(const std::string & path, int n_gpu_layers, codec_model & model,
         return false;
     }
     model.precise_outputs = ::tts_cpp::detail::backend_is_metal(model.backend);
-    if (!load_weights(file, model.backend, &model.ctx_w, &model.buffer_w, error)) {
+    if (!load_weights(file, model.backend, &model.ctx_w, &model.buffer_w, error,
+                      measure ? &measure->weights_bytes : nullptr)) {
         return false;
     }
 
@@ -663,6 +720,18 @@ bool load_codec(const std::string & path, int n_gpu_layers, codec_model & model,
         return false;
     }
     return true;
+}
+
+bool load_codec(const std::string & path, int n_gpu_layers, codec_model & model,
+                std::string * error) {
+    return load_codec_impl(path, n_gpu_layers, model, error, /*measure=*/nullptr);
+}
+
+bool load_codec_metadata_only(const std::string & path, int n_gpu_layers,
+                              codec_model & model, fit_load_measure & measure,
+                              std::string * error) {
+    measure = fit_load_measure{};
+    return load_codec_impl(path, n_gpu_layers, model, error, &measure);
 }
 
 void free_codec(codec_model & model) {

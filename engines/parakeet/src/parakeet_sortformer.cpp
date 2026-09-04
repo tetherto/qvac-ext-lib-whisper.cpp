@@ -597,6 +597,74 @@ void sortformer_cache_reset(SortformerSpeakerCache & cache, int D) {
     }
 }
 
+int sortformer_measure_head(const ParakeetCtcModel & model, int T_enc,
+                            size_t & out_active_bytes,
+                            size_t & out_cpu_fallback_bytes) {
+    out_active_bytes       = 0;
+    out_cpu_fallback_bytes = 0;
+    const auto & enc   = model.encoder_cfg;
+    const int tf_d     = enc.sortformer_tf_d_model;
+    const int n_heads  = enc.sortformer_tf_n_heads;
+    if (T_enc <= 0 || n_heads <= 0 || tf_d % n_heads != 0) return 1;
+
+    ggml_backend_t backend = model_sortformer_backend(model);
+    if (!backend) return 1;
+
+    const size_t graph_slots = 4096;
+    const size_t overhead = ggml_tensor_overhead() * graph_slots
+                          + ggml_graph_overhead_custom(graph_slots, false);
+    ggml_init_params gp = { overhead, nullptr, true };
+    ggml_context * ctx = ggml_init(gp);
+    if (!ctx) return -1;
+
+    // Always build against the GPU-resident head weights: a metadata-only load
+    // sizes but never populates the Mali force-CPU copies (sortformer_cpu),
+    // and graph construction + measurement only read tensor shapes, which are
+    // identical between the two weight sets.
+    ggml_tensor * x_in  = nullptr;
+    ggml_tensor * x_out = sf_build_graph(ctx, model.sortformer,
+                                         enc.sortformer_tf_n_layers, n_heads,
+                                         tf_d / n_heads, tf_d,
+                                         enc.sortformer_fc_d_model, T_enc, &x_in);
+    ggml_cgraph * cg = ggml_new_graph_custom(ctx, graph_slots, false);
+    ggml_build_forward_expand(cg, x_out);
+
+    // Price with the SAME allocator the real path uses (sf_exec_graph): the
+    // shared scheduler on the normal path -- ggml_backend_sched_reserve_size
+    // runs the real graph split, so per-op CPU fallback lands in the CPU
+    // entry (out_cpu_fallback_bytes; host RAM, not the active device) -- and
+    // a plain gallocr on the force-CPU (Mali-Vulkan) path, where everything
+    // is host RAM and the caller routes it there via model_sortformer_on_cpu.
+    int rc = 0;
+    if (model_sortformer_on_cpu(model)) {
+        ggml_gallocr_t pricer =
+            ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (pricer) {
+            ggml_gallocr_reserve_n_size(pricer, cg, nullptr, nullptr, &out_active_bytes);
+            ggml_gallocr_free(pricer);
+        } else {
+            rc = -2;
+        }
+    } else {
+        ggml_backend_sched_t sched = model_sched(model);
+        if (sched) {
+            const int n_backends = ggml_backend_sched_get_n_backends(sched);
+            std::vector<size_t> sizes((size_t) std::max(n_backends, 1), 0);
+            ggml_backend_sched_reserve_size(sched, cg, sizes.data());
+            // Scheduler backend order is [active, CPU-last]; index 0 is the
+            // active backend's buffer, the rest is CPU per-op fallback.
+            out_active_bytes = sizes[0];
+            for (int i = 1; i < n_backends; ++i) {
+                out_cpu_fallback_bytes += sizes[(size_t) i];
+            }
+        } else {
+            rc = -2;
+        }
+    }
+    ggml_free(ctx);
+    return rc;
+}
+
 int sortformer_diarize_ggml(const ParakeetCtcModel & model,
                             const float * encoder_out,
                             int T_enc, int D_enc,

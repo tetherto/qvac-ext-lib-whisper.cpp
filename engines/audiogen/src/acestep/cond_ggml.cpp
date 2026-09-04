@@ -1,5 +1,6 @@
 #include "cond_ggml.h"
 
+#include "fit_measure.h"
 #include "qwen3_block.h"  // shared Qwen3 loaders + builders + DitGGUF IO
 
 #include "ggml.h"
@@ -70,6 +71,9 @@ struct CondModel {
     ggml_backend_buffer_t map_buf = nullptr;
     bool                  mapped  = false;
     size_t                mapped_bytes = 0;  // sum of mmapped weight nbytes
+
+    bool   measuring          = false;  // metadata-only load: weights sized, never read
+    size_t last_compute_bytes = 0;      // gallocr buffer of the most recent real forward
 };
 
 static void load_silence_latent(CondModel * model, const ggml_tensor * metadata, const void * data) {
@@ -101,7 +105,11 @@ static void dequant_to_f32(const DitGGUF & g, const std::string & name, std::vec
     }
 }
 
-CondModel * cond_model_load(const std::string & path, ggml_backend_t backend, bool verbose) {
+// Shared body of cond_model_load and cond_model_load_metadata_only. When
+// `measure` is non-null the load is metadata-only: the weight allocation is
+// sized into `measure` instead of performed and no tensor data is read.
+static CondModel * cond_model_load_impl(const std::string & path, ggml_backend_t backend, bool verbose,
+                                        AcestepStageMeasure * measure) {
     DitGGUF g;
     if (!dit_gguf_open(g, path)) {
         fprintf(stderr, "[acestep-cond] failed to parse %s\n", path.c_str());
@@ -163,39 +171,57 @@ CondModel * cond_model_load(const std::string & path, ggml_backend_t backend, bo
     // text projector
     m->text_proj_w = q3_create_like(ctx, g, "encoder.text_projector.weight", map_buf);
 
-    m->weight_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (!m->weight_buf) {
-        fprintf(stderr, "[acestep-cond] failed to allocate weight buffer\n");
-        if (map_buf) ggml_backend_buffer_free(map_buf);
-        ggml_free(ctx);
-        dit_gguf_close(g);
-        delete m;
-        return nullptr;
-    }
+    if (measure) {
+        measure->weights_alloc_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            ctx, ggml_backend_get_default_buffer_type(backend));
+        m->measuring = true;
+    } else {
+        m->weight_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (!m->weight_buf) {
+            fprintf(stderr, "[acestep-cond] failed to allocate weight buffer\n");
+            if (map_buf) ggml_backend_buffer_free(map_buf);
+            ggml_free(ctx);
+            dit_gguf_close(g);
+            delete m;
+            return nullptr;
+        }
 
-    // upload
-    q3_load_raw(m->lyric_embed_w, g, "encoder.lyric_encoder.embed_tokens.weight");
-    q3_load_f32(m->lyric_embed_b, g, "encoder.lyric_encoder.embed_tokens.bias");
-    q3_load_f32(m->lyric_norm, g, "encoder.lyric_encoder.norm.weight");
-    for (int i = 0; i < m->lyric_cfg.n_layers; i++) {
-        q3_load_layer(g, "encoder.lyric_encoder.layers." + std::to_string(i), m->lyric_layers[i]);
+        // upload
+        q3_load_raw(m->lyric_embed_w, g, "encoder.lyric_encoder.embed_tokens.weight");
+        q3_load_f32(m->lyric_embed_b, g, "encoder.lyric_encoder.embed_tokens.bias");
+        q3_load_f32(m->lyric_norm, g, "encoder.lyric_encoder.norm.weight");
+        for (int i = 0; i < m->lyric_cfg.n_layers; i++) {
+            q3_load_layer(g, "encoder.lyric_encoder.layers." + std::to_string(i), m->lyric_layers[i]);
+        }
+        q3_load_f32(m->timbre_embed_w, g, "encoder.timbre_encoder.embed_tokens.weight");
+        q3_load_f32(m->timbre_embed_b, g, "encoder.timbre_encoder.embed_tokens.bias");
+        q3_load_f32(m->timbre_norm, g, "encoder.timbre_encoder.norm.weight");
+        for (int i = 0; i < m->timbre_cfg.n_layers; i++) {
+            q3_load_layer(g, "encoder.timbre_encoder.layers." + std::to_string(i), m->timbre_layers[i]);
+        }
+        if (m->use_timbre_cls) q3_load_f32(m->timbre_cls, g, "encoder.timbre_encoder.special_token");
+        q3_load_raw(m->text_proj_w, g, "encoder.text_projector.weight");
     }
-    q3_load_f32(m->timbre_embed_w, g, "encoder.timbre_encoder.embed_tokens.weight");
-    q3_load_f32(m->timbre_embed_b, g, "encoder.timbre_encoder.embed_tokens.bias");
-    q3_load_f32(m->timbre_norm, g, "encoder.timbre_encoder.norm.weight");
-    for (int i = 0; i < m->timbre_cfg.n_layers; i++) {
-        q3_load_layer(g, "encoder.timbre_encoder.layers." + std::to_string(i), m->timbre_layers[i]);
-    }
-    if (m->use_timbre_cls) q3_load_f32(m->timbre_cls, g, "encoder.timbre_encoder.special_token");
-    q3_load_raw(m->text_proj_w, g, "encoder.text_projector.weight");
     m->mapped_bytes = mapped ? dit_gguf_mapped_bytes(ctx, g) : 0;
+    if (measure) {
+        measure->weights_mapped_bytes = m->mapped_bytes;
+        // Mark still-unallocated weights externally-allocated so graph sizing
+        // excludes them (see textenc_model_load_impl). No data is read after.
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data && !t->view_src) {
+                t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+            }
+        }
+    }
 
-    dequant_to_f32(g, "null_condition_emb", m->null_emb);
+    if (!measure) {
+        dequant_to_f32(g, "null_condition_emb", m->null_emb);
+    }
 
     // silence_latent [15000, 64] F32: the canonical VAE encoding of audio silence.
     // For text2music (no reference audio) acestep.cpp feeds its first frame to the
     // timbre encoder to emit the single timbre conditioning token (see engine).
-    {
+    if (!measure) {
         ggml_tensor * sm = dit_gmeta(g, "silence_latent");
         const void *  sd = dit_gdata(g, "silence_latent");
         if (sm && sd && sm->type == GGML_TYPE_F32 &&
@@ -220,6 +246,20 @@ CondModel * cond_model_load(const std::string & path, ggml_backend_t backend, bo
         dit_gguf_close(g);
     }
     return m;
+}
+
+CondModel * cond_model_load(const std::string & path, ggml_backend_t backend, bool verbose) {
+    return cond_model_load_impl(path, backend, verbose, /*measure=*/nullptr);
+}
+
+CondModel * cond_model_load_metadata_only(const std::string & path, ggml_backend_t backend,
+                                          bool verbose, AcestepStageMeasure & measure) {
+    measure = AcestepStageMeasure{};
+    return cond_model_load_impl(path, backend, verbose, &measure);
+}
+
+size_t cond_model_compute_buffer_bytes(const CondModel * m) {
+    return m ? m->last_compute_bytes : 0;
 }
 
 void cond_model_free(CondModel * m) {
@@ -258,7 +298,8 @@ static void fill_slide_mask(std::vector<uint16_t> & md, int S, int W) {
 }
 
 bool cond_model_forward(CondModel * m, const float * text_hidden, int S_text, const float * lyric_embed, int S_lyric,
-                        const float * timbre_feats, int S_ref, std::vector<float> & enc_hidden, int * out_enc_S) {
+                        const float * timbre_feats, int S_ref, std::vector<float> & enc_hidden, int * out_enc_S,
+                        size_t * measure_compute) {
     const int  H          = COND_H;
     const bool has_timbre = (timbre_feats != nullptr && S_ref > 0);
     const int  S_timbre   = has_timbre ? S_ref + (m->use_timbre_cls ? 1 : 0) : 0;
@@ -324,12 +365,26 @@ bool cond_model_forward(CondModel * m, const float * text_hidden, int S_text, co
     if (timbre_out) ggml_build_forward_expand(gf, timbre_out);
 
     ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m->backend));
-    if (!ga || !ggml_gallocr_alloc_graph(ga, gf)) {
-        fprintf(stderr, "[acestep-cond] forward alloc failed\n");
-        if (ga) ggml_gallocr_free(ga);
+    if (!ga) {
+        fprintf(stderr, "[acestep-cond] forward gallocr init failed\n");
         ggml_free(ctx);
         return false;
     }
+    if (measure_compute) {
+        // Size-only twin of the alloc below: same graph, same buffer type.
+        *measure_compute = 0;
+        ggml_gallocr_reserve_n_size(ga, gf, nullptr, nullptr, measure_compute);
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        return true;
+    }
+    if (!ggml_gallocr_alloc_graph(ga, gf)) {
+        fprintf(stderr, "[acestep-cond] forward alloc failed\n");
+        ggml_gallocr_free(ga);
+        ggml_free(ctx);
+        return false;
+    }
+    m->last_compute_bytes = ggml_gallocr_get_buffer_size(ga, 0);
 
     // inputs
     ggml_backend_tensor_set(lyric_in, lyric_embed, 0, (size_t) 1024 * S_lyric * sizeof(float));

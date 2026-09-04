@@ -31,7 +31,8 @@ struct TextEncConfig {
     bool  is_causal         = true;
 };
 
-struct TextEncModel;  // opaque: weight tensors + backend weight buffer
+struct TextEncModel;         // opaque: weight tensors + backend weight buffer
+struct AcestepStageMeasure;  // fit_measure.h
 
 // Load the Qwen3-Embedding GGUF onto `backend` (borrowed). Returns nullptr on
 // failure. Q/K/V and gate/up are loaded as separate tensors (no fusion).
@@ -40,12 +41,32 @@ void                  textenc_model_free(TextEncModel * m);
 const TextEncConfig & textenc_model_config(const TextEncModel * m);
 size_t                textenc_model_weight_bytes(const TextEncModel * m);
 
+// Metadata-only load for the memory-fit preflight: identical backend
+// resolution and tensor wiring to textenc_model_load, but every allocation is
+// SIZED into `measure` (ggml_backend_alloc_ctx_tensors_from_buft_size) instead
+// of performed, and no tensor data is read. The returned model can only build
+// measure graphs (see the `measure_compute` parameters below); it must never
+// run a real forward. Free with textenc_model_free.
+TextEncModel * textenc_model_load_metadata_only(const std::string & path, ggml_backend_t backend,
+                                                bool verbose, AcestepStageMeasure & measure);
+
 // Encode token IDs [S] into hidden states [H, S] (H contiguous per token),
 // written to `hidden_out`. Returns false on failure.
-bool textenc_model_forward(TextEncModel * m, const int32_t * token_ids, int S, std::vector<float> & hidden_out);
+// When `measure_compute` is non-null the call builds the identical graph but
+// only SIZES its compute buffer (ggml_gallocr_reserve_n_size) into it -- no
+// allocation, no upload, no compute; `token_ids` may then be null.
+bool textenc_model_forward(TextEncModel * m, const int32_t * token_ids, int S, std::vector<float> & hidden_out,
+                           size_t * measure_compute = nullptr);
 
 // Embedding-table lookup only (no transformer): token IDs [S] -> [H, S] rows of
 // embed_tokens. Used for the cond-encoder lyric path. Returns false on failure.
-bool textenc_model_embed_lookup(TextEncModel * m, const int32_t * token_ids, int S, std::vector<float> & embed_out);
+// `measure_compute`: same size-only contract as textenc_model_forward.
+bool textenc_model_embed_lookup(TextEncModel * m, const int32_t * token_ids, int S, std::vector<float> & embed_out,
+                                size_t * measure_compute = nullptr);
+
+// Compute-buffer bytes the most recent real forward allocated (0 before the
+// first). Lets the fit parity tests compare the size-only projection against a
+// real allocation byte-for-byte.
+size_t textenc_model_compute_buffer_bytes(const TextEncModel * m);
 
 } // namespace tts_cpp::acestep

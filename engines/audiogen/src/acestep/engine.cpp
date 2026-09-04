@@ -18,6 +18,8 @@
 
 #include "acestep/cancellation_scope.h"
 #include "acestep/backend_registry.h"
+#include "acestep/engine_backends.h"
+#include "acestep/engine_paths.h"
 #include "acestep/audio_edit.h"
 #include "acestep/cover_noise.h"
 #include "acestep/generate_task.h"
@@ -222,45 +224,15 @@ struct Engine::Impl {
     void free_vae()     { vae.reset(); }
 };
 
-// ------------------------------------------------------------ path resolution
-static std::string to_lower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char) std::tolower(c); });
-    return s;
-}
-
-// Classify the four ACE-Step GGUFs in models_dir by anchoring on their known
-// filename stems (Qwen3-Embedding / acestep-*-lm / vae / acestep-v15-{turbo,sft}).
-// Explicit paths in EngineOptions always win over the scan. The stems are chosen
-// so no bare short token (like "lm") can match an unrelated file; the most
-// specific stages (embedding, vae) are tested before the shorter lm/dit stems.
-static void resolve_paths(EngineOptions & o) {
-    if (o.models_dir.empty()) return;
-    std::error_code ec;
-    for (auto & e : fs::directory_iterator(o.models_dir, ec)) {
-        if (!e.is_regular_file()) continue;
-        std::string path = e.path().string();
-        std::string name = to_lower(e.path().filename().string());
-        if (name.size() < 5 || name.substr(name.size() - 5) != ".gguf") continue;
-        auto has = [&](const char * s) { return name.find(s) != std::string::npos; };
-        if (has("embedding") || has("text-enc") || has("textenc")) {
-            if (o.text_enc_model_path.empty()) o.text_enc_model_path = path;
-        } else if (has("vae")) {
-            if (o.vae_model_path.empty()) o.vae_model_path = path;
-        } else if (has("-lm") || has("lm-") || has("_lm") || has("ace-lm") || has("5hz-lm")) {
-            if (o.lm_model_path.empty()) o.lm_model_path = path;
-        } else if (has("turbo") || has("dit") || has("v15") || has("sft")) {
-            if (o.dit_model_path.empty()) o.dit_model_path = path;
-        }
-    }
-}
-
 // ------------------------------------------------------------ construction
+// (models_dir -> per-stage path classification lives in engine_paths.h, shared
+// with the memory-fit preflight.)
 Engine::Engine() : impl_(std::make_unique<Impl>()) {}
 Engine::~Engine() = default;
 
 std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     EngineOptions opts = opts_in;
-    resolve_paths(opts);
+    resolve_stage_paths(opts);
 
     auto need = [&](const std::string & p, const char * what) {
         if (p.empty()) throw std::runtime_error(std::string("acestep engine: missing ") + what + " GGUF");
@@ -282,45 +254,14 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     // static-linked desktop / Apple builds. Must run before any backend init.
     load_backends(opts.backends_dir);
 
-    int nth = opts.n_threads > 0 ? opts.n_threads : (int) std::thread::hardware_concurrency();
-    if (nth < 1) nth = 4;
-
-    // Backend for the ggml stages (text-encoder, LM, cond/detok, DiT). These use
-    // standard ggml ops, so Metal, CUDA, Vulkan, and validated Adreno 700+
-    // OpenCL can run them; opts.n_gpu_layers > 0 opts in. The VAE gets its own
-    // dedicated backend (see Vae::load) and also follows n_gpu_layers now that
-    // its snake / col2im_1d ops are validated on Metal, Vulkan, and Adreno
-    // OpenCL in the ggml-speech fork.
-    // Falls back to CPU when no GPU backend is registered/available.
-    bool on_gpu = false;
-    if (opts.n_gpu_layers > 0) {
-        m->backend = backend_gpu_init(&m->gpu_fallback_reason);
-        on_gpu     = (m->backend != nullptr);
-        if (!on_gpu && v) {
-            fprintf(stderr, "[acestep-engine] GPU requested but no GPU backend available (%s); using CPU\n",
-                    gpu_fallback_reason_name(m->gpu_fallback_reason));
-        }
-    }
-    if (!m->backend) m->backend = backend_cpu_init();
-    if (!m->backend) throw std::runtime_error("acestep engine: backend init failed");
-    if (on_gpu) {
-        if (v) fprintf(stderr, "[acestep-engine] DiT/VAE on GPU backend: %s\n", ggml_backend_name(m->backend));
-        // Dedicated CPU backend for whichever stages are pinned off the GPU below.
-        m->backend_cpu = backend_cpu_init();
-        if (!m->backend_cpu) throw std::runtime_error("acestep engine: CPU backend init failed");
-        backend_set_n_threads(m->backend_cpu, nth);
-    } else {
-        backend_set_n_threads(m->backend, nth);
-        m->backend_cpu = m->backend;  // single CPU backend serves every stage
-    }
-
-    // Stage placement when a GPU is active. The DiT, the VAE and the one-shot
-    // text/cond encoders always run on it. The autoregressive LM and the FSQ
-    // detokenizer are allowlisted per backend, so a backend nobody has measured
-    // keeps the CPU placement and cannot silently regress generated audio.
-    // ACESTEP_LM_GPU / ACESTEP_DETOK_GPU take that measurement without a rebuild.
-    // The policy itself lives in stage_placement.h so it can be unit tested
-    // without a GPU (test/test_acestep_units.cpp); this only applies its answer.
+    // Backend for the ggml stages (text-encoder, LM, cond/detok, DiT), the CPU
+    // backend for stages the placement policy pins off the GPU, and the
+    // per-stage assignments. The VAE gets its own dedicated backend (see
+    // Vae::load) and also follows n_gpu_layers now that its snake / col2im_1d
+    // ops are validated on Metal, Vulkan, and Adreno OpenCL in the ggml-speech
+    // fork. The resolution itself lives in engine_backends.h (shared with the
+    // memory-fit preflight so both agree by construction); the placement
+    // policy in stage_placement.h (unit tested in test/test_acestep_units.cpp).
     //
     // Env escape hatches (applied after the allowlist; CPU wins if both are set):
     //   ACESTEP_LM_GPU=1        -> LM on the GPU, whatever the backend
@@ -328,24 +269,18 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     //   ACESTEP_DETOK_GPU=1     -> detokenizer on the GPU, whatever the backend
     //   ACESTEP_DETOK_CPU=1     -> detokenizer on the CPU, whatever the backend
     //   ACESTEP_ENCODERS_CPU=1  -> move the encoders to the CPU (trim wired mem)
-    ggml_backend_t enc_backend   = m->backend;
-    ggml_backend_t lm_backend    = m->backend;
-    ggml_backend_t detok_backend = m->backend;
-    if (on_gpu) {
-        const StagePlacement place =
-            resolve_stage_placement(backend_reg_name(m->backend), backend_dev_description(m->backend),
-                                    placement_overrides_from_env());
-        if (!place.enc_on_gpu)   enc_backend   = m->backend_cpu;
-        if (!place.lm_on_gpu)    lm_backend    = m->backend_cpu;
-        if (!place.detok_on_gpu) detok_backend = m->backend_cpu;
-        if (v) fprintf(stderr, "[acestep-engine] backends: enc=%s lm=%s detok=%s dit/vae=%s\n",
-                       ggml_backend_name(enc_backend), ggml_backend_name(lm_backend),
-                       ggml_backend_name(detok_backend), ggml_backend_name(m->backend));
+    AcestepBackends rb;
+    if (!resolve_acestep_backends(opts.n_gpu_layers, opts.n_threads, v, rb)) {
+        throw std::runtime_error("acestep engine: backend init failed");
     }
-    m->backend_enc   = enc_backend;
-    m->backend_lm    = lm_backend;
-    m->backend_detok = detok_backend;  // GPU on the allowlisted backends, CPU otherwise
-    m->nth           = nth;
+    m->gpu_fallback_reason = rb.gpu_fallback_reason;
+    m->backend       = rb.backend;
+    m->backend_cpu   = rb.backend_cpu;
+    m->backend_enc   = rb.enc;
+    m->backend_lm    = rb.lm;
+    m->backend_detok = rb.detok;  // GPU on the allowlisted backends, CPU otherwise
+    m->nth           = rb.nth;
+    const int nth    = rb.nth;
 
     // ACE-Step loads six weight sets (text-enc, LM, cond, detok, DiT, VAE). Held
     // resident at once they peak well past a non-entitled iOS app's memory ceiling
@@ -367,10 +302,9 @@ std::unique_ptr<Engine> Engine::create(const EngineOptions & opts_in) {
     vo.verbose      = v;
     vo.with_encoder = false;
     vo.n_threads    = nth;
-    vo.n_gpu_layers = opts.n_gpu_layers;  // validated on Metal, Vulkan, and Adreno OpenCL
-    if (const char * e = std::getenv("ACESTEP_VAE_GPU")) {
-        vo.n_gpu_layers = (e[0] == '1') ? 99 : 0;
-    }
+    // Validated on Metal, Vulkan, and Adreno OpenCL; the ACESTEP_VAE_GPU
+    // override lives in engine_backends.h, shared with the fit projection.
+    vo.n_gpu_layers = vae_gpu_layers_from_env(opts.n_gpu_layers);
     m->vae_opts = vo;
 
     // Read the DiT config from GGUF metadata up front so the context-build step in

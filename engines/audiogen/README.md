@@ -696,6 +696,28 @@ and encodes it in overlapping VAE windows for bounded memory on long inputs.
 
 The first form is the default mode: it decodes a synthetic latent, which checks that real weights load and that the decode graph (`ggml_col2im_1d` + `ggml_snake`) runs on the selected backend. `--roundtrip` encodes a real WAV and prints the per-channel reconstruction correlation, the audible end-to-end VAE check. Both forms take `--gpu`.
 
+### acestep-fit-params
+
+```sh
+./build/audiogen/acestep-fit-params --models-dir /path/to/acestep --duration 60 --n-gpu-layers 99
+```
+
+Memory-fit preflight: projects whether the four stage GGUFs plus a generation
+workload fit the memory available right now, reading only GGUF metadata (no
+weights load, nothing runs). It resolves the same backends and stage placement
+`Engine::create` would, drives each stage loader in metadata-only mode, and
+prices the real compute graphs at the workload's shapes through ggml's
+size-only allocator APIs, so the projection tracks the runtime by construction.
+The default projection follows the per-stage low-memory residency above (the
+peak phase per memory pool); `--keep-stages 1` (or `ACESTEP_KEEP_STAGES`)
+projects the everything-resident mode. Exit code follows the `@qvac/model-fit`
+contract: 0 = fits, 1 = does not fit (a valid answer), 2 = error. `--json`
+emits the projection for the SDK; the library entry point is
+`tts_cpp::acestep::fit_params` (`include/audiogen-cpp/acestep/fit.h`), and
+hosts can link the CLI as `acestep_fit_cli_main`. Workload knobs: `--duration`,
+`--text-tokens`, `--lyric-tokens`, `--lm-cfg`, `--guidance`,
+`--with-source-audio`, `--margin-mib`.
+
 ## Tests and parity
 
 ```sh

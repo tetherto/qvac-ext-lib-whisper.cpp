@@ -273,6 +273,14 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & out,
 // so the next decode rebuilds it.
 void tdt_set_unroll_steps(TdtRuntimeWeights & W, int steps);
 
+// Fit projection: size everything tdt_prepare_runtime would allocate (see
+// DecoderFitMeasure in parakeet_ctc.h) without allocating. Requires a
+// load_from_gguf_metadata_only model. `worst_enc_frames` sizes the worst-case
+// per-window enc-projection graph (clamped to k_enc_proj_T_max). Also covers
+// RNNT models (same runtime).
+int tdt_measure_runtime(const ParakeetCtcModel & model, int worst_enc_frames,
+                        DecoderFitMeasure & out);
+
 void tdt_init_state(TdtRuntimeWeights & W,
                     int blank_id,
                     TdtDecodeState & state);

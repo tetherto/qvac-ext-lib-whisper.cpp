@@ -348,6 +348,8 @@ Include `<parakeet/parakeet.h>` for the complete surface or individual headers.
 | `EngineOptions::prewarm` / `prewarm_audio_seconds` | Run a configurable encoder-only synthetic forward during construction |
 | `parakeet_log_set` | Install the host logging sink |
 | `parakeet_cli_main` | Embed the same CLI entry point exported by the library |
+| `fit_params` | Memory-fit preflight: project whether a GGUF + workload fits the device without loading weights (`<parakeet/fit.h>`) |
+| `parakeet_fit_cli_main` | Embed the `parakeet-fit-params` tool entry point |
 
 Minimal one-shot transcription:
 
@@ -460,6 +462,44 @@ build-parakeet/parakeet \
 `live-mic-attributed` combines a CTC/RNN-T/TDT/EOU ASR model with Sortformer.
 Both capture 16 kHz mono through miniaudio, accept independent streaming and
 backend options, and finalize tail audio on Ctrl-C.
+
+## Memory-fit preflight (`parakeet-fit-params`)
+
+`parakeet-fit-params` projects whether a model fits the device memory
+available right now, **without loading any weights**: it reads only GGUF
+metadata, drives the same loader/graph builders as a real run through ggml's
+size-only allocator APIs, and compares the projection against the device's
+free memory. Library API in `<parakeet/fit.h>` (`parakeet::fit_params`);
+status semantics follow the SDK's `@qvac/model-fit` contract
+(0 = fits, 1 = does not fit, 2 = error — also the exit code).
+
+```bash
+# CPU projection for the default 300 s workload
+build-parakeet/parakeet-fit-params \
+  --model engines/parakeet/models/parakeet-tdt-0.6b-v3.q8_0.gguf
+
+# GPU projection, machine-readable
+build-parakeet/parakeet-fit-params \
+  --model engines/parakeet/models/parakeet-tdt-0.6b-v3.q8_0.gguf \
+  --n-gpu-layers 1 --json
+```
+
+The workload (`--audio-seconds`, default 300) sets the longest single
+transcribe input to project for. Device-side memory is bounded by the
+long-form encoder window, so the device projection saturates once the audio
+exceeds one window; host-side buffers (full-input mel, stitched encoder
+output) keep growing with it. The projection prices the encoder graph
+*cache*, not one graph: a windowed pass keeps up to three window graphs
+resident (`run_encoder`'s 3-slot LRU), and all of them are counted.
+Sortformer diarization does not window — its device projection grows with
+the full input (`O(T^2)` head attention).
+
+The projection is exact where it can be: `test-fit-params` asserts the
+projected weight, encoder-compute, and Sortformer-head bytes equal what a
+real load/encode/diarize allocates, byte for byte. The projection covers the
+offline paths; streaming sessions build smaller per-chunk graphs but rotate
+through the same graph cache with session-dependent keys, so treat the
+offline projection as a guide, not a proven bound, for streaming.
 
 ## Tests and NeMo parity
 

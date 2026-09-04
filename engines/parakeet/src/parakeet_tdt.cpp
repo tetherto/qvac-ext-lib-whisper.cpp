@@ -239,7 +239,14 @@ void upload_lstm_cat_bias(ggml_tensor * dst, const TdtLstmLayer & src) {
 
 // Allocate and fill the per-layer [w_ih | w_hh] stacks on the active backend.
 // Returns false (leaving concat disabled) when any layer is ineligible.
-bool build_lstm_input_concat(TdtRuntimeWeights & W) {
+//
+// Measure mode (`measure_bytes != nullptr`, fit projection): the eligibility
+// decision and tensor shapes are identical, but the backend buffer is *sized*
+// into `*measure_bytes` instead of allocated and no weight data is read
+// (uploads dequantise/read the source weights, which a metadata-only model
+// cannot). The lstm_cat tensors are marked externally-allocated so the LSTM
+// graphs that reference them measure exactly like the real ones.
+bool build_lstm_input_concat(TdtRuntimeWeights & W, size_t * measure_bytes = nullptr) {
     const int H = W.H_pred;
     for (int l = 0; l < W.L; ++l) {
         if (!lstm_layer_concatenable(W.weights->lstm[l], H)) return false;
@@ -260,6 +267,18 @@ bool build_lstm_input_concat(TdtRuntimeWeights & W) {
         const std::string base = "tdt.lstm_cat." + std::to_string(l);
         ggml_set_name(W.lstm_cat[l].w, (base + ".w").c_str());
         ggml_set_name(W.lstm_cat[l].b, (base + ".b").c_str());
+    }
+
+    if (measure_bytes) {
+        *measure_bytes += ggml_backend_alloc_ctx_tensors_from_buft_size(
+            W.lstm_cat_ctx, ggml_backend_get_default_buffer_type(W.backend));
+        for (ggml_tensor * t = ggml_get_first_tensor(W.lstm_cat_ctx); t;
+             t = ggml_get_next_tensor(W.lstm_cat_ctx, t)) {
+            if (!t->data && !t->view_src) {
+                t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+            }
+        }
+        return true;
     }
 
     W.lstm_cat_buffer = ggml_backend_alloc_ctx_tensors(W.lstm_cat_ctx, W.backend);
@@ -795,7 +814,11 @@ void expand_unroll_outputs(TdtRuntimeWeights & rt,
     for (ggml_tensor * n : state_writes) ggml_build_forward_expand(rt.g_unroll, n);
 }
 
-bool build_unroll_graph(TdtRuntimeWeights & rt, int blank_id, int max_symbols) {
+// `measure_bytes` (fit projection): when non-null the graph is built and its
+// compute buffer *sized* into `*measure_bytes` instead of allocated, then the
+// graph is freed again (rt keeps no unroll state).
+bool build_unroll_graph(TdtRuntimeWeights & rt, int blank_id, int max_symbols,
+                        size_t * measure_bytes = nullptr) {
     free_unroll_graph(rt);
 
     const int K = rt.unroll_steps;
@@ -831,6 +854,18 @@ bool build_unroll_graph(TdtRuntimeWeights & rt, int blank_id, int max_symbols) {
     if (!graph_runs_on_backend(rt.backend, rt.g_unroll)) {
         free_unroll_graph(rt);
         return false;
+    }
+
+    if (measure_bytes) {
+        *measure_bytes = 0;
+        ggml_gallocr_t pricer =
+            ggml_gallocr_new(ggml_backend_get_default_buffer_type(rt.backend));
+        if (pricer) {
+            ggml_gallocr_reserve_n_size(pricer, rt.g_unroll, nullptr, nullptr, measure_bytes);
+            ggml_gallocr_free(pricer);
+        }
+        free_unroll_graph(rt);
+        return true;
     }
 
     rt.alloc_unroll = ggml_gallocr_new(ggml_backend_get_default_buffer_type(rt.backend));
@@ -871,7 +906,11 @@ void ensure_unroll_graph(TdtRuntimeWeights & rt, int blank_id, int max_symbols) 
 // the metadata locally and freeing it at eviction keeps streaming
 // callers (Mode 3 with varying right-lookahead-ms → many distinct
 // T_enc) bounded by the LRU cap regardless of distinct-T churn.
-TdtRuntimeWeights::EncProjGraph build_enc_proj_graph(TdtRuntimeWeights & rt, int T) {
+// `measure_bytes` (fit projection): when non-null the graph is built and its
+// compute buffer *sized* into `*measure_bytes` instead of allocated; an empty
+// EncProjGraph is returned.
+TdtRuntimeWeights::EncProjGraph build_enc_proj_graph(TdtRuntimeWeights & rt, int T,
+                                                     size_t * measure_bytes = nullptr) {
     TdtRuntimeWeights::EncProjGraph g{};
     g.T = T;
 
@@ -910,6 +949,17 @@ TdtRuntimeWeights::EncProjGraph build_enc_proj_graph(TdtRuntimeWeights & rt, int
 
     g.cg = ggml_new_graph_custom(g.ctx, /*size*/ 32, /*grads*/ false);
     ggml_build_forward_expand(g.cg, g.out);
+
+    if (measure_bytes) {
+        *measure_bytes = 0;
+        ggml_gallocr_t pricer = ggml_gallocr_new(ggml_backend_get_default_buffer_type(rt.backend));
+        if (pricer) {
+            ggml_gallocr_reserve_n_size(pricer, g.cg, nullptr, nullptr, measure_bytes);
+            ggml_gallocr_free(pricer);
+        }
+        ggml_free(g.ctx);
+        return TdtRuntimeWeights::EncProjGraph{};
+    }
 
     g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(rt.backend));
     if (!g.alloc || !ggml_gallocr_alloc_graph(g.alloc, g.cg)) {
@@ -1093,8 +1143,14 @@ std::vector<float> build_duration_table(const ParakeetCtcModel & model, int num_
     return table;
 }
 
-int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W,
-                        bool allow_fused_lstm, bool allow_concat_lstm) {
+// Shared body of tdt_prepare_runtime and tdt_measure_runtime. When `measure`
+// is non-null every allocation the real path makes is sized into `measure`
+// instead of performed (fit projection; requires a metadata-only model whose
+// weight tensors are marked externally-allocated), and W is left non-ready.
+// `measure_enc_frames` sizes the worst-case per-window enc-projection graph.
+static int tdt_prepare_runtime_impl(const ParakeetCtcModel & model, TdtRuntimeWeights & W,
+                                    bool allow_fused_lstm, bool allow_concat_lstm,
+                                    DecoderFitMeasure * measure, int measure_enc_frames) {
     W = TdtRuntimeWeights{};
 
     const bool is_nemotron =
@@ -1169,6 +1225,24 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W,
     W.argmax_on_gpu   = W.use_graphs && backend_runs_transducer_argmax(W.backend, W.V_out, W.V_plus_1, W.num_durations);
 
     if (!W.use_graphs) {
+        if (measure) {
+            // ---- CPU fallback, sized: the dequantised host f32 copies ----
+            auto f32_bytes = [](const ggml_tensor * t) {
+                return t ? (size_t) ggml_nelements(t) * sizeof(float) : (size_t) 0;
+            };
+            measure->host_bytes += f32_bytes(W.weights->predict_embed);
+            for (const TdtLstmLayer & lyr : W.weights->lstm) {
+                measure->host_bytes += f32_bytes(lyr.w_ih) + f32_bytes(lyr.w_hh)
+                                     + f32_bytes(lyr.b_ih) + f32_bytes(lyr.b_hh);
+            }
+            measure->host_bytes += f32_bytes(W.weights->joint_enc_w)
+                                 + f32_bytes(W.weights->joint_enc_b)
+                                 + f32_bytes(W.weights->joint_pred_w)
+                                 + f32_bytes(W.weights->joint_pred_b)
+                                 + f32_bytes(W.weights->joint_out_w)
+                                 + f32_bytes(W.weights->joint_out_b);
+            return 0;
+        }
         // ---- CPU fallback: dequantise weights to host f32 ----
         dequantize_to_f32(W.weights->predict_embed, W.embed);
         W.host_lstm.clear();
@@ -1235,14 +1309,29 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W,
             ggml_set_name(W.zero_dur_idx, "tdt.zero_dur_idx");
         }
 
-        W.persist_buffer = ggml_backend_alloc_ctx_tensors(W.persist_ctx, W.backend);
-        if (!W.persist_buffer) {
-            std::fprintf(stderr, "tdt_prepare_runtime: failed to allocate persistent state buffer\n");
-            return 4;
+        if (measure) {
+            // Size the persistent state, then mark it externally-allocated so
+            // the graph measurements below don't count it a second time.
+            measure->device_state_bytes += ggml_backend_alloc_ctx_tensors_from_buft_size(
+                W.persist_ctx, ggml_backend_get_default_buffer_type(W.backend));
+            for (ggml_tensor * t = ggml_get_first_tensor(W.persist_ctx); t;
+                 t = ggml_get_next_tensor(W.persist_ctx, t)) {
+                if (!t->data && !t->view_src) {
+                    t->data = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+                }
+            }
+        } else {
+            W.persist_buffer = ggml_backend_alloc_ctx_tensors(W.persist_ctx, W.backend);
+            if (!W.persist_buffer) {
+                std::fprintf(stderr, "tdt_prepare_runtime: failed to allocate persistent state buffer\n");
+                return 4;
+            }
         }
         W.enc_proj_T_max = T_max;
 
-        if (W.dur_table) {
+        // Uploads write through real device pointers; a measured runtime has
+        // none (its tensors carry the externally-allocated marker only).
+        if (W.dur_table && !measure) {
             const std::vector<float> table = build_duration_table(model, W.num_durations);
             const int32_t zero = 0;
             ggml_backend_tensor_set(W.dur_table, table.data(), 0, table.size() * sizeof(float));
@@ -1264,14 +1353,64 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W,
         return 5;
     }
 
+    size_t lstm_cat_bytes = 0;
     W.concat_lstm_input = allow_concat_lstm &&
                           backend_runs_concat(W.backend, W.H_pred) &&
-                          build_lstm_input_concat(W);
+                          build_lstm_input_concat(W, measure ? &lstm_cat_bytes : nullptr);
     if (!W.concat_lstm_input) W.lstm_cat.clear();
+    if (measure) {
+        // The concatenated [w_ih | w_hh] stacks live on the device for the
+        // runtime's lifetime, alongside the persistent state.
+        measure->device_state_bytes += lstm_cat_bytes;
+    }
 
     build_lstm_graph(W);
     build_joint_graph(W);
     build_lstm_joint_graph(W);
+
+    if (measure) {
+        // The three fixed-shape gallocrs coexist for the runtime's lifetime,
+        // so their buffers sum (they are not shared or maxed).
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(W.backend);
+        for (ggml_cgraph * cg : { W.g_lstm, W.g_joint, W.g_lstm_joint }) {
+            ggml_gallocr_t pricer = ggml_gallocr_new(buft);
+            if (!pricer) {
+                std::fprintf(stderr, "tdt_measure_runtime: failed to create pricing gallocr\n");
+                return 6;
+            }
+            size_t sz = 0;
+            ggml_gallocr_reserve_n_size(pricer, cg, nullptr, nullptr, &sz);
+            ggml_gallocr_free(pricer);
+            measure->device_compute_bytes += sz;
+        }
+        // Worst-case per-window enc-projection graph (built lazily at decode
+        // time). Larger windows are projected in <= k_enc_proj_T_max chunks,
+        // matching enc_proj_persist's capacity.
+        int T = measure_enc_frames;
+        if (T > TdtRuntimeWeights::k_enc_proj_T_max) T = TdtRuntimeWeights::k_enc_proj_T_max;
+        if (T > 0) {
+            size_t sz = 0;
+            build_enc_proj_graph(W, T, &sz);
+            measure->device_compute_bytes += sz;
+        }
+        // Unrolled decode graph: built lazily by ensure_unroll_graph under
+        // exactly these conditions and resident alongside the fixed graphs.
+        // max_symbols mirrors the decode default (TdtDecodeOptions /
+        // rnnt_max_symbols_per_step); the graph's footprint is driven by
+        // unroll_steps, not the symbol cap.
+        if (W.fused_lstm_cell && W.argmax_on_gpu && W.unroll_steps >= 1 &&
+            W.dur_table && W.zero_dur_idx) {
+            const int max_symbols = W.rnnt_mode
+                                        ? model.encoder_cfg.rnnt_max_symbols_per_step
+                                        : TdtDecodeOptions{}.max_symbols_per_step;
+            if (max_symbols >= 1) {
+                size_t sz = 0;
+                build_unroll_graph(W, model.blank_id, max_symbols, &sz);
+                measure->device_compute_bytes += sz;
+            }
+        }
+        return 0;
+    }
 
     W.alloc_lstm       = ggml_gallocr_new(ggml_backend_get_default_buffer_type(W.backend));
     W.alloc_joint      = ggml_gallocr_new(ggml_backend_get_default_buffer_type(W.backend));
@@ -1288,6 +1427,23 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W,
     }
 
     return 0;
+}
+
+int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W,
+                        bool allow_fused_lstm, bool allow_concat_lstm) {
+    return tdt_prepare_runtime_impl(model, W, allow_fused_lstm, allow_concat_lstm,
+                                    /*measure=*/nullptr, /*measure_enc_frames=*/0);
+}
+
+int tdt_measure_runtime(const ParakeetCtcModel & model, int worst_enc_frames,
+                        DecoderFitMeasure & out) {
+    out = DecoderFitMeasure{};
+    TdtRuntimeWeights W;  // scaffolding only; destructor frees the metadata ctxs
+    // Mirror the real Engine call: both graph refinements enabled, with the
+    // same backend-capability probes deciding what actually builds.
+    return tdt_prepare_runtime_impl(model, W, /*allow_fused_lstm=*/true,
+                                    /*allow_concat_lstm=*/true,
+                                    &out, worst_enc_frames);
 }
 
 void tdt_set_unroll_steps(TdtRuntimeWeights & W, int steps) {

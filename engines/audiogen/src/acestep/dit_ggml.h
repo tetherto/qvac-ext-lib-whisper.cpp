@@ -55,7 +55,8 @@ inline bool is_sft_model_name(const std::string & model_name) {
     return model_name.find("sft") != std::string::npos;
 }
 
-struct DitModel;  // opaque: fused weight tensors + backend weight buffer
+struct DitModel;             // opaque: fused weight tensors + backend weight buffer
+struct AcestepStageMeasure;  // fit_measure.h
 
 // Load DiT weights from `path` onto `backend` (borrowed). Returns nullptr on
 // failure. Reads config from GGUF metadata; fuses QKV / gate-up when tensor
@@ -64,6 +65,18 @@ DitModel *        dit_model_load(const std::string & path, ggml_backend_t backen
 void              dit_model_free(DitModel * m);
 const DitConfig & dit_model_config(const DitModel * m);
 size_t            dit_model_weight_bytes(const DitModel * m);
+
+// Metadata-only load for the memory-fit preflight: identical tensor wiring to
+// dit_model_load, but the weight allocation is SIZED into `measure` instead of
+// performed and no tensor data is read. Only good for the measure-mode forward
+// below; free with dit_model_free.
+DitModel * dit_model_load_metadata_only(const std::string & path, ggml_backend_t backend,
+                                        bool verbose, AcestepStageMeasure & measure);
+
+// Compute-buffer bytes of the persistent forward-graph cache (0 when no graph
+// has been built); lets the fit parity tests compare projection vs the real
+// resident allocation.
+size_t dit_model_compute_buffer_bytes(const DitModel * m);
 
 // Inputs for one DiT forward (velocity prediction). N = batch (CFG uses N=2).
 struct DitForwardInputs {
@@ -92,7 +105,14 @@ struct DitForwardInputs {
 
 // Run one forward pass. Writes velocity [out_channels, T, N] (channel-major per
 // frame) to `velocity_out`. Returns false on failure.
-bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<float> & velocity_out);
+// When `measure_compute` is non-null the call builds the identical graph for
+// `in`'s shapes but only SIZES its compute buffer (the size-only twin of the
+// persistent graph-cache allocation) -- nothing is allocated, uploaded, or
+// computed, and the graph cache is left untouched. The data pointers in `in`
+// may then be null; `sa_mask_sw` / `ca_mask` still select the masked graph
+// shape by non-nullness (pass any non-null pointer, as dit_sample always does).
+bool dit_model_forward(DitModel * m, const DitForwardInputs & in, std::vector<float> & velocity_out,
+                       size_t * measure_compute = nullptr);
 
 // One cross-attention head to capture during the lyric-alignment probe.
 struct DitAttentionHead {

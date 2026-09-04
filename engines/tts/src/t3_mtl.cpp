@@ -26,6 +26,7 @@
 #include "t3_alignment_analyzer.h"
 
 #include "backend_util.h"
+#include "fit_price.h"
 #include "gguf_stream.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -1680,8 +1681,10 @@ bool load_model_gguf_mtl(const std::string & path,
                          chatterbox_model & model,
                          int requested_ctx,
                          int n_gpu_layers,
-                         ggml_type kv_type) {
+                         ggml_type kv_type,
+                         t3_load_measure * measure) {
     extern int g_log_verbose;
+    if (measure) *measure = t3_load_measure{};
     // no_alloc=true: tmp_ctx carries tensor METADATA only; payloads are
     // streamed straight from the file into the backend buffer below so the
     // full data section is never staged in host memory (see gguf_stream.h).
@@ -1768,29 +1771,35 @@ bool load_model_gguf_mtl(const std::string & path,
         ggml_set_name(freq_factors, "rope_freq_factors");
         model.rope_freq_factors = freq_factors;
 
-        model.buffer_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
-        if (!model.buffer_w) {
-            throw std::runtime_error("load_model_gguf_mtl: ggml_backend_alloc_ctx_tensors failed for "
-                                     "weights buffer (backend out of memory?)");
-        }
+        if (measure) {
+            measure->weights_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+                model.ctx_w, ggml_backend_get_default_buffer_type(model.backend));
+            t3_mark_externally_allocated(model.ctx_w);
+        } else {
+            model.buffer_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
+            if (!model.buffer_w) {
+                throw std::runtime_error("load_model_gguf_mtl: ggml_backend_alloc_ctx_tensors failed for "
+                                         "weights buffer (backend out of memory?)");
+            }
 
-        {
-            ::tts_cpp::detail::gguf_stream_reader reader(gguf_ctx, path);
-            if (!reader.ok()) throw std::runtime_error("failed to reopen GGUF for tensor data: " + path);
-            for (ggml_tensor * cur = ggml_get_first_tensor(model.ctx_w); cur; cur = ggml_get_next_tensor(model.ctx_w, cur)) {
-                if (cur == freq_factors) continue;
-                if (!reader.to_backend(ggml_get_name(cur), cur)) {
-                    throw std::runtime_error(std::string("failed to stream tensor '") +
-                                             ggml_get_name(cur) + "' from " + path);
+            {
+                ::tts_cpp::detail::gguf_stream_reader reader(gguf_ctx, path);
+                if (!reader.ok()) throw std::runtime_error("failed to reopen GGUF for tensor data: " + path);
+                for (ggml_tensor * cur = ggml_get_first_tensor(model.ctx_w); cur; cur = ggml_get_next_tensor(model.ctx_w, cur)) {
+                    if (cur == freq_factors) continue;
+                    if (!reader.to_backend(ggml_get_name(cur), cur)) {
+                        throw std::runtime_error(std::string("failed to stream tensor '") +
+                                                 ggml_get_name(cur) + "' from " + path);
+                    }
                 }
             }
-        }
 
-        {
-            std::vector<float> ff = compute_llama3_freq_factors(
-                hp.head_dim, hp.rope_theta, hp.rope_scale_factor,
-                hp.rope_low_freq, hp.rope_high_freq, hp.rope_orig_max_pos);
-            ggml_backend_tensor_set(freq_factors, ff.data(), 0, ff.size() * sizeof(float));
+            {
+                std::vector<float> ff = compute_llama3_freq_factors(
+                    hp.head_dim, hp.rope_theta, hp.rope_scale_factor,
+                    hp.rope_low_freq, hp.rope_high_freq, hp.rope_orig_max_pos);
+                ggml_backend_tensor_set(freq_factors, ff.data(), 0, ff.size() * sizeof(float));
+            }
         }
 
         model.text_emb        = require_tensor(model, "chatterbox/text_emb");
@@ -1873,10 +1882,16 @@ bool load_model_gguf_mtl(const std::string & path,
         // (none on the MTL hot path; kept nullable on purpose).
         model.memory_k_uncond = nullptr;
         model.memory_v_uncond = nullptr;
-        model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
-        if (!model.buffer_kv) {
-            throw std::runtime_error("load_model_gguf_mtl: ggml_backend_alloc_ctx_tensors failed for "
-                                     "KV-cache buffer (backend out of memory?)");
+        if (measure) {
+            measure->kv_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+                model.ctx_kv, ggml_backend_get_default_buffer_type(model.backend));
+            t3_mark_externally_allocated(model.ctx_kv);
+        } else {
+            model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
+            if (!model.buffer_kv) {
+                throw std::runtime_error("load_model_gguf_mtl: ggml_backend_alloc_ctx_tensors failed for "
+                                         "KV-cache buffer (backend out of memory?)");
+            }
         }
 
         // Phase 15: per-layer fused-matmul stacks for the Metal hot path.
@@ -1925,6 +1940,14 @@ bool load_model_gguf_mtl(const std::string & path,
                 l.wqkv = ggml_new_tensor_2d(model.ctx_stack, l.wq->type, n_embd, 3 * n_embd);
             }
             (void) n_ff;
+            if (measure) {
+                // Size the stack instead of allocating; the pack loop below
+                // reads weight data, so the measure path skips it (there is
+                // no buffer to register either).
+                measure->stack_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+                    model.ctx_stack, ggml_backend_get_default_buffer_type(model.backend));
+                t3_mark_externally_allocated(model.ctx_stack);
+            } else {
             model.buffer_stack = ggml_backend_alloc_ctx_tensors(model.ctx_stack, model.backend);
             if (!model.buffer_stack) {
                 throw std::runtime_error("load_model_gguf_mtl: ggml_backend_alloc_ctx_tensors failed for "
@@ -1969,6 +1992,7 @@ bool load_model_gguf_mtl(const std::string & path,
                 copy_into(l.wv);
                 ggml_backend_tensor_set(l.wqkv, scratch.data(), 0, off);
             }
+            }  // end !measure
         }
 
         {
@@ -2209,6 +2233,40 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
         if (cum >= r) return (int32_t) i;
     }
     return (int32_t)(V - 1);
+}
+
+// ----------------------------------------------------------------------------
+// Memory-fit measurement (include/tts-cpp/chatterbox/fit.h): price the MTL
+// prompt + deepest-step graphs without allocating, through the same builders
+// and dispatch decision run_{prompt,step}_pass{,_b2} use.  The GPU path runs
+// the single B=2 CFG graph; the CPU path runs the same-shape B=1 graph twice
+// (cond + uncond), which prices identically per pass.
+// ----------------------------------------------------------------------------
+
+bool t3_measure_compute_mtl(const chatterbox_model & model, int n_text_tokens, int n_past,
+                            uint64_t & device_bytes, uint64_t & host_bytes) {
+    device_bytes = 0;
+    host_bytes   = 0;
+    const bool use_b2 = !::tts_cpp::detail::backend_is_cpu(model.backend);
+    ggml_cgraph * gp = use_b2 ? build_prompt_graph_mtl_b2(model, n_text_tokens)
+                              : build_prompt_graph_mtl(model, n_text_tokens,
+                                                       /*is_uncond=*/false);
+    ::tts_cpp::detail::fit_graph_price prompt, step;
+    if (!::tts_cpp::detail::fit_price_graph(model.backend, gp,
+                                            2 * CHBX_MAX_NODES, prompt)) {
+        return false;
+    }
+    ggml_cgraph * gs = use_b2 ? build_step_graph_mtl_b2(model, n_past)
+                              : build_step_graph_mtl(model, n_past, /*is_uncond=*/false);
+    if (!::tts_cpp::detail::fit_price_graph(model.backend, gs,
+                                            2 * CHBX_MAX_NODES, step)) {
+        return false;
+    }
+    // Both graphs allocate through one gallocr (or the one shared scheduler),
+    // which grows to the larger reservation.
+    device_bytes = std::max(prompt.device_bytes, step.device_bytes);
+    host_bytes   = std::max(prompt.host_bytes, step.host_bytes);
+    return true;
 }
 
 } // namespace tts_cpp::chatterbox::detail

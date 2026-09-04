@@ -37,6 +37,7 @@ struct LMConfig {
 struct LMModel;  // opaque
 struct DitGGUF;
 struct Qwen3Layer;
+struct AcestepStageMeasure;  // fit_measure.h
 
 // Fused-load internals, exposed for unit tests: copy one GGUF tensor into the
 // row-concatenated dst at byte offset `off` (advancing it), and load one
@@ -58,6 +59,43 @@ size_t           lm_model_weight_bytes(const LMModel * m);
 int              lm_num_kv_sets(const LMModel * m);
 bool             lm_model_embeddings_quantized(const LMModel * m);
 
+// Metadata-only load for the memory-fit preflight: identical backend
+// resolution, tensor wiring (fusion decision included), and KV-cache layout to
+// lm_model_load, but every allocation is SIZED into `measure` instead of
+// performed and no tensor data is read. Only good for the measure-mode
+// forwards below; free with lm_model_free.
+LMModel * lm_model_load_metadata_only(const std::string & path, ggml_backend_t backend, int max_seq_len,
+                                      bool verbose, int n_kv_sets, AcestepStageMeasure & measure);
+
+// KV-cache buffer bytes of a real load (0 on a metadata-only model, whose KV
+// bytes are reported in its AcestepStageMeasure instead).
+size_t lm_model_kv_bytes(const LMModel * m);
+
+// Compute-buffer bytes of the persistent forward-graph cache (0 when no graph
+// has been built); lets the fit parity tests compare projection vs the real
+// resident allocation.
+size_t lm_model_compute_buffer_bytes(const LMModel * m);
+
+// Bytes of the compact tied-head copy lm_build_partial_head would allocate for
+// `count` rows (same tensor shape/type, sized not allocated).
+size_t lm_measure_partial_head_bytes(const LMModel * m, int count);
+
+// Size-only twins of the two forward paths, for the memory-fit preflight.
+// Build the identical graph at the given shape and write its compute-buffer
+// size (ggml_gallocr_reserve_n_size) -- nothing is allocated, uploaded, or
+// computed, the graph cache and KV positions are left untouched.
+//   measure_prefill: one forward over n_tokens at KV position 0.
+//   measure_decode: one single-stream decode step whose KV window has reached
+//     kv_len (the graph's mask/view size is GGML_PAD(kv_len, 256) capped at
+//     max_seq_len -- pass max_seq_len for the worst case).
+//   measure_decode_batch: the batched-CFG decode step (N consecutive sets) at
+//     kv_len, with the compact head at logit_offset (0 = full head). Fails
+//     (returns false) where the real path would: no flash attention or
+//     n_kv_sets < N.
+bool lm_model_measure_prefill(LMModel * m, int n_tokens, int logit_limit, size_t & compute_bytes);
+bool lm_model_measure_decode(LMModel * m, int kv_len, int logit_limit, size_t & compute_bytes);
+bool lm_model_measure_decode_batch(LMModel * m, int N, int kv_len, int logit_offset, size_t & compute_bytes);
+
 // Reset the KV cache for one set (start a new sequence).
 void lm_reset(LMModel * m, int set = 0);
 int  lm_kv_pos(const LMModel * m, int set = 0);
@@ -72,15 +110,19 @@ int  lm_kv_pos(const LMModel * m, int set = 0);
 // logit_limit > 0 projects only the tied-head prefix rows [0, logit_limit) and
 // returns that many logits - valid only when the caller can never select a
 // token past the limit (FSM-constrained Phase 1).
+// `measure_compute` non-null: size-only mode (see lm_model_measure_prefill),
+// token_ids may be null; prefer the lm_model_measure_* wrappers.
 bool lm_model_forward(LMModel * m, const int32_t * token_ids, int n_tokens, std::vector<float> & logits_out,
-                      int set = 0, std::vector<float> * layer_states_out = nullptr, int logit_limit = 0);
+                      int set = 0, std::vector<float> * layer_states_out = nullptr, int logit_limit = 0,
+                      size_t * measure_compute = nullptr);
 
 // Decode one token for each KV set in a single batched graph. `sets` must name
 // consecutive caches and `logit_offset` optionally projects only the tied-head
 // rows [logit_offset, vocab_size), matching ACE-Step's Phase-2 compact head.
 // Returns logits as N consecutive vectors of size vocab_size-logit_offset.
 bool lm_model_forward_batch(LMModel * m, const int32_t * token_ids, const int * sets, int n,
-                            std::vector<float> & logits_out, int logit_offset = 0);
+                            std::vector<float> & logits_out, int logit_offset = 0,
+                            size_t * measure_compute = nullptr);
 bool lm_model_supports_batched_decode(const LMModel * m);
 
 } // namespace tts_cpp::acestep

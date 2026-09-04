@@ -18,6 +18,9 @@
 #include "audio8/codec_ops.h"
 #include "audio8/graph.h"
 
+#include "fit_price.h"
+#include "fit_util.h"
+
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -358,6 +361,58 @@ bool encode_audio(codec_model & model, const float * pcm, int n_samples, int n_t
     if (cancelled(cancel, error)) return false;
     return run_analysis(model, features, positions, n_frames, n_threads, codes_out, taps,
                         error);
+}
+
+int encode_positions(const codec_model & model, int n_frames) {
+    return encoder_positions(model.hp, n_frames);
+}
+
+int encode_feature_width(const codec_model & model) {
+    return feature_width(model);
+}
+
+// Fit measurement (include/tts-cpp/audio8/fit.h): price what one encode_audio
+// of an n_frames reference leaves resident, without allocating. The
+// convolution stack runs in fixed-width blocks (run_conv_blocks), so its
+// worst block is the configured width plus the causal context; the analysis
+// graph sees the whole reference at once. The two arenas (model.block_allocr /
+// model.allocr) are separate and both stay resident, so they sum.
+bool measure_encode_memory(codec_model & model, int n_frames, codec_fit_measure & out) {
+    using ::tts_cpp::fitutil::sat_add;
+    out = codec_fit_measure{};
+    if (n_frames <= 0) return false;
+    std::string error;
+    if (!check_encodable(model, n_frames, &error)) return false;
+
+    const int positions = encoder_positions(model.hp, n_frames);
+    {
+        const int stride  = total_encoder_stride(model.hp);
+        const int context = analysis_context(model);
+        const int block_columns = std::max(1, model.analysis_block_columns);
+        const int worst = std::min(block_columns + context, positions);
+        scratch work(AUDIO8_MAX_NODES);
+        if (!work.ok()) return false;
+        mark_output(work.graph, build_conv_stack(work.ctx, model, worst * stride));
+        ::tts_cpp::detail::fit_graph_price price;
+        if (!fit_price_graph(model.backend, work.graph, 2 * AUDIO8_MAX_NODES, price)) {
+            return false;
+        }
+        out.device_bytes = sat_add(out.device_bytes, price.device_bytes);
+        out.host_bytes   = sat_add(out.host_bytes, price.host_bytes);
+    }
+    {
+        scratch work(AUDIO8_MAX_NODES);
+        if (!work.ok()) return false;
+        const analysis_graph built = build_analysis(work.ctx, model, positions, n_frames);
+        for (ggml_tensor * codes : built.codes) mark_output(work.graph, codes);
+        ::tts_cpp::detail::fit_graph_price price;
+        if (!fit_price_graph(model.backend, work.graph, 2 * AUDIO8_MAX_NODES, price)) {
+            return false;
+        }
+        out.device_bytes = sat_add(out.device_bytes, price.device_bytes);
+        out.host_bytes   = sat_add(out.host_bytes, price.host_bytes);
+    }
+    return true;
 }
 
 }  // namespace detail
