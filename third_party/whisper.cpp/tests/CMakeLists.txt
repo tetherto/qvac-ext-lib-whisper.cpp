@@ -119,6 +119,29 @@ target_link_libraries(${PARAMS_TEST} PRIVATE whisper)
 add_test(NAME ${PARAMS_TEST} COMMAND ${PARAMS_TEST})
 set_tests_properties(${PARAMS_TEST} PROPERTIES LABELS "unit;gh")
 
+# Memory-fit preflight: model-free unit test for the CLI helpers and the
+# whisper_fit_params argument/status contract (QVAC patch, see PATCHES.md)
+set(FIT_CLI_TEST test-whisper-fit-cli)
+add_executable(${FIT_CLI_TEST} ${FIT_CLI_TEST}.cpp)
+target_include_directories(${FIT_CLI_TEST} PRIVATE ../include ../ggml/include ../examples)
+target_link_libraries(${FIT_CLI_TEST} PRIVATE whisper)
+add_test(NAME ${FIT_CLI_TEST} COMMAND ${FIT_CLI_TEST})
+set_tests_properties(${FIT_CLI_TEST} PROPERTIES LABELS "unit;gh")
+
+# Memory-fit preflight: byte-parity gates against a REAL load of the committed
+# tiny + silero fixtures -- the projection must equal what whisper actually
+# allocates (QVAC patch, see PATCHES.md). Pass "gpu" manually as a third arg
+# to re-run the parity check on a GPU backend.
+set(FIT_TEST test-whisper-fit-params)
+add_executable(${FIT_TEST} ${FIT_TEST}.cpp)
+target_include_directories(${FIT_TEST} PRIVATE ../include ../ggml/include)
+target_link_libraries(${FIT_TEST} PRIVATE whisper)
+target_compile_definitions(${FIT_TEST} PRIVATE
+    WHISPER_FIT_TEST_MODEL="${PROJECT_SOURCE_DIR}/models/for-tests-ggml-tiny.bin"
+    WHISPER_FIT_TEST_VAD_MODEL="${PROJECT_SOURCE_DIR}/models/for-tests-silero-v6.2.0-ggml.bin")
+add_test(NAME ${FIT_TEST} COMMAND ${FIT_TEST})
+set_tests_properties(${FIT_TEST} PROPERTIES LABELS "unit;tiny;gh")
+
 # VAD test tests VAD in isolation
 set(VAD_TEST test-vad)
 add_executable(${VAD_TEST} ${VAD_TEST}.cpp)
